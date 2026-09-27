@@ -1,0 +1,171 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] mapc: attribute a STA-MLD to the AP-MLD reporting it
+
+A client that roams is reported by BOTH the node it left and the node it
+joined. Measured 2026-08-02 with an iPhone moving 4g -> x8:
+
+  E2TRACE: ULOZEN sta_mld 7a:6f:.. pod ap_mld 00:0c:43:26:60:10 links=3
+  E2TRACE: ULOZEN sta_mld 7a:6f:.. pod ap_mld 7e:04:1c:81:7c:2e links=1
+  ... alternating, once per Topology Response round
+
+sta_mld is keyed on the client address alone, so the two reports overwrite
+each other and whichever arrived last became "the truth" - usually the stale
+one, whose link count decays as the old node loses the affiliated links one
+by one. The DB ended up claiming a three-link MLO client had one link, on a
+BSSID it had already left.
+
+Neither the element nor the table kept the AP-MLD address, even though the
+Associated STA MLD Config TLV carries it, so the controller had no way to
+say where a client is - which is also the first thing steering needs to ask.
+
+This adds ap_mld_macaddr and last_seen. They deliberately do NOT arbitrate:
+they record who claimed what and when, so a fresh claim can be told from a
+fading one. The ghost itself is an agent-side defect (a node keeps a
+stamldlist entry for a client its own HAL no longer reports) and is fixed
+separately; until then the columns at least make the disagreement visible
+rather than silently resolving it wrong.
+
+Schema goes to v2. The DB lives in /etc/mapc and is kept across a flash, so
+CREATE TABLE IF NOT EXISTS cannot widen it - an existing table keeps its old
+column set and every INSERT naming a new column fails. mapdb_migrate() runs
+ALTER TABLE ADD COLUMN inside the same transaction as the schema apply. Its
+return value is ignored on purpose: a second run fails with "duplicate
+column name", which is exactly the state we want.
+---
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -16,7 +16,7 @@
+ #define MAPDB_SCHEMA_H
+ 
+ /* Bump when the DDL below changes; drives the schema_version migration gate. */
+-#define MAPDB_SCHEMA_VERSION 1
++#define MAPDB_SCHEMA_VERSION 2
+ 
+ /* schema.sql, verbatim. CREATE TABLE IF NOT EXISTS throughout -> idempotent. */
+ static const char MAPDB_SCHEMA_SQL[] =
+@@ -328,7 +328,15 @@
+ 	"    bytes_tx INTEGER, bytes_rx INTEGER,      -- [:477/:478]\n"
+ 	"    hostname             TEXT,               -- [:474]\n"
+ 	"    ipv4 TEXT, ipv6 TEXT,                    -- [:472/:473]\n"
+-	"    num_sta              INTEGER             -- [:485]\n"
++	"    num_sta              INTEGER,            -- [:485]\n"
++	"    -- Which AP-MLD is reporting this client, and when it last said so.\n"
++	"    -- Not in wifi_dataelements.h: the Associated STA MLD Config TLV\n"
++	"    -- carries the AP-MLD address but the element does not keep it, so\n"
++	"    -- without these two the DB cannot answer where a client is - and a\n"
++	"    -- roamed client is reported by BOTH its old and its new node, which\n"
++	"    -- silently made the last writer win (measured 2026-08-02).\n"
++	"    ap_mld_macaddr       TEXT,\n"
++	"    last_seen            INTEGER\n"
+ 	");\n"
+ 	"\n"
+ 	"-- 19. affiliated STA links of a STA-MLD (R6 telemetry; wifi_affiliated_sta_element)\n"
+--- a/src/db/mapdb.c
++++ b/src/db/mapdb.c
+@@ -64,6 +64,53 @@
+ 	return (rc == MAPDB_DONE) ? MAPDB_OK : MAPDB_ERR;
+ }
+ 
++/* Bring an existing DB up to MAPDB_SCHEMA_VERSION.
++ *
++ * The DB lives in /etc/mapc and is deliberately kept across a flash (see the
++ * mapc-db-keep default), so CREATE TABLE IF NOT EXISTS is not enough: a table
++ * that already exists keeps its old column set and every INSERT naming a new
++ * column fails. ALTER TABLE ADD COLUMN is the only in-place widening SQLite
++ * offers; it is idempotent enough for our purpose because a second attempt
++ * fails with 'duplicate column name', which is exactly the state we want, so
++ * the return value is deliberately ignored.
++ */
++static int mapdb_migrate(mapdb *db)
++{
++	mapdb_stmt *st = NULL;
++	int version = 0;
++	int rc;
++
++	if (mapdb_prepare(db, "SELECT version FROM schema_version LIMIT 1", &st) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	rc = mapdb_step(st);
++	if (rc == MAPDB_ROW)
++		version = mapdb_column_int(st, 0);
++	mapdb_finalize(st);
++
++	if (rc != MAPDB_ROW)
++		return MAPDB_OK;	/* fresh DB - seeding handles it */
++
++	if (version >= MAPDB_SCHEMA_VERSION)
++		return MAPDB_OK;
++
++	/* v1 -> v2: attribute a STA-MLD to the AP-MLD reporting it. */
++	mapdb_exec(db, "ALTER TABLE sta_mld ADD COLUMN ap_mld_macaddr TEXT");
++	mapdb_exec(db, "ALTER TABLE sta_mld ADD COLUMN last_seen INTEGER");
++
++	if (mapdb_prepare(db, "UPDATE schema_version SET version=?, applied_at=?",
++			  &st) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	mapdb_bind_int(st, 1, MAPDB_SCHEMA_VERSION);
++	mapdb_bind_int(st, 2, (long long)time(NULL));
++
++	rc = mapdb_step(st);
++	mapdb_finalize(st);
++
++	return (rc == MAPDB_DONE) ? MAPDB_OK : MAPDB_ERR;
++}
++
+ int mapdb_apply_schema(mapdb *db)
+ {
+ 	if (!db)
+@@ -79,6 +126,11 @@
+ 	if (mapdb_seed_version(db) != MAPDB_OK)
+ 		goto fail;
+ 
++	/* Widen an already-seeded DB. Runs inside the same transaction, so a
++	 * half-applied migration cannot survive a crash. */
++	if (mapdb_migrate(db) != MAPDB_OK)
++		goto fail;
++
+ 	if (mapdb_commit(db) != MAPDB_OK)
+ 		goto fail;			/* roll back; don't leave the txn open */
+ 
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -752,16 +752,26 @@
+ 		"ON CONFLICT(bssid) DO UPDATE SET mld_macaddr=excluded.mld_macaddr, "
+ 		"ruid=excluded.ruid, link_id=excluded.link_id, "
+ 		"punct_bitmap=excluded.punct_bitmap";
++	/* ap_mld_macaddr + last_seen: a roamed client is reported by BOTH the
++	 * node it left and the node it joined - measured 2026-08-02, the two
++	 * reports alternated and whichever landed last became "the truth",
++	 * which was usually the stale one with a shrinking link count. The
++	 * columns do not arbitrate on their own; they record who claimed what
++	 * and when, so the caller can tell a fresh claim from a fading one
++	 * (and so the DB can finally answer "where is this client"). */
+ 	static const char *ins_stamld =
+ 		"INSERT INTO sta_mld(mld_macaddr, is_bsta, emlmr_enabled, "
+-		"emlsr_enabled, str_enabled, nstr_enabled, num_sta) "
+-		"VALUES(?,0,?,?,?,?,?) "
++		"emlsr_enabled, str_enabled, nstr_enabled, num_sta, "
++		"ap_mld_macaddr, last_seen) "
++		"VALUES(?,0,?,?,?,?,?,?,?) "
+ 		"ON CONFLICT(mld_macaddr) DO UPDATE SET is_bsta=0, "
+ 		"emlmr_enabled=excluded.emlmr_enabled, "
+ 		"emlsr_enabled=excluded.emlsr_enabled, "
+ 		"str_enabled=excluded.str_enabled, "
+ 		"nstr_enabled=excluded.nstr_enabled, "
+-		"num_sta=excluded.num_sta";
++		"num_sta=excluded.num_sta, "
++		"ap_mld_macaddr=excluded.ap_mld_macaddr, "
++		"last_seen=excluded.last_seen";
+ 	static const char *ins_affsta =
+ 		"INSERT INTO affiliated_sta(macaddr, mld_macaddr, bssid) "
+ 		"VALUES(?,?,?) "
+@@ -918,6 +928,8 @@
+ 				mapdb_bind_int(st, 4, sm->str_enabled ? 1 : 0);
+ 				mapdb_bind_int(st, 5, sm->nstr_enabled ? 1 : 0);
+ 				mapdb_bind_int(st, 6, sm->num_sta);
++				mapdb_bind_text(st, 7, mldmac);
++				mapdb_bind_int(st, 8, (long long)time(NULL));
+ 				if (stmt_finish(c->db, st) != MAPDB_OK) {
+ 					mapdb_rollback(c->db);
+ 					return;

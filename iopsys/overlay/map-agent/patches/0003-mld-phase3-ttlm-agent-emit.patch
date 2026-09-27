@@ -1,0 +1,116 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: mld phase3 ttlm agent emit
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/agent_cmdu.c
++++ b/src/agent_cmdu.c
+@@ -1379,7 +1379,12 @@
+ 				agent_gen_associated_sta_mld_config(a, resp, s);
+ 		}
+ 
+-		/* TODO: TID-to-Link Mapping Policy TLV */
++		/* TID-to-Link Mapping Policy TLV (0xE6) - rides the Topology
++		 * Response alongside the AP-MLD Config TLV (0xE0) so the
++		 * controller ingests both together (WOZIWRT R6 step 3). */
++		if (a->num_ap_mld > 0)
++			if (agent_gen_tid_to_link_mapping(a, resp))
++				goto error;
+ #endif
+ 	}
+ #endif
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -4696,6 +4696,83 @@
+ 	return ret;
+ }
+ 
++#if (EASYMESH_VERSION > 5)
++/* TID-to-Link Mapping Policy TLV (0xE6) - WOZIWRT R6 DB Phase 1.5 (step 3),
++ * first open implementation. The base stack defined only the TLV number and
++ * left a literal TODO. Here we serialize the default TID-to-Link map: every
++ * TID (0..7) mapped to every affiliated link of each AP-MLD, direction =
++ * WIFI7_TID_TO_LINK_SUPP_NxM, derived from data the agent already holds
++ * (mld->num_affiliated_ap + each affiliated AP's mlo_link_id) - no new HAL
++ * call. Byte-walk into the reserved TLV (see struct
++ * tlv_tid_to_link_mapping_policy); the trailing arrays are variable so keep a
++ * running offset and never write past TTLM_TLV_RESERVE. */
++#define TTLM_TLV_RESERVE 2048
++int agent_gen_tid_to_link_mapping(struct agent *a, struct cmdu_buff *frm)
++{
++	agnt_trace(LOG_MLO, "%s: --->\n", __func__);
++
++	struct netif_mld *mld = NULL;
++	struct tlv *t;
++	int offset = 0;
++	int ret;
++
++	t = cmdu_reserve_tlv(frm, TTLM_TLV_RESERVE);
++	if (!t)
++		return -1;
++
++	t->type = MAP_TLV_TID_TO_LINK_MAPPING_POLICY;
++	t->len = 0;
++
++	/* num_mlds */
++	t->data[offset++] = a->num_ap_mld;
++
++	list_for_each_entry(mld, &a->apmldlist, list) {
++		int nmap_off, i, tid;
++		uint8_t num_mappings = 0;
++
++		if (offset + 7 > TTLM_TLV_RESERVE)
++			break;
++
++		/* AP-MLD MAC address */
++		memcpy(&t->data[offset], mld->macaddr, 6);
++		offset += 6;
++
++		/* num_mappings placeholder, back-patched after the loop */
++		nmap_off = offset++;
++
++		for (i = 0; i < mld->num_affiliated_ap; i++) {
++			struct netif_ap *ap;
++
++			ap = agent_get_ap(a, mld->affiliated_ap[i]);
++			if (!ap || !ap->is_affiliated_ap)
++				continue;
++
++			/* default map: every TID 0..7 -> this link */
++			for (tid = 0; tid < 8; tid++) {
++				if (offset + 3 > TTLM_TLV_RESERVE)
++					break;
++				t->data[offset++] = (uint8_t)tid;
++				t->data[offset++] = WIFI7_TID_TO_LINK_SUPP_NxM;
++				t->data[offset++] = (uint8_t)ap->mlo_link_id;
++				num_mappings++;
++			}
++		}
++
++		t->data[nmap_off] = num_mappings;
++	}
++
++	t->len = offset;
++
++	ret = cmdu_put_tlv(frm, t);
++	if (ret) {
++		agnt_err(LOG_MLO, "%s: error: cmdu_put_tlv()\n", __func__);
++		return -1;
++	}
++
++	return ret;
++}
++#endif
++
+ int agent_gen_bsta_mld_config(struct agent *a, struct cmdu_buff *frm)
+ {
+ 	agnt_trace(LOG_MLO, "%s: --->\n", __func__);
+--- a/src/agent_tlv.h
++++ b/src/agent_tlv.h
+@@ -216,6 +216,7 @@
+ #if (EASYMESH_VERSION > 5)
+ int agent_gen_wifi7_agent_caps(struct agent *a, struct cmdu_buff *frm);
+ int agent_gen_ap_mld_config(struct agent *a, struct cmdu_buff *frm);
++int agent_gen_tid_to_link_mapping(struct agent *a, struct cmdu_buff *frm);
+ int agent_gen_bsta_mld_config(struct agent *c, struct cmdu_buff *frm);
+ int agent_gen_eht_operations(struct agent *a, struct cmdu_buff *frm);
+ int agent_gen_affiliated_ap_metrics(struct agent *a, struct cmdu_buff *frm,

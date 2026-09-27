@@ -1,0 +1,28 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: the affiliated-stations comment described the code it replaced
+
+The comment above the affiliated-station query still explained why the
+code should ask wifi.ap instead of wifi.apmld - the reading that dated
+from the master-BSSID clobber era, before the per-link identity fixes,
+and the exact trap the 2026-08-04 review called out (finding 2.7): the
+next person debugging empty stations would be steered at the wrong ubus
+object by the comment sitting directly above code that does the
+opposite. Comment-only change.
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3070,10 +3070,11 @@
+ 	 * conditional so non-MLD stations are not lost. */
+ #if (EASYMESH_VERSION >= 6)
+ 	if (ap->is_affiliated_ap) {
+-		/* 987: query the MLD netdev's wifi.ap object. wifi.apmld.<mld>
+-		 * "stations" is empty on mt76 (its apmld assoclist is empty);
+-		 * wifi.ap.<mld> "stations" returns the MLD clients (libwifi 937),
+-		 * reporting each client's bssid as the AP-MLD master address. */
++		/* Query the MLD netdev's wifi.apmld object: "stations" returns
++		 * the affiliated stations with their per-link identity. (It once
++		 * read as empty on mt76 - that was the master-BSSID clobber
++		 * erasing per-link addresses, since fixed - which is why an older
++		 * version of this comment steered readers to wifi.ap instead.) */
+ 		snprintf(objname, sizeof(objname), "wifi.apmld.%s", ap->mld_ifname);
+ 		method = "stations";
+ 		obj_id = WIFI_OBJECT_INVALID;	/* resolve MLD netdev by name */

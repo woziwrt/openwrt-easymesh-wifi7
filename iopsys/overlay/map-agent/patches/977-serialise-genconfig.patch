@@ -1,0 +1,102 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 977: only one genconfig at a time
+
+"multiap conf" is reached from two places that fire together on the first boot
+after an upgrade: /etc/uci-defaults/991-multiap-genconfig, and the ieee80211
+hotplug handler, which runs once per radio - three times on MT7996. Nothing
+serialised them, and map_genconf() reads /etc/config/mapagent, rewrites it and
+commits. Two concurrent runs read the same starting state, and the one that
+commits second drops whatever the first one added.
+
+Measured on hardware 2026-07-31, colocated controller, boot after flash:
+
+  up=15s  multiap <- S10boot       :: uci set mapagent.bhmld_ap_5=ap ...
+  up=16s  multiap <- hotplug-call  :: uci set mapagent.bhmld_ap_5=ap ...
+
+  before: ap=8  bhmld=4  mld=2  affiliated_ap=15
+  after:  ap=6  bhmld=0  mld=2  affiliated_ap=13
+
+The trace was taken with a shim in front of uci that records every writing
+invocation together with its caller, and it contains no "uci delete" for those
+sections at all - in either run. Nothing removes them. The write is lost.
+
+That was confirmed by making the write impossible rather than by watching it:
+a read-only bind mount over /etc/config/mapagent held from the 20th to the 90th
+second turned the silent overwrite into "/sbin/uci: I/O error" and the
+configuration came through the flash intact, ap=8 bhmld=4, where the same flash
+without it ended at ap=6 bhmld=0.
+
+The same race accounts for the bsta sections that outlive their interfaces. A
+lost write drops an addition in one direction and a removal in the other, so the
+leftovers are not generated - they are forgotten, which is why they neither
+accumulate nor disappear. Their count differs per node under an identical image
+and an identical role: three on one agent, one on another. Deliberate generation
+would produce the same count on both.
+
+A plain reboot is unaffected, and this is worth stating because it shaped the
+whole investigation: by then uci-defaults have been removed, only the hotplug
+path runs, and there is nobody to race with. Ten reboots across the same day
+never reproduced it; every flash did.
+
+The lock is held across the whole generator rather than just the commit. The
+read and the commit have to be one unit - serialising only the write would still
+let the second run begin from a stale copy and reintroduce the same loss. The
+pattern and the lock directory are the ones this script already uses for the
+backhaul path.
+
+What this does not address: map-agent writes to the same file from its own
+process. That is a third writer, it is not on this path, and if it turns out to
+lose writes as well it needs its own answer rather than a wider lock here.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/script/multiap	2026-07-31 15:27:00.840991915 +0200
++++ b/src/script/multiap	2026-07-31 15:27:00.841101129 +0200
+@@ -102,7 +102,46 @@
+ setup_conf() {
+ 	. /lib/multiap/map_genconfig
+ 
+-	map_genconf
++	# Only one generator at a time.
++	#
++	# This entry point is reached from two places that fire together on the
++	# first boot after an upgrade: /etc/uci-defaults/991-multiap-genconfig,
++	# and the ieee80211 hotplug handler, which runs once per radio - three
++	# times on MT7996. Nothing serialised them.
++	#
++	# map_genconf() reads /etc/config/mapagent, rewrites it and commits. Two
++	# concurrent runs therefore both read the same starting state, and the one
++	# that commits second silently drops whatever the first one added. Nothing
++	# is deleted - the write is simply lost.
++	#
++	# Measured on hardware 2026-07-31, colocated controller, boot after flash:
++	#
++	#   up=15s  multiap <- S10boot       :: uci set mapagent.bhmld_ap_5=ap ...
++	#   up=16s  multiap <- hotplug-call  :: uci set mapagent.bhmld_ap_5=ap ...
++	#   result: ap 8 -> 6, bhmld 4 -> 0, affiliated_ap 15 -> 13
++	#
++	# and there is no "uci delete" anywhere in the trace for those sections.
++	# Blocking the file read-only across that window (bind mount, EROFS) left
++	# the configuration intact, which is what identified the write as lost
++	# rather than undone.
++	#
++	# The same race explains the leftover bsta sections that outlive their
++	# interfaces: a lost write drops an addition in one direction and a removal
++	# in the other. Their count differs per node under an identical image -
++	# three on one agent, one on another - which is what a race looks like and
++	# what deliberate generation does not.
++	#
++	# A plain reboot is unaffected: uci-defaults have been removed by then, so
++	# only the hotplug path runs and there is nobody to race with.
++	#
++	# The lock is held across the whole generator, because the read and the
++	# commit have to be one unit - serialising only the commit would still let
++	# the second run start from a stale copy. Same pattern and same directory
++	# as the backhaul lock already used in this script.
++	(
++		flock -x 200
++		map_genconf
++	) 200>/var/lock/map.genconfig.lock
+ }
+ 
+ bsta_updown() {

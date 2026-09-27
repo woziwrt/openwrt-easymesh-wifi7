@@ -1,0 +1,79 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: a block on an AP-MLD must reach every affiliated link
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+An AP-MLD keeps a separate deny ACL behind each affiliated links own hostapd
+control socket ("<ifname>_link<id>"); the parent socket is one link alone.
+iface_block_sta() asked get_ctrl_interface_band() for the socket, and that
+function returns the bare ifname whatever band it is handed, so the block
+landed on a single leg. The client re-associated over one of the others and
+the steering decision was silently lost.
+
+HW-measured 2026-09-03 on agent .4, ap-mld-1 with three links:
+
+  after assoc_control mode 3 on link0 BSSID 36:91:ac:f9:29:c6
+    ap-mld-1        [b8:09:8a:50:f2:2a]
+    ap-mld-1_link0  [b8:09:8a:50:f2:2a]
+    ap-mld-1_link1  []          <-- client could come back here
+    ap-mld-1_link2  []
+
+  adding the MAC to _link1 and _link2 by hand returned OK and all four
+  sockets then held it, so the per-link sockets are the right target.
+
+Note this is not the MediaTek path: mtk_mld_block_sta() is compiled only
+under CONFIG_MTK, which this target does not set (TARGET_WIFI_TYPE=MAC80211),
+so the default module below is what actually runs here. qca.c:146 already
+composes "%s_link%u" the same way.
+
+A non-MLO AP - a legacy single-leg node joining the backhaul - has no links
+to enumerate and keeps the original single-socket path unchanged.
+
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1524,12 +1524,46 @@
+ 
+ static int iface_block_sta(const char *ifname, enum wifi_band band, uint8_t *sta, int block)
+ {
++	struct wifi_mlo_link links[8];
++	int num = ARRAY_SIZE(links);
+ 	char *ctrl_iface = NULL;
+ 	int ret;
+ 
+ 	libwifi_dbg("[%s, %s] %s called " MACSTR " %s\n", ifname, wifi_band_to_str(band),
+ 		    __func__, MAC2STR(sta), block ? "block" : "unblock");
+ 
++	/* An AP-MLD keeps a separate deny ACL behind each affiliated link's own
++	 * hostapd control socket ("<ifname>_link<id>"); the parent socket is one
++	 * link alone. get_ctrl_interface_band() returns the bare ifname whatever
++	 * band it is handed, so a block issued on an AP-MLD landed on a single
++	 * leg and the client simply re-associated over another one.
++	 *
++	 * Measured 2026-09-03 on ap-mld-1 with three links: after a block,
++	 * ap-mld-1 and ap-mld-1_link0 held the MAC while _link1 and _link2 were
++	 * empty. Adding the MAC to _link1/_link2 by hand took effect, so the
++	 * per-link sockets are the right target. qca.c does the same fan-out.
++	 *
++	 * A non-MLO AP - a legacy single-leg node joining the backhaul - has no
++	 * links to enumerate, so it falls through to the original single-socket
++	 * path below and behaves exactly as before. Keep it that way.
++	 */
++	if (nlwifi_get_mlo_links(ifname, BAND_ANY, links, &num) == 0 && num > 1) {
++		char link_iface[256];
++		int i, rc = 0;
++
++		for (i = 0; i < num; i++) {
++			snprintf(link_iface, sizeof(link_iface), "%s_link%u",
++				 ifname, links[i].id);
++			rc |= hostapd_iface_block_sta(link_iface, sta, block);
++		}
++
++		/* A half-applied block is a hole, so report the failure. We do not
++		 * roll back: undoing a partial unblock would re-block the client,
++		 * which is worse than an unblock the caller can simply repeat.
++		 */
++		return rc;
++	}
++
+ 	ret = wifi_get_ctrl_interface_band(ifname, band, &ctrl_iface);
+ 	if (WARN_ON(ret))
+ 		return ret;

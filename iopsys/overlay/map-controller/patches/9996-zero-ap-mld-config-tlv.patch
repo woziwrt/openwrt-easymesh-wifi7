@@ -1,0 +1,95 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 9996: stop putting uninitialised memory in the AP MLD Config TLV
+
+cntlr_gen_ap_mld_config() builds the TLV into a buffer from cmdu_reserve_tlv(),
+which only returns a pointer and clears nothing (cmdu.c:637). The loop then
+advances past four fields without writing them - AP_MLD_MAC_Addr (6), a 20-byte
+reserved block, Affiliated_AP_MAC_Addr (6) and an 18-byte reserved block - so 50
+bytes per MLD keep whatever the buffer previously held, and that goes out on the
+wire.
+
+The consequence is not the leak, it is the reload. The receiving agent decides
+whether to reconfigure by hashing the entire TLV:
+
+	if (update_sha256_hash(...AP_MLD_CONFIG..., a->ap_mld_cfg_sha256)) {
+		mlo_process_ap_mld_config(...);
+		a->reconfig_reason |= AGENT_RECONFIG_REASON_MLD_ID;
+		timer_set(&a->reload_scheduler, RELOAD_TIMEOUT * 1000);
+	} else
+		"Skip AP MLD configuration TLV, no change"
+
+With garbage in the gaps the hash differs on every generation, so the "no
+change" branch is unreachable and the agent tears down and rebuilds its AP-MLD
+on *every* AP MLD Config Request - whatever the request was actually for.
+
+Measured on hardware 2026-08-01. A TID-to-Link policy was pushed to an agent
+(patches 9993-9995); the policy itself arrived and was applied correctly, and
+eight seconds later:
+
+	hostapd: Could not read interface ap-mld-2 flags: No such device
+	hostapd: Remove MLD interface ap-mld-2
+	hostapd: Create MLD interface ap-mld-2 on phy phy0, radio mask: 6
+	hostapd: Failed to create interface ap-mld-2: -23 (Too many open files
+	         in system)
+
+The neighbour backhauled through that AP-MLD lost its uplink and re-attached to
+the controller instead. The mesh recovered on its own, and the file-descriptor
+exhaustion was transient (416 of 812464 afterwards), but a steering policy that
+rebuilds a radio is not a steering policy.
+
+Zeroing is what the format asks for anyway: both MAC fields are preceded by
+their *_Valid flag, which this generator sets to 0, and the remaining two blocks
+are reserved. Done once after the reserve rather than at the four skip sites, so
+that a field added later cannot reintroduce it.
+
+This is not caused by the TTLM patches; they only made it visible. The TTLM
+generator writes every byte it advances over.
+
+diff -urN a/src/cntlr_tlv.c b/src/cntlr_tlv.c
+--- a/src/cntlr_tlv.c	2026-08-01 21:51:02.627993211 +0200
++++ b/src/cntlr_tlv.c	2026-08-01 21:51:02.628072479 +0200
+@@ -2538,6 +2538,44 @@
+ 	if (!t)
+ 		return -1;
+ 
++	/* Zero it first. cmdu_reserve_tlv() only hands back a pointer into the
++	 * CMDU buffer - it does not clear anything (cmdu.c:637) - and the loop
++	 * below advances past four fields without writing them:
++	 *
++	 *	len += 6;   AP_MLD_MAC_Addr
++	 *	len += 20;  reserved
++	 *	len += 6;   Affiliated_AP_MAC_Addr
++	 *	len += 18;  reserved
++	 *
++	 * That is 50 bytes per MLD of whatever the buffer happened to hold, and
++	 * it goes out on the wire.
++	 *
++	 * The cost is not cosmetic. handle_ap_mld_config_request() decides
++	 * whether to reconfigure by hashing the whole TLV
++	 * (update_sha256_hash -> AGENT_RECONFIG_REASON_MLD_ID -> reload_scheduler).
++	 * With garbage in the gaps the hash is different every time, so the
++	 * "no change, skip reconfiguration" branch can never be taken and the
++	 * agent rebuilds its AP-MLD on *every* AP MLD Config Request.
++	 *
++	 * Measured on hardware 2026-08-01: eight seconds after one such request
++	 * the agent logged
++	 *
++	 *	hostapd: Remove MLD interface ap-mld-2
++	 *	hostapd: Failed to create interface ap-mld-2: -23 (Too many open
++	 *	         files in system)
++	 *
++	 * and the neighbour that was backhauled through that AP-MLD lost its
++	 * uplink and had to re-attach elsewhere.
++	 *
++	 * Zeroing is also what the fields ask for: both MAC addresses are
++	 * preceded by their *_Valid flag, which this generator sets to 0, and
++	 * the other two blocks are reserved.
++	 *
++	 * Done once here rather than at the four skip sites so that a field
++	 * added later cannot reintroduce this.
++	 */
++	memset(t->data, 0, 1024);
++
+ 	tlv_data = (struct tlv_ap_mld_config *)t->data;
+ 
+ 	t->type = MAP_TLV_AP_MLD_CONFIG;

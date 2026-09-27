@@ -1,0 +1,2981 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh - rpcd exec plugin: the read-only command dictionary the mesh UI
+# (and anything else) talks to. One source of truth: the controller DB.
+# Usage: ubus call easymesh <method> - see `list`.
+
+# Boundary: db.sh, names.sh and sys.sh come from easymesh-core. They own the
+# database path, the names file and the role lookup, and this file must not
+# reach past them to any of the three. The boundary is held by DEPENDS in the
+# Makefile - by the build, not by a convention someone has to remember.
+#
+# A missing library must say so. Sourcing a file that is not there kills the
+# shell on the spot, rpcd gets nothing back, and the UI draws an empty page -
+# which is how five of the seven instruments measured on 2026-09-05 lied: they
+# reported nothing and looked like they reported zero.
+for _lib in db names sys; do
+	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
+		echo "{\"error\":\"easymesh-core missing: /usr/share/easymesh/$_lib.sh\"}"
+		exit 1
+	}
+	. "/usr/share/easymesh/$_lib.sh"
+done
+unset _lib
+
+# One box, two names.
+#
+# A node is remembered by its AL-MAC, and that address is drawn fresh on every
+# boot - there is no stable hardware MAC on these boards. So a node that comes
+# back is a stranger: the controller files a new agent row for it and the old
+# one stays, holding the radios it registered under the name it used to have.
+#
+# Measured 2026-08-20, three nodes and four rows. The agent that had rebooted
+# appeared twice: once under its current AL-MAC with zero radios, and once
+# under the previous one with all three - and that stale half was the FRESHER
+# of the two, refreshed 15 s ago against the real node's 54, because the radio
+# metrics keep arriving and keep stamping the row they were first filed under.
+# Which is why this ghost showed a green dot where every ghost before it had
+# been orange, and why it was worth understanding rather than reaping by age:
+# no age test can tell these two apart.
+#
+# The radios can. A ruid comes from the hardware and does not change across a
+# reboot, so when a node's radio is claimed as somebody else's AP-MLD, the two
+# names belong to one box - and the apmld side is the one that got re-keyed,
+# so it names the survivor. The rule needs no clock and no 1905 lookup, and it
+# does not hide a freshly joined node: nothing else claims its radios.
+#
+# It also says WHOSE the ghost is, which is worth more than hiding it. The
+# edges pointing at the dead name are re-pointed at the living one instead -
+# on the same measurement, the picture drew the child of the rebooted node
+# hanging off its ghost, so the shape was right and only the label was dead.
+# A ruid is evidence of identity only if it is unique. The MediaTek default
+# 00:0c:43:26:60:xx is not.
+#
+# The rule below says: when one node's radio is claimed as another node's
+# AP-MLD, the two names are one box. That holds because a ruid comes from the
+# card and no two cards share one - except when a card's efuse block with the
+# MAC was never burned, and mt76 falls back to the vendor default. The BPI-R4
+# Pro 8X has exactly such a card (measured 2026-07-25: 13 fewer blocks burned
+# than the cards in the BPI-R4 (4 GB) and BPI-R4 (8 GB)), so all three of its
+# radios are 00:0c:43:26:60:10/11/12.
+#
+# On 2026-09-02 an agent came up with its fronthaul AP-MLD on that same default
+# address. The rule then declared the controller a ghost of that agent and
+# dropped it from the Nodes table. Both boxes were healthy and unrelated.
+#
+# The agent lost the address again on its next boot, so it is a start-up
+# condition rather than a fixed misconfiguration - which means it can come back
+# at any time, on any node. The controller carries the address permanently, so
+# this guard is needed even once the fronthaul side is fixed.
+GHOST_CTE="with ghost as (
+	select distinct r.agent_almac as fake, p.agent_almac as real_al
+	from radio r join apmld p on p.mld_macaddr = r.ruid
+	where p.agent_almac <> r.agent_almac
+	  and r.ruid not like '00:0c:43:26:60:%')"
+
+# How long a row may go unheard and still be drawn as a node.
+#
+# Two different questions got answered with one number here, and they are not
+# the same question:
+#
+#   how long to REMEMBER   20 days (MAPC_DB_HISTORY_DAYS)   recovery
+#   how long to DRAW        NODE_EXPIRE_TIME                liveness
+#
+# The database is right to keep a box that has been away three minutes - that
+# is the guarantee it exists for, and db_restore() needs it. The picture is not
+# right to claim the box is there. The controller's own model forgets a node
+# after NODE_EXPIRE_TIME (cntlr.h: 180 s), so anything older than that is
+# history, not topology.
+#
+# Doubled, because the row is stamped by the model and read by a different
+# process: at exactly 180 the two would disagree for one pass every time.
+#
+# Found 2026-08-20, the same hour the re-parenting fix landed: with the radios
+# handed back to the living node, the leftover row stops being a ghost by the
+# rule above - it holds nothing that belongs to anyone else - and started being
+# drawn as if it were a freshly joined box.
+NODE_DRAW_MAX_AGE=${NODE_DRAW_MAX_AGE:-360}
+
+# How long a silent node is worth a health warning. Past this it is history.
+SILENT_WARN_MAX_AGE=${SILENT_WARN_MAX_AGE:-86400}
+
+# The same rule for STATIONS - and it is a different thing from the ghost reaper.
+#
+# The row of a departed client in `sta` is NOT a ghost - it is there on purpose.
+# mapc_db_ageout() keeps departed clients for MAPC_DB_HISTORY_DAYS = 20 days,
+# because that is exactly what the database is for: it remembers what is no
+# longer on the air. Deleting it would mean throwing away the one thing it
+# exists for.
+#
+# The bug was that `stations` took everything seen in the last 24 hours and
+# passed it off as presence. Measured 2026-09-06: a smartwatch disconnected for
+# 16 hours was still listed, while `summary.live` already (correctly) no longer
+# counted it - so the summary knew and the list did not.
+#
+# Rule: a client that IS connected is always drawn. A client that has left is
+# drawn for a little while longer (useful during roaming) and then disappears
+# from the PICTURE - not from the database. The same boundary as for nodes, so
+# it only has to be learned once.
+# How long a client that nobody reports any more stays in the picture.
+#
+# THREE queries draw clients - stations, mlds and affiliated - and until
+# 2026-09-06 each had its own idea: 360 s, 24 hours and 1 hour. So a client
+# that walked out of the building vanished from the topology view and sat in
+# the Clients tab for the rest of the day, and the two views of one mesh
+# disagreed with each other in front of the user. Measured that day with
+# ba:a9:1b:53:17:82, an MLO phone that had disconnected: absent from every
+# node's air, absent from the picture, still listed as a client.
+#
+# The row is NOT deleted - history is what the database is for. It stops
+# being drawn, which is a different thing, and all three queries now stop
+# drawing it at the same moment.
+STA_DRAW_MAX_AGE=${STA_DRAW_MAX_AGE:-360}
+
+# A node that owns no radio is not a node.
+#
+# Measured 2026-08-20 by giving an agent a new AL-MAC on purpose - which is what
+# a reflash does to it, and what made the controller claim four nodes when there
+# were three. The radios follow the box to its new name within seconds, and the
+# old name is left holding nothing at all. From that moment nobody reports under
+# it, so its row simply stops ageing forward and sits there being drawn.
+#
+# The controller's own model reaps it after ~135 s. The picture kept it for the
+# full NODE_DRAW_MAX_AGE, so for four more minutes the drawing disagreed with
+# the model it is drawing. Age alone cannot tell the two apart; ownership can.
+#
+# The grace exists because a genuinely new node exists before its radios are
+# reported. It is generous - radios arrive in the same exchange as the join -
+# and the cost of being wrong in that direction is a node drawn a minute late,
+# against a dead one drawn for six.
+NODE_RADIOLESS_GRACE=${NODE_RADIOLESS_GRACE:-90}
+
+# ...but a box that went quiet is still a box. Until 2026-09-26 a node silent
+# past NODE_DRAW_MAX_AGE simply dropped out of the picture, and six minutes
+# after a box died the Overview turned green: "All 4 boxes online, every link
+# healthy" (pair-as-a-user test, finding #45). A dead box keeps its radios - nobody
+# takes them over - while a reflash leftover loses them within seconds (above),
+# so ownership tells the two apart here too. A silent node that still owns a
+# radio is drawn as silent for as long as health warns about it, until the
+# user forgets it.
+# A function, not a variable: $now is set further down, per call.
+draw_where() {
+	echo "(($now - a.last_seen) < $NODE_DRAW_MAX_AGE
+	  or (($now - a.last_seen) < $SILENT_WARN_MAX_AGE
+	      and exists (select 1 from radio r3 where r3.agent_almac = a.almac)))"
+}
+
+# Node names, two sources merged. The database rows come from the name a
+# node told the mesh about itself (device_name, set from its hostname by the
+# wizard); the file is the manual override that predates that chain and stays
+# authoritative where both exist - JSON object keys repeat DB-first and every
+# consumer here parses with last-key-wins. On a database without the
+# device_name column the query returns nothing and the file carries on alone.
+# Third source, and the only one that follows a box through a reflash: what the
+# nodes say about themselves right now, over 1905. The topology extension of
+# ieee1905d collects a Device Identification TLV from every node it reaches and
+# hands it over on ubus; the database column is a copy of that same thing and
+# can be stale, or empty on a node that has never been written down.
+#
+# Nodes still carrying the stock device_name are skipped on purpose. "OpenWrt"
+# is not a name - it is every box at once, which reads worse in the picture than
+# an honest MAC address, because two lines with the same label look like one node.
+# A default name that is not the same on every box.
+#
+# Measured 2026-08-20: all three nodes in the lab answered "BPI-R4-SD", because
+# 99-set-hostname names a box after the medium it booted from and they all boot
+# from SD. Three identical labels in the picture read worse than three MAC
+# addresses - two lines with the same name look like one node, which is the very
+# confusion the naming was meant to end.
+#
+# The system hostname is deliberately left alone. It is product-wide, addresses
+# can be tied to it, and its own script says so. This sets only the mesh name.
+#
+# The suffix comes from the storage the box booted from, because on these boards
+# the MAC is not stable - it is regenerated on every boot, which is how a
+# reflashed node used to come back as a stranger. A card serial survives both a
+# reboot and a reflash. If the card moves to another board the name follows the
+# card, which is the honest answer: on this system the card carries the identity.
+default_mesh_name() {
+	local id=""
+	for f in /sys/block/mmcblk0/device/serial /sys/block/nvme0n1/serial; do
+		[ -r "$f" ] && id=$(cat "$f" 2>/dev/null | tr -dc "0-9a-fA-F") && [ -n "$id" ] && break
+	done
+	[ -n "$id" ] || id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -dc "0-9a-f")
+	[ -n "$id" ] || { echo ""; return; }
+	printf "easymesh-%s\n" "$(echo "$id" | tail -c 7)"
+}
+
+
+# "node-a, node-b" from a query returning one AL-MAC per row.
+# The SSID this node serves its backhaul on, read from the agent config.
+# Needed to tell a client apart from a neighbour's bSTA: both show up in
+# `iw station dump`, and only the interface they sit on distinguishes them.
+bh_ssid() {
+	local i t
+	i=0
+	while uci -q get "mapagent.@ap[$i]" >/dev/null 2>&1; do
+		t=$(uci -q get "mapagent.@ap[$i].type")
+		[ "$t" = "backhaul" ] && { uci -q get "mapagent.@ap[$i].ssid"; return 0; }
+		i=$((i + 1))
+	done
+}
+
+# Clients this node is serving RIGHT NOW, asked of the radio rather than the
+# database.
+#
+# The database is the wrong witness for "who is connected". Its client rows
+# are filled from reports the agents send, and those stop arriving without
+# anything else breaking: measured 2026-08-26, sta was fresh (3 s) while
+# sta_mld had frozen 9.2 h earlier - and the same afternoon it was the other
+# way round, sta stale at 374 s while sta_mld kept coming. After a mesh-wide
+# sysupgrade BOTH went quiet and the overview reported nobody, while three
+# clients were associated and one of them was the machine asking.
+#
+# A node always knows its own. Only the main MLD interfaces are asked - the
+# `ap-mld-N.staM` ones are the backhaul's per-STA legs and carry neighbouring
+# agents, not clients - and the backhaul BSS itself is skipped by SSID.
+local_client_macs() {
+	local i s bh
+	bh=$(bh_ssid)
+	for i in $(iw dev 2>/dev/null | awk '/Interface ap-/{print $2}' | grep -v '\.'); do
+		s=$(iw dev "$i" info 2>/dev/null | sed -n 's/^\tssid \(.*\)/\1/p')
+		[ -n "$bh" ] && [ "$s" = "$bh" ] && continue
+		iw dev "$i" station dump 2>/dev/null | sed -n 's/^Station \([0-9a-f:]*\).*/\1/p'
+	done
+}
+
+namelist() {
+	local m out="" sep=""
+	for m in $(sq1 "$1"); do
+		out="$out$sep$(nameof "$m")"
+		sep=", "
+	done
+	echo "$out"
+}
+
+# Ages in a warning are read at a glance, so round them. The exact second is in
+# the node table for anyone who wants it.
+human_age() {
+	[ "$1" -lt 120 ] 2>/dev/null && { echo "$1 s"; return; }
+	[ "$1" -lt 7200 ] 2>/dev/null && { echo "$(($1 / 60)) min"; return; }
+	echo "$(($1 / 3600)) h"
+}
+
+
+# A joining node needs an address in the mesh subnet, and the user is the
+# wrong one to ask: they would have to know which addresses the other boxes
+# took, which is exactly the bookkeeping this wizard exists to remove. So the
+# node asks the wire instead - the setup instructions already require the
+# cable to be in, and the same cable that will deliver the backhaul keys also
+# answers ARP for every live address. Nodes live below .100 (the DHCP pool
+# starts there), so the probe walks .2 upward and takes the first silence.
+# arping -D is the same question mesh-gwd asks before claiming the VIP.
+#
+# The honest limit: a node that is powered off does not answer, and its
+# address can be handed out again. The mesh survives it noisily rather than
+# silently - and v1 trades that corner for a wizard with nothing to type.
+# The top of the node range is not a constant: it is one below where this
+# box hands out DHCP. .99 with the stock pool (start 100); lower when somebody
+# moved the pool down in LuCI, so that nodes and clients never share a range.
+# A pool starting at .2 or lower leaves no range at all - then .99 again and
+# the in-use checks in pick_mesh_addr are all that stand between the two.
+node_addr_max() {
+	local st
+	st=$(uci -q get dhcp.lan.start)
+	case "$st" in ''|*[!0-9]*) st=100 ;; esac
+	[ "$st" -gt 2 ] && [ "$st" -le 100 ] && { echo $((st - 1)); return; }
+	echo 99
+}
+
+# Which mesh addresses a person may type, and why the rest are refused.
+#
+# The mesh subnet is not empty space. Measured on the lab controller:
+#
+#   .1          the founder, by convention
+#   .2 - .99    claimed by joining nodes, lowest free first (pick_mesh_addr)
+#   .100- .249  handed to clients by DHCP (dhcp.lan start 100 limit 150)
+#   .253        PRIMARY_MARK - "somebody in this mesh has a real cable"
+#   .254        the VIP the clients use as their gateway, moved between boxes
+#
+# .254 is the one that looks most sensible to type and breaks the most. The
+# founder would own the gateway address statically; mesh-gwd reads itself as
+# holding the VIP forever, so it can never hand it over, and failover to a box
+# with a live uplink stops working. Worse, mesh_lan() skips addresses ending
+# .253 and .254 when it works out the mesh prefix, so the daemon on that box
+# would be deriving VIP and MESH_NET from whatever it found instead.
+#
+# Nothing refused any of this before: the only check was that the string looked
+# like a.b.c.d. Refusing it here, once, beats explaining it afterwards.
+mesh_addr_reason() {
+	local a="$1" o mx
+	case "$a" in
+	*[!0-9.]*|*..*|.*|*.) echo "expected four numbers like 10.10.10.1"; return 0 ;;
+	esac
+	[ "$(echo "$a" | tr -cd . | wc -c)" = 3 ] || { echo "expected four numbers like 10.10.10.1"; return 0; }
+	for o in $(echo "$a" | tr . " "); do
+		{ [ "$o" -ge 0 ] && [ "$o" -le 255 ]; } 2>/dev/null || { echo "expected four numbers like 10.10.10.1"; return 0; }
+	done
+	o=${a##*.}
+	mx=$(node_addr_max)
+	[ "$o" -ge 1 ] && [ "$o" -le "$mx" ] && return 0
+	case "$o" in
+	0|255)   echo "this address ends in .$o, which is the network itself or its broadcast - no box can have it. End the address between .1 and .$mx." ;;
+	253|254) echo "this address ends in .$o, and that one belongs to the mesh gateway - it moves between boxes and no box may own it. End the address between .1 and .$mx." ;;
+	*)       echo "this address ends in .$o. Everything from .$((mx + 1)) up is handed out to clients or kept by the mesh. End the address between .1 and .$mx." ;;
+	esac
+}
+
+# Where does the box with this AL-MAC actually live?
+#
+# Three lookups and no search. The first version of this asked every address
+# from .2 to .20 over SSH until one answered with the right AL-MAC, and that
+# was wrong twice over. On a mesh that has no agents yet it is nineteen
+# timeouts in a row - far longer than ubus waits - so the call came back "No
+# response" and a rename that had in fact already been written looked like a
+# failure (2026-09-04, first rename on a freshly flashed controller). And the
+# one box that search could never find is the CONTROLLER itself, which does
+# not sit in that range at all: it is the node most likely to be renamed first.
+#
+# So the local box answers "local" and is renamed with no network involved,
+# and every other node is looked up in what the controller already holds:
+# ieee1905's topology, which reports an address per device at any depth, and
+# then the reservation ledger, which still has an address for a box that is
+# switched off. All three are instant and none of them can time out. A node
+# genuinely unknown to both returns empty in milliseconds, and the rename
+# succeeds on the controller exactly as it did before.
+# AL-MACs of the devices 1905 knows and that report no IPv4 address at all.
+# Absent from the dump is not the same thing: that is a node ieee1905d has
+# not got to yet, and it must still block.
+addrless_1905_ids() {
+	ubus -t 5 call ieee1905.topology dump 2>/dev/null | awk '
+		/"ieee1905id"/ { id = $2; gsub(/[",]/, "", id); next }
+		/"num_ipv4"/ { v = $2; gsub(/[",]/, "", v)
+			if (id != "" && v == "0") print tolower(id)
+			id = "" }'
+}
+
+find_node_addr() {
+	local want mine ip
+	want=$(echo "$1" | tr 'A-Z' 'a-z')
+	[ -n "$want" ] || return 1
+
+	mine=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+	[ -n "$mine" ] && [ "$want" = "$mine" ] && { echo local; return 0; }
+
+	ip=$(live_addrs_json | tr 'A-Z,' 'a-z\n' | grep "\"$want\":" |
+		sed 's/.*:"//; s/".*//' | head -1)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+
+	ip=$(awk -v w="$want" 'tolower($1) == w { print $2; exit }' "$RESV" 2>/dev/null)
+	[ -n "$ip" ] && { echo "$ip"; return 0; }
+	return 1
+}
+
+# ⚠️ Everything from mesh_addrs_in_use() down to the end of
+# ask_controller_addr() exists a second time, byte for byte, in
+# easymesh-wifi:/usr/share/easymesh/addr.sh - which bh-key-adopt sources to
+# give a button-joined box its address. This package cannot source that file
+# (it does not depend on easymesh-wifi), so the two must be changed together;
+# `diff` the two blocks if in doubt. Fixing only one of them leaves exactly
+# half the joins broken, which is worse than leaving both broken because
+# nobody can tell which half they are looking at. The reservation ledger below
+# the marker is NOT shared - only the controller keeps one.
+
+# Every address in the mesh subnet this box KNOWS is spoken for.
+#
+# Silence on the wire is not evidence of an address being free, and no number
+# of repeats makes it into evidence. The ARP probe below already learned that
+# once (2026-08-10, a node three rooms out) and answered it by asking twice.
+# On 2026-09-04 the same fault came back on a five-node mesh of depth 3: the
+# node holding .2 sat three wireless hops away, all six probes were lost, and
+# .2 was handed to a second box. The node that had it first went off the map
+# entirely - it kept an address that now answers somewhere else.
+#
+# Two rounds were not enough because more rounds are the wrong instrument. A
+# broadcast that has to survive three wireless hops fails for reasons that do
+# not average out, and the one box that never has to guess is the controller:
+# ieee1905d reports an ipv4_address for every device in the topology, at any
+# depth, over 1905 rather than over broadcast ARP. That is the same source the
+# Nodes tab already draws the address column from, so nothing new is collected
+# here - it is only asked before an address is given away instead of after.
+#
+# ALL of a device's ipv4 entries are taken, not the first: a node may hold two
+# (the controller holds .1, .253 and .254), and reading only the first would
+# report the others as free. Over-reporting is the safe direction - the worst
+# it costs is a node numbered .5 instead of .3.
+#
+# The neighbour table and the DHCP leases are added because they cost nothing
+# and cover what 1905 cannot see: a box that is on the wire without being in
+# the mesh. Entries with no lladdr, or in FAILED/INCOMPLETE, are the leftovers
+# of our own earlier probes and mean the opposite of occupied.
+mesh_addrs_in_use() {
+	local prefix="$1" mb="$2"
+	{
+		ubus -t 5 call ieee1905.topology dump 2>/dev/null |
+			sed -n 's/^[[:space:]]*"ip":[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p'
+		ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+		if [ -n "$mb" ]; then
+			ip -4 neigh show dev "$mb" 2>/dev/null
+		else
+			ip -4 neigh show 2>/dev/null
+		fi | awk '/lladdr/ && !/FAILED|INCOMPLETE/ {print $1}'
+		awk '{print $3}' /tmp/dhcp.leases 2>/dev/null
+	} | awk -F. -v p="$prefix" 'NF==4 && $1"."$2"."$3==p {print}' | sort -u
+}
+
+pick_mesh_addr() {
+	local base="${1%.*}" iface n=2 used mx
+	# Second argument overrides the probe interface: the wired join asks on
+	# the lan bridge it shares with the mesh, the controller (suggesting an
+	# address for an over-the-air join) asks on the mesh bridge itself.
+	iface="${2:-$(uci -q get network.lan.device)}"
+	iface="${iface:-br-lan}"
+	command -v arping >/dev/null 2>&1 || return 1
+	# Asked once, before the walk: the answer cannot change under it, and the
+	# walk skips whole ranges without paying six seconds of ARP for each.
+	#
+	# Third argument is a newline-separated list of addresses to treat as
+	# taken although nothing on the wire says so yet. That is what the
+	# controller's reservation ledger passes in, and it is the only thing
+	# here that can rule out an address BEFORE its box starts using it.
+	used=$(printf '%s\n%s\n' "$(mesh_addrs_in_use "$base" "$iface")" "$3" |
+		grep -v '^$' | sort -u)
+	mx=$(node_addr_max)
+	while [ $n -le "$mx" ]; do
+		# Knowledge vetoes, silence only confirms. An address somebody is
+		# known to hold is never probed - that is the case ARP gets wrong -
+		# and an address nobody is known to hold still has to be silent
+		# twice before it is handed out, which is what catches a box that
+		# is on the wire without being in the mesh.
+		if echo "$used" | grep -Fxq "$base.$n"; then
+			n=$((n + 1))
+			continue
+		fi
+		if arping -D -q -c 3 -w 3 -I "$iface" "$base.$n" >/dev/null 2>&1; then
+			sleep 1
+			if arping -D -q -c 3 -w 3 -I "$iface" "$base.$n" >/dev/null 2>&1; then
+				echo "$base.$n"
+				return 0
+			fi
+		fi
+		n=$((n + 1))
+	done
+	return 1
+}
+
+# Ask the controller to hand out an address AND write it down in one step.
+#
+# Every local probe - ARP, 1905, the neighbour table - can only report a state
+# that has already happened. Between "the controller worked out that .2 is
+# free" and "the box that was given .2 starts answering on it" there is a
+# window in which every one of them still says free, and on 2026-09-04 two
+# boxes were configured minutes apart and both landed on .2 through exactly
+# that window. Measuring harder does not close it; only writing the answer
+# down before it is used does, and only one box can keep that ledger.
+#
+# So the box that needs an address stops working it out and asks. It sends
+# the name it will be known by, so a box that comes back gets its own number
+# back rather than the next free one.
+#
+# Deliberately not jsonfilter: this runs from easymesh-wifi too, which does
+# not depend on it, and the answer is one flat object.
+ask_controller_addr() {
+	local ctrl="$1" almac="$2" sess out
+	[ -n "$ctrl" ] || return 1
+	command -v curl >/dev/null 2>&1 || return 1
+	sess=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
+		"http://$ctrl/ubus" 2>/dev/null |
+		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p')
+	[ -n "$sess" ] || return 1
+	out=$(curl -s --max-time 12 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sess\",\"easymesh\",\"claim_address\",{\"almac\":\"$almac\"}]}" \
+		"http://$ctrl/ubus" 2>/dev/null)
+	out=$(echo "$out" | sed -n 's/.*"address":"\([0-9][0-9.]*\)".*/\1/p' | head -1)
+	[ -n "$out" ] || return 1
+	echo "$out"
+}
+
+# ---- end of the block shared with easymesh-wifi:addr.sh ---------------------
+# Everything below is the controller's alone: it keeps the ledger, and no other
+# box has one to keep.
+
+# The reservation ledger: which address belongs to which box, written down
+# BEFORE the box is told about it.
+#
+# This is the part that makes the answer deterministic rather than merely
+# well-informed. mesh_addrs_in_use() reports what is; the ledger records what
+# has been promised. Without it, two boxes set up minutes apart can both be
+# told .2 - each probe run happening while the other box is still being
+# configured - which is what happened on 2026-09-04 and could not have been
+# prevented by asking the network more carefully.
+#
+# One line per box: <key> <address> <unix time>. It lives under /etc/mapc,
+# which 97-mapc-db-keep puts in /etc/sysupgrade.conf, so the promises outlive
+# a firmware upgrade - deliberately. An address that survives the upgrade of
+# the controller but is handed to somebody else afterwards is the same fault
+# in slower motion.
+#
+# The key is the joining box's AL-MAC when it has one. That address is drawn
+# fresh on some boots (see the ghost note at the top of this file), so it is
+# not a hardware identity - but the ledger is only written at JOIN time, not
+# at every boot, so the churn is bounded by joins. A box that re-joins with a
+# new AL-MAC files a new line; its old one is released by resv_prune() once it
+# is both old and no longer in the agent table, and until then the only cost
+# is a number nobody is using. That is the safe direction and it is chosen on
+# purpose.
+RESV=/etc/mapc/addr-reservations
+RESV_LOCK=/etc/mapc/addr-reservations.lock
+# A month. Long enough that a box switched off over the holidays keeps its
+# number, short enough that a lab that has been rebuilt twice does not run out.
+RESV_MAX_AGE=${RESV_MAX_AGE:-2592000}
+# How long a number put aside for a box that has not arrived yet is held.
+# Long enough to cover the whole join - the push-button window re-arms three
+# times and the box reboots twice inside it - and short enough that a press
+# nobody followed up on costs one number for half an hour rather than for a
+# month. A pending line is the only kind that expires on age alone: there is
+# no box to ask whether it still wants the number.
+PENDING_MAX_AGE=${PENDING_MAX_AGE:-1800}
+# Expiry is lazy, on purpose: resv_prune() runs at the top of both paths that
+# decide anything (resv_hold_pending, resv_claim) and nothing else reads the
+# ledger. An expired pending line can therefore sit in the file for days on a
+# mesh nobody pairs into - 2026-09-24 it was one from 21. 9. - and it still
+# cannot hold back or hand out a number. It goes on the next press or join.
+
+resv_addrs() { awk 'NF>=2 {print $2}' "$RESV" 2>/dev/null; }
+
+# Which box does the mesh say holds this address right now? Empty means "the
+# mesh does not report it", which is not the same as "nobody has it" - hence
+# the ARP confirmation that pick_mesh_addr still does on top.
+live_owner_of() {
+	ubus -t 5 call ieee1905.topology dump 2>/dev/null | awk -v want="$1" '
+		/"ieee1905id"/ { id = $2; gsub(/[",]/, "", id) }
+		/"ip"/ { v = $2; gsub(/[",]/, "", v); if (v == want) { print id; exit } }'
+}
+
+# Release a promise only when it is BOTH stale and orphaned.
+#
+# Age alone is not enough: a node that has held .3 for a year is exactly the
+# node whose number must not be given away. Absence alone is not enough
+# either: a box being reflashed is absent for minutes. Requiring both means
+# the ledger errs towards holding a number nobody needs, which costs one
+# number, against handing out a number somebody has, which costs a node.
+resv_prune() {
+	local tmp known
+	[ -s "$RESV" ] || return 0
+	known=" $(sq1 "select almac from agent;" 2>/dev/null | tr '\n' ' ') "
+	tmp="$RESV.$$"
+	awk -v now="$now" -v maxage="$RESV_MAX_AGE" -v pmax="$PENDING_MAX_AGE" \
+	    -v known="$known" '
+		NF >= 3 {
+			# A pending line names no box, so the "stale AND orphaned" rule
+			# below cannot apply to it - it is orphaned from the moment it is
+			# written. Age is all there is, and it is the right test: the
+			# press it belongs to is long over.
+			if ($1 ~ /^pending-/) { if ((now - $3) > pmax) next; print; next }
+			if ((now - $3) > maxage && index(known, " " $1 " ") == 0) next
+			print
+		}' "$RESV" > "$tmp" 2>/dev/null && mv "$tmp" "$RESV" 2>/dev/null
+	rm -f "$tmp"
+}
+
+resv_forget() {
+	local tmp="$RESV.$$"
+	[ -s "$RESV" ] || return 0
+	grep -v "^$1 " "$RESV" > "$tmp" 2>/dev/null && mv "$tmp" "$RESV" 2>/dev/null
+	rm -f "$tmp"
+}
+
+# One line per box, replaced and not appended (a box asking twice must not end
+# up holding two numbers), and swapped in whole so a reader never sees half a
+# ledger. The caller holds the lock.
+resv_write() {
+	local tmp="$RESV.$$"
+	{ grep -v "^$1 " "$RESV" 2>/dev/null
+	  printf '%s %s %s\n' "$1" "$2" "$now"; } > "$tmp" 2>/dev/null &&
+		mv "$tmp" "$RESV" 2>/dev/null
+	rm -f "$tmp"
+}
+
+# Take the ledger lock, or say so. Without it two joins interleave between the
+# read and the write, which is the very race this file exists to end.
+resv_lock() {
+	local i
+	mkdir -p /etc/mapc 2>/dev/null
+	[ -f "$RESV" ] || : > "$RESV" 2>/dev/null
+	exec 9>>"$RESV_LOCK" 2>/dev/null || return 1
+	# busybox flock has no -w. It can block for ever (-x) or give up at once
+	# (-n) and there is nothing in between, so `flock -x -w 15 9` - the
+	# util-linux spelling - fails on the option before it ever tries the
+	# lock. It fails QUIETLY: resv_lock returned 1, every caller took its
+	# "the ledger is busy" branch, and the ledger stayed empty on a mesh
+	# where two boxes had just been given the same address. It was written
+	# to close exactly that fault and had never once been written to.
+	# (Found 2026-09-04; easymesh-trace already carried a comment saying
+	# busybox has no -w, so this was known and forgotten.)
+	#
+	# rpcd must not be able to hang, so the bounded wait is built out of the
+	# non-blocking form: fifteen tries a second apart, the same ceiling the
+	# -w was asking for.
+	i=0
+	while [ "$i" -lt 15 ]; do
+		flock -xn 9 2>/dev/null && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	exec 9>&-
+	return 1
+}
+resv_unlock() { flock -u 9 2>/dev/null; exec 9>&-; }
+
+# Give this box an address and write it down, with nobody else able to run
+# between the two.
+#
+# The number a press has put aside, if there is one. Freshest wins, but there
+# is normally only ever one - see resv_hold_pending().
+resv_pending_addr() {
+	awk 'NF >= 3 && $1 ~ /^pending-/ { print $3, $2 }' "$RESV" 2>/dev/null |
+		sort -rn | head -1 | awk '{ print $2 }'
+}
+
+# Drop the pending line holding this address. Used when a real box takes it
+# over; resv_write() only replaces a line keyed by AL-MAC and would leave the
+# pending one behind, holding a second number forever.
+resv_drop_pending() {
+	local tmp="$RESV.$$"
+	awk -v a="$1" '!($1 ~ /^pending-/ && $2 == a)' "$RESV" > "$tmp" 2>/dev/null &&
+		mv "$tmp" "$RESV" 2>/dev/null
+	rm -f "$tmp"
+}
+
+# Put a number aside for a box that is about to arrive but cannot ask yet.
+#
+# This is what removes the wait. Until 2026-09-04 the ledger was written only
+# when the joining box itself called claim_address, which happens minutes into
+# bh-key-adopt - so between pressing the button and the box asking, nothing
+# anywhere recorded that a number had been promised, and a second pairing
+# started in that window was told the same one. Telling the user to wait is
+# not a fix; the controller knows a box is coming the moment the button is
+# pressed, so it writes the promise then.
+#
+# A second press reuses the number rather than burning another: pressing again
+# because nothing seemed to happen is the normal thing to do, and three
+# presses must not cost three addresses.
+resv_hold_pending() {
+	local base="$1" mb="$2" addr
+	resv_lock || return 1
+	resv_prune
+	addr=$(resv_pending_addr)
+	if [ -z "$addr" ]; then
+		addr=$(pick_mesh_addr "$base" "$mb" "$(resv_addrs)")
+		[ -n "$addr" ] && printf 'pending-%s %s %s\n' "$now" "$addr" "$now" >> "$RESV" 2>/dev/null
+	fi
+	resv_unlock
+	[ -n "$addr" ] || return 1
+	echo "$addr"
+}
+
+# Prints "<address> <state> <source>". state is new | renewed | moved, source
+# is reservation | live | arp | window - so that a collision found later can be
+# traced to the decision that made it instead of being reconstructed from
+# timestamps.
+resv_claim() {
+	local almac="$1" base="$2" mb="$3" old owner addr state source
+
+	resv_lock || return 1
+	resv_prune
+
+	# The same box asking again gets the same number back - that is what makes
+	# a re-join, or a reflash that kept its AL-MAC, land where it was before.
+	# Given up only if the mesh reports somebody ELSE on it: an address that
+	# is merely quiet is still ours, and an address our own box is answering
+	# on is emphatically ours.
+	old=$(awk -v k="$almac" 'NF>=2 && $1==k {a=$2} END{if (a != "") print a}' "$RESV" 2>/dev/null)
+	if [ -n "$old" ]; then
+		owner=$(live_owner_of "$old")
+		if [ -z "$owner" ] || [ "$owner" = "$almac" ]; then
+			addr="$old"; state=renewed; source=reservation
+		fi
+	fi
+
+	# A press has already put a number aside for whoever turns up. Take that
+	# one: it is the number shown on the Pair a new box line, so the box lands
+	# on the address the user was told it would, and it is the number that has
+	# been out of circulation since the press instead of only from now.
+	if [ -z "$addr" ]; then
+		addr=$(resv_pending_addr)
+		if [ -n "$addr" ]; then
+			owner=$(live_owner_of "$addr")
+			if [ -n "$owner" ] && [ "$owner" != "$almac" ]; then
+				# Somebody is on it after all - the promise was wrong, so
+				# drop it and fall through to picking properly.
+				resv_drop_pending "$addr"
+				addr=""
+			else
+				resv_drop_pending "$addr"
+				[ -n "$old" ] && state=moved || state=new
+				source=window
+			fi
+		fi
+	fi
+
+	if [ -z "$addr" ]; then
+		# Everything anyone has been promised is off the table, whether or
+		# not its box has started using it yet.
+		addr=$(pick_mesh_addr "$base" "$mb" "$(resv_addrs)")
+		[ -n "$old" ] && state=moved || state=new
+		if [ -n "$(ubus -t 5 call ieee1905.topology dump 2>/dev/null |
+				sed -n 's/^[[:space:]]*"ip":[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' |
+				grep "^${base%.*}\.")" ]; then
+			source=live
+		else
+			source=arp
+		fi
+	fi
+
+	[ -n "$addr" ] && resv_write "$almac" "$addr"
+
+	resv_unlock
+
+	[ -n "$addr" ] || return 1
+	printf '%s %s %s\n' "$addr" "$state" "$source"
+}
+
+# An agent has no controller database, and the mesh view is the thing the user
+# came to see. Rather than telling them they are on the wrong box, ask the box
+# that knows.
+#
+# Finding the box with the database used to mean reading
+# network.easymesh.gateway, on the reasoning that an agent routes through the
+# controller. Both halves stopped being true on 2026-08-12, when the mesh moved
+# onto br-lan and br-easymesh was retired: that section no longer exists, so
+# the read returned nothing and every agent said "the controller at  did not
+# answer" - with the address missing from its own error message. And the route
+# now points at the VIP, which any node with an uplink may hold; on
+# 2026-08-14 that was the controller and a fresh agent at the same time, so
+# "where the traffic goes" had stopped meaning "where the database is" anyway.
+#
+# What does hold is a rule the product enforces: the controller sits at .1 of
+# the mesh subnet. That is what the founding form's address means, and the join
+# wizard already derives the pairing gateway the same way. So derive it from
+# this node's own mesh address rather than storing it - state that is written
+# once and renamed later is exactly how this broke.
+#
+# What travels is what is ADDRESSED, not what is read-only.
+#
+# The rule used to be "reads travel, writes stay", and it put rename and
+# forget_node on the wrong side of the line. Both carry the AL-MAC of the node
+# they act on, so forwarding one acts on exactly the node the user picked, from
+# whichever box they happened to open. setup_* is the real local case: it means
+# "do this HERE", and forwarding it would configure the wrong box.
+#
+# Measured 2026-09-06: the table is forwarded from any agent, so a user on an
+# agent saw the whole mesh, clicked the pencil drawn right there, and got
+# "only the controller keeps the names". A control that is visible and refuses
+# is worse than one that is absent.
+CTRL_METHODS="health topology nodes clients client_history steer_history db_stats db_table rename forget_node ttlm_state events"
+
+controller_addr() {
+	local a
+	# An explicit answer wins, for a mesh that does not follow the convention.
+	a=$(uci -q get easymesh.mesh.controller 2>/dev/null)
+	[ -n "$a" ] && { echo "$a"; return; }
+	# Otherwise .1 of our own mesh subnet, skipping the VIP - it lives on the
+	# same bridge and is not an identity.
+	ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+		grep -vE '\.254$' | head -1 | sed 's/\.[0-9]*$/.1/'
+}
+
+# The session is short-lived and used once. Failure is silent on purpose: the
+# caller falls back to saying there is no database here, which is true.
+ubus_session() {
+	local gw="$1"
+	curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
+		"http://$gw/ubus" 2>/dev/null |
+		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p'
+}
+
+# When the call arrives over HTTP, uhttpd hands the plugin the caller's session
+# token alongside the real arguments. It authenticates this node and means
+# nothing on the controller, which rejects the whole call as an unknown
+# parameter - so it is dropped before the question travels.
+strip_session() {
+	echo "$1" | sed -e 's/"ubus_rpc_session":"[^"]*"//' \
+		-e 's/,[[:space:]]*}/}/' \
+		-e 's/{[[:space:]]*,/{/' \
+		-e 's/,[[:space:]]*,/,/g'
+}
+
+proxy_to_controller() {
+	local method="$1" payload="$2" gw sess
+
+	gw="$(controller_addr)"
+	[ -n "$gw" ] || return 1
+
+	# Never ask ourselves. controller_addr falls back to deriving an address
+	# from br-lan, and on a box that is not in a mesh yet that derivation
+	# lands on THIS box - so the node opened an HTTP request to itself and
+	# waited out its own timeout. The overview page waits for four of these
+	# at once, which is why a freshly flashed box sat on "Loading view..."
+	# forever instead of showing the perfectly good "not configured" screen
+	# it already had (measured 2026-08-22 on a box straight from firstboot).
+	#
+	# A real agent derives a different address, so this costs nothing there.
+	if ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+		grep -qx "$gw"; then
+		return 1
+	fi
+
+	sess="$(ubus_session "$gw")"
+	[ -n "$sess" ] || return 1
+
+	payload="$(strip_session "$payload")"
+	case "$payload" in ''|'{}'|'{ }') payload='{}';; esac
+	curl -s --max-time 8 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sess\",\"easymesh\",\"$method\",$payload]}" \
+		"http://$gw/ubus" 2>/dev/null |
+		jsonfilter -e '@.result[1]' 2>/dev/null
+}
+
+# Where a joining box gets its mesh address: from the box that keeps the ledger.
+#
+# The wired join used to work this out for itself by walking the subnet with
+# ARP, from the worst possible vantage point - the edge of the network, one
+# cable into a mesh whose other members may be three wireless hops further on.
+# Worse, whatever it worked out was written nowhere, so the next box to ask
+# could be told the same thing. The controller answers and records in one
+# step (resv_claim), so the question goes there instead.
+#
+# Carrying it needs a route, and a joining box has none: it is still on its
+# firstboot subnet and the mesh is on another. It does have the mesh's DHCP
+# server, though - that is the controller too, and the button join already
+# leans on it for exactly this (easymesh-wps-join:learn_mesh_address). So take
+# one lease, ask the question over it, and give it back.
+#
+# The lease configures an address and nothing else. The stock udhcpc script
+# would also install a default route and a resolver on a box that is in the
+# middle of being reconfigured, and neither is wanted for a single HTTP call.
+JOIN_LEASE=/tmp/easymesh-join-lease
+ask_mesh_for_address() {
+	local gw="$1" iface="$2" lease addr almac script="/tmp/easymesh-join-dhcp.script"
+
+	command -v udhcpc >/dev/null 2>&1 || return 1
+
+	# The name this box will be known by in the mesh, so the ledger entry is
+	# about a box rather than about a moment. Falls back to the bridge MAC,
+	# which is at least this box's own and never somebody else's; a wrong
+	# guess here costs a duplicate ledger line, not a duplicate address.
+	almac=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+	[ -n "$almac" ] && [ "$almac" != "00:00:00:00:00:00" ] ||
+		almac=$(cat "/sys/class/net/$iface/address" 2>/dev/null | tr 'A-Z' 'a-z')
+	[ -n "$almac" ] || return 1
+
+	cat > "$script" <<EOF
+#!/bin/sh
+[ "\$1" = bound ] || [ "\$1" = renew ] || exit 0
+ip -4 addr add "\$ip/\${mask:-24}" dev "\$interface" 2>/dev/null
+echo "\$ip/\${mask:-24}" > $JOIN_LEASE
+EOF
+	chmod +x "$script"
+	rm -f "$JOIN_LEASE"
+
+	udhcpc -i "$iface" -n -q -t 3 -T 3 -s "$script" >/dev/null 2>&1
+	lease=$(cat "$JOIN_LEASE" 2>/dev/null)
+	if [ -n "$lease" ]; then
+		addr=$(ask_controller_addr "$gw" "$almac")
+		ip -4 addr del "$lease" dev "$iface" 2>/dev/null
+	fi
+	rm -f "$script" "$JOIN_LEASE"
+
+	[ -n "$addr" ] || return 1
+	echo "$addr"
+}
+
+# Called instead of need_db by the database-backed methods: if this box has the
+# database, carry on; if not, hand the whole question to the controller and stop.
+need_db_or_proxy() {
+	local method="$1" payload="$2" out
+
+	[ -f "$DB" ] && return 0
+
+	# A box with no role has no mesh to ask, and answering that instantly is
+	# the whole difference between a page that explains itself and a page
+	# that spins. Everything below tries to reach a controller; none of it
+	# can succeed here, and the trying is what costs the wait.
+	if [ ! -f /etc/mapc/role ]; then
+		echo '{"error":"this box is not in a mesh yet - start on the Setup page"}'
+		return 1
+	fi
+
+	case " $CTRL_METHODS " in *" $method "*) ;; *)
+		echo '{"error":"no controller DB on this node"}'
+		return 1 ;;
+	esac
+
+	out="$(proxy_to_controller "$method" "$payload")"
+	if [ -n "$out" ]; then
+		echo "$out"
+		return 1
+	fi
+	# "the controller at  did not answer" is what this said for two days while
+	# the address was empty - the sentence printed the hole in itself and read
+	# like a network problem. Say which of the two it is.
+	addr="$(controller_addr)"
+	if [ -z "$addr" ]; then
+		echo '{"error":"cannot work out where the controller is - this node has no mesh address to derive it from"}'
+	else
+		printf '{"error":"no controller DB here and the controller at %s did not answer"}\n' "$addr"
+	fi
+	return 1
+}
+need_db() {
+	[ -f "$DB" ] && return 0
+	echo '{"error":"no controller DB on this node - ask the controller"}'
+	return 1
+}
+
+now=$(date +%s)
+
+case "$1" in
+list)
+	cat <<'EOF'
+{
+  "setup_state": {},
+  "setup_controller": { "ssid": "str", "wifi_key": "str", "root_password": "str", "address": "str", "hostname": "str", "backhaul_key": "str" },
+  "setup_agent": { "hostname": "str", "gateway": "str" },
+  "credentials": {},
+  "set_credentials": { "ssid": "str", "wifi_key": "str" },
+  "wps_open": { },
+  "wps_join": { "hostname": "str", "gateway": "str", "address": "str" },
+  "wps_status": { },
+  "suggest_address": { },
+  "claim_address": { "almac": "str", "address": "str" },
+  "forget_node": { "almac": "str" },
+  "link_state": {},
+  "parent_scan": {},
+  "bh_trial": { "target": "str", "controller": "str" },
+  "bh_trial_state": {},
+  "rename": { "almac": "str", "name": "str" },
+  "add_status": {},
+  "node_state": {},
+  "health": {},
+  "topology": {},
+  "ttlm_state": {},
+  "events": {},
+  "nodes": {},
+  "clients": {},
+  "client_history": { "mac": "str", "limit": 32 },
+  "steer_history": {},
+  "db_stats": {},
+  "db_table": { "table": "str", "limit": 200 }
+}
+EOF
+	;;
+call)
+	case "$2" in
+	setup_state)
+		# What the wizard needs to pick a screen, and what to warn about.
+		# Read-only. The joining fields exist so the screen after the
+		# reboot can narrate what the box is doing instead of going mute:
+		# bh_key says the mesh has handed the settings over the cable,
+		# bsta_links says the wireless link is standing.
+		# Match the backhaul SSID, not just the type. uci addresses @ap[N]
+		# by order of appearance and the order is a genconfig detail:
+		# measured 2026-08-15 on the BPI-R4 Pro 8X, the bhmld_ap_5/6 sections came
+		# out first there carrying the FRONTHAUL credential under
+		# type=backhaul, so a type-only test reported "the mesh handed the
+		# settings over" from the wrong section. bh-key-adopt read the same
+		# sections the same way and adopted the wrong key until its fuse
+		# blew. Two readers, one missing condition - both fixed here.
+		bhk=false
+		i=0
+		while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+			[ "$(uci -q get mapagent.@ap[$i].type)" = "backhaul" ] &&
+				[ "$(uci -q get mapagent.@ap[$i].ssid)" = "MAP--BH" ] &&
+				[ -n "$(uci -q get mapagent.@ap[$i].key)" ] && { bhk=true; break; }
+			i=$((i + 1))
+		done
+		bsta=$(iw dev 2>/dev/null | awk '/Interface bsta/{print $2; exit}')
+		# One "Connected to" line is printed however many links an MLD holds,
+		# so counting it reports 1 for a two-leg backhaul and the narrator
+		# understates what it just built. The Link lines are the legs.
+		links=0; [ -n "$bsta" ] && links=$(iw dev "$bsta" link 2>/dev/null | grep -cE "^[[:space:]]+Link")
+		aps=$(iw dev 2>/dev/null | grep -c "Interface ap-")
+
+		# The mesh address is read from whichever network carries the mesh:
+		# lan since 2026-08-12, easymesh on nodes set up before that. Naming
+		# one of them left this empty on every node built the other way -
+		# which is exactly what happened when br-easymesh was retired and
+		# this line kept asking for a section that no longer exists.
+		mesh_net=$(uci -q get mapagent.agent.al_bridge | sed 's/^br-//')
+		mesh_net="${mesh_net:-lan}"
+		# boot_id changes on every reboot; the narrator keys its one reload on
+		# it so a self-reboot is caught without a manual refresh.
+		bid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+		# working | settled | failed, written by bh-key-adopt. The setup
+		# overlay waits on this instead of on "the box answers again", so
+		# it covers however many restarts a join actually takes rather
+		# than a number written into the page. Empty on a box that never
+		# runs the finisher - the controller's own setup - and the overlay
+		# reads empty as done.
+		adopt=$(cat /etc/mapc/adopt-state 2>/dev/null)
+		printf '{"role":"%s","hostname":"%s","mesh_addr":"%s","mesh_bridge":"%s","has_root_pw":%s,"wan_up":%s,"bh_key":%s,"bsta_ifname":"%s","bsta_links":%s,"ap_count":%s,"boot_id":"%s","adopt_state":"%s"}\n' \
+			"$(role)" \
+			"$(uname -n)" \
+			"$(uci -q get network.$mesh_net.ipaddr)" \
+			"$(uci -q get mapagent.agent.al_bridge)" \
+			"$(grep -q '^root:[!*]*:' /etc/shadow 2>/dev/null && echo false || echo true)" \
+			"$([ "$(cat /sys/class/net/br-wan/operstate 2>/dev/null)" = up ] && echo true || echo false)" \
+			"$bhk" "$bsta" "$links" "${aps:-0}" "$bid" "$adopt"
+		;;
+	setup_controller)
+		# Founding a new mesh. The only screen that asks the user anything:
+		# what the network is called, its password, a password for the router
+		# itself, and where the mesh addresses live. The backhaul name, its key
+		# and this node's identity are generated - a user who types a backhaul
+		# key can only get it wrong, and would never need to see it again.
+		#
+		# The one exception is deliberate: moving the controller role onto a
+		# different box in an EXISTING mesh. The standing agents hold the old
+		# key and have no wire to be told a new one over, so the new controller
+		# must found the mesh with the key the old one used - then they attach
+		# to it on their own. That is what the optional backhaul_key is for.
+		input=$(cat)
+		ssid=$(echo "$input" | jsonfilter -e '@.ssid' 2>/dev/null)
+		wifikey=$(echo "$input" | jsonfilter -e '@.wifi_key' 2>/dev/null)
+		rootpw=$(echo "$input" | jsonfilter -e '@.root_password' 2>/dev/null)
+		addr=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		bhkey=$(echo "$input" | jsonfilter -e '@.backhaul_key' 2>/dev/null)
+
+		[ -n "$ssid" ] || { echo '{"error":"ssid is required"}'; exit 0; }
+		[ "${#wifikey}" -ge 8 ] 2>/dev/null || { echo '{"error":"wifi password must be at least 8 characters"}'; exit 0; }
+		[ -n "$addr" ] || addr=10.10.10.1
+		if [ -n "$bhkey" ] && [ "${#bhkey}" -lt 8 ]; then
+			echo '{"error":"backhaul key must be at least 8 characters (or left empty to generate one)"}'
+			exit 0
+		fi
+		# A key of exactly 64 characters takes every radio on the box down.
+		# /usr/share/ucode/wifi/ap.uc:140 reads an undeclared `key` on that
+		# branch - it means config.key - and netifd answers the reference
+		# error by tearing down the whole phy. The bug is OpenWrt's, but it
+		# fires on input we accept from the user, and 64 hex characters is
+		# exactly what `openssl rand -hex 32` hands someone who wanted a
+		# strong key (measured 2026-08-13, the air went silent). Refuse it
+		# here with a reason, rather than quietly trimming a key the user
+		# believes they set.
+		for k in "$wifikey" "$bhkey"; do
+			[ "${#k}" -eq 64 ] || continue
+			echo '{"error":"a key of exactly 64 characters is refused - it hits a bug in OpenWrt that takes all radios down. Use any other length, e.g. 63 or 65."}'
+			exit 0
+		done
+
+		# 62 hex from the kernel pool - the shape the stack already uses.
+		# Generated on request, not at first boot: by now the node has been up
+		# for minutes, so the entropy pool is not a question.
+		[ -n "$bhkey" ] || bhkey=$(head -c 31 /dev/urandom | hexdump -v -e '/1 "%02x"')
+
+		# The fronthaul credentials live per band in ieee1905; the backhaul key
+		# goes to every band, so a node joining later does not meet the split
+		# this mesh grew by accident (6 GHz on a different key than 5).
+		i=0
+		while [ $i -lt 12 ]; do
+			s=$(uci -q get ieee1905.@ap[$i].ssid 2>/dev/null) || break
+			[ -n "$s" ] || { i=$((i+1)); continue; }
+			case "$s" in
+			MAP--BH*) uci set ieee1905.@ap[$i].key="$bhkey" ;;
+			*)        uci set ieee1905.@ap[$i].ssid="$ssid"; uci set ieee1905.@ap[$i].key="$wifikey" ;;
+			esac
+			i=$((i+1))
+		done
+		uci commit ieee1905
+
+		# The same truth must reach the controller's own cred store: first
+		# boot filled mapcontroller's fronthaul sections from board defaults,
+		# and WSC M2 hands agents what sits there, not what the user typed.
+		# (The backhaul twin of this write lives in easymesh-role, which is
+		# the one holding the key when the sections must be final.)
+		if uci -q get mapcontroller >/dev/null 2>&1; then
+			for mc in $(uci show mapcontroller 2>/dev/null \
+					| sed -n 's/^mapcontroller\.\([^.][^.]*\)=ap$/\1/p'); do
+				[ "$(uci -q get mapcontroller.$mc.type)" = "fronthaul" ] || continue
+				uci set mapcontroller.$mc.ssid="$ssid"
+				uci set mapcontroller.$mc.key="$wifikey"
+			done
+			uci commit mapcontroller
+		fi
+
+		[ -n "$name" ] && { uci set system.@system[0].hostname="$name"; uci set ieee1905.ieee1905.device_name="$name"; uci commit system; uci commit ieee1905; }
+		[ -n "$rootpw" ] && printf '%s\n%s\n' "$rootpw" "$rootpw" | passwd root >/dev/null 2>&1
+
+		# The address gates the whole mesh-bridge path in easymesh-role:
+		# without it the node would come up on the old layout, mesh in
+		# br-lan, and a fresh flash would build yesterday's network.
+		bad=$(mesh_addr_reason "$addr")
+		[ -n "$bad" ] && { printf '{"error":"%s"}\n' "$bad"; exit 0; }
+		out=$(/usr/sbin/easymesh-role controller --backhaul-key "$bhkey" --mesh-addr "$addr" 2>&1)
+		rc=$?
+
+		# The controller never runs the finisher, so its adopt_state is meant
+		# to be empty - that is how the overlay knows this reboot is the end
+		# of the story. A box that was an agent before still carries the word
+		# from that life, and a leftover "working" would leave the overlay
+		# waiting for a restart that is never coming.
+		rm -f /etc/mapc/adopt-state
+		printf '{"ok":%s,"role":"controller","address":"%s","log":"%s"}\n' \
+			"$([ $rc = 0 ] && echo true || echo false)" "$addr" \
+			"$(echo "$out" | tr '\n' ' ' | sed 's/"/\\"/g')"
+		;;
+	setup_agent)
+		# Joining an existing mesh. Deliberately asks for nothing but a name:
+		# the network name, its password and the backhaul key all already
+		# exist, and a node told them again is a node that can be told them
+		# wrongly. It receives them over the cable from the controller, the way
+		# the standard intends - proven on hardware 2026-08-09.
+		input=$(cat)
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		gw=$(echo "$input" | jsonfilter -e '@.gateway' 2>/dev/null)
+		[ -n "$gw" ] || gw=10.10.10.1
+
+		[ -n "$name" ] && { uci set system.@system[0].hostname="$name"; uci set ieee1905.ieee1905.device_name="$name"; uci commit system; uci commit ieee1905; }
+
+		# Quiet down BEFORE the wire is touched. The image this node was
+		# flashed from boots believing it is a controller with DHCP on, and
+		# the address probe is the moment the user has a cable to the mesh
+		# in hand. A joining box goes silent first, then goes looking: even
+		# if everything after this line fails, the mesh never meets a second
+		# DHCP server or a second controller. easymesh-role repeats these
+		# idempotently as part of the real role change.
+		uci set dhcp.lan.ignore='1'
+		uci commit dhcp
+		/etc/init.d/dnsmasq reload >/dev/null 2>&1
+		if [ "$(uci -q get mapcontroller.controller.enabled)" = "1" ]; then
+			uci set mapcontroller.controller.enabled='0'
+			uci commit mapcontroller
+			/etc/init.d/mapcontroller stop >/dev/null 2>&1
+		fi
+
+		# The mesh must answer on the wire before anything else is decided:
+		# it proves the cable, the segment and the address in one stroke,
+		# and it is what keeps the address probe from ever choosing blind.
+		# Asked DAD-style (-D, sender 0.0.0.0) on purpose - the nodes run
+		# arp_ignore and stay silent to a plain ARP from a foreign-subnet
+		# sender (measured on a BPI-R4 (4 GB), 2026-08-10), but everyone answers a
+		# duplicate-address probe. Defended means the mesh is there.
+		iface=$(uci -q get network.lan.device)
+		iface="${iface:-br-lan}"
+		if arping -D -q -c 3 -w 3 -I "$iface" "$gw" >/dev/null 2>&1; then
+			printf '{"error":"the mesh at %s is not reachable. Connect this box by cable to a box that is already in the mesh, then press Join again."}\n' "$gw"
+			exit 0
+		fi
+
+		# Ask the ledger, then fall back to asking the wire. The controller
+		# is the only box that can see a node three hops away AND the only
+		# one that remembers what it has already promised; this one can do
+		# neither, and on 2026-09-04 that is how two boxes ended up on .2 -
+		# the second of them unreachable ever since. The ARP walk stays for
+		# the case the controller cannot answer at all, which is a mesh that
+		# does not have one yet, and the answer says which of the two decided
+		# so the next collision does not have to be guessed at either.
+		src=ledger
+		addr=$(ask_mesh_for_address "$gw" "$iface")
+		if [ -z "$addr" ]; then
+			src=arp
+			logger -t easymesh "join: the mesh at $gw did not hand out an address - falling back to the ARP probe, which neither sees past one wireless hop nor writes anything down"
+			addr=$(pick_mesh_addr "$gw")
+		fi
+		[ -n "$addr" ] || {
+			echo '{"error":"no free mesh address found - is the cable to the mesh plugged in?"}'
+			exit 0
+		}
+
+		out=$(/usr/sbin/easymesh-role agent "$gw" --mesh-addr "$addr" 2>&1)
+		rc=$?
+
+		# Open the join's state here, where the join starts.
+		#
+		# The setup overlay waits on adopt_state and reads an empty one as
+		# "nothing left to wait for" - right for the controller, which never
+		# runs the finisher. But bh-key-adopt publishes its first word from
+		# inside a loop that sleeps its whole interval before it looks at
+		# anything, and skips the write entirely until the key has been
+		# delivered. On a fresh box the file therefore does not exist yet,
+		# while uhttpd has been answering for a while. The overlay's first
+		# question after the reboot lands in that gap, reads empty as done,
+		# and hands the user a login screen - and half a minute later the box
+		# restarts under their hands and reads as dead rather than as busy.
+		#
+		# That is the wired join as seen on 2026-08-16, and it survived the
+		# fix of the day before because that one changed WHAT the overlay
+		# waits on, not WHEN the answer starts existing.
+		#
+		# So whoever starts a join says so, and the state exists before the
+		# box ever goes down; bh-key-adopt only moves it on from there. It
+		# doubles as the reset a second join needs, because a "settled" left
+		# over from an earlier one would end the next overlay on its first
+		# restart for the very same reason.
+		#
+		# Only when the finisher is actually installed: a box without it
+		# would sit on "working" until the overlay's hard stop instead of
+		# reaching the login screen it could have had straight away.
+		[ $rc = 0 ] && [ -x /usr/sbin/bh-key-adopt ] && {
+			mkdir -p /etc/mapc
+			echo working > /etc/mapc/adopt-state
+			[ -s /etc/mapc/join-started ] || date +%s > /etc/mapc/join-started 2>/dev/null
+			rm -f /etc/mapc/join-fallback-reboot
+		}
+
+		# addr_source travels with the answer so a collision found later can
+		# be traced to the decision that made it - ledger or bare ARP -
+		# without anyone having to reconstruct it from logs.
+		printf '{"ok":%s,"role":"agent","gateway":"%s","address":"%s","addr_source":"%s","log":"%s"}\n' \
+			"$([ $rc = 0 ] && echo true || echo false)" "$gw" "$addr" "$src" \
+			"$(echo "$out" | tr '\n' ' ' | sed 's/"/\\"/g')"
+		;;
+	add_status)
+		# What to put on the screen of the box the user already has open.
+		#
+		# The LEDs lost this argument on their own merits: they are small,
+		# there are a lot of them, and on a shelf of blinking things one more
+		# blinking thing is not a message. The controller, meanwhile, knows
+		# everything worth saying and has a screen the user is already looking
+		# at, because pressing the first button is what brought them here.
+		#
+		# Every state below is read from something that already existed - the
+		# armed marker, the log, the model. Nothing new is plumbed through the
+		# join itself, which is deliberate: the join is hard enough to get
+		# right without a progress protocol threaded through its reboots.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"state":"idle","note":"only the controller runs an add"}'
+			exit 0
+		fi
+		st=/tmp/easymesh-add.state
+		[ -f "$st" ] || { echo '{"state":"idle"}'; exit 0; }
+
+		armed_at=$(head -1 "$st" | awk '{print $2}')
+		[ -n "$armed_at" ] || { echo '{"state":"idle"}'; exit 0; }
+		age=$(( $(date +%s) - armed_at ))
+
+		# A box that is in the model now and was not in the list then.
+		newcomer=""
+		for m in $(sq1 "select almac from agent where last_seen > $armed_at;"); do
+			tail -n +2 "$st" | grep -qi "^$m$" || { newcomer="$m"; break; }
+		done
+
+		if [ -n "$newcomer" ]; then
+			# Appearing in the model is NOT the same as being finished.
+			#
+			# A joining box reports itself as soon as it can talk 1905, which
+			# is before its last reboot - the one where bh-key-adopt puts the
+			# credentials into service. Announcing "done" there is a claim the
+			# user disproves within seconds, because the box then goes away
+			# again and its lamp goes dark. Reported by the user 2026-08-22:
+			# "the green appears before the agent is up after the third
+			# reboot".
+			#
+			# depth and upstream_bssid together say it is hanging off a parent
+			# rather than merely talking, and a fresh last_seen says it is
+			# doing so right now rather than having done so before a reboot.
+			#
+			# A foreign agent never names its own uplink (a MediaTek R3 box
+			# sends neither 0xE1 nor a Link Metric Response), so upstream_bssid
+			# stays empty for good and it was called stalled ten minutes
+			# after it had joined and taken our SSIDs (2026-09-18). For a box
+			# that reports no bSTA MLD of its own - i.e. not one of ours - an
+			# edge the controller placed it by counts instead. Ours keep the
+			# strict test: that is what stops "done" before their last reboot.
+			settled=$(sq1 "select count(*) from agent a
+				where a.almac='$newcomer' and a.depth > 0
+				  and a.last_seen > $(date +%s) - 30
+				  and ((a.upstream_bssid is not null and a.upstream_bssid != '')
+				       or (not exists (select 1 from bstamld b
+				                       where b.agent_almac = a.almac)
+				           and exists (select 1 from topology_link t
+				                       where t.child_almac = a.almac)));")
+			if [ "${settled:-0}" -lt 1 ]; then
+				# Settling has to be able to end.
+				#
+				# Without a ceiling, ONE box that half-joins - it reports
+				# itself over 1905, then never comes back with a depth and an
+				# upstream - holds this panel on "finishing up" for ever. The
+				# whole mesh then reads as busy adding somebody, and the next
+				# box cannot be added at all. Measured 2026-09-04: a node that
+				# had last spoken nine minutes earlier kept the add flow open
+				# for thirteen, and the user's report was the plainest kind -
+				# "nothing else can be added".
+				#
+				# Ten minutes, against a join that takes four. Long enough
+				# that a slow box is never called stalled, short enough that
+				# nobody waits out an evening on one that is. Saying "stalled"
+				# costs nothing if it is wrong: the mesh is untouched and the
+				# screen's advice is to press again, which is what a genuinely
+				# slow box would want anyway.
+				if [ "$age" -gt "${ADD_SETTLE_MAX:-600}" ]; then
+					printf '{"state":"stalled","almac":"%s","name":"%s","elapsed_s":%s}\n' \
+						"$newcomer" "$(nameof "$newcomer")" "$age"
+					exit 0
+				fi
+				printf '{"state":"settling","almac":"%s","name":"%s","elapsed_s":%s}\n' \
+					"$newcomer" "$(nameof "$newcomer")" "$age"
+				exit 0
+			fi
+			printf '{"state":"joined","almac":"%s","name":"%s","elapsed_s":%s}\n' \
+				"$newcomer" "$(nameof "$newcomer")" "$age"
+			exit 0
+		fi
+
+		# The second press, confirmed in seconds instead of in minutes.
+		#
+		# The WPS button on these boards is recessed - it takes a paperclip -
+		# so a press that did not land is a normal outcome, not an edge case.
+		# Until now the only confirmation was the finished key exchange, which
+		# is minutes away, so someone who missed the button had no way to know
+		# and every reason to think the whole thing was broken.
+		#
+		# WPS-ENROLLEE-SEEN is hostapd saying a box nearby is asking to pair.
+		# It arrives as soon as the enrollee probes, which is as soon as its
+		# button worked. Treated as optional on purpose: if it never appears -
+		# and it was not in today's log, which may be buffer rotation or may be
+		# that our enrollee does not probe that way - the run simply reaches
+		# 'paired' as before and nothing is worse than it was.
+		# The credential-went-across fact, latched the first time anyone
+		# looks, because the log it is read from is a ring that loses it.
+		# Written by whoever notices first - this poll or the re-arm loop -
+		# and thrown away when the next press arms a new window, so it can
+		# never answer for a press it did not belong to.
+		reg=/tmp/easymesh-add.regsuccess
+		if [ ! -f "$reg" ]; then
+			reg_now=$(logread -l 400 2>/dev/null | grep WPS-REG-SUCCESS | tail -1)
+			if [ -n "$reg_now" ] &&
+			   [ "$reg_now" != "$(cat /tmp/easymesh-add.regbase 2>/dev/null)" ]; then
+				date +%s > "$reg" 2>/dev/null
+			fi
+		fi
+		reg_at=$(cat "$reg" 2>/dev/null)
+		[ -n "$reg_at" ] && [ "$reg_at" -ge "$armed_at" ] 2>/dev/null || reg_at=""
+
+		if [ -z "$reg_at" ] && logread -l 400 2>/dev/null | grep -q WPS-ENROLLEE-SEEN; then
+			printf '{"state":"seen","elapsed_s":%s}\n' "$age"
+			exit 0
+		fi
+
+		# WPS-REG-SUCCESS means the credential went across. Everything after
+		# that is the new box restarting itself, which takes minutes and looks
+		# like nothing at all from here - which is exactly when a user gives up
+		# and starts pressing things, so this state has to be reported loudly.
+		if [ -n "$reg_at" ]; then
+			# The keys went across and then the box went quiet for longer than
+			# the join has ever taken. Reported as its own state because the
+			# alternative is a screen that says "working" for ever, which is
+			# the one message a user cannot act on. Measured 2026-08-20: press
+			# to counted-in-the-mesh was 4 min 17 s, so twice that is late by
+			# any reading and not a threshold anyone will hit by being patient.
+			if [ "$age" -gt 600 ]; then
+				printf '{"state":"stalled","elapsed_s":%s}\n' "$age"
+				exit 0
+			fi
+			printf '{"state":"paired","elapsed_s":%s}\n' "$age"
+			exit 0
+		fi
+
+		# The window is 120 s and wps_open re-arms it three times; past that,
+		# nobody pressed. Reported as its own state rather than as failure -
+		# nothing is broken, the second button was simply never pressed.
+		if [ "$age" -gt 420 ]; then
+			printf '{"state":"nobody","elapsed_s":%s}\n' "$age"
+			exit 0
+		fi
+
+		printf '{"state":"armed","elapsed_s":%s,"window_left_s":%s}\n' \
+			"$age" "$(( 420 - age ))"
+		;;
+	rename)
+		# Naming a box after it has joined, from the mesh, instead of before
+		# it has joined, from a LuCI nobody can reach yet. That ordering was
+		# the whole problem: a beginner cannot open a second web interface on
+		# a box that is not on the network, and asking them to do it first is
+		# how onboarding gets abandoned halfway.
+		#
+		# The pencil does not keep a name here. It writes the name into the
+		# BOX, as its hostname - the same field LuCI writes, so the two ways
+		# of renaming a box lead to one place instead of two that drift.
+		#
+		# The ledger line this leaves behind is not the name. It is the
+		# record of an instruction that the box has not confirmed yet, and
+		# mesh-names-sync clears it the moment the box reports the name
+		# itself. Until 2026-09-06 this line WAS the name and outranked the
+		# box: measured that day on node .3, after one use of the pencil the
+		# box was renamed at the box to CELLAR, said so over 1905, and the
+		# picture kept drawing BEDROOM.
+		#
+		# Why the box and not a table here: the owner unplugs a box, finds it
+		# months later, plugs a cable into it and asks what it is. Only a
+		# name that lives in the box can answer that.
+		input=$(cat)
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			# Not our ledger to write - hand the whole question to the
+			# box that keeps it. What can fail here is the network, so
+			# that is what the answer talks about; the old wording was
+			# a statement about our architecture, which tells a user
+			# nothing they can act on.
+			out="$(proxy_to_controller rename "$input")"
+			[ -n "$out" ] && { echo "$out"; exit 0; }
+			echo '{"error":"the controller did not answer"}'
+			exit 0
+		fi
+		almac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null)
+		newname=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+		case "$almac" in
+		[0-9a-fA-F][0-9a-fA-F]:*) ;;
+		*) echo '{"error":"which node? give an AL-MAC"}'; exit 0 ;;
+		esac
+		# One word, and none of the characters that would let a name become a
+		# second column or a second line in a file read by awk.
+		newname=$(echo "$newname" | tr -d " \t\r\n" | tr -cd "A-Za-z0-9._-")
+		[ -n "$newname" ] || { echo '{"error":"a name cannot be empty"}'; exit 0; }
+
+		# Write down the instruction BEFORE trying to carry it out, and
+		# leave it written even when the write succeeds. It is cleared by
+		# mesh-names-sync when the box reports the name on the wire - never
+		# here, on the strength of an ssh that returned 0.
+		#
+		# A fuse recorded before the outcome is how a step gets switched off
+		# while looking done: 2026-09-04, a box kept its factory address with
+		# the marker in place claiming it had been given one.
+		ledger_set "$almac" "$newname" pending ||
+			{ echo '{"error":"could not write the name down"}'; exit 0; }
+		logger -t easymesh "rename $almac to $newname requested"
+
+		# Only the hostname is written. device_name follows it through
+		# mesh-name, which is triggered by the config.change event below and
+		# is the single place that keeps the two in step - setting both here
+		# as well would be a second mechanism doing the same job, and the two
+		# would eventually disagree.
+		#
+		# The event matters more than it looks: without it the box carries
+		# the new hostname while ieee1905d keeps announcing the old name,
+		# because the daemon holds the name from startup. It took the
+		# override file to hide that until now.
+		node_ip=$(find_node_addr "$almac" 2>/dev/null)
+		hostname_set=false
+		if [ "$node_ip" = "local" ]; then
+			# This box. No ssh, no address, nothing that can hang: the
+			# controller is usually the first node anybody renames and it
+			# must not depend on being reachable from itself.
+			uci set system.@system[0].hostname="$newname"
+			uci commit system
+			echo "$newname" > /proc/sys/kernel/hostname
+			ubus -t 5 call service event \
+				'{"type":"config.change","data":{"package":"system"}}' \
+				>/dev/null 2>&1
+			hostname_set=true
+			logger -t easymesh "hostname of $almac (this box) set to $newname"
+		elif [ -n "$node_ip" ]; then
+			# -y -y, not -y: a reflashed box answers with a new host key
+			# and a single -y refuses a key that CHANGED. And the box
+			# confirms its own AL-MAC before taking the name, because an
+			# address borrowed from the ledger can belong to a neighbour
+			# by the time it is used (2026-09-20, the controller wore an
+			# agent's name).
+			almac_l=$(echo "$almac" | tr 'A-Z' 'a-z')
+			timeout 12 ssh -y -y -o BatchMode=yes \
+				"root@$node_ip" "[ \"\$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')\" = '$almac_l' ] || exit 3
+					uci set system.@system[0].hostname='$newname'
+					uci commit system
+					echo '$newname' > /proc/sys/kernel/hostname
+					ubus call service event '{\"type\":\"config.change\",\"data\":{\"package\":\"system\"}}'" \
+				>/dev/null 2>&1
+			case $? in
+			0)	hostname_set=true
+				logger -t easymesh "hostname of $almac set to $newname on $node_ip" ;;
+			3)	logger -t easymesh "$node_ip does not answer as $almac; $newname not written" ;;
+			*)	logger -t easymesh "could not set hostname of $almac on $node_ip" ;;
+			esac
+		else
+			logger -t easymesh "no address for $almac - the name waits in the ledger"
+		fi
+
+		printf '{"ok":true,"almac":"%s","name":"%s","hostname_set":%s}\n' \
+			"$almac" "$newname" "$hostname_set"
+		;;
+	link_state)
+		# Which legs of THIS node's backhaul MLD are alive, as measured by
+		# /usr/sbin/easymesh-linkstat. Local and read-only: every node answers
+		# for itself, so this is deliberately NOT in CTRL_METHODS and is never
+		# proxied to the controller.
+		#
+		# A stale sample is not health. The model already has one field that
+		# describes how an MLD was BUILT and gets read as how it is RUNNING
+		# (bstamld.num_bsta, 2 on every box including the ghost of one that
+		# left); a cached linkstat handed out after the daemon died would be
+		# the same defect with a new name. Past 90 s - three sampling windows -
+		# this says it has nothing, and the caller must treat that as unknown,
+		# not as two good legs.
+		f=/tmp/easymesh/linkstat.json
+		ts=$(jsonfilter -i "$f" -e '@.ts' 2>/dev/null)
+		if [ -z "$ts" ] || [ $(( $(date +%s) - ts )) -gt 90 ]; then
+			echo '{"links":[],"stale":true}'
+			exit 0
+		fi
+		cat "$f"
+		;;
+	bh_trial)
+		# Start a parent trial HERE (easymesh-bh-trial): it measures, moves,
+		# measures and keeps or reverts on its own, with its own fuse,
+		# because the link a remote rollback would use is the one at risk.
+		# Returns at once; the result is read with bh_trial_state. Local,
+		# like link_state - the controller calls the node, never a proxy.
+		input=$(cat)
+		t=$(echo "$input" | jsonfilter -e '@.target' 2>/dev/null | tr 'A-Z' 'a-z')
+		c=$(echo "$input" | jsonfilter -e '@.controller' 2>/dev/null)
+		case "$t" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) echo '{"error":"target: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
+		esac
+		case "$c" in
+		*[!0-9.]*|'') echo '{"error":"controller: expected an IPv4 address"}'; exit 0 ;;
+		esac
+		p=$(cat /tmp/easymesh/bh-trial.pid 2>/dev/null)
+		if [ -n "$p" ] && grep -q easymesh-bh-trial "/proc/$p/cmdline" 2>/dev/null; then
+			echo '{"error":"a trial is already running"}'; exit 0
+		fi
+		rm -f /tmp/easymesh/bh-trial.json
+		setsid /usr/sbin/easymesh-bh-trial "$t" "$c" 5203 </dev/null >/dev/null 2>&1 &
+		echo '{"started":true}'
+		;;
+	bh_trial_state)
+		p=$(cat /tmp/easymesh/bh-trial.pid 2>/dev/null)
+		if [ -n "$p" ] && grep -q easymesh-bh-trial "/proc/$p/cmdline" 2>/dev/null; then
+			echo '{"running":true}'
+		elif [ -s /tmp/easymesh/bh-trial.json ]; then
+			cat /tmp/easymesh/bh-trial.json
+		else
+			echo '{"none":true}'
+		fi
+		;;
+	parent_scan)
+		# Which parents this node can hear, from /usr/sbin/easymesh-parent-scan.
+		# Local and read-only, like link_state. The scan runs every 10 min;
+		# past 25 min it says it has nothing - a parent heard an hour ago is
+		# not a candidate now.
+		f=/tmp/easymesh/parents.json
+		ts=$(jsonfilter -i "$f" -e '@.ts' 2>/dev/null)
+		if [ -z "$ts" ] || [ $(( $(date +%s) - ts )) -gt 1500 ]; then
+			echo '{"cand":[],"stale":true}'
+			exit 0
+		fi
+		cat "$f"
+		;;
+	forget_node)
+		# A re-provisioned box, or one taken out of service, leaves a row
+		# the controller keeps believing in - the ghosts that pile up in
+		# the node list. Only the controller owns the database, and the
+		# map-controller daemon holds it open, so the safe delete is:
+		# stop the daemon, remove the node from every table keyed by its
+		# AL-MAC, start it again. agent_backhaul is a VIEW - deleting by
+		# table avoids touching it. A live node re-registers within
+		# seconds, so this only sticks for one that is truly gone.
+		input=$(cat)
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			out="$(proxy_to_controller forget_node "$input")"
+			[ -n "$out" ] && { echo "$out"; exit 0; }
+			echo '{"error":"the controller did not answer"}'
+			exit 0
+		fi
+		mac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		case "$mac" in
+		[0-9a-f][0-9a-f]:*[0-9a-f][0-9a-f]) ;;
+		*) echo '{"error":"almac: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
+		esac
+		/etc/init.d/mapcontroller stop >/dev/null 2>&1
+		# The daemon holds the DB in WAL mode; give the lock a moment to
+		# clear after stop, or the delete silently races it.
+		sleep 1
+		# The same set of tables the hourly janitor uses for a node that has
+		# been gone twenty days (mapc_sync.c: doom_sql[]), with almac=? in
+		# place of last_seen<cutoff. Until now this deleted six tables and
+		# left eleven: affiliated_sta, sta_mld, ttlm, affiliated_ap,
+		# affiliated_bsta, radio_caps, operating_class, scan_result, bss,
+		# neighbor and ieee1905_security all kept rows pointing at a node
+		# that no longer existed. The schema has no ON DELETE CASCADE, so
+		# the order below is not cosmetic: children first, and every child
+		# set resolved from the parent table BEFORE that parent is emptied.
+		#
+		# One transaction, so a node is either forgotten or not. Half a
+		# deletion is worse than none - it leaves a node with rows the model
+		# will keep tripping over.
+		#
+		# $mac is the validated AL-MAC from the case above; that test is
+		# what makes this safe to interpolate and it must stay.
+		sqlite3 -cmd ".timeout 3000" "$DB" "
+		BEGIN;
+		DELETE FROM affiliated_sta WHERE mld_macaddr IN
+		  (SELECT mld_macaddr FROM sta_mld WHERE ap_mld_macaddr IN
+		    (SELECT mld_macaddr FROM apmld WHERE agent_almac='$mac'));
+		DELETE FROM sta_mld WHERE ap_mld_macaddr IN
+		  (SELECT mld_macaddr FROM apmld WHERE agent_almac='$mac');
+		DELETE FROM ttlm WHERE mld_macaddr IN
+		  (SELECT mld_macaddr FROM apmld WHERE agent_almac='$mac');
+		DELETE FROM affiliated_ap WHERE mld_macaddr IN
+		  (SELECT mld_macaddr FROM apmld WHERE agent_almac='$mac');
+		DELETE FROM apmld WHERE agent_almac='$mac';
+		DELETE FROM affiliated_bsta WHERE mld_macaddr IN
+		  (SELECT mld_macaddr FROM bstamld WHERE agent_almac='$mac');
+		DELETE FROM bstamld WHERE agent_almac='$mac';
+		DELETE FROM sta WHERE agent_almac='$mac';
+		DELETE FROM radio_caps WHERE ruid IN (SELECT ruid FROM radio WHERE agent_almac='$mac');
+		DELETE FROM operating_class WHERE ruid IN (SELECT ruid FROM radio WHERE agent_almac='$mac');
+		DELETE FROM scan_result WHERE ruid IN (SELECT ruid FROM radio WHERE agent_almac='$mac');
+		DELETE FROM bss WHERE ruid IN (SELECT ruid FROM radio WHERE agent_almac='$mac');
+		DELETE FROM radio WHERE agent_almac='$mac';
+		DELETE FROM topology_link WHERE child_almac='$mac' OR parent_almac='$mac';
+		DELETE FROM neighbor WHERE neighbor='$mac' OR next_hop='$mac';
+		DELETE FROM ieee1905_security WHERE id='$mac';
+		DELETE FROM agent WHERE almac='$mac'
+		  AND almac <> COALESCE((SELECT controller_almac FROM network LIMIT 1),'');
+		COMMIT;" 2>/dev/null
+		# bsta_link is ours and is created on demand by
+		# easymesh-linkstat-collect, so it may not exist yet. Kept out of the
+		# transaction above: a missing table would abort the whole thing and
+		# the node would stay.
+		sqlite3 -cmd ".timeout 3000" "$DB" "DELETE FROM bsta_link WHERE agent_almac='$mac';" 2>/dev/null
+		# topology_link_history keeps the edges this node ever had. Not
+		# deleted, closed: history is what the database is for, and an open
+		# interval on a box that is gone is the one thing that would be wrong.
+		sqlite3 -cmd ".timeout 3000" "$DB" "UPDATE topology_link_history SET to_ts=$(date +%s)
+		  WHERE to_ts IS NULL AND (child_almac='$mac' OR parent_almac='$mac');" 2>/dev/null
+		# Success is measured, not guessed: the row is gone or it is not.
+		gone=$(sqlite3 -cmd ".timeout 3000" "$DB" "select count(*) from agent where almac='$mac';" 2>/dev/null)
+		/etc/init.d/mapcontroller start >/dev/null 2>&1
+		# A panel narrating the arrival of a box that has just been deleted
+		# is a story about nothing, and it outlives the deletion: measured
+		# 2026-08-23, forgetting a wiped node left "the new box is here and
+		# finishing up" on screen with no such box anywhere. If the node
+		# being forgotten was not in the mesh when this window was armed,
+		# it IS the box that window was about, so the window goes with it.
+		#
+		# The promise goes with the row, too. A box being forgotten is a box
+		# whose number is meant to become available again - that is what the
+		# button is for - and a ledger entry outliving it would keep the
+		# number out of circulation with nothing on screen to say so.
+		resv_forget "$mac"
+
+		st=/tmp/easymesh-add.state
+		if [ -f "$st" ] && ! tail -n +2 "$st" | grep -qi "^$mac$"; then
+			rm -f "$st" /tmp/easymesh-add.regsuccess /tmp/easymesh-add.regbase
+		fi
+		printf '{"ok":%s,"forgot":"%s"}\n' "$([ "${gone:-1}" = 0 ] && echo true || echo false)" "$mac"
+		;;
+	suggest_address)
+		# The bookkeeping the wizard exists to remove: which mesh address is
+		# free. Only the controller can answer - not because it sits on the
+		# mesh segment (every node does) but because it is the only box with
+		# the whole topology, and an address three hops away is invisible to
+		# anything else. The joining box asks this over DHCP+HTTP during a
+		# wired join, and the user carries the number across for a button
+		# join, read off the Pair a new box line.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"error":"only the controller can suggest an address"}'
+			exit 0
+		fi
+		# Which bridge carries the mesh is a per-node fact, not a constant:
+		# br-lan since 2026-08-12, br-easymesh on nodes set up before that.
+		# easymesh-role records it in al_bridge, so read it back instead of
+		# naming one - hardcoding either answer probes the wrong wire on
+		# half the fleet and reports every address as free.
+		mb=$(uci -q get mapagent.agent.al_bridge)
+		mb="${mb:-br-lan}"
+		base=$(ip -4 addr show "$mb" 2>/dev/null | sed -n "s/.*inet \([0-9.]*\)\/.*/\1/p" | head -1)
+
+		# Do not answer from a view that is missing somebody.
+		#
+		# mesh_addrs_in_use() turns the 1905 topology into the veto list, and
+		# a veto list is only worth what its source is complete. If ieee1905d
+		# is restarting, or a node's address has not been reported yet, the
+		# gap looks exactly like a free address - which is the fault this
+		# whole change exists to close, reintroduced one layer up.
+		#
+		# The test is exact rather than a count: a 1905 device is keyed by its
+		# AL-MAC, which is the same key the agent table uses (verified on the
+		# five-node lab mesh, 2026-09-04 - all five matched one for one). So
+		# every node the controller still draws must appear in the dump with
+		# an address, or no address is suggested at all.
+		#
+		# Refusing is the safe failure. The wizard says so and the user tries
+		# again a few seconds later; handing out a live address costs a node
+		# that answers on somebody else's number and is never reachable again.
+		# A mesh being founded has no agent rows yet, so this loop runs zero
+		# times and the ARP probe below is still the whole answer there.
+		# Advisory, and it says so: nothing is written down here. The page
+		# re-renders this line on every poll, and a reservation burnt per
+		# render would eat the subnet by lunchtime. The promise is made when
+		# a box actually claims (claim_address), which is the only moment
+		# there is a box to make it to.
+		seen=$(live_addrs_json)
+		addrless=$(addrless_1905_ids)
+		missing=""
+		for al in $(sq1 "$GHOST_CTE select a.almac from agent a
+				where a.almac not in (select fake from ghost)
+				  and ($now - a.last_seen) < $NODE_DRAW_MAX_AGE;"); do
+			case "$seen" in
+			*"\"$al\":\""*) continue ;;
+			esac
+			# A node 1905 reports with no IPv4 at all, and that never
+			# had an address from us (no line in the ledger), has none
+			# to be missing: a foreign agent that keeps its own LAN and
+			# answers no Higher Layer Query (MediaTek R3, 2026-09-18).
+			# Waiting for it blocked pairing for good. Any address such
+			# a box does hold on the wire is still vetoed through ARP
+			# and the leases in mesh_addrs_in_use().
+			if echo "$addrless" | grep -qx "$al" &&
+			   ! awk -v w="$al" 'tolower($1) == w { f = 1 } END { exit !f }' "$RESV" 2>/dev/null; then
+				continue
+			fi
+			missing="${missing:+$missing, }$(nameof "$al")"
+		done
+		if [ -n "$missing" ]; then
+			printf '{"error":"cannot say which address is free yet - the mesh has not reported an address for %s. Wait a few seconds and try again."}\n' "$missing"
+			exit 0
+		fi
+
+		resv_prune
+		# If the button has been pressed, a number is already being held and
+		# that is the one to show. Showing a freshly picked one instead would
+		# put a different address on screen from the one the arriving box is
+		# going to be given, which is the same confusion as no address at all.
+		addr=$(resv_pending_addr)
+		if [ -n "$addr" ]; then
+			printf '{"address":"%s","reserved":true,"source":"window"}\n' "$addr"
+			exit 0
+		fi
+		addr=$(pick_mesh_addr "${base:-10.10.10.1}" "$mb" "$(resv_addrs)")
+		if [ -n "$addr" ]; then
+			printf '{"address":"%s","reserved":false,"source":"live"}\n' "$addr"
+		else
+			echo '{"error":"no free address found"}'
+		fi
+		;;
+	claim_address)
+		# Hand out an address AND write it down, with nothing able to run in
+		# between. Every path that gives a box a number goes through here.
+		#
+		# The wizard's suggest_address above only shows a number; this is the
+		# one that promises it. Splitting the two is deliberate: a promise
+		# made to nobody is a number lost, and a number shown without a
+		# promise is the race we are closing.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"error":"only the controller can hand out an address"}'
+			exit 0
+		fi
+		input=$(cat)
+		almac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		want=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
+		case "$almac" in
+		[0-9a-f][0-9a-f]:*[0-9a-f][0-9a-f]) ;;
+		*) echo '{"error":"almac: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
+		esac
+
+		mb=$(uci -q get mapagent.agent.al_bridge)
+		mb="${mb:-br-lan}"
+		base=$(ip -4 addr show "$mb" 2>/dev/null | sed -n "s/.*inet \([0-9.]*\)\/.*/\1/p" | head -1)
+		base="${base:-10.10.10.1}"
+
+		# An address the caller was told by hand - typed into the join wizard,
+		# or already living on a box that is only now being written down. It
+		# is recorded rather than second-guessed, EXCEPT when the mesh says
+		# somebody else is on it, which is the one case where honouring the
+		# request creates the very collision this file is about.
+		if [ -n "$want" ]; then
+			bad=$(mesh_addr_reason "$want")
+			[ -n "$bad" ] && { printf '{"error":"%s"}\n' "$bad"; exit 0; }
+			owner=$(live_owner_of "$want")
+			if [ -n "$owner" ] && [ "$owner" != "$almac" ]; then
+				printf '{"error":"%s is already held by %s - ask without an address and one will be picked"}\n' \
+					"$want" "$(nameof "$owner")"
+				exit 0
+			fi
+			resv_lock || {
+				echo '{"error":"the address ledger is busy - try again"}'
+				exit 0
+			}
+			resv_write "$almac" "$want"
+			resv_unlock
+			logger -t easymesh "address ledger: $almac keeps $want (asked for by name)"
+			printf '{"address":"%s","almac":"%s","state":"asked","source":"reservation"}\n' "$want" "$almac"
+			exit 0
+		fi
+
+		out=$(resv_claim "$almac" "$base" "$mb")
+		if [ -z "$out" ]; then
+			echo '{"error":"could not reserve an address - the ledger is locked or the subnet is full"}'
+			exit 0
+		fi
+		got=${out%% *}; rest=${out#* }
+		state=${rest%% *}; source=${rest##* }
+		logger -t easymesh "address ledger: $almac takes $got ($state, decided by $source)"
+		printf '{"address":"%s","almac":"%s","state":"%s","source":"%s"}\n' \
+			"$got" "$almac" "$state" "$source"
+		;;
+	credentials)
+		# What the network is called right now, so a form can open with the
+		# truth in it instead of a placeholder that looks like the truth.
+		# Measured 2026-08-22: the founding form opens empty with a grey
+		# "10.10.10.1" in the address field, and anyone who fills in only a
+		# name and a password moves their mesh to a different network.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"error":"only the controller knows the credentials"}'
+			exit 0
+		fi
+		ssid=""; key=""
+		for mc in $(uci show mapcontroller 2>/dev/null \
+				| sed -n 's/^mapcontroller\.\([^.][^.]*\)=ap$/\1/p'); do
+			[ "$(uci -q get mapcontroller.$mc.type)" = "fronthaul" ] || continue
+			ssid=$(uci -q get mapcontroller.$mc.ssid)
+			key=$(uci -q get mapcontroller.$mc.key)
+			[ -n "$ssid" ] && break
+		done
+		printf '{"ssid":"%s","wifi_key":"%s"}\n' "$ssid" "$key"
+		;;
+	set_credentials)
+		# Rename the network, or change its password, without rebuilding it.
+		#
+		# Until now this took a re-onboarding of every node: agents receive
+		# fronthaul credentials in WSC M2 at join time and nothing pushed
+		# them again afterwards (measured 2026-07-28 - the controller read
+		# the new SSID and the agents kept the old one, which is two networks
+		# of different names and clients that fall off after a roam).
+		#
+		# EasyMesh has the mechanism for exactly this: AP-Autoconfiguration
+		# Renew. map-controller generates it (cntlr_gen_ap_autoconfig_renew)
+		# the moment its config diff reports changed credentials, and every
+		# agent answers with a fresh M1 and takes the M2 that comes back. The
+		# controller's own agent is on that multicast too, so the box holding
+		# this session reconfigures itself the same way as the rest - no
+		# reboot anywhere, and nothing special about being the controller.
+		#
+		# So all this does is write the truth in the two places the WSC
+		# exchange reads from, and then ask for the diff to be looked at.
+		#
+		# Controller only, deliberately. An agent relaying WSC was measured
+		# not to work (2026-08-11), and a second box writing credentials is
+		# how a mesh ends up with two answers to one question.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"error":"only the controller can change the network name or password. Open this page on the controller."}'
+			exit 0
+		fi
+		input=$(cat)
+		ssid=$(echo "$input" | jsonfilter -e '@.ssid' 2>/dev/null)
+		key=$(echo "$input" | jsonfilter -e '@.wifi_key' 2>/dev/null)
+		[ -n "$ssid" ] || { echo '{"error":"the network needs a name"}'; exit 0; }
+		[ "${#key}" -ge 8 ] 2>/dev/null || { echo '{"error":"the wifi password needs at least 8 characters"}'; exit 0; }
+		# The 64-character trap, same as founding: ap.uc:140 reads an
+		# undeclared key on that branch and netifd tears down every phy.
+		[ "${#key}" -ne 64 ] || {
+			echo '{"error":"a key of exactly 64 characters is refused - it hits a bug in OpenWrt that takes all radios down. Use any other length."}'
+			exit 0
+		}
+
+		# Nothing to do is worth saying out loud rather than pretending to
+		# work: a renew for an unchanged network would restart every agent
+		# for no reason.
+		cur_ssid=""; cur_key=""
+		for mc in $(uci show mapcontroller 2>/dev/null \
+				| sed -n 's/^mapcontroller\.\([^.][^.]*\)=ap$/\1/p'); do
+			[ "$(uci -q get mapcontroller.$mc.type)" = "fronthaul" ] || continue
+			cur_ssid=$(uci -q get mapcontroller.$mc.ssid)
+			cur_key=$(uci -q get mapcontroller.$mc.key)
+			[ -n "$cur_ssid" ] && break
+		done
+		if [ "$ssid" = "$cur_ssid" ] && [ "$key" = "$cur_key" ]; then
+			echo '{"ok":true,"unchanged":true}'
+			exit 0
+		fi
+
+		# Both stores, and only the fronthaul in each. MAP--BH is how nodes
+		# find each other; changing it is a different order of risk and is
+		# not on offer here.
+		i=0
+		while [ $i -lt 12 ]; do
+			s=$(uci -q get ieee1905.@ap[$i].ssid 2>/dev/null) || break
+			[ -n "$s" ] || { i=$((i+1)); continue; }
+			case "$s" in
+			MAP--BH*) ;;
+			*) uci set ieee1905.@ap[$i].ssid="$ssid"; uci set ieee1905.@ap[$i].key="$key" ;;
+			esac
+			i=$((i+1))
+		done
+		uci commit ieee1905
+
+		for mc in $(uci show mapcontroller 2>/dev/null \
+				| sed -n 's/^mapcontroller\.\([^.][^.]*\)=ap$/\1/p'); do
+			[ "$(uci -q get mapcontroller.$mc.type)" = "fronthaul" ] || continue
+			uci set mapcontroller.$mc.ssid="$ssid"
+			uci set mapcontroller.$mc.key="$key"
+		done
+		uci commit mapcontroller
+
+		# reconf, NOT reload. reload was measured to swallow the change into
+		# memory without sending anything (2026-07-28), and reconf then
+		# compared the file against a copy that already agreed with it and
+		# reported "no changes detected" - which read as "propagation does
+		# not work" and was really "there was nothing left to notice".
+		out=$(ubus -t 20 call map.controller reconf 2>&1)
+		rc=$?
+		# What map-controller says it did, not what a log grep guessed. The
+		# first version looked for "credentials changed" in logread and
+		# reported renew_sent:false on a run that had demonstrably worked -
+		# info() does not land there. The reconf reply is the authority.
+		case "$out" in
+		*"changes applied"*) sent=true ;;
+		*)                   sent=false ;;
+		esac
+
+		# And the box holding this session, which the renew does not reach.
+		#
+		# The controller runs an agent too, so the expectation was that it
+		# would take the multicast Renew like everyone else. It does not -
+		# map-controller ignores autoconfig traffic from itself, and there is
+		# a string in the binary saying so. Measured 2026-08-23: after a
+		# rename the agent broadcast the new name within one restart and the
+		# controller was still on the air with the old one. Two names, one
+		# mesh, and easymesh-check said so out loud:
+		#   "the mesh fronthaul is 'X' but this box broadcasts 'Y'"
+		#
+		# So the controller applies its own credentials the plain way. Only
+		# the fronthaul MLD: ap-mld-2 carries MAP--BH and is how nodes find
+		# each other.
+		for w in $(uci show wireless 2>/dev/null \
+				| sed -n 's/^wireless\.\([^.][^.]*\)=wifi-iface$/\1/p'); do
+			[ "$(uci -q get wireless.$w.multi_ap)" = "1" ] && continue
+			cur=$(uci -q get wireless.$w.ssid)
+			[ "$cur" = "$cur_ssid" ] || continue
+			uci set wireless.$w.ssid="$ssid"
+			uci set wireless.$w.key="$key"
+		done
+		for m in ap_mld_1; do
+			uci -q get wireless.$m >/dev/null 2>&1 || continue
+			uci set wireless.$m.ssid="$ssid"
+			uci set wireless.$m.key="$key"
+		done
+		uci commit wireless
+
+		# A reboot, not a wifi reload. On MT7996 a reload has been measured
+		# to take the radios down and not bring them back, and a controller
+		# that goes dark takes the mesh with it. The agents pay one restart
+		# for the same change; this is the same price, and the caller is told
+		# rather than surprised by it.
+		printf '{"ok":%s,"renew_sent":%s,"reboot_required":true,"reconf":"%s"}\n' \
+			"$([ $rc -eq 0 ] && echo true || echo false)" \
+			"$sent" \
+			"$(echo "$out" | tr -d '"\n' | cut -c1-120)"
+		;;
+	wps_open)
+		# Open the 120 s push-button window on the fronthaul the founding
+		# armed for Multi-AP WPS (wps_pushbutton only equips the BSS; this
+		# is the actual press). Controller only - an agent window would
+		# hand out credentials it does not own.
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			echo '{"error":"this box is not the controller"}'
+			exit 0
+		fi
+		if /usr/sbin/hostapd_cli -i ap-mld-1 wps_pbc >/dev/null 2>&1; then
+			# Write down the moment and who was already here, because that
+			# is the whole of what add_status needs later: a box that turns
+			# up in the model and was not in this list is the box being
+			# added. Nothing else on the controller can tell the difference
+			# between a new node and a node that had merely been quiet.
+			{
+				printf 'armed %s\n' "$(date +%s)"
+				sqlite3 -cmd ".timeout 3000" "$DB" "select almac from agent;" 2>/dev/null
+			} > /tmp/easymesh-add.state 2>/dev/null
+			# A latch from the previous press says nothing about this one.
+			#
+			# Neither does a WPS-REG-SUCCESS still sitting in the log from
+			# it - and on a lab afternoon there is always one. Time is no
+			# help here (logread stamps are text, and the box's clock moves
+			# under us), so remember the last such line as it stands right
+			# now: a success belonging to THIS press is the one that makes
+			# that line different. Rolling cannot fool it either - a line
+			# that scrolls away leaves the tail changed too, and the tail
+			# only becomes a success if there is a matching line at all.
+			rm -f /tmp/easymesh-add.regsuccess
+			logread -l 400 2>/dev/null | grep WPS-REG-SUCCESS | tail -1 \
+				> /tmp/easymesh-add.regbase 2>/dev/null
+
+			# Put an address aside for the box that is on its way. Doing it
+			# here rather than when that box finally asks is what lets a
+			# second pairing be started straight away instead of the user
+			# being told to wait for the first one to settle.
+			_mb=$(uci -q get mapagent.agent.al_bridge); _mb="${_mb:-br-lan}"
+			_base=$(ip -4 addr show "$_mb" 2>/dev/null |
+				sed -n "s/.*inet \([0-9.]*\)\/.*/\1/p" | head -1)
+			_held=$(resv_hold_pending "${_base:-10.10.10.1}" "$_mb")
+			[ -n "$_held" ] &&
+				logger -t easymesh "address ledger: $_held held for the box being added" ||
+				logger -t easymesh "address ledger: no address could be held - the subnet may be full"
+			# Hold the door open across the enrollee's own restart.
+			#
+			# The box being added reboots before it can pair at all - the
+			# join worker restarts it to get a clean radio - and that takes
+			# longer than the 120 s WPS window. So whoever presses second
+			# has to be the controller, which is the opposite of what anyone
+			# expects: on every consumer mesh you press the box you already
+			# have first. Measured 2026-08-20 by pressing in the natural
+			# order and watching the window expire while the new box was
+			# still booting.
+			#
+			# Re-arming three times makes the order stop mattering, which is
+			# the only version a user can be told. It is not free - a push
+			# button window is an open door and the standard picked 120 s on
+			# purpose - so it is bounded, and it stops the moment a pairing
+			# actually succeeds rather than running out the clock.
+			# One re-arm loop at a time.
+			#
+			# A second press used to start a second loop beside the first,
+			# and two of them re-arm the window every ~50 s instead of every
+			# 100 - a push button window that effectively never closes, which
+			# is the one thing the 120 s in the standard is there to prevent.
+			kill "$(cat /tmp/easymesh-add.rearm.pid 2>/dev/null)" 2>/dev/null
+			setsid /bin/sh -c '
+				for _ in 1 2 3; do
+					sleep 100
+					# Latch it while it is still in the window. The log is a
+					# ring: on a mesh this chatty WPS-REG-SUCCESS scrolls out
+					# of 400 lines in minutes, and once it is gone "it worked"
+					# and "nobody pressed" look identical from here. Measured
+					# 2026-08-23: two successful joins in the full log, none
+					# in the window, and the screen told the user their press
+					# had never landed - which is the one message that makes
+					# them press again.
+					_now=$(logread -l 400 2>/dev/null | grep WPS-REG-SUCCESS | tail -1)
+					if [ -n "$_now" ] &&
+					   [ "$_now" != "$(cat /tmp/easymesh-add.regbase 2>/dev/null)" ]; then
+						date +%s > /tmp/easymesh-add.regsuccess 2>/dev/null
+						exit 0
+					fi
+					/usr/sbin/hostapd_cli -i ap-mld-1 wps_pbc >/dev/null 2>&1 &&
+						logger -t easymesh "wps: window re-armed - the box being added restarts once before it can pair"
+				done
+			' >/dev/null 2>&1 &
+			echo $! > /tmp/easymesh-add.rearm.pid 2>/dev/null
+			# The steering daemon reads an enrollee as an idle legacy
+			# client and deauthenticates it mid-handshake - measured
+			# 2026-08-11, round D died exactly there. Muzzle it for the
+			# window plus the join that follows; the delayed start is
+			# idempotent, so repeated presses just push the leash back.
+			# Muzzle it only if it had anything to say. Written as an
+			# unconditional stop-then-start, this STARTED a daemon that was
+			# not running - and mlo-steerd is not enabled at boot, so on a
+			# freshly booted controller the only thing that ever started it
+			# was us. Measured 2026-08-20: while it runs it calls set_attlm
+			# every 10 s, the driver rebuilds chanctx each time, and the
+			# resulting overlapping CSAs wedge hostapd outright and cost the
+			# mesh most of its throughput on the way. Our own add-a-node
+			# procedure was switching that on, five minutes after every press.
+			# "Is it running?" must not match our own delayed starter below:
+			# that wrapper carries the words mlo-steerd in its command line, so
+			# `pgrep -f mlo-steerd` finds IT and reports a daemon that is not
+			# running. A second press within the 300 s window therefore SCHEDULED
+			# A START of a daemon that had never run - reintroducing exactly the
+			# bug the paragraph above says was fixed. Found 2026-08-26.
+			#
+			# `pgrep -x mlo-steerd` is no answer either: procd runs it as
+			# `/bin/sh /root/mlo-steerd.sh`, so the process is named sh. Ask procd,
+			# and fall back to the script name, which the wrapper never carries.
+			if [ -x /etc/init.d/mlo-steerd ] &&
+			   { /etc/init.d/mlo-steerd running >/dev/null 2>&1 ||
+			     pgrep -f "mlo-steerd\.sh" >/dev/null 2>&1; }; then
+				/etc/init.d/mlo-steerd stop >/dev/null 2>&1
+				setsid /bin/sh -c 'sleep 300; /etc/init.d/mlo-steerd start' >/dev/null 2>&1 &
+			fi
+			# A join leaves mapcontroller spinning - measured 2026-08-19 on
+			# the production image: VSZ 20 MB -> 1 GB, state R, load 2, and
+			# both `status` and every AP-Autoconfig search go unanswered.
+			# The agent that was just paired then sits at `wsc: 0` forever
+			# and the join this window was opened for never finishes, while
+			# the box itself looks healthy. Ask three times over the minutes
+			# the join needs, and restart only a controller that has really
+			# stopped answering - a healthy one is never touched.
+			setsid /bin/sh -c '
+				for wait in 150 90 90; do
+					sleep $wait
+					ubus -t 8 call map.controller status >/dev/null 2>&1 && continue
+					logger -t easymesh "wps: mapcontroller stopped answering - restarting so the join can finish"
+					/etc/init.d/mapcontroller restart
+					sleep 20
+				done
+			' >/dev/null 2>&1 &
+			echo '{"ok":true,"window_s":120}'
+		else
+			echo '{"error":"could not open the WPS window - is the fronthaul up?"}'
+		fi
+		;;
+	wps_join)
+		# The wireless twin of setup_agent. The real work takes minutes
+		# (first-boot firmware load, a 120 s credential window) and rpcd
+		# kills an exec plugin after two - so this only launches the worker
+		# and returns. Progress lands in /tmp/wps-join.state (wps_status).
+		input=$(cat)
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		gw=$(echo "$input" | jsonfilter -e '@.gateway' 2>/dev/null)
+		addr=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
+		if [ -n "$addr" ]; then
+			bad=$(mesh_addr_reason "$addr")
+			[ -n "$bad" ] && { printf '{"error":"%s"}\n' "$bad"; exit 0; }
+		fi
+		# No default invented here, deliberately - and none invented further
+		# down the chain either. The way out is the gateway VIP, which moves
+		# between boxes, so an agent must never be pinned to whichever box
+		# happened to hold it at join time; this used to answer 10.10.10.1,
+		# the controller's own fixed address, and every caller had to pass the
+		# VIP explicitly or quietly get an agent routed around the arbitration.
+		#
+		# easymesh-role used to fill the gap with 10.10.10.254. That is the
+		# right VIP only for a mesh living on 10.10.10, and on a mesh at
+		# 172.16.10 it left the agent routing to an address nobody holds
+		# (measured 2026-08-23). It now leaves the gateway unset, and the
+		# empty gateway is what bh-key-adopt waits for: it asks the mesh over
+		# DHCP and comes back with the address and the gateway together.
+		#
+		# Saying nothing is the correct thing to say when we do not know
+		# better than the callee - as long as the callee does not guess either.
+
+		if [ -n "$name" ]; then
+			uci set system.@system[0].hostname="$name"
+			uci set ieee1905.ieee1905.device_name="$name"
+			uci commit system; uci commit ieee1905
+		else
+			# A button press carries no name. Give the box one of its own
+			# rather than let it join as the same "BPI-R4-SD" as everyone
+			# else; the user renames it later, from the mesh, once there
+			# is a mesh to rename it from.
+			case "$(uci -q get ieee1905.ieee1905.device_name)" in
+			""|OpenWrt|BPI-R4|BPI-R4-SD|BPI-R4-NAND|BPI-R4-eMMC|BPI-R4-NVMe)
+				auto=$(default_mesh_name)
+				[ -n "$auto" ] && {
+					uci set ieee1905.ieee1905.device_name="$auto"
+					uci commit ieee1905
+				}
+				;;
+			esac
+		fi
+
+		echo "starting" > /tmp/wps-join.state
+		setsid /usr/libexec/easymesh-wps-join "$gw" "$addr" >/dev/null 2>&1 &
+		printf '{"ok":true,"note":"join started - poll wps_status; press the controller button when it says ready"}\n'
+		;;
+	wps_status)
+		# The join worker narrates into a state file; hand it to the caller.
+		#
+		# The file lives in /tmp and the worker reboots the box on purpose,
+		# so the story it tells does not survive the story it is telling.
+		# Two things have to come from somewhere that does: between the
+		# reboot and the resume init's first line there is a window where
+		# the file is gone and the join is very much alive - answering
+		# "nothing" there hands a mid-join user a blank wizard - and the
+		# page that comes back has forgotten which controller it was told
+		# to pair with, so it used to name the default subnet and be wrong
+		# on every other one. The pending note outlives the reboot and
+		# knows both, which is what it was already written for.
+		# The synthesised state has to READ DIFFERENTLY from the real one, and
+		# not merely fill the gap. They mean opposite things: the worker's own
+		# "preparing the radio" says a reboot is coming, this one says a reboot
+		# has already happened and the box is on its way back. A wizard that
+		# cannot tell them apart puts its reboot screen up on a box that is
+		# already running, waits, finds it answering, reloads - and does that
+		# every twenty seconds until the resume init gets a word in, eating the
+		# two-minute window the user needs to press the button on the
+		# controller.
+		st=$(cat /tmp/wps-join.state 2>/dev/null)
+		gw=""
+		[ -f /etc/easymesh-wps-pending ] && read -r gw _ < /etc/easymesh-wps-pending
+		[ -n "$st" ] || [ -z "$gw" ] || st="resuming - the radio is coming back up"
+		printf '{"state":"%s","gateway":"%s"}\n' "$(echo "$st" | sed 's/"/\\"/g')" "$gw"
+		;;
+	node_state)
+		r=$(role)
+		bsta=$(iw dev 2>/dev/null | awk '/Interface bsta/{print $2; exit}')
+		links=0; [ -n "$bsta" ] && links=$(iw dev "$bsta" link 2>/dev/null | grep -cE "^\s+Link")
+		printf '{"role":"%s","hostname":"%s","has_db":%s,"bsta_ifname":"%s","bsta_links":%s}\n' \
+			"$r" "$(uname -n)" "$([ -f "$DB" ] && echo true || echo false)" "$bsta" "$links"
+		;;
+	health)
+		need_db_or_proxy health || exit 0
+		# Boxes heard in the last 180 s. The table keeps a node for 20 days,
+		# and a foreign agent adds a row on every boot (a new AL address
+		# each time), so counting rows said 8 for a mesh of 3 (2026-09-18).
+		nodes=$(sq1 "select count(*) from agent where last_seen >= $now-180;")
+		ctrl=$(sq1 "select count(*) from network;")
+		# A node silent for more than a day is history, not an outage. A
+		# foreign agent takes a new AL address on every boot (MediaTek R3,
+		# 2026-09-17), so without a bound each of its reboots would read as
+		# a dead node for the 20 days the DB keeps it.
+		stale=$(sq1 "select count(*) from agent where last_seen < $now-180
+			and last_seen >= $now-$SILENT_WARN_MAX_AGE;")
+		old=$(sq1 "select count(*) from agent where last_seen < $now-$SILENT_WARN_MAX_AGE;")
+		# nodes (except the root) that no topology_link row claims as child
+		# depth -1 is a node the tree could not place: it has no upstream
+		# either, and it is the one that most needs saying (was: depth>0).
+		# Live nodes only: a box that is gone has no edge because it is
+		# gone, and the silent warning already says that.
+		orphans=$(sq1 "select count(*) from agent a where coalesce(a.depth,-1)<>0 and a.last_seen >= $now-180 and not exists
+			(select 1 from topology_link t where t.child_almac=a.almac);")
+		# two nodes must never share an AP-MLD address (factory-EEPROM trap, found 2026-08-08)
+		dup_mld=$(sq1 "select count(*) from (select mld_macaddr from apmld
+			group by mld_macaddr having count(distinct agent_almac)>1);")
+		dbsize=$(wc -c < "$DB" 2>/dev/null || echo 0)
+		warn=""
+
+		[ "${ctrl:-1}" -gt 1 ] && warn="$warn,\"more than one controller\""
+
+		if [ "${stale:-0}" -gt 0 ]; then
+			who=$(namelist "select almac from agent where last_seen < $now-180
+				and last_seen >= $now-$SILENT_WARN_MAX_AGE order by last_seen;")
+			worst=$(sq1 "select max($now - last_seen) from agent where last_seen < $now-180
+				and last_seen >= $now-$SILENT_WARN_MAX_AGE;")
+			warn="$warn,\"silent: $who (oldest $(human_age "${worst:-0}"))\""
+		fi
+
+		[ "${old:-0}" -gt 0 ] &&
+			warn="$warn,\"$old node(s) silent for over a day, kept as history\""
+
+		if [ "${orphans:-0}" -gt 0 ]; then
+			who=$(namelist "select a.almac from agent a where coalesce(a.depth,-1)<>0 and a.last_seen >= $now-180 and not exists
+				(select 1 from topology_link t where t.child_almac=a.almac);")
+			warn="$warn,\"no upstream: $who\""
+		fi
+
+		# A second DHCP server in the mesh (easymesh-dhcp-probe asks the
+		# whole mesh by broadcast; a foreign agent left in router mode is
+		# the usual source). The probe runs in the background, at most every
+		# DHCP_PROBE_EVERY_S, with every descriptor closed so this call does
+		# not wait for it; the answer shows up on the next poll.
+		ds=/tmp/easymesh-dhcp-servers
+		probed=$(awk '$1 == "probed" { print $2 }' "$ds" 2>/dev/null)
+		if [ -x /usr/libexec/easymesh-dhcp-probe ] &&
+		   { [ -z "$probed" ] || [ $((now - probed)) -gt "${DHCP_PROBE_EVERY_S:-900}" ]; }; then
+			( /usr/libexec/easymesh-dhcp-probe </dev/null >/dev/null 2>&1 & )
+		fi
+		rogue=""
+		while read -r smac sip st kind; do
+			[ "$smac" = probed ] && continue
+			[ -n "$sip" ] || continue
+			al=$(live_addrs_json | tr ',{}' '\n\n\n' |
+				sed -n "s/^\"\([0-9a-f:]*\)\":\"$sip\"$/\1/p" | head -1)
+			# An RA and a DHCPv6 reply carry no address to print, and
+			# the damage they do is the point - so print that instead.
+			case "${kind:-dhcp4}" in
+			ra)    what="IPv6 router advertisements" ;;
+			dhcp6) what="DHCPv6" ;;
+			*)     what="$sip" ;;
+			esac
+			rogue="${rogue:+$rogue, }$([ -n "$al" ] && nameof "$al" || echo "$smac") ($what)"
+		done < "$ds" 2>/dev/null
+		[ -n "$rogue" ] &&
+			warn="$warn,\"another address server in the mesh: $rogue - its clients may get a wrong address, a wrong gateway and no internet\""
+
+		if [ "${dup_mld:-0}" -gt 0 ]; then
+			who=$(namelist "select distinct agent_almac from apmld where mld_macaddr in
+				(select mld_macaddr from apmld group by mld_macaddr
+				 having count(distinct agent_almac)>1);")
+			warn="$warn,\"AP-MLD MAC shared by: $who\""
+		fi
+
+
+		# An uplink nobody but the model believes in. Worth saying out loud:
+		# the topology picture is drawn from these edges, so an unconfirmed one
+		# is a drawing the reader has no reason to trust.
+		unconfirmed_sql="select t.child_almac from topology_link t
+			left join bstamld b on b.agent_almac = t.child_almac
+			where ((b.agent_almac is null or coalesce(b.ap_mld_macaddr, '') = '')
+			       and coalesce(t.source,'child') not in
+			           ('parent-assoc','neighbor','neighbor-mutual'))
+			   or t.parent_almac <> (select p.agent_almac from apmld p
+			        where p.mld_macaddr = b.ap_mld_macaddr)"
+		unconf=$(sq1 "select count(*) from ($unconfirmed_sql);")
+		if [ "${unconf:-0}" -gt 0 ]; then
+			who=$(namelist "$unconfirmed_sql;")
+			warn="$warn,\"uplink not confirmed by the node itself: $who\""
+		fi
+		# Which box the clients' way out (the VIP) is on right now. mesh-gwd
+		# moves it to whichever node has the uplink - the controller's cable,
+		# a cable in an agent, or the LTE box - and until 2026-09-25 no page
+		# could say which. The holder is the box whose MAC answers for the VIP;
+		# only neighbours already in the ARP table are compared, so this costs
+		# one ping and never a scan.
+		gw=""
+		vip=$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+			grep -vE '\.(253|254)$' | head -1 | sed 's/\.[0-9]*$/.254/')
+		if [ -n "$vip" ]; then
+			if ip -4 -o addr show br-lan 2>/dev/null | grep -q " $vip/"; then
+				gw=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+			else
+				ping -c 1 -W 1 "$vip" >/dev/null 2>&1
+				vmac=$(ip neigh show "$vip" dev br-lan 2>/dev/null |
+					awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
+				if [ -n "$vmac" ]; then
+					for pair in $(live_addrs_json | tr -d '{}" ' | tr ',' ' '); do
+						nip=${pair##*:}; nal=${pair%:*}
+						nmac=$(ip neigh show "$nip" dev br-lan 2>/dev/null |
+							awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
+						[ -n "$nmac" ] && [ "$nmac" = "$vmac" ] && { gw=$nal; break; }
+					done
+				fi
+			fi
+		fi
+		printf '{"num_nodes":%s,"stale_nodes":%s,"db_bytes":%s,"warnings":[%s]%s}\n' \
+			"${nodes:-0}" "${stale:-0}" "${dbsize:-0}" "${warn#,}" \
+			"${gw:+,\"gateway\":{\"almac\":\"$gw\",\"addr\":\"$vip\"\}}"
+		;;
+	events)
+		need_db_or_proxy events || exit 0
+		# The last 24 h of the mesh in plain words, newest first, built only
+		# from what the controller already keeps: the parent history in the
+		# database, and the lines its own services write to the log
+		# (mesh-gwd for the gateway, the parent planner, the TTLM producer,
+		# the radio card check). Nothing new is collected for this.
+		since=$((now - 86400))
+		. /usr/share/easymesh/names.sh 2>/dev/null
+		live_names_json 2>/dev/null | sed 's/^{//; s/}$//' | tr ',' '\n' |
+			sed 's/^[[:space:]]*"//; s/":"/ /; s/"[[:space:]]*$//' > /tmp/.ev-names.$$
+		{
+			# parent history: an edge that opened in the window
+			sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+				SELECT h.from_ts, 'move', h.child_almac, h.parent_almac,
+				       ifnull((SELECT p.parent_almac FROM topology_link_history p
+				               WHERE p.child_almac = h.child_almac AND p.to_ts IS NOT NULL
+				                 AND p.to_ts BETWEEN h.from_ts - 600 AND h.from_ts
+				                 AND p.parent_almac != h.parent_almac
+				               ORDER BY p.to_ts DESC LIMIT 1), '-')
+				FROM topology_link_history h WHERE h.from_ts >= $since;" 2>/dev/null
+			# Who carried the internet (easymesh-gw-watch), in order, starting
+			# with the last change before the window so the first move in it
+			# can say where the internet came from.
+			sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+				SELECT ts, 'gw', ifnull(almac, '-'), ifnull(class, '-')
+				FROM gateway_history
+				WHERE ts >= ifnull((SELECT max(ts) FROM gateway_history WHERE ts < $since), $since)
+				ORDER BY ts;" 2>/dev/null
+			# the controller's own services
+			grep -E ' (mesh-gwd|easymesh-parent-plan|ttlm-policy|card-check)(\[[0-9]+\])?:' /var/log/messages 2>/dev/null |
+			awk -v y="$(date +%Y)" '
+				BEGIN { split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " "); for (i = 1; i <= 12; i++) mon[m[i]] = sprintf("%02d", i) }
+				{ ts = y "-" mon[$1] "-" sprintf("%02d", $2) " " $3; tag = $5; sub(/\[.*/, "", tag); sub(/:$/, "", tag)
+				  msg = $0; sub(/^[^:]*:[^:]*:[^:]*: /, "", msg); print ts "\t" tag "\t" msg }' |
+			while IFS='	' read -r ts tag msg; do
+				e=$(date -u -d "$ts" +%s 2>/dev/null) || continue
+				[ "$e" -ge "$since" ] || continue
+				echo "$e log $tag $msg"
+			done
+		} | awk -v names=/tmp/.ev-names.$$ -v self="$(uci -q get system.@system[0].hostname)" -v since="$since" '
+			BEGIN { while ((getline l < names) > 0) { split(l, f, " "); nm[tolower(f[1])] = f[2] } }
+			function n(a) { a = tolower(a); return (a in nm) ? nm[a] : a }
+			function esc(t) { gsub(/\\/, "\\\\", t); gsub(/"/, "\\\"", t); return t }
+			function out(ts, kind, text) {
+				key = kind "|" text
+				# the same line again: within the hour, or within the day for
+				# the planner, whose dry run repeats one proposal every hour
+				if (key in seen && ts - seen[key] < (kind == "planner" ? 86400 : 3600)) return
+				seen[key] = ts
+				printf "%s{\"ts\":%d,\"kind\":\"%s\",\"text\":\"%s\"}", (k++ ? "," : ""), ts, kind, esc(text)
+			}
+			function via(al, cl) { return n(al) " (" (cl == "cable" ? "cable" : "mobile modem") ")" }
+			$2 == "gw" {
+				ts = $1; al = $3; cl = $4
+				# A gap that ends within a minute is told once, by the move that
+				# ends it. Only a longer one, or one still going, gets a line
+				# of its own.
+				if (al == "-") {
+					if (gseen && !gdown) gdown_txt = "No box has internet any more - the mesh has no way out (it went through " via(gal, gcl) ")"
+					if (!gdown) gdown = ts
+					next
+				}
+				if (gdown && gdown_txt != "" && ts - gdown > 60 && gdown >= since) out(gdown, "internet", gdown_txt)
+				gdown_txt = ""
+				if (ts >= since) {
+					if (!gseen) out(ts, "internet", "Internet goes out through " via(al, cl))
+					else if (gdown) {
+						t = (al == gal && cl == gcl) ? "Internet is back through " via(al, cl) : "Internet moved from " via(gal, gcl) " to " via(al, cl)
+						out(ts, "internet", t " - no internet for about " (ts - gdown) " s")
+					}
+					else if (al != gal || cl != gcl)
+						out(ts, "internet", "Internet moved from " via(gal, gcl) " to " via(al, cl) " - any gap was shorter than 10 s")
+				}
+				gseen = 1; gal = al; gcl = cl; gdown = 0
+				next
+			}
+			END { if (gdown && gdown_txt != "" && gdown >= since) out(gdown, "internet", gdown_txt) }
+			$2 == "move" {
+				if ($5 != "-") out($1, "topology", n($3) " moved from " n($5) " to " n($4))
+				else out($1, "topology", n($3) " joined under " n($4))
+				next
+			}
+			$2 == "log" {
+				ts = $1; tag = $3; msg = $0; sub(/^[^ ]+ [^ ]+ [^ ]+ /, "", msg)
+				if (tag == "mesh-gwd") {
+					# Only what this log can say about this box. Who holds the
+					# gateway comes from gateway_history above: these lines
+					# exist only in the controller log and were printed under
+					# its name even for a move between two other boxes.
+					if (msg ~ /^no carrier on /) out(ts, "internet", "Cable unplugged on " self)
+					else if (msg ~ /^VIP already held/) out(ts, "internet", self " has a cable too and stands by as a spare")
+				} else if (tag == "easymesh-parent-plan") {
+					if (match(msg, /^would ([0-9a-f:]+): MOVE ([0-9a-f:]+) \(depth ([0-9]+)[^>]*> ([0-9a-f:]+) \(depth ([0-9]+)/, a))
+						out(ts, "planner", "The parent planner would move " n(a[1]) " from " n(a[2]) " to " n(a[4]) " (" a[3] " -> " a[5] " hops) - dry run, not done")
+					else if (match(msg, /^([0-9a-f:]+): MOVE ([0-9a-f:]+)[^>]*> ([0-9a-f:]+)/, a))
+						out(ts, "planner", "The parent planner moved " n(a[1]) " from " n(a[2]) " to " n(a[3]))
+				} else if (tag == "ttlm-policy") {
+					if (match(msg, /^pin [0-9a-f:]+ \(child ([0-9a-f:]+)[^)]*\) to leg ([0-9]+)/, a))
+						out(ts, "links", n(a[1]) ": all traffic moved to one link (link " a[2] ") - the other keeps losing data")
+					else if (match(msg, /^release [0-9a-f:]+ \(child ([0-9a-f:]+)/, a))
+						out(ts, "links", n(a[1]) ": both links in use again")
+					else if (match(msg, /^alternate ([0-9a-f:]+): start/, a))
+						out(ts, "links", n(a[1]) " started alternating bands as a repeater")
+					else if (match(msg, /^alternate ([0-9a-f:]+): end/, a))
+						out(ts, "links", n(a[1]) " stopped alternating bands")
+				} else if (tag == "card-check") {
+					if (msg ~ /^suspect radio cards: none/) out(ts, "card", "Radio card check: no suspect card")
+					else if (msg ~ /^suspect radio cards: /) {
+						t = msg; sub(/^suspect radio cards: /, "", t)
+						# One pass, left to right: the part already rewritten is
+						# never searched again. Searching the whole string again
+						# looped forever when a box had no name - n() gave the
+						# same address back and match() found it again (seen
+						# 2026-09-25: three awk at 25 % CPU each, Events timed out).
+						r = ""
+						while (match(t, /[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}/)) { r = r substr(t, 1, RSTART - 1) n(substr(t, RSTART, RLENGTH)); t = substr(t, RSTART + RLENGTH) }
+						t = r t
+						out(ts, "card", "Radio card check: suspect " t)
+					}
+				}
+			}' > /tmp/.ev-out.$$
+		rm -f /tmp/.ev-names.$$
+		printf '{"events":[%s]}\n' "$(cat /tmp/.ev-out.$$)"
+		rm -f /tmp/.ev-out.$$
+		;;
+	ttlm_state)
+		need_db_or_proxy ttlm_state || exit 0
+		# What the TTLM producer (easymesh-ttlm-policy) decided, and whether it
+		# was allowed to act on it. Two rules, two switches: rule 1 (evade a
+		# bad leg) is live only with /etc/mapc/ttlm-policy-live, rule 2
+		# (alternate bands across a repeater) only with ttlm-alternate-live.
+		# While a rule is dry its decisions sit in /tmp and nothing is sent.
+		# The Backhaul page shows both, so a dry run can be read before it is
+		# switched on.
+		st=/tmp/easymesh/ttlm-policy
+		lines() {
+			[ -r "$1" ] || { echo '[]'; return; }
+			grep -v '^#' "$1" | awk 'NF >= 5 {
+				m = ""; for (i = 5; i <= NF; i++) m = m (m ? " " : "") $i
+				printf "%s{\"parent\":\"%s\",\"ap_mld\":\"%s\",\"sta\":\"%s\",\"map\":\"%s\"}", (n++ ? "," : "["), $1, $2, $3, m
+			} END { if (!n) printf "["; printf "]" }'
+		}
+		r1=/etc/mapc/ttlm-policy; [ -e /etc/mapc/ttlm-policy-live ] || r1=$st/ttlm-policy.dry
+		alive=$(cat $st/alive 2>/dev/null)
+		strok=$(grep -v '^#' /etc/mapc/str-ok 2>/dev/null | awk 'NF { printf "%s\"%s\"", (n++ ? "," : ""), tolower($1) }')
+		# Boxes whose radio card hears itself (easymesh-card-check): the
+		# Nodes page names them, and rule 2 must keep them out of relaying.
+		suspect=$(grep -v '^#' /etc/mapc/card-suspect 2>/dev/null | awk 'NF >= 3 {
+			printf "%s{\"almac\":\"%s\",\"band\":%d,\"excess_db\":%s}", (n++ ? "," : ""), tolower($1), $2, $3 }')
+		# ...and the boxes it has enough history to judge at all; any other
+		# box is still being measured, not normal.
+		judged=$(awk 'NF { printf "%s\"%s\"", (n++ ? "," : ""), tolower($1) }' /tmp/easymesh/card-check/judged 2>/dev/null)
+		# the per-repeater state of rule 2: on n_above below_since seen bytes
+		alt=""
+		for f in $st/alt.*; do
+			[ -r "$f" ] || continue
+			read -r on nab bsince seen bytes < "$f"
+			alt="$alt,{\"almac\":\"${f##*/alt.}\",\"on\":${on:-0},\"above\":${nab:-0}}"
+		done
+		# which box each backhaul station belongs to: the rules speak of
+		# station MLD addresses, the page of boxes
+		bsta=$(arr "select mld_macaddr as sta, agent_almac as almac from bstamld
+			where agent_almac is not null and mld_macaddr != '';")
+		printf '{"rule1_live":%s,"rule2_live":%s,"alive_s":%s,"str_ok":[%s],"card_suspect":[%s],"card_judged":[%s],"rule1":%s,"rule2":%s,"repeaters":[%s],"bsta":%s}\n' \
+			"$([ -e /etc/mapc/ttlm-policy-live ] && echo true || echo false)" \
+			"$([ -e /etc/mapc/ttlm-alternate-live ] && echo true || echo false)" \
+			"$([ -n "$alive" ] && echo $(( now - alive )) || echo null)" \
+			"$strok" "$suspect" "$judged" "$(lines "$r1")" "$(lines "$st/alternate.dry")" "${alt#,}" "${bsta:-[]}"
+		;;
+	topology)
+		need_db_or_proxy topology || exit 0
+		printf '{"nodes":%s,"links":%s,"names":%s,"pending":%s,"addrs":%s}\n' \
+			"$(arr "$GHOST_CTE select a.almac, a.depth, a.is_agent, ($now - a.last_seen) as age_s,
+				b.upstream_bssid, b.wifi_hops, b.backhaul_band, b.backhaul_bands,
+				/* The AL address of the parent, so the Backhaul column can name
+				 * the box instead of printing a BSSID at the user. */
+				b.backhaul_upstream_al, b.media_type,
+				/* limit 1 without an order by picks whichever row sqlite
+				 * happens to return. topology_link is keyed
+				 * (child_almac, parent_almac, iface_mac), so one child may hold
+				 * several rows and the answer was a coin toss between them.
+				 * Prefer the edge the child itself confirmed, then the parent,
+				 * then a guess from 1905 neighbours - the same ranking the
+				 * parent_state case below already uses. */
+				(select t.source from topology_link t
+					where t.child_almac = a.almac
+					order by case t.source
+						when 'child' then 0
+						when 'parent-assoc' then 1
+						when 'neighbor-mutual' then 2
+						when 'neighbor' then 3
+						else 4 end, t.parent_almac
+					limit 1) as bh_source,
+				(select max(bm.num_bsta) from bstamld bm
+					where bm.agent_almac=a.almac) as bsta_links,
+				/* How many legs are ALIVE, as opposed to how many the MLD was
+				 * built from. bsta_links above is num_bsta out of TLV 0xE1 and
+				 * describes construction: it is 2 on every box here, on the
+				 * MediaTek box that has one leg, and on the row a departed box
+				 * left behind. On 2026-09-21 the driver declared a 6 GHz leg
+				 * lost and this number did not move, because nothing about it
+				 * can move.
+				 * bsta_link is written by easymesh-linkstat-collect from what
+				 * each node measures on its own air, and a row nobody refreshed
+				 * within 90 s is not counted - a leg we cannot hear about is
+				 * unknown, never up.
+				 * A degraded leg is alive: linkstat says degraded for one
+				 * tx_failed in a window, or for beacons below half while
+				 * data still flows (2026-09-24, card A dropouts). Counting
+				 * only up drew 1 of 2 legs on nodes carrying both.
+				 * Keep every comment in here free of double quotes: the SQL
+				 * travels as an argument already wrapped in them, and one more
+				 * ends the argument early. That emptied the whole Nodes tab for
+				 * a day on 2026-09-01. */
+				(select count(*) from bsta_link l
+					where l.agent_almac=a.almac
+					  and l.state in ('up','degraded')
+					  and ($now - l.last_seen) < 90) as bsta_links_live,
+				/* Per leg: id:state:band:beacon_pct:rx_bytes:tx_bytes:last_seen.
+				 * The byte counts are the leg's cumulative counters from
+				 * iw station dump, seen from the child - rx is downstream,
+				 * tx upstream. They are NOT per-window deltas: linkstat takes
+				 * deltas of beacons and tx_failed only (read wrong on
+				 * 2026-09-24, it drew 10 Mbit/s per leg over 50 kbit/s of real
+				 * traffic). The picture takes the rate from two samples with
+				 * different last_seen, so a leg that is alive but carries
+				 * nothing no longer looks the same as the busy one. */
+				(select group_concat(l.link_id || ':' || l.state || ':' || l.band
+					|| ':' || coalesce(l.beacon_pct, '') || ':' || coalesce(l.rx_bytes, '')
+					|| ':' || coalesce(l.tx_bytes, '') || ':' || coalesce(l.last_seen, '')
+					|| ':' || coalesce(l.rx_mbit, '') || ':' || coalesce(l.tx_mbit, '')
+					|| ':' || coalesce(l.rssi, '') || ':' || coalesce(l.chain_spread, ''), ',')
+					from bsta_link l where l.agent_almac=a.almac
+					  and ($now - l.last_seen) < 90) as bsta_link_detail,
+				/* Link rate of this node's backhaul station as its parent last
+				 * saw it, in kbit/s: the PHY rate out of the Associated STA
+				 * Extended Link Metrics (0xC8), filed under the MLD address
+				 * since map-agent 99999999g (2026-09-25). A rate, not a
+				 * throughput - measured the same day, about a third of it
+				 * arrives as TCP. Only while the station is associated and
+				 * heard from in the last 5 min. */
+				(select s.last_dl_rate from sta s join bstamld bm on s.macaddr = bm.mld_macaddr
+					where bm.agent_almac = a.almac and ifnull(s.associated,0) = 1
+					  and ($now - s.last_seen) < 300
+					order by s.last_seen desc limit 1) as bh_dl_kbps,
+				(select s.last_ul_rate from sta s join bstamld bm on s.macaddr = bm.mld_macaddr
+					where bm.agent_almac = a.almac and ifnull(s.associated,0) = 1
+					  and ($now - s.last_seen) < 300
+					order by s.last_seen desc limit 1) as bh_ul_kbps,
+				/* How many legs are ALIVE, as opposed to how many the MLD was
+				 * built from. bsta_links above is num_bsta out of TLV 0xE1 and
+				 * describes construction: it is 2 on every box here, on the
+				 * MediaTek box that has one leg, and on the row a departed box
+				 * left behind. On 2026-09-21 the driver declared a 6 GHz leg
+				 * lost and this number did not move, because nothing about it
+				 * can move.
+				 * bsta_link is written by easymesh-linkstat-collect from what
+				 * each node measures on its own air, and a row nobody refreshed
+				 * within 90 s is not counted - a leg we cannot hear about is
+				 * unknown, never up.
+				 * A degraded leg is alive: linkstat says degraded for one
+				 * tx_failed in a window, or for beacons below half while
+				 * data still flows (2026-09-24, card A dropouts). Counting
+				 * only up drew 1 of 2 legs on nodes carrying both.
+				 * Keep every comment in here free of double quotes: the SQL
+				 * travels as an argument already wrapped in them, and one more
+				 * ends the argument early. That emptied the whole Nodes tab for
+				 * a day on 2026-09-01. */
+				(select count(*) from bsta_link l
+					where l.agent_almac=a.almac
+					  and l.state in ('up','degraded')
+					  and ($now - l.last_seen) < 90) as bsta_links_live,
+				/* Per leg: id:state:band:beacon_pct:rx_bytes:tx_bytes:last_seen.
+				 * The byte counts are the leg's cumulative counters from
+				 * iw station dump, seen from the child - rx is downstream,
+				 * tx upstream. They are NOT per-window deltas: linkstat takes
+				 * deltas of beacons and tx_failed only (read wrong on
+				 * 2026-09-24, it drew 10 Mbit/s per leg over 50 kbit/s of real
+				 * traffic). The picture takes the rate from two samples with
+				 * different last_seen, so a leg that is alive but carries
+				 * nothing no longer looks the same as the busy one. */
+				(select group_concat(l.link_id || ':' || l.state || ':' || l.band
+					|| ':' || coalesce(l.beacon_pct, '') || ':' || coalesce(l.rx_bytes, '')
+					|| ':' || coalesce(l.tx_bytes, '') || ':' || coalesce(l.last_seen, '')
+					|| ':' || coalesce(l.rx_mbit, '') || ':' || coalesce(l.tx_mbit, '')
+					|| ':' || coalesce(l.rssi, '') || ':' || coalesce(l.chain_spread, ''), ',')
+					from bsta_link l where l.agent_almac=a.almac
+					  and ($now - l.last_seen) < 90) as bsta_link_detail
+				from agent a left join agent_backhaul b on a.almac=b.almac
+				where a.almac not in (select fake from ghost)
+				  and $(draw_where)
+				  and (exists (select 1 from radio r2
+						where r2.agent_almac = a.almac)
+				       or ($now - a.last_seen) < $NODE_RADIOLESS_GRACE);")" \
+			"$(arr "$GHOST_CTE select distinct
+				coalesce(gc.real_al, t.child_almac)  as child_almac,
+				coalesce(gp.real_al, t.parent_almac) as parent_almac,
+				t.wifi_hops, t.source, t.media_type,
+				-- An edge has two ends and until now we drew it on one.
+				-- topology_link is what the model believes; bstamld is the
+				-- child's own report of the AP-MLD it is attached to. Where
+				-- the child never reported, the edge is a claim nobody
+				-- corroborates - which on 2026-08-09 drew a BPI-R4 (4 GB) node under a
+				-- node that had been powered off for nine minutes.
+				case
+				  -- The child never reported (a foreign agent, a wired
+				  -- one). Since 2026-09-18 the controller says where the
+				  -- edge came from instead: the parent listing the child's
+				  -- bSTA, or 1905 neighbours. Only an edge with neither is
+				  -- a claim nobody corroborates.
+				  -- A bSTA MLD row with no AP MLD in it is the child saying
+				  -- nothing about its parent (MediaTek R3 fills the links and
+				  -- leaves ap_mld_macaddr empty, 2026-09-18). Comparing the
+				  -- parent against that NULL fell through to conflict.
+				  when b.agent_almac is null or coalesce(b.ap_mld_macaddr, '') = '' then
+				    case t.source
+				      when 'parent-assoc' then 'parent'
+				      when 'neighbor-mutual' then 'mutual'
+				      when 'neighbor' then 'inferred'
+				      else 'unconfirmed'
+				    end
+				  -- against the REWRITTEN parent, not the raw one: comparing a
+				  -- ghost with the child's (correct) claim reports a conflict
+				  -- that the rewrite has already resolved.
+				  when coalesce(gp.real_al, t.parent_almac) =
+				       (select p.agent_almac from apmld p
+				        where p.mld_macaddr = b.ap_mld_macaddr) then 'confirmed'
+				  else 'conflict'
+				end as parent_state,
+				(select p.agent_almac from apmld p
+				  where p.mld_macaddr = b.ap_mld_macaddr) as parent_claimed
+				from topology_link t
+				left join ghost gc on gc.fake = t.child_almac
+				left join ghost gp on gp.fake = t.parent_almac
+				left join bstamld b
+					on b.agent_almac = coalesce(gc.real_al, t.child_almac)
+				-- A ghost and its living half are one box: the edge between
+				-- them is a node hanging off itself, not a link.
+				where coalesce(gc.real_al, t.child_almac)
+				   <> coalesce(gp.real_al, t.parent_almac);")" \
+			"$(names_json)" \
+			"$(pending_json)" \
+			"$(live_addrs_json)"
+		;;
+	nodes)
+		need_db_or_proxy nodes || exit 0
+		printf '{"nodes":%s,"names":%s,"pending":%s,"addrs":%s}\n' \
+			"$(arr "$GHOST_CTE select a.almac, a.depth, ($now - a.last_seen) as age_s,
+				a.manufacturer, a.model, a.sw_version, a.sta_count,
+				a.max_mld_num, a.tid_link_caps,
+				b.upstream_bssid, b.wifi_hops, b.backhaul_band, b.backhaul_bands,
+				/* The AL address of the parent, so the Backhaul column can name
+				 * the box instead of printing a BSSID at the user. */
+				b.backhaul_upstream_al, b.media_type,
+				/* limit 1 without an order by picks whichever row sqlite
+				 * happens to return. topology_link is keyed
+				 * (child_almac, parent_almac, iface_mac), so one child may hold
+				 * several rows and the answer was a coin toss between them.
+				 * Prefer the edge the child itself confirmed, then the parent,
+				 * then a guess from 1905 neighbours - the same ranking the
+				 * parent_state case below already uses. */
+				(select t.source from topology_link t
+					where t.child_almac = a.almac
+					order by case t.source
+						when 'child' then 0
+						when 'parent-assoc' then 1
+						when 'neighbor-mutual' then 2
+						when 'neighbor' then 3
+						else 4 end, t.parent_almac
+					limit 1) as bh_source,
+				/* The Nodes table asked for the band but never for the link count, so
+				 * (n.bsta_links || 0) >= 2 was always false there and every agent fell
+				 * through to a single band - while the topology picture two rows above,
+				 * which does select it, said MLO . 2 links about the same link.
+				 * Do not put double quotes in these comments: the SQL sits inside
+				 * "$(arr "...")" and a quote ends the argument, so arr gets a
+				 * truncated query, sqlite refuses it and the table comes back
+				 * empty. That is what happened to this very block on 2026-09-01
+				 * and it emptied the whole Nodes tab until 2026-09-02.
+				 * Measured 2026-09-01. */
+				(select max(bm.num_bsta) from bstamld bm
+					where bm.agent_almac=a.almac) as bsta_links,
+				(select count(*) from radio r where r.agent_almac=a.almac) as radios,
+				(select count(*) from apmld m where m.agent_almac=a.almac) as apmlds,
+				/* A MediaTek R3 agent reports each backhaul BSS as an AP MLD
+				 * with one affiliated AP. Counted as MLDs that read as four
+				 * MLO networks on a box that has one. */
+				(select count(*) from apmld m where m.agent_almac=a.almac
+					and m.num_ap >= 2) as apmlds_mlo,
+				/* Count where the client actually IS, and ask only sta.
+				 *
+				 * This used to be legacy + a join through sta_mld.ap_mld_macaddr,
+				 * gated on last_seen within 5 min. Both halves were wrong. The gate
+				 * is the freeze that already cost us the summary (see the clients
+				 * branch), and the join is worse: ap_mld_macaddr goes stale when a
+				 * client roams, so the row was credited to the node it LEFT.
+				 * Measured 2026-08-26 - a client whose sta row was 18 s old carried
+				 * an ap_mld_macaddr 42979 s (12 h) out of date, and the count landed
+				 * on the wrong agent while the controller reported none of its own.
+				 *
+				 * sta already holds one row per client - MLD address for an MLO
+				 * client, plain address for a legacy one - and its agent_almac is
+				 * refreshed from Link Metrics. The affiliated legs live only in
+				 * affiliated_sta, so nothing here double-counts. Verified: the
+				 * per-node numbers now add up to summary.live. */
+				(select count(*) from sta s where s.agent_almac=a.almac
+					and s.associated=1 and ifnull(s.is_bsta,0)=0) as clients
+				from agent a left join agent_backhaul b on a.almac=b.almac
+				where a.almac not in (select fake from ghost)
+				  and $(draw_where);")" \
+			"$(names_json)" \
+			"$(pending_json)" \
+			"$(live_addrs_json)"
+		;;
+	clients)
+		need_db_or_proxy clients || exit 0
+		# live = legacy stations (not bsta, not an MLO leg) + MLO clients that
+		# are still associated. Mirrors the mesh-status union - sta alone lies
+		# about MLO clients and roaming bookkeeping.
+		#
+		# Both halves need association AND freshness, and which row supplies
+		# each matters.
+		#
+		# Association alone over-counts: nothing clears sta.associated when a
+		# client leaves. Measured 2026-08-27 - a phone whose battery died was
+		# still associated=1 at an age of 1062 s and the overview counted it,
+		# while a legacy client gone for 20 min had correctly gone away. That
+		# is one ghost per departed MLO client, for good.
+		#
+		# Freshness alone under-counts, but only if it is read off the wrong
+		# row: sta_mld stops being refreshed while the client keeps working
+		# (2026-08-26: Watch at 2 s in sta and 16652 s in sta_mld). So take
+		# freshness from the client's own sta row, which does keep up - the
+		# ghost above sat at 1062 s there while every live client was under
+		# 25 s - and never from sta_mld.
+		#
+		# A mesh-wide sysupgrade still staleness the whole table at once. That
+		# is what the radio union below is for: it holds the count up while
+		# the agents start reporting again, and it self-corrects within about
+		# a minute. A ghost never self-corrects, which is why this trade is
+		# the right way round.
+		# Having a row in sta_mld does not make a client MLO. The row is
+		# written for anything that associates to a BSS belonging to an
+		# AP-MLD, it is never removed, and it is kept for 20 days. Measured
+		# 2026-08-27 against the radios: three clients were counted as MLO
+		# and only one was. One of the other two was a Mac the HAL reports
+		# as 802.11n - Wi-Fi 4 cannot do multi-link at all - and the third
+		# was a phone that had been switched off for half an hour.
+		#
+		# (Superseded 2026-09-25, see mlo_set below.) A client is MLO now if it currently holds at least two affiliated
+		# links carrying their OWN link addresses. The self-referencing row
+		# (macaddr = mld_macaddr) is the history entry, not a link: the one
+		# genuine MLO client had two legs on b6:5b:1b and 3a:a9:3c, while
+		# both impostors had a single leg equal to themselves.
+		#
+		# The same distinction matters when excluding legs from the legacy
+		# count: 9 of the 11 rows in affiliated_sta were self-referencing,
+		# so excluding every macaddr found there dropped ordinary
+		# single-link clients as well and left legacy at 1 instead of 3.
+		# Freshness comes from whichever row is actually being refreshed.
+		# Neither table is reliably the fresher one: measured 2026-08-27,
+		# an active Mac sat at 0 s in sta and 8668 s in sta_mld, and forty
+		# minutes later an active phone sat at 316 s in sta and 1 s in
+		# sta_mld and its legs. `associated` was 0 in BOTH rows while that
+		# phone was passing traffic with 10 ms of inactivity on the radio.
+		# So take the newest evidence of all three and do not require the
+		# flag. A client that is really gone goes stale everywhere at once -
+		# the ghost that started this had 8492 s in every one of them.
+		fresh="min(ifnull($now - s.last_seen, 99999),
+			   ifnull((select min($now - m2.last_seen) from sta_mld m2
+				   where m2.mld_macaddr = s.macaddr), 99999),
+			   ifnull((select min($now - a2.last_seen) from affiliated_sta a2
+				   where a2.mld_macaddr = s.macaddr), 99999))"
+		# 2026-09-25: the two-fresh-legs test above turned every MLO client
+		# into "legacy" five minutes after it associated. affiliated_sta is
+		# written when the client associates and NOT refreshed while it stays
+		# (an iPhone with three legs of its own, all 4532 s old, while it was
+		# associated) - the same freeze as sta_mld. And an MLSR phone uses one
+		# link at a time anyway. Being MLO is a property of the association:
+		# a leg under an address of its OWN exists only for an MLD client.
+		# The impostors of 2026-08-27 had only a self-leg (macaddr =
+		# mld_macaddr), which this still excludes; whether the client is
+		# here now is the job of $fresh on its sta row.
+		mlo_set="select m.mld_macaddr from sta_mld m
+			where ifnull(m.is_bsta,0)=0
+			  and exists (select 1 from affiliated_sta a
+				where a.mld_macaddr = m.mld_macaddr
+				  and a.macaddr <> a.mld_macaddr)"
+		legacy=$(sq1 "select count(*) from sta s where $fresh < 300
+			and ifnull(s.is_bsta,0)=0
+			and s.macaddr not in (select macaddr from affiliated_sta
+					      where macaddr <> mld_macaddr)
+			and s.macaddr not in ($mlo_set);")
+		mlo=$(sq1 "select count(*) from ($mlo_set) x
+			where exists (select 1 from sta s
+				where s.macaddr = x.mld_macaddr and $fresh < 300);")
+		# DHCP hostnames live in the leases file, not in the DB (found 2026-08-08)
+		dhcp=$(awk 'NF>=4 && $4!="*" {printf "%s\"%s\":\"%s\"", s, $2, $4; s=","} END{if(!s) printf ""}' /tmp/dhcp.leases 2>/dev/null)
+		# ... and then get written into the row everything else reads.
+		#
+		# Without this the same reply carries the name twice: once in
+		# dhcp_names, correctly, and once as stations[].hostname = null,
+		# because that column is read from the database and nobody ever
+		# wrote it. Measured 2026-09-07: dhcp_names {"ba:a9:..":"iPhone"}
+		# beside hostname=None for the same address, in one printf.
+		#
+		# The leases file is in /tmp, which is RAM: after a controller
+		# restart every client is nameless until it happens to renew, which
+		# has been measured taking up to 12 h. Copying the name into sta
+		# makes it survive the restart, which is the whole point of having
+		# the column.
+		#
+		# Only rows that would change are touched, so the common case is a
+		# read. Single quotes in a name are doubled - a hostname is client
+		# controlled and reaches SQL from the network.
+		while read -r _lt _mac _ip _name _rest; do
+			[ -n "$_name" ] && [ "$_name" != "*" ] || continue
+			_name=$(printf '%s' "$_name" | sed "s/'/''/g")
+			sqlite3 -cmd ".timeout 3000" "$DB" "update sta set hostname='$_name', ipv4='$_ip'
+				where macaddr='$_mac'
+				  and (ifnull(hostname,'')<>'$_name'
+				    or ifnull(ipv4,'')<>'$_ip');" 2>/dev/null
+		done < /tmp/dhcp.leases 2>/dev/null
+		# Union the database with what this node's radio can see. Whichever
+		# source has gone quiet, the other still holds the client - and the
+		# radio never goes quiet about its own. Counted by address so a client
+		# present in both is counted once.
+		live=$(( ${legacy:-0} + ${mlo:-0} ))
+		# The affiliated legs of an MLO client are rows in sta too, and
+		# without the same exclusion legacy uses above, each leg counts as
+		# a client of its own. Measured 2026-09-03: one iMac plus a phone
+		# on two legs reported live=3 - the right number from the wrong
+		# addends, which is worse than a wrong number because it looks
+		# correct. The leg rows themselves are a separate defect (the 60s
+		# poll adds them without attaching them to their MLD); this only
+		# stops them from inflating the count.
+		_seen=$(sqlite3 -cmd ".timeout 3000" "$DB" "select macaddr from sta where associated=1
+			and ifnull(is_bsta,0)=0
+			and macaddr not in (select macaddr from affiliated_sta
+					    where macaddr <> mld_macaddr);" 2>/dev/null)
+		_extra=$(printf '%s\n%s\n' "$_seen" "$(local_client_macs)" | grep -v '^$' |
+			sort -u | wc -l)
+		[ "${_extra:-0}" -gt "$live" ] && live=$_extra
+		# The parts have to add up to the whole, or the page contradicts
+		# itself inside one sentence: "4 live (2 legacy, 1 MLO)". Whatever
+		# the radio saw beyond the database has no type yet - it is a client
+		# whose row has not caught up - so it lands in legacy, the half that
+		# does not claim multi-link.
+		[ $(( ${legacy:-0} + ${mlo:-0} )) -lt "$live" ] &&
+			legacy=$(( live - ${mlo:-0} ))
+		printf '{"summary":{"live":%s,"legacy":%s,"mlo":%s},"dhcp_names":{%s},"stations":%s,"mlds":%s,"affiliated":%s}\n' \
+			"$live" "${legacy:-0}" "${mlo:-0}" "$dhcp" \
+			"$(arr "select s.macaddr, s.hostname, s.ipv4, s.agent_almac, s.bssid,
+				s.rcpi, s.associated, s.is_bsta, ($now - s.last_seen) as age_s,
+				s.last_dl_rate as dl_rate
+				from sta s where s.last_seen > $now-86400
+				  and (ifnull(s.associated,0)=1
+				       or s.last_seen > $now-$STA_DRAW_MAX_AGE)
+				order by s.last_seen desc;")" \
+			"$(arr "select m.mld_macaddr, m.hostname, m.ipv4, m.num_sta,
+				m.ap_mld_macaddr, a.agent_almac,
+				(select s.associated from sta s
+				 where s.macaddr = m.mld_macaddr) as associated,
+				(select ($now - s.last_seen) from sta s
+				 where s.macaddr = m.mld_macaddr) as sta_age_s,
+				(select min($now - a.last_seen) from affiliated_sta a
+				 where a.mld_macaddr = m.mld_macaddr
+				   and a.macaddr <> a.mld_macaddr) as leg_age_s,
+				(select s.agent_almac from sta s
+				 where s.macaddr = m.mld_macaddr) as sta_agent_almac,
+				($now - m.last_seen) as age_s
+				from sta_mld m left join apmld a on m.ap_mld_macaddr=a.mld_macaddr
+				where ifnull(m.is_bsta,0)=0 and m.last_seen > $now-86400
+				  and (m.last_seen > $now-$STA_DRAW_MAX_AGE
+				       or exists (select 1 from sta s
+				                  where s.macaddr = m.mld_macaddr
+				                    and ifnull(s.associated,0)=1));")" \
+			"$(arr "select a.macaddr, a.mld_macaddr, a.bssid, substr(a.ruid,1,17) ruid,
+				a.rcpi, a.dl_rate, a.ul_rate, ($now - a.last_seen) as age_s
+				from affiliated_sta a
+				/* the legs of the LAST association, however old: they are
+				 * not refreshed while the client stays (see clients above) */
+				where a.last_seen >= (select max(a3.last_seen) - 60
+				                      from affiliated_sta a3
+				                      where a3.mld_macaddr = a.mld_macaddr)
+				  and exists (select 1 from sta_mld m
+				              where m.mld_macaddr = a.mld_macaddr
+				                and (m.last_seen > $now-$STA_DRAW_MAX_AGE
+				                     or exists (select 1 from sta s
+				                                where s.macaddr = m.mld_macaddr
+				                                  and ifnull(s.associated,0)=1)));")"
+		;;
+	client_history)
+		input=$(cat)
+		need_db_or_proxy client_history "$input" || exit 0
+		mac=$(echo "$input" | jsonfilter -e '@.mac' 2>/dev/null | tr 'A-F' 'a-f')
+		limit=$(echo "$input" | jsonfilter -e '@.limit' 2>/dev/null)
+		case "$limit" in ''|*[!0-9]*) limit=32;; esac
+		[ "$limit" -gt 512 ] && limit=512
+		case "$mac" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f])
+			printf '{"mac":"%s","samples":%s}\n' "$mac" \
+				"$(arr "select rcpi, dl_rate, ul_rate, ts from sta_metrics_hist
+					where macaddr='$mac' order by ts desc limit $limit;")"
+			;;
+		*)	echo '{"error":"mac: expected aa:bb:cc:dd:ee:ff"}' ;;
+		esac
+		;;
+	steer_history)
+		# controller keeps its own steer bookkeeping - pass it through verbatim
+		out=$(ubus -t 5 call map.controller dump_steer_history 2>/dev/null)
+		[ -n "$out" ] && echo "$out" || echo '{"error":"controller not available"}'
+		;;
+	db_stats)
+		need_db_or_proxy db_stats || exit 0
+		tables=$(sq1 "select name from sqlite_master where type='table' and name not like 'sqlite_%' order by name;")
+		out=""
+		for t in $tables; do
+			n=$(sq1 "select count(*) from $t;")
+			out="$out,{\"table\":\"$t\",\"rows\":${n:-0}}"
+		done
+		printf '{"db_bytes":%s,"tables":[%s]}\n' "$(wc -c < "$DB")" "${out#,}"
+		;;
+	db_table)
+		# The argument is read before the guard so it can travel with the
+		# question when this node forwards it to the controller.
+		input=$(cat)
+		table=$(echo "$input" | jsonfilter -e '@.table' 2>/dev/null)
+		limit=$(echo "$input" | jsonfilter -e '@.limit' 2>/dev/null)
+		case "$limit" in ''|*[!0-9]*) limit=200;; esac
+		need_db_or_proxy db_table "$input" || exit 0
+		# The name arrives from a browser, so it is never spliced into SQL as
+		# given: it is stripped to the characters a table name can contain and
+		# then only accepted if a table by exactly that name exists. Anything
+		# else is refused rather than escaped.
+		t=$(echo "$table" | tr -cd 'A-Za-z0-9_')
+		[ -n "$t" ] && [ -n "$(sq1 "select name from sqlite_master where type='table' and name='$t';")" ] || {
+			echo '{"error":"no such table"}'
+			exit 0
+		}
+		printf '{"table":"%s","rows":%s}\n' "$t" "$(arr "select * from $t limit $limit;")"
+		;;
+	*)
+		echo '{"error":"unknown method"}'
+		;;
+	esac
+	;;
+esac

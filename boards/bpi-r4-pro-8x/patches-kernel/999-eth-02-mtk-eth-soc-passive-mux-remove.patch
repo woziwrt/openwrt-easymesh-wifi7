@@ -1,0 +1,27 @@
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Subject: net: ethernet: mtk_eth_soc: add mux cleanup to mtk_remove
+
+Add mtk_release_all_muxes() call to mtk_remove() to properly clean up
+passive mux resources when the driver is removed.
+
+Split from 999-eth-01 due to line number divergence between Sinovoip
+6.6 and vanilla 6.12 kernel at the mtk_remove location.
+
+Ported from Sinovoip/MTK 999-2708 (kernel 6.6) to kernel 6.12.
+
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5998,6 +5998,7 @@ static void mtk_remove(struct platform_device *pdev)
+ 	mtk_cleanup(eth);
+ 	free_netdev(eth->dummy_dev);
+ 	mtk_mdio_cleanup(eth);
++	mtk_release_all_muxes(eth);
+ }
+
+ #define DESC_SIZE(struct_name)				\

@@ -1,0 +1,13 @@
+{
+    "admin/network/wifimgr": {
+        "title": "WiFi Manager",
+        "order": 17,
+        "action": {
+            "type": "view",
+            "path": "wifimgr/index"
+        },
+        "depends": {
+            "acl": [ "luci-mod-network-wifimgr" ]
+        }
+    }
+}

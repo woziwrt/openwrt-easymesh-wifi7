@@ -1,0 +1,794 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-role - make this node the mesh controller or an agent.
+#
+# Usage:
+#   easymesh-role controller [--backhaul-key <hex>] [--mesh-addr <ip>]
+#   easymesh-role agent [<gateway-ip>] [--backhaul-key <hex>] [--mesh-addr <ip>]
+#
+# --mesh-addr is the gate to the mesh network layout: with it, br-lan becomes
+# the user's network at that address, one copper socket is carved out of it as
+# the service port at 192.168.1.1, the mesh WiFi joins br-lan and mesh-gwd is
+# enabled. Without it the script behaves exactly as it always has - every node
+# already deployed runs this script, and a changed default would reconfigure
+# them all on the next role change.
+#
+# A mesh has exactly one controller; every other node is an agent. The choice
+# is deliberate and explicit: with several boxes powered up at once nothing
+# can tell which one the user meant to lead, and guessing produces failures
+# that surface days later.
+#
+# Both roles are fully specified: each branch sets every value the other one
+# touches, so switching a node from agent to controller (or back) leaves no
+# residue from the previous role. Re-running the same role is a no-op.
+
+ROLE="$1"
+shift 2>/dev/null
+
+# The backhaul key is what actually joins a node to the mesh. Both sides must
+# carry the same one; without it the role is set but the node has no way in.
+BACKHAUL_KEY=""
+MESH_ADDR=""
+MGMT_PORT=""
+POS=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--backhaul-key) BACKHAUL_KEY="$2"; shift 2 ;;
+	--mesh-addr) MESH_ADDR="$2"; shift 2 ;;
+	--mgmt-port) MGMT_PORT="$2"; shift 2 ;;
+	*) POS="$1"; shift ;;
+	esac
+done
+set -- "$POS"
+
+# The agent's default route must point at the gateway VIP, not at a fixed
+# node. Whichever node holds the uplink claims that address, so the route
+# survives moving the cable to a different box; hardcoding the controller's
+# own address would strand every agent the moment the uplink moves.
+#
+# No default. The VIP is derived from the mesh - setup_mesh_network builds it
+# as ${addr%.*}.254 from the address it is handed - and a caller who knows the
+# mesh passes it in. A caller who does not know it must not be answered with a
+# guess: this used to default to 10.10.10.254, which is the right VIP only for
+# a mesh that happens to live on 10.10.10. Measured 2026-08-23 on a mesh at
+# 172.16.10: an agent joined by button and was left routing to 10.10.10.254,
+# an address nothing in that mesh holds.
+#
+# Empty is the honest answer, and it is also the useful one: it is what tells
+# bh-key-adopt the address is still unknown, so it asks the mesh over DHCP and
+# comes back here with both the address and the gateway that go together.
+GW="${1:-}"
+
+usage() {
+	echo "usage: easymesh-role {controller|agent} [gateway-ip] [--backhaul-key <hex>] [--mesh-addr <ip>]"
+	exit 1
+}
+
+BACKHAUL_TOOL=/usr/sbin/mlo-backhaul-setup
+
+# The mesh IS br-lan, minus one socket kept back for service.
+#
+# Between 2026-08-09 and 2026-08-12 the mesh had a bridge of its own,
+# br-easymesh, so that br-lan could stay exactly as OpenWrt ships it: every
+# socket answering 192.168.1.1, the way back in when the mesh is broken.
+# That bridge is gone, and it is worth writing down why, because the reasoning
+# that created it was sound and only stopped being sound when the target
+# changed.
+#
+# It held no ports - only WiFi - and a portless bridge is one netifd will not
+# claim unless told the emptiness is deliberate. Nobody told it. So the boot
+# became a race with hostapd, which creates the bridge itself when its config
+# names one (ap-mld-2 has wds_sta). Lose the race and netifd is locked out for
+# good: no address, no DHCP, no client anywhere in the mesh - while 1905, bound
+# to the member interfaces rather than the bridge, keeps reporting a healthy
+# topology. Three days of existence, one total outage, and a fleet split into
+# nodes that had the bridge and nodes that did not.
+#
+# What killed it was not that failure but the port model: once the user's
+# sockets belong to the mesh, br-lan is down to a single service port anyway,
+# and two bridges are one more than the job needs. So the mesh moves back into
+# br-lan and the service port is carved out of it instead - the same two
+# broadcast domains, one bridge fewer, and no way to end up with an empty one.
+#
+# The price is real and must be said out loud: 192.168.1.1 can be identical on
+# every node only because that socket is NOT in the mesh - the mesh is a single
+# L2 domain and one address cannot live on all of it. So the service address
+# stops answering on every socket and answers on exactly one. That socket is
+# lan3 on a classic BPI-R4 and must be named explicitly on boards without it.
+#
+# map_genconfig derives the network name from the bridge (al_bridge minus the
+# "br-" prefix) and never hardcodes br-lan, so pointing it here is enough.
+MESH_BRIDGE=br-lan
+MESH_NET=lan
+
+# The socket held back from the mesh, by board.
+#
+# This defaulted to lan3 and told other boards to pass --mgmt-port. Nobody
+# does: all three callers - the controller and agent paths in the api, and the
+# air join - invoke this script without it (checked 2026-08-14). So a Pro 8X
+# would have died on "service port lan3 does not exist here" the first time
+# anyone founded a mesh on one, over an argument the caller was never taught.
+#
+# Which socket it is, is a decision rather than a hardware fact, so it belongs
+# with the code that makes it. On a classic BPI-R4 the convention is lan3. On a
+# Pro 8X it is mxl_lan0 - the same one node-config.sh in the builder carves out
+# and node-heartbeat looks for. (An older comment here said mxl_lan1; the board
+# has mxl_lan0 through mxl_lan5 per DTS patch 046, and the two places that act
+# on it both say mxl_lan0. The comment was simply wrong.)
+#
+# Guessing is still not allowed: an unknown board falls through to lan3 and, if
+# that socket does not exist, dies below with a message naming the fix. A wrong
+# guess here produces a node nobody can reach, which is worse than a refusal.
+default_mgmt_port() {
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		bananapi,bpi-r4-pro-8x) echo mxl_lan0 ;;
+		*)                      echo lan3     ;;
+	esac
+}
+MGMT_PORT="${MGMT_PORT:-$(default_mgmt_port)}"
+MGMT_ADDR=192.168.1.1
+
+# The bridge device section is found by name, not by index: how many device
+# sections an image declares, and in what order, differs per board.
+lan_device_index() {
+	local i=0 n
+	while n=$(uci -q get network.@device[$i].name); do
+		[ "$n" = "$MESH_BRIDGE" ] && { echo "$i"; return 0; }
+		i=$((i + 1))
+	done
+	return 1
+}
+
+setup_mesh_network() {
+	local addr="$1" gw="$2" idx p ports="" vip="${1%.*}.254"
+
+	idx=$(lan_device_index) || \
+		die "no $MESH_BRIDGE device section in /etc/config/network"
+
+	# A service port that is not on this board would leave the node with no
+	# way in at all, so this is fatal and nothing has been written yet.
+	[ -e "/sys/class/net/$MGMT_PORT" ] || \
+		die "service port $MGMT_PORT does not exist here - pass --mgmt-port"
+
+	# Carve the service socket out of the bridge; the mesh keeps the rest.
+	# Rebuilding the list rather than del_list'ing one entry keeps this
+	# idempotent on re-runs and on boards where the port was never in it.
+	for p in $(uci -q get network.@device[$idx].ports); do
+		[ "$p" = "$MGMT_PORT" ] && continue
+		ports="$ports $p"
+	done
+	# Never leave the bridge without a port. A portless br-lan is exactly the
+	# shape that cost us a morning on 2026-08-12 - netifd will not claim it,
+	# hostapd creates it first, and the node ends up with no address and a
+	# topology that still looks healthy. On a board with a single socket the
+	# service port cannot be carved out of it, and saying so is the only
+	# honest answer.
+	[ -n "$ports" ] || \
+		die "$MGMT_PORT is the only port in $MESH_BRIDGE - nothing left for the mesh"
+
+	uci -q delete network.@device[$idx].ports
+	for p in $ports; do
+		uci add_list network.@device[$idx].ports="$p"
+	done
+
+	# Now that the user's sockets are in the mesh, a cable between two nodes
+	# is a second path between bridges the wireless backhaul already joins -
+	# a loop, and loops on a bridge are a broadcast storm, not a warning.
+	# It is not a corner case: the wired join asks for exactly this. The box
+	# is cabled to the mesh, takes its settings over that cable, reboots, and
+	# brings up its backhaul while the cable is still in. Seen on hardware
+	# 2026-08-12 during the first wired join on this layout - the LEDs went
+	# wild and pulling the cable was the only way to stop it.
+	#
+	# STP blocks the redundant path instead of the user having to. Convergence
+	# costs about 30 s on a topology change, which is a good trade against a
+	# storm, and it makes the cable a working standby: unplug the wireless
+	# parent and the wire takes over on its own.
+	uci set network.@device[$idx].stp=1
+
+	# The root of that tree is the bridge with the lowest id, and with equal
+	# priorities the lowest id is the lowest MAC - on 2026-09-25 a random
+	# agent in the middle of the mesh. Every join is then a topology change
+	# decided around that agent, and a box went "connected, healthy, cut off"
+	# for ten minutes right when the next one joined (pair-as-a-user test,
+	# findings #47, #49). The controller is the top of the tree the mesh is built as;
+	# make it the top of the spanning tree too. Agents go back to the default
+	# so a former controller does not keep the claim.
+	if [ "$ROLE" = controller ]; then
+		uci set network.@device[$idx].priority=4096
+	else
+		uci -q delete network.@device[$idx].priority
+	fi
+
+	uci set network.$MESH_NET=interface
+	uci set network.$MESH_NET.device="$MESH_BRIDGE"
+	uci set network.$MESH_NET.proto=static
+	uci set network.$MESH_NET.ipaddr="$addr"
+	uci set network.$MESH_NET.netmask=255.255.255.0
+
+	# An agent has a static address, so nothing hands it a default route: it
+	# would serve clients happily while being unable to reach the internet
+	# itself. The controller is the top of the tree and needs no gateway.
+	#
+	# Both the route and the resolver point at the VIP, never at the address
+	# the caller passed. That address is whichever box the user typed into
+	# the join screen - the founder - and the founder is not the way out; the
+	# box holding the uplink is, and that moves. Pinning either to a fixed
+	# node undoes the whole point of the VIP.
+	# Measured 2026-08-12, uplink pulled from the controller: the VIP moved
+	# to the agent in 7 s and traffic followed it, but every node still asked
+	# the old controller for names - and it had no upstream left, so the mesh
+	# resolved nothing while routing perfectly. Clients read that as a total
+	# outage.
+	# The gateway is written here; the resolver deliberately is not.
+	#
+	# netifd copies network.lan.dns into the resolv file on every
+	# reconfiguration, and that file is also where mesh-gwd points the box at
+	# the VIP when it has no uplink of its own. Setting both makes two writers
+	# of one line: measured 2026-08-12, mesh-gwd removed the VIP nameserver on
+	# claiming the address (correctly - a gateway asking itself is a loop, not
+	# a resolver) and netifd put it straight back from the config, leaving the
+	# node that holds the VIP listed as its own first DNS server.
+	#
+	# So DNS has one owner, and it is mesh-gwd: it adds the VIP while routing
+	# out through it and drops it again on taking the address over. A node with
+	# its own uplink needs nothing here - the lease brings real servers.
+	# The gateway does not have this problem: mesh-gwd deletes the static
+	# default via the VIP whenever it claims, so the two never disagree.
+	if [ -n "$gw" ]; then
+		uci set network.$MESH_NET.gateway="$vip"
+	else
+		uci -q delete network.$MESH_NET.gateway
+	fi
+	uci -q delete network.$MESH_NET.dns
+
+	# The service socket: the same address on every node, which is only
+	# possible because this port is the one thing NOT bridged into the mesh -
+	# the mesh is a single L2 domain and one address cannot live on all of it.
+	# It carries no gateway and no DNS: it is a way in, never a way out, and a
+	# second default route here would fight the one the mesh just set.
+	# No DHCP either (setup_mesh_dhcp) - a laptop on this port uses a static
+	# address on purpose, so the path keeps working when nothing else does.
+	uci set network.mgmt=interface
+	uci set network.mgmt.device="$MGMT_PORT"
+	uci set network.mgmt.proto=static
+	uci set network.mgmt.ipaddr="$MGMT_ADDR"
+	uci set network.mgmt.netmask=255.255.255.0
+	uci -q delete network.mgmt.gateway
+	uci -q delete network.mgmt.dns
+
+	# Set here rather than in setup_mesh_dhcp, which only the controller
+	# calls: an agent needs its service socket quiet too. Without a dhcp
+	# section dnsmasq would leave it alone anyway, but "quiet by accident"
+	# is the kind of thing a later default flips without anyone noticing.
+	uci set dhcp.mgmt=dhcp
+	uci set dhcp.mgmt.interface=mgmt
+	uci set dhcp.mgmt.ignore='1'
+	uci commit dhcp
+
+	# Both networks need to be in a firewall zone, or they are not networks
+	# this box will route for: traffic belonging to no zone is neither
+	# forwarded nor translated. A node in that state hands its clients an
+	# address and no way out, and does it silently - the wireless works, the
+	# mesh works, only the internet is missing. The service network fails
+	# quieter still: it answers ping and refuses ssh and LuCI, which reads
+	# exactly like a wedged box.
+	# Both join the lan zone rather than getting one of their own: they are
+	# trusted exactly as much as the LAN is, and separate zones would need
+	# the same forwarding rule written twice.
+	# $MESH_NET is normally already there - stock config puts lan in this
+	# zone - but the del_list/add_list pair costs nothing and keeps this
+	# working if it ever is not.
+	local z i=0 n
+	while z=$(uci -q get firewall.@zone[$i].name); do
+		[ "$z" = lan ] && break
+		i=$((i + 1))
+	done
+	if [ "$z" = lan ]; then
+		for n in "$MESH_NET" mgmt; do
+			uci -q del_list firewall.@zone[$i].network="$n"
+			uci add_list firewall.@zone[$i].network="$n"
+		done
+		uci commit firewall
+	fi
+
+	uci set mapagent.agent.al_bridge="$MESH_BRIDGE"
+
+	# 1905 listens on the mesh bridge, which is now also the wire the NEXT
+	# joining box gets cabled to - CMDU traffic and the onboarding cable are
+	# the same broadcast domain again, so one entry does both jobs. Until
+	# 2026-08-12 this needed two, and dropping br-lan from the pair once made
+	# a wizard-set node reboot deaf to the very cable the wizard had told the
+	# user to plug in (hardware, 2026-08-10: the controller never heard the
+	# rebooted node again).
+	#
+	# The service port is deliberately NOT listed. Onboarding must happen on
+	# a mesh socket: two nodes cabled service-port to service-port would both
+	# be holding 192.168.1.1 on that wire, and the join would be racing an
+	# address collision it cannot see.
+	# The del_list before add_list is just dedupe on re-runs.
+	uci -q del_list ieee1905.@al-iface[0].ifname="$MESH_BRIDGE" 2>/dev/null
+	uci add_list ieee1905.@al-iface[0].ifname="$MESH_BRIDGE"
+
+	uci commit network
+	uci commit ieee1905
+	# al_bridge is set above; without this commit it evaporates on reboot -
+	# and this function only ever runs right before one.
+	uci commit mapagent
+}
+
+# The controller hands out addresses to mesh clients, and since the mesh is
+# the lan again this is plain dhcp.lan - the section every stock config
+# already has. Whether it actually serves is decided per role and not here:
+# the controller branch sets dhcp.lan.ignore=0, the agent branch sets it to 1,
+# because two DHCP servers on one broadcast domain is a fault that looks like
+# intermittent bad luck for days.
+# Nodes live below .100 (static, chosen at setup), so the pool starts there.
+# Clients are handed the VIP as their gateway, not this node: the internet
+# follows the cable, and the VIP follows the internet.
+setup_mesh_dhcp() {
+	local addr="$1" vip="${1%.*}.254"
+
+	uci set dhcp.$MESH_NET=dhcp
+	uci set dhcp.$MESH_NET.interface="$MESH_NET"
+	uci set dhcp.$MESH_NET.start=100
+	uci set dhcp.$MESH_NET.limit=150
+	uci set dhcp.$MESH_NET.leasetime=12h
+	uci -q delete dhcp.$MESH_NET.dhcp_option
+	uci add_list dhcp.$MESH_NET.dhcp_option="3,$vip"
+
+	# Option 6 for the same reason as option 3. Without it dnsmasq offers
+	# itself, so every client in the mesh resolves through this box - and a
+	# controller that has lost its uplink has no upstream to forward to. It
+	# still routes (the VIP moved, traffic flows through the new gateway) but
+	# answers nothing, which a user experiences as the internet being down
+	# while every ping succeeds. Pointing names at the VIP puts the resolver
+	# where the uplink is, the same way the route already goes.
+	uci add_list dhcp.$MESH_NET.dhcp_option="6,$vip"
+	uci commit dhcp
+}
+
+# Enable only - the daemon starts on the reboot this script already asks for.
+# Starting it here would race the uncommitted network config, and sourcing it
+# into a shell once left two copies fighting over the gateway (2026-08-09).
+enable_mesh_gwd() {
+	if [ -x /etc/init.d/mesh-gwd ]; then
+		/etc/init.d/mesh-gwd enable
+	else
+		echo "easymesh-role: mesh-gwd not installed - the internet will not follow the cable" >&2
+	fi
+}
+
+# The WiFi that belongs to the mesh joins the mesh network. The user's sockets
+# are already there - they are what br-lan is - so wire and air end up on one
+# network, which is the whole point: a laptop on a cable and a phone on the air
+# are on the same network whichever box they picked.
+move_wifi_to_mesh() {
+	local s
+	for s in ap_mld_1 ap_mld_2 sta_mld_1; do
+		uci -q get "wireless.$s" >/dev/null 2>&1 || continue
+		uci set "wireless.$s.network=$MESH_NET"
+	done
+	uci commit wireless
+}
+
+# mlo-steerd ships with luci-app-wifimgr and starts itself on every board
+# (S95 in the image). On a standalone router that is its job. On a mesh node
+# it is a second daemon deciding which links a client may use, and the two
+# fight: it rewrites A-TTLM every 10 s from what one AP can see, while the
+# mesh steers from the whole topology. hostapd answers the collision out loud
+# - "Busy: A-TTLM is on-going" - and the client pays for it. Measured on
+# 2026-08-12: 151/2 Mbps through a node it was steering, 490/30 without it.
+#
+# Its numbers are not trustworthy either (ret=740%, busy6G=844% in the same
+# log), so there is nothing here worth preserving by running it alongside.
+# The steering logic belongs inside the mesh, where the topology is; until it
+# moves there, taking a mesh role simply takes the wheel away from it.
+#
+# Only disabled, never removed: the node may be given back to wifimgr later,
+# and one enable puts it back.
+stop_competing_steering() {
+	[ -x /etc/init.d/mlo-steerd ] || return 0
+	/etc/init.d/mlo-steerd stop 2>/dev/null
+	/etc/init.d/mlo-steerd disable 2>/dev/null
+	echo "easymesh-role: mlo-steerd stopped and disabled - the mesh steers links now"
+}
+
+# A node that spent its first minutes believing it was the root wrote itself
+# into a controller database. Left behind, it haunts the topology as a node
+# nobody has ever seen - and on 2026-08-09 exactly that kind of leftover row
+# had us chasing a mesh that did not exist.
+forget_own_controller_db() {
+	rm -f /etc/mapc/mapc.db /etc/mapc/mapc.db-shm /etc/mapc/mapc.db-wal 2>/dev/null
+}
+
+# The image this node was flashed from carries complete WiFi credentials, so
+# its agent boots satisfied and never asks the mesh for the real ones. The
+# agent's notion of "configured" lives in two places (read from the sources,
+# confirmed live 2026-08-10): the credentials in the mapagent ap sections,
+# and a SHA-256 of the last applied M2 in /etc/multiap/wsc_m2.json. Clear
+# both and the next boot runs the WSC exchange the cable is there for.
+# (ieee1905.@ap keys are the registrar's own config - deleting those, the
+# first thing we tried, does nothing at all.)
+#
+# The radios go dark until real credentials arrive: with the keys gone there
+# is nothing safe to put on the air, and a joining box must not broadcast its
+# baked backhaul next to the mesh's identically-named real one. bh-key-adopt
+# turns them back on once the mesh has spoken.
+forget_baked_credentials() {
+	local i=0
+
+	# BAKED ones. Keys that arrived over the air are not ours to throw away.
+	#
+	# wsc_m2.json is the receipt for a real WSC exchange: a node that has one
+	# was handed its keys by a controller, and cannot ask for them again on
+	# its own - the exchange needs a window opened on the other side. Wiping
+	# them takes a working agent off the air permanently, and this function
+	# also disables the radios, so it cannot even be seen failing.
+	#
+	# Measured 2026-08-22, and it cost an agent that had just joined by
+	# button and was carrying traffic: this ran as part of a call whose only
+	# purpose was to give that agent a mesh address. Every backhaul key went
+	# to zero length, radios went down, and easymesh-check reported "no
+	# credentials have ever been delivered to this node" - about a node whose
+	# credentials had been delivered perfectly well, minutes earlier.
+	#
+	# The image-baked keys this was written for leave no such receipt, so the
+	# distinction is exact rather than a guess.
+	if [ -f /etc/multiap/wsc_m2.json ]; then
+		echo "easymesh-role: credentials were delivered over the air - keeping them" >&2
+		return 0
+	fi
+
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		uci -q delete mapagent.@ap[$i].key
+		i=$((i + 1))
+	done
+	uci commit mapagent
+	rm -f /etc/multiap/wsc_m2.json 2>/dev/null
+
+	# The adoption markers describe the join that is being replaced, not the
+	# one about to happen. fh-finish.done in particular records which
+	# credential pair bh-key-adopt last settled the fronthaul on, and the
+	# correction is skipped while the mesh keeps advertising that same pair.
+	# Left behind, a second onboarding onto the credentials this node happened
+	# to hold before would be skipped and reported settled - measured
+	# 2026-08-19, the node came up broadcasting OpenWrt-MLD with
+	# adopt-state=settled.
+	rm -f /etc/mapc/fh-finish.done /etc/mapc/fh-finish.loud \
+	      /etc/mapc/bh-adopt.count /etc/mapc/bh-adopt.loud \
+	      /etc/mapc/adopt-state 2>/dev/null
+
+	for i in radio0 radio1 radio2; do
+		uci -q get wireless.$i >/dev/null 2>&1 && uci set wireless.$i.disabled=1
+	done
+	uci commit wireless
+}
+
+# Every node serves a backhaul AP-MLD, including agents: that is what lets a
+# further node attach behind it. A node with only the STA side is a leaf and
+# the mesh cannot grow past it.
+setup_backhaul() {
+	local want_sta="$1"
+
+	if [ -z "$BACKHAUL_KEY" ]; then
+		echo "easymesh-role: no --backhaul-key given, backhaul left untouched" >&2
+		echo "easymesh-role: this node will not join or serve a mesh until it is set" >&2
+		return 0
+	fi
+	if [ ! -x "$BACKHAUL_TOOL" ]; then
+		echo "easymesh-role: $BACKHAUL_TOOL missing - install easymesh-wifi" >&2
+		return 1
+	fi
+
+	"$BACKHAUL_TOOL" --apply-ap --key "$BACKHAUL_KEY" >/dev/null ||
+		die "backhaul AP setup failed"
+	[ "$want_sta" = "sta" ] || return 0
+	"$BACKHAUL_TOOL" --apply-sta --key "$BACKHAUL_KEY" >/dev/null ||
+		die "backhaul STA setup failed"
+}
+
+keep_5ghz_out_of_dfs() {
+	# A mesh backhaul has no business sitting on a DFS channel.
+	#
+	# Nobody chose the channel this box came up on: OpenWrt's wifi detect
+	# takes `band.max_width` - the widest the card can do - and the driver's
+	# default_channel, which on 5 GHz is 36. On MT7996 that means 160 MHz
+	# starting at 5170, and 160 MHz starting anywhere in the non-DFS part is
+	# arithmetically impossible without reaching into it: 5150-5250 is only
+	# 100 MHz wide. So the default lands half the channel on 52-64, where a
+	# radar has the right to evict us.
+	#
+	# For a client AP that is a nuisance - one station reconnects. For a
+	# backhaul it takes the mesh down, because every node behind this one
+	# loses its uplink at once and there is no second path. And it costs a
+	# 60 s CAC on every boot, which is the delay mld-bsta-relink exists to
+	# work around.
+	#
+	# The CZ regulatory domain does not allow 160 MHz there at all, for what
+	# it is worth: 5150-5250 and 5250-5350 are each capped at 80, and only
+	# 5470-5725 carries @160. The kernel glues the two together via AUTO-BW
+	# even though their rules differ (23 vs 20 dBm, DFS vs not).
+	#
+	# 80 MHz from channel 36 covers 5170-5250 exactly: no DFS, no CAC, and
+	# 3 dB more power than the DFS rules would have allowed. The width that
+	# was lost is on 6 GHz, where the card does 320 MHz with no radar at all.
+	#
+	# Only narrowed when the channel is in the non-DFS block. A box already
+	# parked on 100 or 149 was put there by someone who meant it.
+	local ch ht ht80
+	ch=$(uci -q get wireless.radio1.channel)
+	ht=$(uci -q get wireless.radio1.htmode)
+	case "$ch" in 36|40|44|48) ;; *) return 0 ;; esac
+	case "$ht" in
+	*160|*320) ;;
+	*) return 0 ;;
+	esac
+	# Keep the generation prefix the card reported; only the width changes.
+	case "$ht" in
+	EHT*) ht80=EHT80 ;;
+	HE*)  ht80=HE80  ;;
+	VHT*) ht80=VHT80 ;;
+	*)    ht80=HT20  ;;
+	esac
+	uci set wireless.radio1.htmode="$ht80"
+	uci commit wireless
+	echo "5 GHz: $ht -> $ht80 (channel $ch at that width would have reached into DFS)"
+}
+
+die() {
+	echo "easymesh-role: $1" >&2
+	echo "easymesh-role: no changes committed" >&2
+	uci revert dhcp network mapcontroller mapagent 2>/dev/null
+	exit 1
+}
+
+# uci fails on an anonymous section that does not exist yet, which happens on
+# a fresh image or after keep-config from a build with a different default
+# mapagent config. Creating it up front keeps the role application atomic:
+# everything below is staged, and nothing is committed until all of it worked.
+ensure_controller_select() {
+	uci -q get mapagent.@controller_select[0] >/dev/null 2>&1 && return 0
+	uci -q get mapagent >/dev/null 2>&1 || die "no /etc/config/mapagent - is map-agent installed?"
+	uci add mapagent controller_select >/dev/null || die "cannot create controller_select section"
+}
+
+[ -n "$ROLE" ] || usage
+
+# Say out loud that this box is meant to be part of a mesh, before anything
+# else happens.
+#
+# Until someone runs this tool, a box has no business touching the wireless
+# config at all - and today it does. map_genconfig is a hotplug handler
+# (/etc/hotplug.d/ieee80211/11-multiap-genconfig), so it fires on every radio
+# that appears, at every boot, whether or not map-agent is enabled and whether
+# or not it is even running. Measured 2026-08-17: with both mapagent and
+# mapcontroller disabled and every one of our own boot workers switched off, a
+# factory-fresh box still came up with the per-radio defaults rewritten into
+# 'OpenWrt-' and a backhaul called 'MAP--BH'.
+#
+# This marker is what the hotplug gate reads. It is written here because this
+# is the one place all three ways in pass through - setup_controller,
+# setup_agent and phase 2 of the over-the-air join all call easymesh-role - and
+# it is written FIRST, before any config is touched, so the gate is already
+# open by the time the node reboots into its new role and the hotplug runs
+# again. That ordering is what lets map_genconfig create sta_mld_1 for a
+# joining agent exactly when it should, and not a boot earlier.
+mkdir -p /etc/mapc 2>/dev/null
+echo "$ROLE" > /etc/mapc/role 2>/dev/null
+
+case "$ROLE" in
+controller)
+	ensure_controller_select
+	stop_competing_steering
+
+	# The controller hands out addresses; state it explicitly rather than
+	# relying on a default, so the policy is visible on both sides.
+	uci set dhcp.lan.ignore='0' || die "cannot set dhcp.lan.ignore"
+	# ...and it is the only router on the segment for v6 as well. Set both
+	# sides of this explicitly for the same reason as ignore above.
+	uci set dhcp.lan.ra='server' || die "cannot set dhcp.lan.ra"
+	uci set dhcp.lan.dhcpv6='server' || die "cannot set dhcp.lan.dhcpv6"
+
+	# Drop any agent-era default route. A controller that routes to the VIP
+	# it may itself be holding would send its own traffic in a circle.
+	uci -q delete network.lan.gateway 2>/dev/null
+	uci -q delete network.lan.dns 2>/dev/null
+
+	uci -q get mapcontroller >/dev/null 2>&1 || \
+		die "no /etc/config/mapcontroller - install map-controller first"
+	uci set mapcontroller.controller.enabled='1' || die "cannot enable mapcontroller"
+	# Installation left this off so the box would not go looking for a mesh
+	# before anyone told it to. Now it has a role.
+	uci set mapagent.agent.enabled='1' || die "cannot enable mapagent"
+
+	# A controller has no reason to sit dark, and one that arrives here from
+	# the agent branch will otherwise sit dark for good.
+	#
+	# forget_baked_credentials() switches the radios off on purpose: a joining
+	# agent must not broadcast its baked backhaul beside the real mesh, and
+	# bh-key-adopt switches them back on the moment the mesh delivers a key.
+	# bh-key-adopt skips controllers entirely - by design, a controller is
+	# handed its key here - so nothing on that path ever reaches the flag.
+	#
+	# Measured 2026-08-19: a box registered as agent and then re-registered as
+	# controller came up with mapcontroller running, the VIP claimed, the WAN
+	# alive - and `iw dev` empty. The header of this file promises that
+	# switching roles leaves no residue from the previous one. This is the
+	# residue it left.
+	# No `local` here: this runs in the script's main body, not in a function,
+	# and `local` outside a function aborts the whole tool with rc=2 - which
+	# is exactly what the first version of this fix did, silently, right after
+	# the mlo-steerd line and before anything was applied.
+	for _radio in radio0 radio1 radio2; do
+		uci -q get wireless.$_radio >/dev/null 2>&1 || continue
+		uci -q delete wireless.$_radio.disabled
+	done
+	uci commit wireless
+
+	# The creds the controller hands out over WSC M2 live in these sections,
+	# not in the wireless config - and first boot filled them with a random
+	# key nobody ever saw (99-mapcntlr). Left alone, every M2 exchange
+	# re-teaches the agents that phantom key instead of the one on the air,
+	# and the first node to cold-boot alone is locked out of its own mesh
+	# (found the hard way, 2026-08-11). The key this founding was given is
+	# the mesh's one truth, so it overwrites every backhaul cred here.
+	if [ -n "$BACKHAUL_KEY" ]; then
+		for s in $(uci show mapcontroller 2>/dev/null \
+				| sed -n 's/^mapcontroller\.\([^.][^.]*\)=ap$/\1/p'); do
+			[ "$(uci -q get mapcontroller.$s.type)" = "backhaul" ] || continue
+			uci set mapcontroller.$s.key="$BACKHAUL_KEY" || die "cannot set backhaul cred key"
+		done
+	fi
+
+	uci set mapagent.@controller_select[0].mode='auto' || die "cannot set controller_select.mode"
+	uci set mapagent.@controller_select[0].local='1' || die "cannot set controller_select.local"
+	uci set mapagent.@controller_select[0].autostart='1' || die "cannot set controller_select.autostart"
+
+	uci commit dhcp
+	uci commit network
+	uci commit mapcontroller
+	uci commit mapagent
+
+	/etc/init.d/mapcontroller enable
+	/etc/init.d/mapagent enable
+
+	# The controller has no uplink of its own - it is the top of the tree.
+	setup_backhaul ap
+
+	# Arm the fronthaul as a Multi-AP WPS registrar, so a new box can be
+	# joined over the air by pressing a button. wps_open only presses it;
+	# the BSS has to be equipped here, once, at founding.
+	#
+	# This was taken out on 2026-08-11 after the founding that armed it was
+	# followed by map-controller growing from 145M to 296M in minutes with
+	# load ~2, and by clients failing to associate. On 2026-08-12 that was
+	# put back to the test on the current build and did not reproduce:
+	# armed and idle for five minutes, VSZ flat at 23.5M; armed with
+	# mlo-steerd deliberately running alongside for two more, flat again,
+	# load never above 0.4. The steering daemon was the suspect - wps_open
+	# already muzzles it because it deauthenticates an enrollee mid-
+	# handshake - and it was cleared.
+	#
+	# So the arming is back, and what actually spun that day is still
+	# unexplained. That controller differed in more than this: it had just
+	# been wiped and re-founded through the API, it ran the separate
+	# br-easymesh bridge, it was on easymesh-config r113, and it carried
+	# the phantom backhaul key that the same day's fix removed. Any of
+	# those, or their combination, is a better candidate than a flag that
+	# now measures as inert.
+	#
+	# If it ever comes back, the marker is the memory: watch mapcontroller
+	# VSZ. Flat is healthy; a controller that grows tens of megabytes in
+	# minutes is the fault, whatever its cause turns out to be.
+	if uci -q get wireless.ap_mld_1 >/dev/null 2>&1; then
+		bh_ssid="$(uci -q get wireless.ap_mld_2.ssid)"
+		bh_key="$(uci -q get wireless.ap_mld_2.key)"
+		if [ -n "$bh_ssid" ] && [ -n "$bh_key" ]; then
+			uci set wireless.ap_mld_1.multi_ap=2
+			uci set wireless.ap_mld_1.multi_ap_backhaul_ssid="$bh_ssid"
+			uci set wireless.ap_mld_1.multi_ap_backhaul_key="$bh_key"
+			uci set wireless.ap_mld_1.wps_pushbutton=1
+			uci set wireless.ap_mld_1.wps_cred_add_sae=1
+			uci commit wireless
+			echo "easymesh-role: fronthaul armed for push-button join"
+		else
+			echo "easymesh-role: no backhaul credentials yet - fronthaul not armed" >&2
+		fi
+	fi
+
+	# After setup_backhaul on purpose: the backhaul tool writes the wireless
+	# sections this moves, so the other order would move nothing.
+	if [ -n "$MESH_ADDR" ]; then
+		setup_mesh_network "$MESH_ADDR" ""
+		setup_mesh_dhcp "$MESH_ADDR"
+		move_wifi_to_mesh
+		enable_mesh_gwd
+	fi
+	echo "role: controller"
+	;;
+agent)
+	ensure_controller_select
+	stop_competing_steering
+
+	uci set dhcp.lan.ignore='1' || die "cannot set dhcp.lan.ignore"
+	# The same for v6, which was missed when the role logic moved here from
+	# mesh-role - and cost nothing visible, because nobody was watching v6.
+	# Measured 2026-08-17 on a three-node mesh: every node advertised itself
+	# as a router with a ULA prefix of its own, so one laptop held three
+	# addresses at once (fd74:.., fdb4:.., fd00:..) and two nodes appeared in
+	# its router list. Nothing broke only because no v6 arrives from upstream
+	# here; with a provider handing out v6 this is traffic sent to a node that
+	# may have no way out, and it looks like nothing at all from the client.
+	uci set dhcp.lan.ra='disabled' || die "cannot set dhcp.lan.ra"
+	uci set dhcp.lan.dhcpv6='disabled' || die "cannot set dhcp.lan.dhcpv6"
+
+	# An agent has a static bridge address, so nothing gives it a default
+	# route: without this it cannot reach the internet itself (no time sync,
+	# no downloads) while its clients are fine - a silent asymmetry that
+	# wastes an afternoon when it finally matters. With --mesh-addr the route
+	# is written by setup_mesh_network instead, together with the address it
+	# belongs to; the service socket never gets one, so there is always a way
+	# in that does not depend on the mesh being up.
+	# Only when the caller knew one. A button join carries no address and no
+	# gateway - that is its whole point - and inventing one here writes a
+	# route to a box that does not exist and, worse, hides the fact that the
+	# node still has no place in the mesh. Left empty, the missing gateway is
+	# exactly the signal bh-key-adopt waits for.
+	if [ -z "$MESH_ADDR" ]; then
+		if [ -n "$GW" ]; then
+			uci set network.lan.gateway="$GW" || die "cannot set network.lan.gateway"
+			uci set network.lan.dns="$GW" || die "cannot set network.lan.dns"
+		else
+			# Clear rather than leave: a re-run after a failed join would
+			# otherwise keep a stale gateway alive and gate the DHCP path shut.
+			uci -q delete network.lan.gateway
+			uci -q delete network.lan.dns
+		fi
+	fi
+
+	if uci -q get mapcontroller >/dev/null 2>&1; then
+		uci set mapcontroller.controller.enabled='0' || die "cannot disable mapcontroller"
+	fi
+	# Installation left the agent off so a fresh box would not go looking for a
+	# mesh on its own. This node is joining one now.
+	uci set mapagent.agent.enabled='1' || die "cannot enable mapagent"
+	uci set mapagent.@controller_select[0].mode='auto' || die "cannot set controller_select.mode"
+	uci set mapagent.@controller_select[0].local='0' || die "cannot set controller_select.local"
+	# Mandatory: the default starts a local controller as well, and two
+	# controllers invalidate the whole mesh view. Hardware-confirmed.
+	uci set mapagent.@controller_select[0].autostart='0' || die "cannot set controller_select.autostart"
+
+	uci commit dhcp
+	uci commit network
+	uci -q get mapcontroller >/dev/null 2>&1 && uci commit mapcontroller
+	uci commit mapagent
+
+	[ -x /etc/init.d/mapcontroller ] && /etc/init.d/mapcontroller disable
+	/etc/init.d/mapagent enable
+
+	# An agent needs both: the STA to reach its parent, the AP to serve a child.
+	setup_backhaul sta
+
+	if [ -n "$MESH_ADDR" ]; then
+		setup_mesh_network "$MESH_ADDR" "$GW"
+		move_wifi_to_mesh
+		# An agent that once thought it was the root leaves a haunted DB.
+		forget_own_controller_db
+		# ...and baked credentials that stop it ever asking for real ones.
+		forget_baked_credentials
+		enable_mesh_gwd
+	fi
+	echo "role: agent (gateway ${GW:-none yet - asked for over DHCP})"
+	;;
+*)
+	usage
+	;;
+esac
+
+# After both branches, so it has the last word over whatever they set.
+keep_5ghz_out_of_dfs
+
+echo "reboot to apply"

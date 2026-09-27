@@ -1,0 +1,38 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 991 - settle dynbh upgrade loop for a non-best-band leaf
+
+dynbh_upgrade_backhaul_cb only settles when the agent has a downstream child
+or its connected band equals the best configured bSTA priority. A leaf agent
+whose only reachable backhaul band is not the highest-priority one (e.g. a
+2-hop Pro-8X that cannot reach the priority-0 band) satisfies neither, so it
+keeps entering the upgrade path and re-enables + rescans every bStas each
+cycle. That undoes the on-connect disable of the non-uplink bStas, which then
+stay enabled-but-unassociated and, via mt76 apsta follow-sta, hold their
+radios in retry_setup_failed -- collapsing the AP-MLD to a single flapping
+link and intermittently dropping the fronthaul SSID.
+
+Also settle once the bounded upgrade attempts are exhausted (dynbh_attempts>=3,
+the existing give-up signal). dynbh_bh_lost resets dynbh_attempts=0 and
+re-enables all bStas on real uplink loss, so failover and rescanning are
+preserved; nodes that can reach the best band settle via the existing clauses
+before attempts ever climb.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/backhaul.c
++++ b/src/backhaul.c
+@@ -279,6 +279,14 @@
+ 	/* exceptions for which triggering dynbh is not relevant */
+ 	if ((agent_has_downstream(a) && !a->dynbh_upgrade_ongoing) ||
+ 	    (best && (best->cfg->priority == best_prio) && !a->dynbh_upgrade_ongoing) ||
++	    /* 991: a leaf agent whose reachable band is not the best-priority
++	     * one never settles here (no downstream, prio mismatch), so the
++	     * upgrade loop re-enables+rescans every bStas each cycle, undoing the
++	     * on-connect disable and stalling the non-uplink radios (mt76
++	     * follow-sta -> retry_setup_failed). Settle once the bounded upgrade
++	     * attempts are exhausted; dynbh_bh_lost resets attempts=0 on real
++	     * uplink loss, so failover/rescan is preserved. */
++	    (best && a->dynbh_attempts >= 3 && !a->dynbh_upgrade_ongoing) ||
+ 	    agent_is_backhaul_type_eth() || a->cfg.backhaul_override ||
+ 	    !agent_is_bsta_onboarded(a)) {
+ 		timer_set(&a->dynbh_scheduler, timeout * 1000);

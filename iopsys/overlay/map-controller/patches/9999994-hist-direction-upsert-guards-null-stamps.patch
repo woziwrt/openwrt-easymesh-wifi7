@@ -1,0 +1,122 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: hist sample direction, upsert keep-last-good, sta_mld NULL stamps
+
+Three sync-layer fixes from the 2026-08-06 blind review plus one from
+the same day\x27s repeated-verification sampling:
+
+- the client-level mapc_hist_sample() call passed ul/dl swapped against
+  the (rcpi, dl, ul) prototype, so history rows written through that
+  one call site carried reversed directions (per-leg calls were
+  correct). Rows sampled between 2026-08-05 and this fix inherit the
+  swap - noted here so nobody trusts them blindly.
+- the sta upsert overwrote rcpi and est_mac_rate_* unconditionally, so
+  a freshly restarted controller (zeroed live model) erased measured
+  values - the DB-side twin of the in-model guards, done as
+  keep-last-good CASE per the review\x27s systemic-lever recommendation.
+- v2-era sta_mld rows got last_seen without a backfill and the 20-day
+  retention would reap those NULL rows on its first tick after an
+  upgrade; the janitor now stamps NULLs with the current time first
+  (idempotent, self-healing for any database vintage).
+
+Hygiene: drop dead mapc_del_sta() (zero callers; ageout is the only
+eraser) and the unused MAPC_HIST_MAX_ROWS define.
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -557,9 +557,14 @@
+ 		"bssid=excluded.bssid, associated=excluded.associated, "
+ 		"is_bsta=excluded.is_bsta, agent_almac=excluded.agent_almac, "
+ 		"last_ul_rate=excluded.last_ul_rate, last_dl_rate=excluded.last_dl_rate, "
+-		"est_mac_rate_ul=excluded.est_mac_rate_ul, "
+-		"est_mac_rate_dl=excluded.est_mac_rate_dl, conn_time=excluded.conn_time, "
+-		"rcpi=excluded.rcpi, util_tx=excluded.util_tx, util_rx=excluded.util_rx, "
++		"est_mac_rate_ul=CASE WHEN excluded.est_mac_rate_ul>0 "
++		"THEN excluded.est_mac_rate_ul ELSE sta.est_mac_rate_ul END, "
++		"est_mac_rate_dl=CASE WHEN excluded.est_mac_rate_dl>0 "
++		"THEN excluded.est_mac_rate_dl ELSE sta.est_mac_rate_dl END, "
++		"conn_time=excluded.conn_time, "
++		"rcpi=CASE WHEN excluded.rcpi>0 AND excluded.rcpi<>255 "
++		"THEN excluded.rcpi ELSE sta.rcpi END, "
++		"util_tx=excluded.util_tx, util_rx=excluded.util_rx, "
+ 		"pkts_tx=excluded.pkts_tx, pkts_rx=excluded.pkts_rx, "
+ 		"bytes_tx=excluded.bytes_tx, bytes_rx=excluded.bytes_rx, "
+ 		"errors_tx=excluded.errors_tx, errors_rx=excluded.errors_rx, "
+@@ -616,7 +621,7 @@
+ 	 * (affiliated_sta writer); this covers legacy clients and the
+ 	 * client-level row. */
+ 	if (d && s->state != STA_DISCONNECTED)
+-		mapc_hist_sample(c, mac, bssid, d->rcpi, d->ul_rate, d->dl_rate);
++		mapc_hist_sample(c, mac, bssid, d->rcpi, d->dl_rate, d->ul_rate);
+ 
+ 	/* 999992: one MAC cannot be associated to two nodes at once, so the
+ 	 * moment a node reports this client, every row for it under a DIFFERENT
+@@ -644,24 +649,6 @@
+ 	}
+ }
+ 
+-void mapc_del_sta(struct controller *c, struct sta *s)
+-{
+-	static const char *sql = "DELETE FROM sta WHERE macaddr=?";
+-	char mac[18];
+-	mapdb_stmt *st = NULL;
+-
+-	if (!c->db)
+-		return;
+-
+-	mac2str(s->macaddr, mac);
+-
+-	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
+-		warn("mapc_sync: sta delete prepare: %s\n", mapdb_last_error(c->db));
+-		return;
+-	}
+-	mapdb_bind_text(st, 1, mac);
+-	stmt_finish(c->db, st);
+-}
+ 
+ /* Delete sta rows for node @n that are NOT in its live stalist -- the re-flash
+  * bSTA ghosts that never emit a disassoc event. Conservative: an empty (or
+@@ -714,7 +701,7 @@
+ 	 * associated is written as (state != STA_DISCONNECTED) and only for the
+ 	 * stations a node currently reports, so a client that roamed away is
+ 	 * never written again and its row keeps associated=1 forever. A roaming
+-	 * client leaves without disassociating, and mapc_del_sta() runs only
++	 * client leaves without disassociating, and explicit deletion ran only
+ 	 * when the event's BSSID and node both match the stored ones, so that
+ 	 * path never fires either. Measured 2026-08-04: 20 rows, every single
+ 	 * one claiming to be associated, against three real associations in the
+@@ -1868,7 +1855,6 @@
+ }
+ 
+ #define MAPC_DB_HISTORY_DAYS	20
+-#define MAPC_HIST_MAX_ROWS	10000
+ 
+ /* DB policy pack: hourly janitor, called from the heartbeat. Departed rows
+  * older than MAPC_DB_HISTORY_DAYS go away (this finally caps the
+@@ -1883,6 +1869,18 @@
+ 	if (!c->db)
+ 		return;
+ 
++	/* v2-era sta_mld rows got the last_seen column without a backfill;
++	 * stamp NULLs here (every tick, idempotent) so the retention below
++	 * ages them from now instead of reaping rows of unknown age on the
++	 * first tick after an upgrade. */
++	if (mapdb_prepare(c->db,
++			  "UPDATE sta_mld SET last_seen=?1 WHERE last_seen IS NULL",
++			  &st) == MAPDB_OK) {
++		mapdb_bind_int(st, 1, (long long)time(NULL));
++		stmt_finish(c->db, st);
++	}
++	st = NULL;
++
+ 	if (mapdb_prepare(c->db,
+ 			  "DELETE FROM sta WHERE COALESCE(associated,0)=0 "
+ 			  "AND COALESCE(last_seen,0) < ?", &st) == MAPDB_OK) {
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -50,7 +50,6 @@
+ 		      const char *bssid, int rcpi, int dl_rate, int ul_rate);
+ void mapc_mark_sta_gone(struct controller *c, struct sta *s);
+ void mapc_db_ageout(struct controller *c);
+-void mapc_del_sta(struct controller *c, struct sta *s);
+ 
+ /* Reconcile sta rows for @n against its live stalist (drop re-flash ghosts). */
+ void mapc_sync_sta_sweep(struct controller *c, struct node *n);

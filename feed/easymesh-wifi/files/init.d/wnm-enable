@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# Runs before netifd starts wifi (S20), so `option bss_transition 1` is already
+# in /etc/config/wireless when hostapd is configured from it. Ordering is the
+# whole point: doing this later would mean a `wifi reload` to take effect, and
+# on MT7996 a reload during mesh formation is the most disruptive thing we can
+# do. See /usr/sbin/wnm-enable for the measurement this recovers.
+#
+# Synchronous, like mld-config-check: it must finish before the next init
+# script runs. It is a no-op on every boot after the first, so it costs nothing.
+
+START=19
+
+boot() {
+	/usr/sbin/wnm-enable >/dev/null 2>&1
+}
+
+stop() {
+	return 0
+}
+
+# start() is deliberately not where the work lives. rcS calls every S* script
+# with "boot"; base-files default_postinst calls "start" on every init script a
+# package ships, on install and on upgrade alike. This one only ever means to
+# act while the node is coming up, and the ten-minute boot window it also
+# checks is a guess from uptime that guesses wrong exactly when it matters -
+# installing a few minutes after a flash lands inside it. Asking the init
+# system what it is doing beats inferring it from a clock.
+start() {
+	echo "wnm-enable: boot only - it runs itself on the next restart" >&2
+}

@@ -1,0 +1,164 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99999: keep the measurement outside the model that is torn down
+
+cntlr_parse_ap_mld_config_tlv() opens with cntlr_free_apmld_list(), which frees
+every AP-MLD of the node - and with them the STA-MLDs and their affiliated legs.
+That runs on every Topology Response, before parse_associated_sta_mld_config()
+rebuilds the legs from the 0xE2 TLV.
+
+So a per-link measurement written onto a leg has a lifetime of at most one
+minute, and never survives to the next database sync. 99996 carried values
+across the leg rebuild, which was the wrong rebuild: by the time that code runs,
+the object graph it was protecting has already been freed and replaced.
+
+Measured on hardware 2026-08-04, client on x8, active 6 GHz leg, UHD video
+running so there was real traffic to measure:
+
+	writer   leg 3e:ab:72:ad:e8:87 on 0a:0c:43:26:a0:10  rcpi 136
+	sync     affiliated_sta.rcpi = 0
+
+rcpi 136 is -42 dBm and matched what libwifi reported on that leg. The value was
+correct every single time - measured, transported, parsed and written - and then
+freed before anyone read it.
+
+Keep it in a small fixed table keyed by leg address and BSSID, written when the
+measurement arrives and read back when the leg is created. Stale entries are
+harmless: a leg that never returns is never read, and a leg that moves to
+another BSS does not match its old key.
+
+Separately, and left alone here: cntlr_free_apmld_list() frees mld->aplist and
+mld->ttlmlist but not mld->stamldlist, so every Topology Response leaks the
+STA-MLD elements of every AP-MLD. Worth a patch of its own.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2935,6 +2935,97 @@
+  * Matched on leg address AND BSSID: the same address on a different BSS is a
+  * different link and must not inherit the reading.
+  */
++/* Measured per-link values, kept outside the MLD model.
++ *
++ * cntlr_parse_ap_mld_config_tlv() opens with cntlr_free_apmld_list(), which
++ * tears down every AP-MLD of the node - and with it the STA-MLDs and their
++ * affiliated legs. That happens on every Topology Response, before
++ * parse_associated_sta_mld_config() builds the legs again. So anything written
++ * onto a leg is gone within a minute no matter how carefully the rebuild
++ * carries it: by then the whole object graph has been freed and replaced.
++ *
++ * Measured 2026-08-04, client on x8 with an active 6 GHz leg:
++ *
++ *   writer   leg 3e:ab:72:ad:e8:87 on 0a:0c:43:26:a0:10  rcpi 136
++ *   sync     affiliated_sta.rcpi = 0
++ *
++ * rcpi 136 is -42 dBm and matched libwifi exactly. The value was right every
++ * time; it just had nowhere to live that survived until the next sync.
++ *
++ * So keep it here, keyed by leg address and BSSID, and hand it back when the
++ * leg is created. Small and fixed-size: an MLD has at most a handful of legs
++ * and stale entries are harmless - a leg that never comes back is simply never
++ * read, and a leg that moves to another BSS does not match its old key.
++ */
++#define AFFSTA_CACHE_MAX 32
++
++static struct affsta_metric {
++	uint8_t macaddr[6];
++	uint8_t bssid[6];
++	uint8_t rcpi;
++	uint32_t dl_rate;
++	uint32_t ul_rate;
++	bool used;
++} affsta_cache[AFFSTA_CACHE_MAX];
++
++static int affsta_cache_next;
++
++static struct affsta_metric *affsta_cache_find(const uint8_t *macaddr,
++					       const uint8_t *bssid)
++{
++	int i;
++
++	for (i = 0; i < AFFSTA_CACHE_MAX; i++) {
++		if (!affsta_cache[i].used)
++			continue;
++		if (memcmp(affsta_cache[i].macaddr, macaddr, 6) ||
++		    memcmp(affsta_cache[i].bssid, bssid, 6))
++			continue;
++		return &affsta_cache[i];
++	}
++
++	return NULL;
++}
++
++static void affsta_cache_store(const uint8_t *macaddr, const uint8_t *bssid,
++			       uint8_t rcpi, uint32_t dl_rate, uint32_t ul_rate)
++{
++	struct affsta_metric *e = affsta_cache_find(macaddr, bssid);
++	int i;
++
++	if (!e) {
++		for (i = 0; i < AFFSTA_CACHE_MAX; i++) {
++			if (affsta_cache[i].used)
++				continue;
++			e = &affsta_cache[i];
++			break;
++		}
++	}
++
++	/* Full: take the next slot round-robin. Losing the oldest reading is
++	 * better than refusing new ones. */
++	if (!e) {
++		e = &affsta_cache[affsta_cache_next];
++		affsta_cache_next = (affsta_cache_next + 1) % AFFSTA_CACHE_MAX;
++		memset(e, 0, sizeof(*e));
++	}
++
++	memcpy(e->macaddr, macaddr, 6);
++	memcpy(e->bssid, bssid, 6);
++	e->used = true;
++
++	/* 99993's rule again: nothing measured must not erase something. */
++	if (rcpi && rcpi != 255)
++		e->rcpi = rcpi;
++	else if (!e->rcpi)
++		e->rcpi = rcpi;
++
++	if (dl_rate)
++		e->dl_rate = dl_rate;
++	if (ul_rate)
++		e->ul_rate = ul_rate;
++}
++
+ static void cntlr_affiliated_sta_metrics(struct controller *c,
+ 					 const uint8_t *macaddr,
+ 					 const uint8_t *bssid,
+@@ -2946,6 +3037,10 @@
+ 	if (!c || !macaddr || !bssid)
+ 		return;
+ 
++	/* Store first: the live elements below are torn down and rebuilt on
++	 * every Topology Response, the cache is not. */
++	affsta_cache_store(macaddr, bssid, rcpi, dl_rate, ul_rate);
++
+ 	list_for_each_entry(n, &c->agentlist, list) {
+ 		struct wifi_apmld_element *mld;
+ 
+@@ -4828,6 +4923,21 @@
+ 			memcpy(as->bssid, ent, 6);
+ 			memcpy(as->macaddr, ent + 6, 6);
+ 
++			/* Restore the measurement. The cache is the durable copy
++			 * - it outlives cntlr_free_apmld_list(), which the
++			 * kept[] carry below cannot, because by the time we get
++			 * here that teardown has already happened. */
++			{
++				struct affsta_metric *e =
++					affsta_cache_find(as->macaddr, as->bssid);
++
++				if (e) {
++					as->rcpi = e->rcpi;
++					as->dl_rate = e->dl_rate;
++					as->ul_rate = e->ul_rate;
++				}
++			}
++
+ 			/* restore what we had measured for this leg on this BSS */
+ 			for (k = 0; k < nkept; k++) {
+ 				if (memcmp(kept[k].macaddr, as->macaddr, 6) ||

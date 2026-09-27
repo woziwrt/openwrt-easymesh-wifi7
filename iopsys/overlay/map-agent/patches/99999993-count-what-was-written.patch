@@ -1,0 +1,140 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: count what was written, not what was intended
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Three TLV builders write a count and then skip entries under it. The
+controller reads the count, finds fewer entries than it was promised, and
+parses the rest of the TLV out of whatever follows. Nothing logs, on either
+side: the sender wrote a well-formed buffer and the receiver read a
+well-formed field.
+
+  agent_gen_bss_config_report_tlv   (*num_bss)++ and the BSSID both go out,
+                                    then `if (!ap->cfg) continue` leaves -
+                                    so the entry is counted, six bytes are
+                                    written, and the report byte and SSID
+                                    are not. ap->cfg == NULL is an ORDINARY
+                                    state here: map-agent deletes its own ap
+                                    sections (99999991), so on a live mesh
+                                    this fires rather than not.
+
+  agent_gen_ap_mld_config           numAffiliatedAPs written before the
+                                    loop; an AP that is gone or no longer
+                                    affiliated is skipped and still counted.
+
+  agent_gen_associated_sta_mld_config
+                                    numAffiliatedSTAs written before the
+                                    loop; a leg whose struct sta is gone is
+                                    skipped and still counted. This is the
+                                    mechanical source of legs that exist on
+                                    the controller and nowhere else - the
+                                    ghosts we had been reaping in the
+                                    controller instead of preventing here.
+
+The correct idiom is already in this file, sixty lines below the last of
+them: agent_gen_bss_advanced_config() remembers the offset of the count,
+writes a zero, and increments it after each entry is written. All three are
+moved to it; the bss_config_report case additionally has its guard moved
+above the write, because there the count was not the only thing that had
+already happened.
+
+Two more sites were checked and left alone: agent_gen_wifi7_agent_caps
+counts correctly already (its `continue` is in a nested loop that writes
+before it counts), and agent_gen_bsta_mld_config has no skip at all.
+
+Verify on hardware: on a node whose ap sections have been deleted at least
+once, the controller's affiliated_ap / affiliated_sta row counts must match
+what the agent reports over ubus, and must stay matched across a client
+roam.
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -4012,6 +4012,20 @@
+ 			if (bss->enabled) {
+ 				int len;
+ 
++				/* An ap with no cfg used to be counted and then
++				 * half written: the BSSID went out, the report
++				 * byte and the SSID did not, and num_bss claimed
++				 * one more than the buffer held. The controller
++				 * read a truncated entry and everything after it
++				 * shifted under it.
++				 *
++				 * ap->cfg == NULL is an ORDINARY state here -
++				 * map-agent deletes ap sections itself - so
++				 * leave before writing anything, not after.
++				 */
++				if (!ap->cfg)
++					continue;
++
+ 				(*num_bss)++;
+ 
+ 				len = strlen(bss->ssid);
+@@ -4022,8 +4036,6 @@
+ 				t->len += 6;
+ 
+ 				/*report bits */
+-				if (!ap->cfg)
+-					continue;
+ 
+ 				/* Here the in use flag is 0 and not in use flag is 1*
+ 				 * So if it is backhaul the fronthaul flag is 1
+@@ -4666,6 +4678,7 @@
+ 
+ 	struct tlv_ap_mld_config *data;
+ 	struct netif_mld *mld = NULL;
++	int num_aff_ap_offset;
+ 	int offset = 0;
+ 	struct tlv *t;
+ 	int ret = 0;
+@@ -4717,8 +4730,17 @@
+ 
+ 		offset += 20; /* reserved */
+ 
+-		/* numAffiliatedAPs */
+-		t->data[offset++] = mld->num_affiliated_ap;
++		/* numAffiliatedAPs
++		 *
++		 * Counted after the entry is written, not before it is tried.
++		 * An affiliated AP that is gone, or no longer affiliated, is
++		 * skipped below and the old code still claimed it - so the
++		 * controller read one entry more than the buffer held and the
++		 * rest of the TLV shifted. Same idiom as the num_radio_offset
++		 * in agent_gen_bss_advanced_config().
++		 */
++		num_aff_ap_offset = offset;
++		t->data[offset++] = 0;
+ 		for (i = 0; i < mld->num_affiliated_ap; i++) {
+ 			struct wifi_radio_element *re = NULL;
+ 			struct netif_ap *ap;
+@@ -4727,6 +4749,8 @@
+ 			if (!ap || !ap->is_affiliated_ap)
+ 				continue;
+ 
++			t->data[num_aff_ap_offset]++;
++
+ 			/* Affiliated AP MAC Addr Valid */
+ 			t->data[offset] = AP_MLD_CONF_AFF_AP_ADDR_VALID;
+ 			// TODO: ap->link_id_valid
+@@ -5123,7 +5147,13 @@
+ 
+ 	offset += 18; /* reserved */
+ 
+-	data->num_affiliated_sta = mld->num_affiliated_sta;
++	/* Count what was written, not what was intended. A leg whose struct sta
++	 * is gone is skipped below, and the old code still claimed it: the
++	 * controller then read one entry more than the buffer held. That is the
++	 * mechanical source of legs that exist on the controller and nowhere
++	 * else - the ghosts we had been reaping instead of preventing.
++	 */
++	data->num_affiliated_sta = 0;
+ 	offset += 1;
+ 
+ 	for (i = 0; i < mld->num_affiliated_sta; i++) {
+@@ -5133,6 +5163,8 @@
+ 		if (!s)
+ 			continue;
+ 
++		data->num_affiliated_sta++;
++
+ 		memcpy(&t->data[offset], s->bssid, 6);
+ 		offset += 6;
+ 		memcpy(&t->data[offset], s->macaddr, 6);

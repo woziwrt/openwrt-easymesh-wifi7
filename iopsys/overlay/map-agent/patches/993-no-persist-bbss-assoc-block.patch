@@ -1,0 +1,74 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 993 - never persist a backhaul BSS association block
+
+An association block on a *backhaul* BSS is written straight to UCI, so it
+survives a restart and a cold power cycle. Nothing clears it on its own:
+agent_init_ifaces_assoc_mode() reloads disallow_assoc from UCI on every start,
+pushes it back into the driver and disconnects all STAs. hostapd then advertises
+MBO "association disallowed", and every bSTA picks the BSS as the right one and
+is then required to skip it:
+
+  wlan2: 3: 76:04:1c:81:bc:2f ssid='MAP--BH' level=-13 freq=6135
+  wlan2:    selected based on RSN IE
+  wlan2:    skip - MBO association disallowed (reason 2)
+
+No auth attempt ever reaches the AP, so from the outside this is
+indistinguishable from an RF, key or range problem, while the agents see the AP
+at -13 dBm with a matching PSK and SSID. A node that ends up in this state never
+rejoins the mesh -- observed on a 3-node lab after the backhaul dropped, across
+two cold power cycles, until disallow_assoc was cleared by hand.
+
+The client path already treats this as strictly temporary: a Validity Period is
+mandatory for Client Blocking / Timed Block, it arms restrict_timer, and the
+block lives in runtime state only. The bBSS path takes none of that -- it does
+not read validity_period, arms no timer, and additionally persists to UCI.
+
+Keep the block runtime-only so a restart always recovers, and keep persisting
+the *unblock* so a node already stuck by an older build clears itself on the
+first allow. Warn on every bBSS block: the originator of the request that armed
+it is not yet identified, and this makes the next occurrence visible in the log.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/assoc_ctrl.c
++++ b/src/assoc_ctrl.c
+@@ -804,7 +804,18 @@
+ 
+ 		if (!wifi_set_ap_mbo_association_mode(ap->ifname, disallow)) {
+ 			ap->cfg->disallow_assoc = disallow;
+-			uci_apply_bss_association_mode(ap->ifname, disallow);
++			/* 993: a bBSS block must not outlive the process.
++			 * Persisting it bricks the backhaul across reboots
++			 * with no way back, so keep it runtime-only. Still
++			 * persist the unblock, so a node stuck by an older
++			 * build clears itself on the first allow.
++			 */
++			if (!disallow)
++				uci_apply_bss_association_mode(ap->ifname, false);
++			else
++				agnt_warn(LOG_STEER,
++					  "993: bBSS %s assoc blocked (runtime only)\n",
++					  ap->ifname);
+ 		}
+ 
+ 		goto send_ack;
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1618,7 +1618,16 @@
+ 	ret = wifi_set_ap_mbo_association_mode(ap->ifname, !allowed);
+ 	if (!ret) {
+ 		ap->cfg->disallow_assoc = !allowed;
+-		uci_apply_bss_association_mode(ap->ifname, !allowed);
++		/* 993: see assoc_ctrl.c -- never persist a block on a
++		 * backhaul BSS. The only way back is wifi_del_sta()
++		 * landing exactly on max_sta - 1, which a sudden peer
++		 * loss never delivers.
++		 */
++		if (allowed || !(ap->cfg->multi_ap & 0x01))
++			uci_apply_bss_association_mode(ap->ifname, !allowed);
++		else
++			warn("993: bBSS %s assoc blocked (runtime only), num_sta=%d max_sta=%d\n",
++			     ap->ifname, ap->num_sta, ap->max_sta);
+ 	}
+ 
+ 	return ret;

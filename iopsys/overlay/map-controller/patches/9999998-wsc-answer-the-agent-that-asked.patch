@@ -1,0 +1,89 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: answer the agent that asked, not the one that carried the question
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+handle_ap_autoconfig_wsc() is the last handler that calls cntlr_node_add_radio()
+without knowing who wrote the message. 99994 built the idiom, 999999 rolled it
+out to three handlers and 9999995 to three more; this one was never counted
+because nothing about it looked like attribution. It is, and it is the one that
+matters most: it decides where the credentials go.
+
+An agent two hops out sends its M1 through its parent. The 1905 layer resolves
+the frame to the parent (an AL address is a cache of direct neighbours, and the
+uplink carries the parent's bSTA MLD as source), so `n` is the parent. The
+handler then does all five of these under that wrong node:
+
+	cmdu = cntlr_gen_ap_autoconfig_wsc(cntlr, n, ...)   /* M2 -> parent */
+	  -> cntlr_node_add_radio(c, n, radio_id)           /* radio -> parent */
+	n->last_config = c->cfg.last_change;                /* parent marked done */
+	np = cntlr_get_node_policy(&c->cfg, rx_cmdu->origin);
+	cmdu = cntlr_gen_policy_config_req(cntlr, rx_cmdu->origin, ...)  /* -> parent */
+
+Measured on hardware 2026-09-06, five nodes, .4 two hops out behind .5:
+
+	18 x  cmdu:0x0009 (WSC M2)        dst: b6:4e:26:6b:37:01   (.5, the relay)
+	18 x  cmdu:0x8003 (Policy Config) dst: b6:4e:26:6b:37:01   (.5, the relay)
+	 0 x  either one addressed to 6e:cf:a0:89:e7:c5             (.4, the author)
+
+	/etc/multiap/wsc_m2.json   .1 yes  .2 yes  .3 yes  .5 yes   .4 ABSENT
+
+.4 had been up 12 hours and had never been configured by the controller. It runs
+because it kept the backhaul key it was adopted with; nothing else about it was
+ever set from here. It asks again every ~16 s, forever, because the answer keeps
+going to somebody else.
+
+The visible symptom was somewhere else entirely, which is why this took a night
+to find. Each unanswered round moves .4's three radios to .5 in the model
+(965 does that, correctly, on the premise that a radio reporting under another
+name is a box that was renamed - true for a reboot, false for a relay), and the
+next Topology Response moves them back, because that handler has an independent
+source of truth in the Device Information TLV. 8042 moves in 11.5 hours, 222/h,
+flat all night. mapc.db holds the wrong owner in about 3 % of reads.
+
+It also poisons the handler that would otherwise have been right:
+handle_early_ap_cap_report resolves the author from the *current* owner of the
+first radio it names. Once this handler has moved that radio to the relay, that
+lookup answers "the relay" and the remaining two follow. Measured the same hour:
+36 calls, 6 with the rebind firing, 30 without.
+
+So fix it where the cycle starts. The AP Radio Basic Capabilities TLV is
+mandatory in an M1 and names a radio; a radio belongs to exactly one box. Rebind
+n to its owner and leave the author in rx_cmdu->origin, which the three writes
+below already read. No behaviour change when the M1 arrived directly (owner == n).
+
+Verify on hardware: watch a node two hops out for one minute after deploy.
+`cmdu:0x0009|dst:` must name the author, `/etc/multiap/wsc_m2.json` must appear
+on it, and cntlr_radio_reparent must fall silent.
+
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -1664,6 +1664,29 @@
+ 	ap_caps = (struct tlv_ap_radio_basic_cap *)
+ 		tv[AP_AUTOCONFIGURATION_WSC_AP_RADIO_BASIC_CAPS_IDX][0]->data;
+ 
++	/* The 99994 idiom, WSC flavour - and the one that decides where the
++	 * credentials land. An M1 relayed by the agent's parent arrives with
++	 * the parent as origin; every write below would then configure the
++	 * parent and leave the author unconfigured forever (measured
++	 * 2026-09-06: 18 of 18 M2s and 18 of 18 Policy Configs addressed to
++	 * the relay, and the author had no wsc_m2.json after 12 hours up).
++	 *
++	 * The AP Radio Basic Capabilities TLV is mandatory in an M1 and names
++	 * a radio, and a radio belongs to exactly one box.
++	 */
++	{
++		struct netif_radio *own = cntlr_find_radio(c, ap_caps->radio);
++
++		if (own && own->agent && own->agent != n) {
++			cntlr_dbg(LOG_APCFG, "%s: M1 is from " MACFMT
++				  ", relayed by " MACFMT "; answering the former\n",
++				  __func__, MAC2STR(own->agent->almacaddr),
++				  MAC2STR(n->almacaddr));
++			n = own->agent;
++			memcpy(rx_cmdu->origin, n->almacaddr, 6);
++		}
++	}
++
+ 	cntlr_dbg(LOG_APCFG, "%s: prepare AP-autoconfig WSC response\n", __func__);
+ 	cmdu = cntlr_gen_ap_autoconfig_wsc(cntlr, n, rx_cmdu, ap_caps->radio,
+ 					   tv[AP_AUTOCONFIGURATION_WSC_WSC_IDX][0],

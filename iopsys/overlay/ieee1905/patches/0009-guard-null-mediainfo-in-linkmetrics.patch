@@ -1,0 +1,91 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905 0009: do not dereference a NULL mediainfo for MLD interfaces
+
+Patch 0007 gives an interface whose probe was skipped a real media type:
+
+	n->media = strstr(ifname, "-mld") ? I1905_802_11BE : I1905_MEDIA_UNKNOWN;
+
+and argues, correctly for the TLV it was written for, that "nothing is lost by
+leaving mediainfo NULL" - cmdu_output.c omits the ieee80211_info block for 11ax
+and 11be anyway (sizeof_mediainfo = 0).
+
+That is true in cmdu_output.c and false one file over. i1905_al.c branches on
+the media type, not on the pointer:
+
+	if (!IS_MEDIA_WIFI(iface->media)) {	/* ethernet: never touches mediainfo */
+	} else {
+		struct i1905_wifi_mediainfo *mediainfo =
+			(struct i1905_wifi_mediainfo *)iface->mediainfo;
+		struct ieee80211_info *wifi =
+			(struct ieee80211_info *) &mediainfo->info;
+		...
+		if (wifi->role == IEEE80211_ROLE_AP && ...)
+
+Before 0007 an MLD interface reported I1905_MEDIA_UNKNOWN, took the ethernet
+side and never looked at mediainfo. After 0007 it reports 802.11be, takes the
+WiFi side, and dereferences NULL. The && short-circuits left to right, so the
+skip_wifi_probe test added by 0001 is reached too late to help.
+
+Measured on hardware 2026-08-02, controller (BPI-R4, colocated agent, three
+AP-MLD interfaces plus two 4addr children):
+
+	exit_code 139 (SIGSEGV) from procd, 53 respawns, one every ~20 s
+	#0 i1905_dm_update_interface_linkmetrics at i1905_al.c:135
+	#1 i1905_dm_update_interface_self        at i1905_al.c:356
+	#2 i1905_dm_refresh_self                 at i1905_al.c:434
+	#3 i1905_periodic_refresh_self           at i1905.c:1977
+
+The periodic self-refresh is what makes it a loop rather than a one-off. The
+consequences are quiet and expensive: the neighbour table never survives long
+enough to be built, so every ieee1905.al.<if> reports zero neighbours, the
+controller stays stuck at "wait for map-plugin" and never subscribes for 1905
+CMDUs, and every unicast send is refused with
+
+	send_cmdu: cmdu 800d to <agent> was NOT sent (mid 0)
+	           - destination is not a direct 1905 neighbour
+
+which is why no Associated STA Link Metrics query ever reaches an agent, why
+rcpi stays 0 for every client in the controller database, and why
+dump_steer_summary has been all zeros with thresholds correctly configured.
+The mesh looked healthy throughout: num_nodes 3, topology complete, clients
+associated and passing traffic, because all of that rides on relayed multicast.
+
+Guard the pointer rather than reverting 0007: leaving mediainfo NULL for MLD is
+deliberate and the TLV is byte for byte correct without it. A NULL mediainfo now
+means "no probe result", res stays -1, and the existing else already logs that.
+
+Only i1905_al.c needs this. An earlier revision of this patch also "hardened"
+cmdu_output.c:366 for symmetry with its sibling at :327 and the build rejected
+it - correctly:
+
+	cmdu_output.c:366: error: the comparison will always evaluate as true
+	for the address of mediainfo will never be NULL [-Werror=address]
+
+The two sites hold different structures. i1905_dm.h:266 is `uint8_t *mediainfo`
+and can be NULL; i1905_dm.h:422 is `uint8_t mediainfo[32]`, an inline array
+whose address never is. There was no asymmetry to fix.
+
+diff -urN a/src/i1905_al.c b/src/i1905_al.c
+--- a/src/i1905_al.c	2026-08-02 06:59:50.781400840 +0200
++++ b/src/i1905_al.c	2026-08-02 06:59:50.792448191 +0200
+@@ -126,15 +126,16 @@
+ 		} else {
+ 			struct i1905_wifi_mediainfo *mediainfo =
+ 				(struct i1905_wifi_mediainfo *)iface->mediainfo;
+-			struct ieee80211_info *wifi =
+-				(struct ieee80211_info *) &mediainfo->info;
++			struct ieee80211_info *wifi = mediainfo ?
++				(struct ieee80211_info *) &mediainfo->info : NULL;
+ 			struct i1905_metric metric = {0};
+ 			int res = -1;
+ 
+ 			memset(&metric, 0, sizeof(struct i1905_metric));
+-			if (wifi->role == IEEE80211_ROLE_AP && !iface->skip_wifi_probe) {
++			if (wifi && wifi->role == IEEE80211_ROLE_AP &&
++			    !iface->skip_wifi_probe) {
+ 				res = platform_wifi_get_assoc_sta_metric(iface->ifname, nif->r_macaddr, &metric);
+-			} else if (wifi->role == IEEE80211_ROLE_STA) {
++			} else if (wifi && wifi->role == IEEE80211_ROLE_STA) {
+ 				res = platform_wifi_get_interface_metric(iface->ifname, &metric);
+ 			}
+ 

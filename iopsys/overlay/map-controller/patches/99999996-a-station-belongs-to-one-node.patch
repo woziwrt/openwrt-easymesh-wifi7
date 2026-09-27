@@ -1,0 +1,121 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a station belongs to one node, enforced where it is linked
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+struct sta carries a single list head. Linking a station into a second node's
+list without unlinking it from the first does not put it in two lists - it
+splices the two lists together, and a walk over either never ends.
+
+Measured on the live mesh 2026-09-06 14:55:
+
+    95642 log lines in 32 seconds, ~3000 a second,
+    from a collection whose timer fires once a second
+
+The walk was not repeating. It was not returning. VSZ 20 MB -> 850 MB, ubus
+stopped answering, no agent was processed for nine minutes, every node aged
+past NODE_DRAW_MAX_AGE, and the entire topology vanished from the web UI.
+
+Four call sites reach node_add_sta and each is expected to have detached the
+station first. Three do it as
+
+    old_n = cntlr_find_node(c, s->agent_almacaddr);
+    if (old_n)
+            node_del_sta(old_n, s);
+
+and when that lookup misses, the detach is skipped while the add runs anyway.
+Requiring four callers to remember is how this got here, so the rule is moved
+to the one function that links.
+
+The trigger needs no misbehaving client. One that moves ONCE leaves the old AP
+holding a stale association - measured the same day, ba:a9:1b:53:17:82 idle
+279 s on the node it had left while live on another - so two nodes report it,
+which is the normal state during any handover.
+
+Three changes, one idea: make "is this station attached?" answerable, and
+answer it in the only place that attaches.
+
+  node_add_sta       unlink and drop the earlier reference before linking
+  node_del_sta       list_del_init, not list_del
+  node_update_stalist  same
+
+The _init matters. libubox list_del leaves the head {NULL, NULL}, so
+list_empty() answers false for a station attached to nothing - the guard would
+be blind from the first detach onwards - and a later list_del walks a NULL
+pointer. Detached must look detached. sta_alloc() was missing its
+INIT_LIST_HEAD for the same reason and is fixed in 99999995.
+
+sta_dec_ref() does not free at zero; it starts the ageout timer, so the
+station stays valid across the unlink.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
+
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -733,6 +733,42 @@
+ 		return -1;
+ 	}
+ 
++	/* A station is attached to AT MOST ONE node, and this is the only
++	 * place that attaches one - so this is where the rule is kept.
++	 *
++	 * struct sta carries a single list head. Linking it into a second
++	 * node's list without unlinking it from the first does not put it in
++	 * two lists; it splices the two lists together, and from then on a walk
++	 * over either of them never ends. Measured 2026-09-06: 95642 log lines
++	 * in 32 seconds from a collection whose timer fires once a second - the
++	 * walk was not repeating, it was not returning. VSZ 20 MB -> 850 MB,
++	 * ubus mute, no agent processed for nine minutes, and the whole
++	 * topology gone from the web UI.
++	 *
++	 * Four call sites reach this function and each one is expected to have
++	 * removed the station from its previous node first. Three of them do it
++	 * as "old_n = cntlr_find_node(...); if (old_n) node_del_sta(old_n, s);"
++	 * - and when that lookup misses, the removal is skipped while the add
++	 * below runs anyway. Requiring four callers to remember is how this got
++	 * here; the rule belongs in one place instead.
++	 *
++	 * The trigger needs no misbehaving client. One that moves ONCE leaves
++	 * the old AP holding a stale association - measured the same day,
++	 * ba:a9:1b:53:17:82 idle 279 s on the node it had left while live on
++	 * another - so two nodes report it, which is the normal state during
++	 * any handover.
++	 *
++	 * sta_dec_ref() balances the reference the earlier add took. It does
++	 * not free at zero, it starts the ageout timer, so s stays valid here.
++	 */
++	if (!list_empty(&s->list)) {
++		cntlr_warn(LOG_STA, "%s: STA " MACFMT " was still attached to a node"
++			   " - unlinking before adding to " MACFMT "\n",
++			   __func__, MAC2STR(s->macaddr), MAC2STR(n->almacaddr));
++		list_del_init(&s->list);
++		sta_dec_ref(s);
++	}
++
+ 	memcpy(s->agent_almacaddr, n->almacaddr, 6);
+ 	list_add(&s->list, &n->stalist);
+ 	n->sta_count++;
+@@ -762,7 +798,12 @@
+ 			"\"bssid\":\"" MACFMT "\"}", MAC2STR(s->macaddr), MAC2STR(n->almacaddr), MAC2STR(s->bssid));
+ 	cntlr_notify_event(n->cntlr, CNTLR_EVENT_CLIENT_DISCONNECT, ev_data);
+ 
+-	list_del(&s->list);
++	/* _init, not plain list_del: libubox's list_del leaves the head as
++	 * {NULL, NULL}, which makes list_empty() answer "false" for a station
++	 * attached to nothing - so the guard in node_add_sta would be blind
++	 * from the first detach onwards - and makes a later list_del walk a
++	 * NULL pointer. Detached must look detached. */
++	list_del_init(&s->list);
+ 	n->sta_count--;
+ 	sta_dec_ref(s);
+ 
+@@ -796,7 +837,8 @@
+ 		}
+ 
+ 		if (!found) {
+-			list_del(&s->list);
++			/* _init for the same reason as in node_del_sta. */
++			list_del_init(&s->list);
+ 			n->sta_count--;
+ 			sta_dec_ref(s);
+ 		}

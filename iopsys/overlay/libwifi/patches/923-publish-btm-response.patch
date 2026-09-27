@@ -1,0 +1,143 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: publish the BTM Response as wifi.sta btm-resp
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Second half of the defect fixed by 922, for the other event that never
+reached map-agent: the BSS Transition Management Response. Steering works,
+but the controller is never told a client answered, so btm_success stays 0
+and no policy can ever learn whether a steer succeeded.
+
+Same root cause: libwifi asks hostapd for raw action frames - which is where
+a BTM Response arrives - through the iopsys-only ubus method event_mask_add,
+which OpenWrt's hostapd does not have. The subscription fails with "Method
+not found" and the frame never arrives. map-agent's own handler
+(process_sta_btm_resp_evt) and everything below it, down to
+wifi_send_sta_report(), have always been correct and simply never fire.
+
+hostapd does emit the response on the control interface of the hapd that
+received it:
+
+  BSS-TM-RESP <addr> status_code=<u> bss_termination_delay=<u> [target_bssid=<mac>]
+
+so it lands on the affiliated link's socket, which this source already holds
+and drains. Publish it from there.
+
+Details that are easy to get wrong and were checked against the consumer:
+
+  - map-agent parses "status" as a STRING, not an integer.
+  - "target_bssid" is absent when the client rejected the request; the
+    handler treats it as optional and only reads it on success.
+  - the address is translated to the affiliated one through the table 922
+    fills on association, so a client is named identically in both events.
+    Without that, agent_get_sta() misses on an MLO client.
+  - "bssid" carries the link the response arrived on. map-agent resolves the
+    AP for this event by ifname, and an affiliated link has no name it knows
+    (it holds wlan0/1/2 and ap-mld-1/2, never ap-mld-1_link2), so the event
+    is published under the parent name and patch 99996 makes map-agent
+    prefer the BSSID - the same resolution its association path uses.
+
+This patch alone does not make btm_success move: hostapd discards every BTM
+Response unless bss_transition=1 is in its config, which OpenWrt defaults to
+0 and nothing here was setting ("Ignore BSS Transition Management Response
+... since BSS Transition Management is disabled", measured on bpi-4g). That
+is handled outside this feed by the wnm-enable service.
+
+Applies on top of 922-hostapd-ctrl-publishes-wifi-sta.patch and reuses its
+helpers. Touches only the hapdctrl source in libwifi/modules/wpactrl/wpactrl.c.
+
+--- a/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 14:51:50.109595855 +0200
++++ b/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 14:51:50.109637785 +0200
+@@ -1026,8 +1026,83 @@
+ 	w->req.cb(&w->req);
+ }
+ 
++/* Publish a BTM Response as the ubus "wifi.sta" event "btm-resp" (923).
++ *
++ * hostapd emits this on the control interface of the hapd the response arrived
++ * on - an affiliated link on an MLD:
++ *
++ *   BSS-TM-RESP <addr> status_code=<u> bss_termination_delay=<u> [target_bssid=<mac>]
++ *
++ * map-agent already handles the event end to end: process_sta_btm_resp_evt()
++ * parses it and calls wifi_send_sta_report(), which is what makes btm_success
++ * move at all. Nothing was ever publishing it, for the same reason nothing
++ * published an association - libwifi asks for raw action frames through the
++ * iopsys-only hostapd ubus method event_mask_add, which OpenWrt's hostapd does
++ * not have, so the subscription fails and the frame never arrives.
++ *
++ * NOTE map-agent parses "status" as a STRING, not an integer.
++ *
++ * The address is translated to the affiliated one through the same table the
++ * association path fills, so a client is named identically in both events;
++ * otherwise agent_get_sta() would miss on an MLO client.
++ *
++ * "bssid" carries the link this arrived on. map-agent resolves the AP for this
++ * event by ifname, which cannot name an affiliated link, so patch 99996 lets it
++ * prefer the BSSID - the resolution its association path already uses.
++ */
++static void hapdctrl_emit_btm_resp(struct hapdctrl_event *w,
++				   struct hapdctrl_sock *s, const char *msg)
++{
++	struct event_response *resp = &w->req.resp;
++	uint8_t mac[6], aff[6], target[6];
++	const uint8_t *sta = mac;
++	char tgt[64] = {0};
++	const char *p;
++	int status, len;
++
++	if (!w->req.cb || !resp->data || resp->maxlen < 2)
++		return;
++
++	if (hapdctrl_event_mac(msg, "BSS-TM-RESP", mac) != 0)
++		return;
++
++	p = strstr(msg, "status_code=");
++	if (!p)
++		return;
++	status = atoi(p + strlen("status_code="));
++
++	if (hapdctrl_sock_info(s))
++		return;
++
++	if (s->link_id >= 0 && hapdctrl_stamap_get(s, mac, aff, false) == 0)
++		sta = aff;
++
++	/* Absent when the client rejected the request; map-agent treats the
++	 * field as optional and only reads it on success. */
++	p = strstr(msg, "target_bssid=");
++	if (p && hwaddr_aton(p + strlen("target_bssid="), target))
++		snprintf(tgt, sizeof(tgt),
++			 ", \"target_bssid\":\"" HAPD_MACFMT "\"",
++			 HAPD_MACARG(target));
++
++	len = snprintf((char *)resp->data, resp->maxlen,
++		       "wifi.sta '{\"ifname\":\"%s\", \"event\":\"btm-resp\""
++		       ", \"data\":{\"macaddr\":\"" HAPD_MACFMT "\""
++		       ", \"status\":\"%d\"%s"
++		       ", \"bssid\":\"" HAPD_MACFMT "\"}}'",
++		       w->key, HAPD_MACARG(sta), status, tgt,
++		       HAPD_MACARG(s->bssid));
++
++	if (len < 0 || (uint32_t)len >= resp->maxlen)
++		return;		/* truncated: publishing half a MAC would lie */
++
++	resp->type = WIFI_EVENT_STA_ASSOC;
++	resp->len = len;
++	w->req.cb(&w->req);
++}
++
+ /* Parse one hostapd control message: mutate the parent cache (atomic RMW) and
+- * publish client association changes (922). */
++ * publish client association changes (922) and BTM responses (923). */
+ static void hapdctrl_parse_event(struct hapdctrl_event *w,
+ 				 struct hapdctrl_sock *s, const char *msg)
+ {
+@@ -1051,6 +1126,8 @@
+ 			apconn_cache_sta_del(key, mac);
+ 			hapdctrl_emit_sta(w, s, mac, false);
+ 		}
++	} else if (strstr(msg, "BSS-TM-RESP")) {
++		hapdctrl_emit_btm_resp(w, s, msg);
+ 	} else if (strstr(msg, "AP-ENABLED")) {
+ 		struct hapdctrl_ev ev = { .set_enabled = true, .enabled = true };
+ 

@@ -1,0 +1,409 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: persist the backhaul MLD (bstamld chain)
+
+Adds the controller half of the backhaul MLD chain: the bstamld holder and its
+free path, the bSTA-MLD Config TLV parser, the 0x47 handler and ftable entry,
+the 0xE1 sibling on Topology Response, the mapc_sync block, and the bstamld /
+affiliated_bsta tables in the embedded schema.
+
+Rescued from the 2026-07-16 control-plane work (tag
+backhaul-mld-controlplane-2026-07-16) and re-applied 2026-07-22. The archived
+apply script also carried four reverts of the broken 953 capstone; those were
+skipped because 953 is not in this tree. The schema anchor had to be moved:
+the string now ends with the agent_backhaul view from patch 973, not the table
+the 2026-07-16 anchor expected.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -206,6 +206,10 @@
+ 	struct list_head apmld_list;       /** list of struct wifi_apmld_element */
+ 	struct ieee1905_security_caps sec; /** 1905 security caps (step 2) */
+ 	bool sec_valid;                    /** @sec populated (step 2) */
++	/* DB Phase 1.5 (MLD, bSTA) - APPEND ONLY. A node has exactly one
++	 * backhaul uplink -> single element (NULL until a 0xE1 TLV is parsed),
++	 * not a list. Mirror of apmld_list's lifecycle. */
++	struct wifi_bstamld_element *bstamld;
+ #endif
+ };
+ 
+@@ -217,6 +221,8 @@
+ #if (EASYMESH_VERSION >= 6)
+ /* Free @n->apmld_list and its child lists (DB Phase 1.5). */
+ void cntlr_free_apmld_list(struct node *n);
++/* Free @n->bstamld and its affiliated-link list (DB Phase 1.5, bSTA). */
++void cntlr_free_bstamld(struct node *n);
+ #endif
+ 
+ #define node_for_each_bss(p, r, n)				\
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1680,6 +1680,22 @@
+ 	}
+ 	n->num_apmld = 0;
+ }
++
++
++void cntlr_free_bstamld(struct node *n)
++{
++	struct wifi_affiliated_sta_element *b = NULL, *btmp;
++
++	if (!n->bstamld)
++		return;
++
++	list_for_each_entry_safe(b, btmp, &n->bstamld->affbstalist, list) {
++		list_del(&b->list);
++		free(b);
++	}
++	free(n->bstamld);
++	n->bstamld = NULL;
++}
+ #endif
+ 
+ static bool cntlr_clean_node(struct controller *c, struct node *n)
+@@ -1719,6 +1735,7 @@
+ 	cntlr_clean_radiolist(c, n);
+ #if (EASYMESH_VERSION >= 6)
+ 	cntlr_free_apmld_list(n);
++	cntlr_free_bstamld(n);
+ #endif
+ 
+ 	info("%s: Node " MACFMT " removed due to ageout\n",
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -4258,6 +4258,75 @@
+ 	    n->num_apmld, MAC2STR(n->almacaddr));
+ }
+ 
++/* DB Phase 1.5 (MLD, bSTA): byte-walk the Backhaul STA MLD Config TLV (0xE1)
++ * into n->bstamld. Mirror of cntlr_parse_ap_mld_config_tlv() but for the single
++ * backhaul uplink MLD (exactly one per agent). Wholesale rebuild: any stale
++ * bstamld is freed first. Fixed 32-byte header, 32-byte affiliated links.
++ *
++ * Wire layout (agent_gen_bsta_mld_config / struct tlv_bsta_mld_config):
++ *   flag u8 (bit7 bSTA-MLD-MAC valid, bit6 AP-MLD-MAC valid)
++ *   bsta_mld_macaddr[6], ap_mld_macaddr[6], flag2 u8 (STR/NSTR/EMLSR/EMLMR),
++ *   rsvd[17], num_bsta u8,
++ *   per link (32B): flag3 u8, ruid[6], macaddr[6], rsvd[19] */
++static void cntlr_parse_bsta_mld_config_tlv(struct node *n, const uint8_t *data,
++					    uint16_t len)
++{
++	struct wifi_bstamld_element *mld;
++	uint8_t flag, flag2, num_bsta, i;
++	size_t off;
++
++	/* Flush + rebuild (single MLD, authoritative overwrite). */
++	cntlr_free_bstamld(n);
++
++	if (!data || len < 32)			/* fixed header */
++		return;
++
++	flag     = data[0];
++	flag2    = data[13];
++	num_bsta = data[31];
++
++	/* affiliated links are fixed 32 bytes each */
++	if ((size_t)32 + (size_t)num_bsta * 32 > len)
++		return;
++
++	mld = calloc(1, sizeof(*mld));
++	if (!mld)
++		return;
++	INIT_LIST_HEAD(&mld->affbstalist);
++
++	if (flag & BSTA_MLD_CONF_BSTA_MLD_ADDR_VALID)
++		memcpy(mld->mld_macaddr, data + 1, 6);
++	if (flag & BSTA_MLD_CONF_AP_MLD_ADDR_VALID)
++		memcpy(mld->bssid, data + 7, 6);	/* AP-MLD assoc'd to */
++
++	mld->str_enabled   = !!(flag2 & BSTA_MLD_CONFIG_STR);
++	mld->nstr_enabled  = !!(flag2 & BSTA_MLD_CONFIG_NSTR);
++	mld->emlsr_enabled = !!(flag2 & BSTA_MLD_CONFIG_EMLSR);
++	mld->emlmr_enabled = !!(flag2 & BSTA_MLD_CONFIG_EMLMR);
++	mld->ttlm_enabled  = false;		/* not carried in 0xE1 */
++	mld->num_aff_bsta  = num_bsta;
++
++	off = 32;
++	for (i = 0; i < num_bsta; i++) {
++		const uint8_t *p = data + off;
++		struct wifi_affiliated_sta_element *b;
++
++		b = calloc(1, sizeof(*b));
++		if (!b)
++			break;
++		memcpy(b->ruid, p + 1, 6);
++		memcpy(b->macaddr, p + 1 + 6, 6);
++		/* bssid/linkid not carried in this TLV -> left zero */
++		list_add_tail(&b->list, &mld->affbstalist);
++		off += 32;
++	}
++
++	n->bstamld = mld;
++
++	dbg("%s: parsed bSTA-MLD " MACFMT " (%u link(s)) for " MACFMT "\n",
++	    __func__, MAC2STR(mld->mld_macaddr), num_bsta, MAC2STR(n->almacaddr));
++}
++
+ /* DB Phase 1.5 (MLD, step 3): byte-walk the TID-to-Link Mapping Policy TLV
+  * (0xE6, WOZIWRT-defined) out of @cmdu into the ttlmlist of each matching
+  * AP-MLD. MUST run AFTER cntlr_parse_ap_mld_config_tlv(), which (re)builds
+@@ -4374,6 +4443,27 @@
+ 
+ 	return 0;
+ }
++
++
++/* DB Phase 1.5 (MLD, bSTA): handler for Backhaul STA MLD Config Response
++ * (0x8047). The bSTA-MLD Config TLV (0xE1) is peeked directly (no validate-
++ * parse dependency), mirroring the AP-MLD path. */
++int handle_bsta_mld_config_response(void *cntlr, struct cmdu_buff *cmdu,
++				    struct node *n)
++{
++	struct tlv *t;
++
++	trace("%s:--->\n", __func__);
++
++	if (!n)
++		return -1;
++
++	t = cmdu_peek_tlv(cmdu, MAP_TLV_BACKHAUL_STA_MLD_CONFIG);
++	if (t)
++		cntlr_parse_bsta_mld_config_tlv(n, t->data, tlv_length(t));
++
++	return 0;
++}
+ #endif /* EASYMESH_VERSION >= 6 */
+ 
+ int cntlr_send_ap_mld_configuration_request(struct controller *c, struct node *n)
+@@ -4613,6 +4703,11 @@
+ 	[0x45] = {
+ 		.handle = handle_ap_mld_config_response,
+ 	},
++	/* bSTA-MLD Config Response (0x8047); non-NULL handler also opens
++	 * is_cmdu_for_us() for this CMDU type. */
++	[0x47] = {
++		.handle = handle_bsta_mld_config_response,
++	},
+ 	[0x4d] = {
+ 		.handle = handle_bss_config_extended_report,
+ 	},
+@@ -4753,6 +4848,18 @@
+ 					parse_tid_to_link_policy(n, cmdu);
+ 					mapc_sync_apmld(c, n);
+ 				}
++				/* bSTA-MLD Config TLV (0xE1) rides Topology
++				 * Response too; refresh + persist. */
++				{
++					struct tlv *btlv = cmdu_peek_tlv(cmdu,
++						MAP_TLV_BACKHAUL_STA_MLD_CONFIG);
++
++					if (btlv) {
++						cntlr_parse_bsta_mld_config_tlv(n,
++							btlv->data, tlv_length(btlv));
++						mapc_sync_bstamld(c, n);
++					}
++				}
+ 			}
+ #endif
+ 			break;
+@@ -4764,6 +4871,13 @@
+ 			mapc_sync_agent(c, n);
+ 			mapc_sync_apmld(c, n);
+ 			break;
++		case CMDU_BSTA_MLD_CONFIG_RESPONSE:
++			/* handle_bsta_mld_config_response() already parsed 0xE1
++			 * into n->bstamld; agent first for the FK
++			 * bstamld.agent_almac -> agent(almac). */
++			mapc_sync_agent(c, n);
++			mapc_sync_bstamld(c, n);
++			break;
+ #endif
+ 		case CMDU_AP_CAPABILITY_REPORT:
+ #if (EASYMESH_VERSION > 5)
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -48,6 +48,10 @@
+  * txn (DB Phase 1.5, MLD step 1). ttlm is deferred to step 3. */
+ void mapc_sync_apmld(struct controller *c, struct node *n);
+ 
++/* Rebuild the 'bstamld' + 'affiliated_bsta' rows for @n from n->bstamld, one
++ * txn (DB Phase 1.5, bSTA-MLD). Single backhaul uplink; NULL -> tables cleared. */
++void mapc_sync_bstamld(struct controller *c, struct node *n);
++
+ /* Upsert the single 'ieee1905_security' row for @n from n->sec (DB Phase 1.5,
+  * MLD step 2). No-op unless n->sec_valid. */
+ void mapc_sync_security(struct controller *c, struct node *n);
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -733,6 +733,142 @@
+ }
+ #endif /* EASYMESH_VERSION >= 6 */
+ 
++/* ---- bstamld (+ affiliated_bsta) ------------------------------------- */
++#if (EASYMESH_VERSION >= 6)
++
++/* Drop this agent's backhaul bSTA-MLD rows FK-child-first (foreign_keys=ON):
++ * affiliated_bsta references bstamld(mld_macaddr). Bound by agent_almac. */
++static int bstamld_delete_agent_rows(struct controller *c, const char *almac)
++{
++	static const char *dels[2] = {
++		"DELETE FROM affiliated_bsta WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM bstamld WHERE agent_almac=?)",
++		"DELETE FROM bstamld WHERE agent_almac=?",
++	};
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		mapdb_stmt *st = NULL;
++
++		if (mapdb_prepare(c->db, dels[i], &st) != MAPDB_OK) {
++			warn("mapc_sync: bstamld del prepare: %s\n",
++			     mapdb_last_error(c->db));
++			return MAPDB_ERR;
++		}
++		mapdb_bind_text(st, 1, almac);
++		if (stmt_finish(c->db, st) != MAPDB_OK)
++			return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++/* Wholesale-rebuild this node's backhaul bSTA-MLD tables from n->bstamld, one
++ * txn. FK insert order: bstamld (parent) -> affiliated_bsta (child). n->bstamld
++ * is a single element (one backhaul uplink) or NULL (delete leaves clean). */
++void mapc_sync_bstamld(struct controller *c, struct node *n)
++{
++	static const char *ins_mld =
++		"INSERT INTO bstamld(mld_macaddr, agent_almac, ap_mld_macaddr, "
++		"emlmr_enabled, emlsr_enabled, str_enabled, nstr_enabled, num_bsta) "
++		"VALUES(?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(mld_macaddr) DO UPDATE SET "
++		"agent_almac=excluded.agent_almac, "
++		"ap_mld_macaddr=excluded.ap_mld_macaddr, "
++		"emlmr_enabled=excluded.emlmr_enabled, "
++		"emlsr_enabled=excluded.emlsr_enabled, "
++		"str_enabled=excluded.str_enabled, nstr_enabled=excluded.nstr_enabled, "
++		"num_bsta=excluded.num_bsta";
++	static const char *ins_aff =
++		"INSERT INTO affiliated_bsta(macaddr, mld_macaddr, ruid) "
++		"VALUES(?,?,?) "
++		"ON CONFLICT(macaddr) DO UPDATE SET mld_macaddr=excluded.mld_macaddr, "
++		"ruid=excluded.ruid";
++	static const uint8_t zmac[6] = {0};
++	struct wifi_bstamld_element *mld = n->bstamld;
++	struct wifi_affiliated_sta_element *b;
++	char almac[18], mldmac[18], apmld[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	mac2str(n->almacaddr, almac);
++
++	if (mapdb_begin(c->db) != MAPDB_OK) {
++		warn("mapc_sync: bstamld begin: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++
++	if (bstamld_delete_agent_rows(c, almac) != MAPDB_OK) {
++		mapdb_rollback(c->db);
++		return;
++	}
++
++	/* No backhaul MLD on this node: delete already cleaned the tables. */
++	if (!mld) {
++		if (mapdb_commit(c->db) != MAPDB_OK) {
++			warn("mapc_sync: bstamld commit: %s\n",
++			     mapdb_last_error(c->db));
++			mapdb_rollback(c->db);
++		}
++		return;
++	}
++
++	mac2str(mld->mld_macaddr, mldmac);
++
++	if (mapdb_prepare(c->db, ins_mld, &st) != MAPDB_OK) {
++		warn("mapc_sync: bstamld ins prepare: %s\n",
++		     mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++		return;
++	}
++	mapdb_bind_text(st, 1, mldmac);
++	mapdb_bind_text(st, 2, almac);
++	if (memcmp(mld->bssid, zmac, 6) != 0) {		/* AP-MLD MAC present */
++		mac2str(mld->bssid, apmld);
++		mapdb_bind_text(st, 3, apmld);
++	} else {
++		mapdb_bind_null(st, 3);
++	}
++	mapdb_bind_int(st, 4, mld->emlmr_enabled);
++	mapdb_bind_int(st, 5, mld->emlsr_enabled);
++	mapdb_bind_int(st, 6, mld->str_enabled);
++	mapdb_bind_int(st, 7, mld->nstr_enabled);
++	mapdb_bind_int(st, 8, mld->num_aff_bsta);
++	if (stmt_finish(c->db, st) != MAPDB_OK) {
++		mapdb_rollback(c->db);
++		return;
++	}
++
++	list_for_each_entry(b, &mld->affbstalist, list) {
++		char bmac[18], ruid[18];
++
++		mac2str(b->macaddr, bmac);
++		mac2str(b->ruid, ruid);
++
++		st = NULL;
++		if (mapdb_prepare(c->db, ins_aff, &st) != MAPDB_OK) {
++			warn("mapc_sync: affiliated_bsta ins prepare: %s\n",
++			     mapdb_last_error(c->db));
++			mapdb_rollback(c->db);
++			return;
++		}
++		mapdb_bind_text(st, 1, bmac);
++		mapdb_bind_text(st, 2, mldmac);
++		mapdb_bind_text(st, 3, ruid);
++		if (stmt_finish(c->db, st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++	}
++
++	if (mapdb_commit(c->db) != MAPDB_OK) {
++		warn("mapc_sync: bstamld commit: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++	}
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ /* ---- ieee1905_security ------------------------------------------------ */
+ #if (EASYMESH_VERSION >= 6)
+ 
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -375,6 +375,25 @@
+ 	"  LEFT JOIN topology_link t ON t.child_almac = a.almac\n"
+ 	"  LEFT JOIN bss b           ON b.bssid = t.parent_iface_mac\n"
+ 	"  LEFT JOIN radio r         ON r.ruid  = b.ruid;\n"
++	"\n"
++	"-- 20. backhaul STA-MLD identity (R6; wifi_bstamld_element) - OUR contribution\n"
++	"CREATE TABLE IF NOT EXISTS bstamld (\n"
++	"    mld_macaddr          TEXT PRIMARY KEY,   -- bsta_mld_macaddr [wifi_dataelements.h:493]\n"
++	"    agent_almac          TEXT REFERENCES agent(almac),\n"
++	"    ap_mld_macaddr       TEXT,               -- AP-MLD assoc'd to; bssid [:494]\n"
++	"    emlmr_enabled        INTEGER,            -- [:496]\n"
++	"    emlsr_enabled        INTEGER,            -- [:497]\n"
++	"    str_enabled          INTEGER,            -- [:498]\n"
++	"    nstr_enabled         INTEGER,            -- [:499]\n"
++	"    num_bsta             INTEGER             -- num affiliated bSTAs [:502]\n"
++	");\n"
++	"\n"
++	"-- 21. affiliated bSTA links of a backhaul STA-MLD (R6; wifi_affiliated_sta_element)\n"
++	"CREATE TABLE IF NOT EXISTS affiliated_bsta (\n"
++	"    macaddr              TEXT PRIMARY KEY,   -- affiliated bSTA link MAC [wifi_dataelements.h:428]\n"
++	"    mld_macaddr          TEXT REFERENCES bstamld(mld_macaddr),\n"
++	"    ruid                 TEXT                -- radio hosting the link [:430]\n"
++	");\n"
+ ;
+ 
+ #endif /* MAPDB_SCHEMA_H */

@@ -1,0 +1,66 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Give an already-configured node the marker it predates.
+#
+# ⚠️ This file lives in easymesh-wifi, next to the gates that read it, and that
+# placement is the whole point.
+#
+# It used to ship in easymesh-config. base-files default_postinst runs a
+# package's uci-defaults first and only then `start` on its init scripts - but
+# that ordering holds WITHIN one package. easymesh-config depends on
+# easymesh-wifi, so apk configures easymesh-wifi first: its gated services were
+# asked to start while the file that writes their answer was still one package
+# away. And a procd `start` whose start_service declares no instance does not
+# decline - rc.common closes the service and procd drops what was running. So
+# every upgrade of the existing fleet had a window in which this package told
+# its own services to stop, on a node carrying mesh traffic.
+#
+# Moving the file removes the window instead of papering over it with a cleverer
+# test. There is no heuristic here that the factory cannot reproduce, because
+# there no longer needs to be one.
+#
+# Everything that asks "has anyone made this box a mesh node?" reads
+# /etc/mapc/role, written by easymesh-role before it touches anything else.
+# Nodes configured before that file existed do not have it, and there has to be
+# a way for them to say so - otherwise the gates would treat a working mesh node
+# as factory-fresh and stop rebuilding its configuration at boot.
+#
+# The mark used for that until 2026-08-17 was a non-empty dhcp.lan.ignore. It
+# cannot be used, and the reason is worth writing down because three separate
+# gates were built on it: easymesh-dhcp-safe writes dhcp.lan.ignore='1' on every
+# box that is not a controller, factory ones included. So the mark is set on a
+# router nobody has touched, one boot later at the latest, and from then on every
+# gate reading it concludes the box is a mesh node. Traced on hardware that day:
+# the board came up with map-agent's own fronthaul name across all three radios
+# and a backhaul on the air, three builds in a row.
+#
+# What cannot be faked is a backhaul key. The factory ships the fallback from
+# 99-mapcntlr ('1234567890', derived from an empty get_mac_label); a node that
+# has joined a mesh carries the controller's real one. A controller is even
+# plainer: easymesh-role is the only thing that ever writes dhcp.lan.ignore='0',
+# and it writes it together with mapcontroller.controller.enabled='1'.
+#
+# Runs before 89-easymesh-quiet-until-role, which needs the answer.
+
+[ -f /etc/mapc/role ] && exit 0
+
+# The test itself lives in boot-window.sh, because the gates in easymesh-wifi
+# need the same answer during the window before this file has run - see
+# is_mesh_node() there. Sourcing it must fail loudly: a silent failure here
+# leaves the mark unwritten and every gate answering "factory" on a node that
+# is carrying mesh traffic. Exiting non-zero keeps the file for the next boot.
+[ -r /usr/share/easymesh/boot-window.sh ] || {
+	echo "88-easymesh-role-marker: cannot read boot-window.sh - not marking" >&2
+	exit 1
+}
+. /usr/share/easymesh/boot-window.sh
+
+role=$(configured_mesh_role)
+[ -n "$role" ] || exit 0
+
+mkdir -p /etc/mapc 2>/dev/null
+echo "$role" > /etc/mapc/role 2>/dev/null
+logger -t easymesh-config "configured before /etc/mapc/role existed - marked as $role"
+exit 0

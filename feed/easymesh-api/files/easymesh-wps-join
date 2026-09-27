@@ -1,0 +1,609 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/libexec/easymesh-wps-join - the long half of the wireless join.
+#
+# rpcd kills an exec plugin that talks for more than two minutes, so the
+# ubus method only launches this worker; progress lands in a state file
+# the wizard polls (wps_status).
+#
+# v5, soft-restart-first. Read this instead of the v4 note it replaces: that
+# one described reboots that have not been the default since 2026-09-20, and
+# a header that describes the opposite of what the code does is how
+# JOIN_NO_REBOOT cost an afternoon on 2026-09-21.
+#
+# Rebuilding a virgin box's radios at runtime (four APs torn down, one
+# station raised) was a coin toss on MT7996, so the join was built as
+# config-then-boot: phase one writes the station config, deletes the
+# image-default BSS sections (deleted, not disabled - the product rule),
+# leaves a pending note and restarts. Phase two then runs the proven chain:
+# press, catch the credential, role BEFORE adopt, and bh-key-adopt finishes
+# the job.
+#
+# What changed is only what "restart" means. easymesh-soft-restart replays
+# the part of the boot the join needs - services in rc.d order, wifi down,
+# the radios' ieee80211 hotplug, network reload, wifi up - and is the
+# DEFAULT since 2026-09-20 (2bf926b). /etc/mapc/join-with-reboot is the
+# opt-OUT that puts a box back on the old reboot path without a downgrade.
+# There is no file that turns the soft path ON; not rebooting is what
+# happens unless that one file says otherwise.
+
+
+# Which BSSID to press the button against.
+#
+# The fronthaul is an AP-MLD: one logical AP, but a separate BSSID on every
+# band it spans. WPS predates that. Its overlap rule - if two APs are pairing
+# at once, refuse, so nobody is handed to the neighbour by accident - has no
+# way to tell two links of one router from two routers. Measured 2026-08-13:
+# the enrollee saw 52:02:cc:05:b2:03 and 56:02:cc:05:92:03, both links of the
+# same controller, declared WPS-OVERLAP-DETECTED and cancelled. The join then
+# timed out and blamed the controller window, which had been open all along.
+# Whether it happened depended on how many links the scan caught before
+# deciding, which is why the same procedure had worked the day before.
+#
+# Naming one BSSID removes the choice, and with it the rule. It has to be a
+# BSSID this station can reach: the enrollee joins through the backhaul
+# station, and that lives on a backhaul radio - 5 or 6 GHz, never 2.4, because
+# the backhaul MLD does not span it. Pointing at the 2.4 GHz link instead did
+# remove the overlap and then delivered nothing, twice, for two minutes each
+# (measured 2026-08-13). The station lists that BSS in a scan and still cannot
+# associate to it.
+#
+# So the band is not a preference, it is a constraint: take the one the station
+# interface is on. phyX.N-staM carries the radio index in N.
+pick_pbc_bssid() {
+	_sta="$1"
+	_idx=$(echo "$_sta" | sed -n 's/^phy[0-9]*\.\([0-9]*\)-sta.*/\1/p')
+	_band=$(uci -q get "wireless.radio${_idx}.band")
+
+	# Wait for the scan to END, not for five seconds to pass.
+	#
+	# scan_results serves the last completed scan, so reading it while the
+	# supplicant is still walking three bands hands back the PREVIOUS round's
+	# view - which is how the 6 GHz link got picked on 2026-08-13 ("the 5 GHz
+	# one simply had not been seen in that one scan"). Five seconds is not
+	# enough for a 2.4+5+6 sweep on this hardware; the state is.
+	wpa_cli -i "$_sta" scan >/dev/null 2>&1
+	_w=0
+	while [ $_w -lt 15 ]; do
+		wpa_cli -i "$_sta" status 2>/dev/null | grep -q 'wpa_state=SCANNING' || break
+		sleep 1
+		_w=$((_w + 1))
+	done
+	sleep 1
+	wpa_cli -i "$_sta" scan_results 2>/dev/null | grep -F '[WPS-PBC]' > /tmp/wps-pbc.scan
+
+	_own=""; _other=""
+	rm -f "$ELSEWHERE"
+	while read -r _bssid _freq _rest; do
+		case "$_freq" in ''|*[!0-9]*) continue ;; esac
+		_f=2g
+		[ "$_freq" -ge 4900 ] && _f=5g
+		[ "$_freq" -ge 5925 ] && _f=6g
+		if [ "$_f" = "$_band" ]; then
+			[ -n "$_own" ] || _own="$_bssid"
+		else
+			[ -n "$_other" ] || _other="$_bssid"
+		fi
+	done < /tmp/wps-pbc.scan
+	rm -f /tmp/wps-pbc.scan
+	[ -n "$_other" ] && : > "$ELSEWHERE"
+
+	# A BSS on another band is a last resort, and it has to stay last: the
+	# station cannot associate to it. Taking it on the first look is how the
+	# 6 GHz link got picked at 19:24 on 2026-08-13 - the 5 GHz one simply had
+	# not been seen in that one scan - and the join then sat in PBC for two
+	# minutes against a BSS it could never reach.
+	#
+	# So the caller says how patient to be, and only gives up on the right
+	# band after several rounds. Wrong band late beats wrong band immediately;
+	# both beat "any", which brings the overlap rule back.
+	# Aiming across bands is the last resort, and "last" now means something
+	# stronger than "after four rounds": only when there is no band left to
+	# move to. Moving beats pointing every time - the station can associate
+	# where it moves and cannot associate where it points.
+	#
+	# Measured 2026-09-21, and it is why the band walk did not run on its
+	# first test: the station sat on 6 GHz, saw the controller's 2.4 GHz BSS
+	# in the scan, and this branch took it at round 4 - three seconds before
+	# the walk would have moved there. A target had been set, so the walk's
+	# "nobody here" test was false for ever after, and the join died against
+	# a BSS it could never reach with the walk still waiting its turn.
+	if [ -n "$_own" ]; then
+		echo "$_own"
+	elif [ -f "$ELSEWHERE" ] && join_band_next "$(join_band_now)" >/dev/null 2>&1; then
+		: # somewhere better to be; say nothing and let the walk move us
+	elif [ "${2:-0}" -ge 4 ]; then
+		# The marker is a file because this runs in a command substitution -
+		# a variable set here dies with the subshell, and the failure message
+		# downstream needs to know we settled for a BSS on the wrong band.
+		[ -n "$_other" ] && { logger -t wps-join \
+			"no PBC on the ${_band} radio after $2 tries - settling for $_other"; : > "$OTHERBAND"; }
+		echo "$_other"
+	fi
+}
+
+STATE=/tmp/wps-join.state
+PENDING=/etc/easymesh-wps-pending
+# Opt-in: the join replays the relevant part of the boot instead of rebooting
+# (easymesh-soft-restart; see bh-key-adopt restart_to_apply).
+# Default since 2026-09-20; /etc/mapc/join-with-reboot is the way back to the
+# old path. See the long note in bh-key-adopt.
+JOIN_WITH_REBOOT=/etc/mapc/join-with-reboot
+# There is no join-without-reboot file to look for: not rebooting is what
+# happens unless JOIN_WITH_REBOOT asks otherwise. The name outlived the
+# opt-in it belonged to (soft join became the default 2026-09-20) and then
+# cost an afternoon on 2026-09-21, when a stale box still carried the file
+# and it read as the switch that decides this.
+no_reboot() {
+	[ -f "$JOIN_WITH_REBOOT" ] && return 1
+	[ -x /usr/sbin/easymesh-soft-restart ]
+}
+OTHERBAND=/tmp/wps-join.otherband
+# "a BSS is advertising PBC on a band that is not ours".
+#
+# This is the only honest reason to move: it is the difference between
+# "nobody is calling on this band" and "nobody has pressed the button yet",
+# which look identical from a scan and are not the same thing at all. A file
+# because pick_pbc_bssid runs in a command substitution, same as OTHERBAND.
+ELSEWHERE=/tmp/wps-join.elsewhere
+# Which radio the join is currently listening on. In /etc because the old path
+# still reboots between phases and /tmp does not survive that.
+BANDFILE=/etc/mapc/wps-join-band
+
+# The order to try bands in, best reach first.
+#
+# 2.4 GHz answers almost every real pairing: measured from the far end of the
+# flat on 2026-09-21, the controller's fronthaul came in at -40 dBm on 2412,
+# -45 on 5180 and was not in the scan at all on 6135. The same box paired
+# twice on 2.4 GHz and failed on 5 GHz from that spot - associated for 61 s,
+# then "no credential came through in time".
+#
+# But the band that reaches furthest is not always the band the other end is
+# calling on. A foreign controller may advertise WPS on 5 GHz only, and until
+# this afternoon OUR OWN join station was pinned to 5 GHz - so a controller
+# that only called on 2.4 would have been invisible to us. Assuming anything
+# about the far end is how that happens in reverse.
+#
+# So walk them. Not by guessing which band is right, and not by aiming across
+# bands - a station cannot associate outside its own radio, which is why
+# pick_pbc_bssid's last resort below can only ever produce a message. Move to
+# the band instead of pointing at it.
+# Ordered by reach, and derived from what the radios SAY they are.
+#
+# radio0 is 2.4 GHz on every box in the lab, but nothing enforces it: the
+# numbering is generated by `wifi config` on the box being joined, which is
+# the one box whose wireless config nobody has seen. pick_pbc_bssid already
+# reads .band; this is the same question asked one step earlier.
+JOIN_BANDS=$(for _b in 2g 5g 6g; do
+	for _r in radio0 radio1 radio2; do
+		[ "$(uci -q get wireless.$_r.band)" = "$_b" ] && printf '%s ' "$_r"
+	done
+done)
+[ -n "$JOIN_BANDS" ] || JOIN_BANDS="radio0 radio1 radio2"
+
+# Is anyone calling here? That is a scan, not a wait.
+#
+# The window on the controller is 420 s (120 s, re-armed three times). Three
+# bands at the full 180 s wait each would outlast it and arrive at 6 GHz to
+# find the door shut. But "is any BSS advertising PBC on this band" is
+# answered in one scan, so a band nobody is calling on costs ~30 s, and only
+# a band with someone on it gets the patient wait.
+BAND_GIVEUP_ROUNDS=15
+
+join_band_now() {
+	_b=$(cat "$BANDFILE" 2>/dev/null)
+	[ -n "$_b" ] || _b=$(echo $JOIN_BANDS | cut -d' ' -f1)
+	echo "$_b"
+}
+
+# The next band that exists and is not held down in config. A radio somebody
+# switched off is not a band this box has.
+join_band_next() {
+	_seen=""
+	for _r in $JOIN_BANDS; do
+		[ "$_seen" = yes ] && {
+			uci -q get "wireless.$_r" >/dev/null 2>&1 || continue
+			[ "$(uci -q get wireless.$_r.disabled)" = 1 ] && continue
+			echo "$_r"; return 0
+		}
+		[ "$_r" = "$1" ] && _seen=yes
+	done
+	return 1
+}
+
+# Rebuild the station on another radio and re-enter the wait. Costs one soft
+# restart, which is what phase 1 already spends to get a clean radio.
+join_band_switch() {
+	# Read the band we are leaving before overwriting it, or the log says
+	# we moved from the band we moved to.
+	_from=$(join_band_now)
+	mkdir -p /etc/mapc
+	printf '%s\n' "$1" > "$BANDFILE"
+	uci set wireless.wps_join.device="$1"
+	uci commit wireless
+	logger -t wps-join "nobody calling on $_from, moving to $1"
+	step "looking on another band"
+	/usr/sbin/easymesh-soft-restart "wps-join: band $1" || true
+	/etc/init.d/bh-key-adopt start >/dev/null 2>&1
+	exec /usr/libexec/easymesh-wps-join --resume "$GW" "$ADDR"
+}
+
+
+step() { echo "$1" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"; logger -t wps-join "$1"; }
+
+cleanup() {
+	uci -q delete wireless.wps_join
+	uci -q delete network.wpsjoin
+	uci commit wireless; uci commit network
+	rm -f "$BANDFILE"
+}
+
+# Leave the box in a shape somebody can work with.
+#
+# cleanup() deletes wireless.wps_join from uci, but netifd is not told, so the
+# scanning station stays on the air until something reloads - and phase 1 has
+# already deleted every other wifi-iface, so a failed join otherwise ends with
+# a box broadcasting nothing and still holding a radio open for a search.
+# The soft restart is the same one the join spends between its own phases.
+fail() {
+	step "error: $1"
+	cleanup
+	rm -f "$PENDING"
+	[ -x /usr/sbin/easymesh-soft-restart ] &&
+		/usr/sbin/easymesh-soft-restart "wps-join: failed" >/dev/null 2>&1
+	exit 1
+}
+
+# ---------------------------------------------------------------- resume --
+if [ "$1" = "--resume" ]; then
+	GW="$2"; ADDR="$3"
+
+	rm -f "$OTHERBAND" "$ELSEWHERE"
+	step "waiting for the radio"
+	sta=""; n=0
+	while [ $n -lt 45 ]; do
+		sta=$(ls /sys/class/net 2>/dev/null | grep -- '-sta' | head -1)
+		[ -n "$sta" ] && break
+		sleep 2; n=$((n + 1))
+	done
+	[ -n "$sta" ] || fail "no station interface came up"
+
+	step "ready - press Pair a new box on the controller now"
+	spool=/tmp/wps-join-cred.log
+	: > "$spool"
+	ubus listen wps_credentials > "$spool" 2>/dev/null &
+	lpid=$!
+	wpa_cli -i "$sta" wps_cancel >/dev/null 2>&1
+
+	# A BSS only advertises PBC while the window on the controller is open, and
+	# at this point in the story nobody has pressed anything yet - the line
+	# above has just asked them to. Looking for a target here finds nothing and
+	# falls back to "any", which is the one thing that brings the overlap rule
+	# back (measured 2026-08-13: "pairing against any", then two overlaps and a
+	# timeout, on a build that carried the fix). So the search belongs in the
+	# wait below, where it runs again every few seconds until the button is
+	# actually pressed.
+	target=""
+
+	key=""; n=0
+	while [ $n -lt 90 ]; do
+		# Our station ran the WPS round with multi_ap=1, so what comes back
+		# is the backhaul credential - named MAP--BH by our controller and
+		# whatever it likes by any other (MediaTek R3: Multi-AP-1). Taking
+		# only MAP--BH threw away every foreign registrar's answer
+		# (2026-09-18). The event names the station it arrived on.
+		line=$(grep "\"ssid\":\"MAP--BH\"" "$spool" 2>/dev/null | tail -1)
+		[ -n "$line" ] || line=$(grep "\"ifname\":\"$sta\"" "$spool" 2>/dev/null | tail -1)
+		if [ -n "$line" ]; then
+			key=$(echo "$line" | sed -n "s/.*\"key\":\"\([^\"]*\)\".*/\1/p")
+			bhssid=$(echo "$line" | sed -n "s/.*\"ssid\":\"\([^\"]*\)\".*/\1/p")
+			# A name with a space is refused rather than mangled - but
+			# retrying the same spool line 90 times and then blaming the
+			# window ("no credential came through in time") says the one
+			# thing that is certainly untrue: the credential did come.
+			case "$bhssid" in
+			*" "*)
+				kill "$lpid" 2>/dev/null
+				cleanup
+				fail "the registrar sent an SSID with a space in it ('$bhssid') - this build cannot build a backhaul from it"
+				;;
+			'') key="" ;;
+			esac
+			[ -n "$key" ] && break
+		fi
+		# Until a target is found, keep looking: the controller's window opens
+		# when the user gets to it, not when we are ready for them.
+		# Move only when somebody is demonstrably calling on ANOTHER band.
+		#
+		# "No PBC BSS on this band" and "nobody has pressed the button yet"
+		# look identical from here, and for the first minute the second one
+		# is the normal case: the page has only just told the user to walk
+		# to the controller. Moving on that silence costs a soft restart and
+		# ends with the box on 6 GHz, which from the kitchen is not in the
+		# scan at all (2026-09-21: 2412 -40 dBm, 5180 -45, 6135 absent).
+		#
+		# So silence means WAIT and only a PBC BSS seen elsewhere means MOVE.
+		# The walk then still does what it was written for - a foreign
+		# controller calling on a band we are not on - and no longer undoes
+		# the decision to pair on 2.4 GHz.
+		if [ -z "$target" ] && [ "$n" -ge "$BAND_GIVEUP_ROUNDS" ] &&
+		   [ -f "$ELSEWHERE" ] &&
+		   _nb=$(join_band_next "$(join_band_now)"); then
+			kill "$lpid" 2>/dev/null
+			join_band_switch "$_nb"
+		fi
+		if [ -z "$target" ] && [ $((n % 3)) -eq 2 ]; then
+			target=$(pick_pbc_bssid "$sta" $((n / 3)))
+			[ -n "$target" ] && {
+				logger -t wps-join "pairing against $target"
+				wpa_cli -i "$sta" wps_cancel >/dev/null 2>&1
+				wpa_cli -i "$sta" wps_pbc "$target" multi_ap=1 >/dev/null 2>&1
+			}
+		fi
+		# The supplicant's PBC walk lasts 120 s - shorter than a human still
+		# finding the controller tab. Re-press while we wait.
+		[ -n "$target" ] && [ $((n % 30)) -eq 29 ] && \
+			wpa_cli -i "$sta" wps_pbc "$target" multi_ap=1 >/dev/null 2>&1
+		sleep 2; n=$((n + 1))
+	done
+	kill "$lpid" 2>/dev/null
+	[ -n "$key" ] || logger -t wps-join "diag: $(wpa_cli -i "$sta" status 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+	cleanup
+	# Why nothing arrived is knowable right here, and the one sentence this
+	# used to print named the only cause it could not have been: on
+	# 2026-08-13 the window had been open the whole time and the join died of
+	# an overlap, so the message sent the user back to open it again. Each
+	# branch below is a failure that has actually happened, in the order that
+	# rules the others out.
+	if [ -z "$key" ]; then
+		if logread -l 300 2>/dev/null | grep -q WPS-OVERLAP-DETECTED; then
+			fail "two access points were pairing at once, so WPS refused both - wait for the window on the controller to close, then try again"
+		elif [ -z "$target" ]; then
+			fail "no box was offering to pair on any band - press \"Pair a new box\" on the controller first, and keep this box within reach of it"
+		elif [ -f "$OTHERBAND" ]; then
+			fail "the only box offering to pair was on a band this one cannot join ($target) - move the boxes closer and try again"
+		else
+			fail "the controller was found ($target) but no credential came through in time - try again from a clean start"
+		fi
+	fi
+
+	step "credential received - becoming an agent"
+	if [ -z "$ADDR" ]; then
+		step "asking the mesh for an address"
+		ADDR=$(learn_mesh_address) || {
+			logger -t wps-join "no address came back from the mesh - the node joins without the network layout and stays reachable only on the service port"
+			ADDR=""
+		}
+		[ -n "$ADDR" ] && logger -t wps-join "the mesh gave this box $ADDR"
+	fi
+
+	# Unquoted-on-purpose expansion: an empty GW must vanish from the command
+	# line rather than arrive as an empty argument, so easymesh-role falls back
+	# to the gateway VIP it already defaults to. A button press carries no
+	# gateway and should not have to.
+	/usr/sbin/easymesh-role agent ${GW:+"$GW"} ${ADDR:+--mesh-addr "$ADDR"} >/dev/null 2>&1 ||
+		fail "agent role setup failed"
+
+	mkdir -p /etc/mapc
+	echo "${bhssid:-MAP--BH}" > /etc/mapc/bh-ssid
+	i=0
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		[ "$(uci -q get mapagent.@ap[$i].type)" = "backhaul" ] && {
+			uci set mapagent.@ap[$i].ssid="${bhssid:-MAP--BH}"
+			uci set mapagent.@ap[$i].key="$key"
+		}
+		i=$((i + 1))
+	done
+	uci commit mapagent
+	rm -f /etc/mapc/bh-adopt.count "$PENDING"
+	# The stamp was written in phase 1, at the button press, which is what
+	# the deadline is meant to be measured from. Only the fuse is reopened
+	# here, for the part of the join that is still ahead.
+	rm -f /etc/mapc/join-fallback-reboot
+	# Say the join is running before the daemon that finishes it gets a word
+	# in. bh-key-adopt sleeps its whole interval before it publishes anything,
+	# and the box reboots itself inside that window - so the overlay would ask
+	# while the state file is still empty, and empty is what it reads as done.
+	# Same gap as the wired join in easymesh(setup_agent); see the long note
+	# there for how it ends: a login screen, and then a box that vanishes
+	# under the user's hands.
+	mkdir -p /etc/mapc
+	echo working > /etc/mapc/adopt-state
+	/etc/init.d/bh-key-adopt start >/dev/null 2>&1
+	if no_reboot; then
+		step "joined - finishing the setup, no restart needed"
+	else
+		step "joined - the box reboots itself shortly"
+	fi
+	exit 0
+fi
+
+# Where a button press gets an address.
+#
+# --mesh-addr is not decoration: easymesh-role gates the whole mesh network
+# layout on it, and derives the gateway VIP from its subnet. Without one, the
+# node joins the mesh at 1905 level - radios reported, controller counts it -
+# and stays on 192.168.1.1, on a network nobody else is on. Measured 2026-08-20
+# on the first button join: everything worked except that the box could not be
+# reached from the mesh it had just joined.
+#
+# The wizard had the user supply it, via suggest_address on the controller. A
+# button has nobody to ask. But by this point the WPS exchange is done and the
+# backhaul is up, so the box is on the mesh at layer 2 - and the controller has
+# been running DHCP for the mesh all along. Asking it is both the smallest
+# change and the standard answer: the address is unique because the thing that
+# owns the subnet handed it out.
+#
+# Falls back to nothing rather than to a guess. An invented address on a live
+# mesh is a collision, and a node with no address is merely unreachable - which
+# is recoverable over the service port, and says so in the log.
+# Named here rather than borrowed: easymesh-role has a MESH_BRIDGE of its own
+# and this script had none, so the first version of this asked udhcpc to work
+# on an empty interface name.
+MESH_BRIDGE=${MESH_BRIDGE:-br-lan}
+
+# Whose offer is this?
+#
+# The mesh is one L2 domain, and a box inside it can run a DHCP server of its
+# own. Measured 2026-09-21: a foreign agent answered 192.168.50.x on our own
+# bridge, from a box with a static address and no route anywhere. Taking that
+# offer is worse than taking none - the address below is what the rest of the
+# join builds on, and bh-key-adopt then asks ".1 of that subnet" who the
+# controller is. So the wrong offer does not merely misplace this box; it
+# hands the question "who runs this mesh" to the stranger who answered first.
+#
+# Two ways to corroborate, cheapest first. A gateway handed to this script is
+# the strongest word available, because a human or the controller put it
+# there. Without one - a button join carries none - somebody in the offered
+# subnet has to be a 1905 member. A box that never answers Higher Layer Query
+# has no address in that view at all, which is exactly the case to catch.
+offer_is_ours() {
+	local a="$1" pfx
+	pfx=${a%.*}
+	if [ -n "$GW" ]; then
+		case "$a" in "${GW%.*}".*) return 0 ;; esac
+		return 1
+	fi
+	ubus -t 5 call ieee1905.topology dump 2>/dev/null |
+		sed -n 's/^[[:space:]]*"ip":[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' |
+		grep -q "^$pfx\."
+}
+
+learn_mesh_address() {
+	local cidr="" got=""
+	# One attempt per interval rather than a tight loop: the bridge may still
+	# be settling after the credential exchange, and udhcpc is not cheap.
+	local try
+	for try in 1 2 3 4 5 6; do
+		udhcpc -i "$MESH_BRIDGE" -n -q -t 3 -T 3 >/dev/null 2>&1
+		cidr=$(ip -4 -o addr show "$MESH_BRIDGE" 2>/dev/null |
+			awk '{print $4}' | grep -v '^192\.168\.1\.1/' | head -1)
+		got=${cidr%%/*}
+		if [ -n "$got" ]; then
+			if offer_is_ours "$got"; then
+				echo "$got"
+				return 0
+			fi
+			# udhcpc runs here without -s, so the stock script has already
+			# put this address on the bridge. Take it back off: an address
+			# out of a stranger's pool is not a place to be reachable at,
+			# and the next round has to start from a clean interface or it
+			# would read the same one again and call it a fresh offer.
+			logger -t wps-join "a DHCP offer of $got does not belong to this mesh - ignoring it and asking again"
+			ip -4 addr del "$cidr" dev "$MESH_BRIDGE" 2>/dev/null
+		fi
+		sleep 5
+	done
+	return 1
+}
+
+# --------------------------------------------------------------- phase 1 --
+GW="$1"; ADDR="$2"
+
+if no_reboot; then
+	step "preparing the radio"
+else
+	step "preparing the radio - the box restarts once to get a clean one"
+fi
+/etc/init.d/bh-key-adopt stop >/dev/null 2>&1
+
+# This restart ends back on the wizard page, where the story carries on - it
+# is not a join finishing. An earlier attempt on this box may have left a word
+# behind, and the overlay would obey it: "working" keeps it waiting for a
+# finisher that was just stopped, and the page the user has to return to
+# never comes back. The join reopens the state in phase 2.
+rm -f /etc/mapc/adopt-state
+
+# The join is stamped HERE, at the button, not at the credential.
+#
+# Two reasons. A stamp written only in phase 2 leaves phases 1 and 2 with no
+# time limit at all - a soft restart that hangs, or three band hops that go
+# nowhere, are watched by nobody. And both writers create the stamp with
+# `[ -s ] ||`, so a stamp left over from an earlier join would be inherited
+# and this join would start already past its deadline (778fbe4). Writing it
+# unconditionally is what makes the deadline mean "since this button press".
+mkdir -p /etc/mapc
+date +%s > /etc/mapc/join-started
+rm -f /etc/mapc/join-fallback-reboot
+
+# Image defaults die here, permanently - a disabled section resurrects on
+# the next writer's whim, and a joining box has no business broadcasting
+# factory networks anyway.
+for s in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^=.]*\)=wifi-iface.*/\1/p'); do
+	uci delete "wireless.$s"
+done
+for r in radio0 radio1 radio2; do
+	uci -q get wireless.$r >/dev/null 2>&1 && uci -q delete wireless.$r.disabled
+done
+uci set wireless.wps_join=wifi-iface
+# 2.4 GHz, and the band is the whole point of this line.
+#
+# Pairing and carrying traffic want opposite things, and this line is where
+# that gets decided. Pairing happens once, moves a few kilobytes, and has to
+# reach a box somebody just put in an attic or a cellar: range is everything
+# and speed does not matter at all. The backhaul that follows is the other
+# way round, which is why it lives on 5 and 6 GHz. Deriving the join station
+# from the backhaul's radio looked consistent and was exactly backwards.
+#
+# This station is the only radio the box has while it joins, and whatever
+# band it sits on is the only band it can hear the controller calling from.
+# The fronthaul offers WPS on all three (wps_state=2 with multi_ap=2 on
+# phy0.0/0.1/0.2), so the question is only which one carries furthest to
+# somebody standing at a new box with a button - and that is 2.4 GHz.
+#
+# Measured 2026-09-21 from the corridor with the window open, one scan:
+#
+#   2412  -40 dBm  [WPS-PBC]
+#   5180  -45 dBm  [WPS-PBC]
+#   6135  -58 dBm  [WPS-PBC]
+#
+# It was radio1. A box too far for 5 GHz found nothing on its own band, and
+# pick_pbc_bssid()'s last resort then handed it a BSSID on another one, which
+# a station cannot associate to: two minutes that look like pairing and are
+# not. Reported from the field as "6 GHz never reached the kitchen", and the
+# 18 dB above is that report in numbers.
+#
+# The 2026-08-13 measurement that says never to aim at 2.4 GHz was taken with
+# the station on 5 GHz - it rules out aiming ACROSS bands, not this. A station
+# on 2.4 aimed at 2.4 had not been tried until 2026-09-21, when the credential
+# came through on 2437 (wpa_state=COMPLETED, ssid=MAP--BH).
+#
+# Nothing is spent on it: the image-default BSSes are deleted just above, so
+# no MLD sits beside the station to wedge, and easymesh-role rebuilds the box
+# with the real 5+6 GHz backhaul as soon as the credential lands.
+# The radio that IS 2.4 GHz, not the one that usually is.
+_first=$(echo $JOIN_BANDS | cut -d' ' -f1)
+uci set wireless.wps_join.device="$_first"
+mkdir -p /etc/mapc
+printf '%s\n' "$_first" > "$BANDFILE"
+uci set wireless.wps_join.mode=sta
+uci set wireless.wps_join.network=wpsjoin
+uci set wireless.wps_join.ssid=wps-join-placeholder
+uci set wireless.wps_join.encryption=psk2
+uci set wireless.wps_join.key=wps-join-placeholder
+uci commit wireless
+
+# Third field: when this join started.
+#
+# The note is what silences easymesh-genconfig and what makes the button
+# answer "already joining", so it has to be able to END on its own. A worker
+# that is killed - or a soft restart that never comes back - otherwise leaves
+# a box with no wifi-iface, no config writer and no working button, and the
+# only way out is the ten second wipe. bh-key-adopt clears a note this old
+# with nobody behind it.
+printf '%s %s %s\n' "$GW" "$ADDR" "$(date +%s)" > "$PENDING"
+sync
+if no_reboot; then
+	/usr/sbin/easymesh-soft-restart "wps-join: phase 1" || true
+	# After the reboot this replaces, bh-key-adopt came up at S99 (the
+	# pending note makes this a mesh node) and was listening before the
+	# WPS credential arrived. Without it here the event is missed
+	# (2026-09-19).
+	/etc/init.d/bh-key-adopt start >/dev/null 2>&1
+	exec /usr/libexec/easymesh-wps-join --resume "$GW" "$ADDR"
+fi
+sleep 3
+reboot
+exit 0

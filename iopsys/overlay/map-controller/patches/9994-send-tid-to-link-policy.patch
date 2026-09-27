@@ -1,0 +1,208 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 9994: send a TID-to-Link Mapping policy
+
+The agent has had a receive path for TID-to-Link Mapping since map-agent 9993.
+Nothing sent one, so the door was open onto nothing. This is the half that
+decides.
+
+The policy rides the AP MLD Config Request, which the controller already sends
+on a config change (cntlr.c:1561, CONFIG_DIFF_AP_MLD) and re-sends until the
+agent acknowledges (cntlr.c:1842, last_apmld_ack). Reusing that machinery buys
+retry and restart-survival for free; a new ubus command would have bought
+neither and cost five files of command-framework plumbing.
+
+The policy is read from a plain line-oriented file, not a UCI section:
+
+  /etc/mapc/ttlm-policy
+  <agent_almac> <ap_mld_mac> <sta_mld_mac> <dir> <tid>:<map> [<tid>:<map> ...]
+  7a:2e:43:71:26:91 ca:8e:1d:ca:bc:af 06:0c:43:26:82:10 2 6:1 7:1 0:2
+
+The producer is mlo-steerd, a shell daemon that has been driving this actuator
+locally since 2026-07-29. A line is something it can write with printf; a UCI
+schema would have made its job harder and bought us a parser, a diff and a free
+path we do not need. One file describes the whole mesh - lines for other agents
+are skipped - so the file is also readable as the mesh's current TID policy.
+
+<map> is a link BITMAP, not a link id: a TID may sit on several links, and the
+bitmap is what hostapd's negotiated_ttlm takes. dir is hostapd's: 0 downlink,
+1 uplink, 2 both.
+
+No file means no TLV and no cost, which is the normal case for a controller that
+does not steer. A policy block that parses to zero mappings is rewound rather
+than emitted - it would tell the agent nothing and only cost it a parse.
+
+Untested on hardware: this needs a mesh where the controller decides something.
+With map-agent 9993 the path is now complete end to end and can be exercised by
+writing one line to the file and triggering a config reload.
+
+diff -urN a/src/cntlr_cmdu.c b/src/cntlr_cmdu.c
+--- a/src/cntlr_cmdu.c	2026-08-01 18:18:30.150734908 +0200
++++ b/src/cntlr_cmdu.c	2026-08-01 18:18:30.150830353 +0200
+@@ -783,6 +783,151 @@
+ }
+ 
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Put a TID-to-Link Mapping policy on the wire for @agent_mac.
++ *
++ * The agent has had a receive path since map-agent 9993; this is the half that
++ * decides. The policy is read from a plain line-oriented file rather than a UCI
++ * section on purpose: its producer is mlo-steerd, a shell daemon, and a line is
++ * something it can write with printf. A UCI schema would have bought a parser,
++ * a diff, and a free path, and made the producer's job harder.
++ *
++ *	/etc/mapc/ttlm-policy, one policy per line, '#' comments allowed:
++ *
++ *	<agent_almac> <ap_mld_mac> <sta_mld_mac> <dir> <tid>:<map> [<tid>:<map> ...]
++ *
++ *	7a:2e:43:71:26:91 ca:8e:1d:ca:bc:af 06:0c:43:26:82:10 2 6:1 7:1 0:2
++ *
++ * dir is hostapd's: 0 downlink, 1 uplink, 2 both. <map> is a link BITMAP, not a
++ * link id - a TID may sit on several links, and the bitmap is what the actuator
++ * takes.
++ *
++ * Lines for other agents are skipped, so one file describes the whole mesh and
++ * every agent gets only its own policies. Emitting nothing is normal and must
++ * stay cheap: a controller that does not steer has no file at all.
++ *
++ * Wire layout is the mirror of agent_process_tid_to_link_policy(); see ieee1905
++ * patch 0008 for why this direction and the agent's report share a TLV number
++ * and differ in layout.
++ */
++#define TTLM_POLICY_FILE	"/etc/mapc/ttlm-policy"
++#define TTLM_POLICY_RESERVE	1024
++#define TTLM_MAX_TIDS		16
++
++static int cntlr_gen_tid_to_link_policy(struct controller *c,
++					struct cmdu_buff *frm,
++					uint8_t *agent_mac)
++{
++	uint8_t buf[TTLM_POLICY_RESERVE] = {0};
++	char line[256] = {0};
++	int off = 1;		/* [0] = num_policies, back-patched */
++	uint8_t num = 0;
++	struct tlv *t;
++	FILE *f;
++	int ret;
++
++	f = fopen(TTLM_POLICY_FILE, "r");
++	if (!f)
++		return 0;	/* no policy is not an error */
++
++	while (fgets(line, sizeof(line), f)) {
++		uint8_t agent[6], apmld[6], stamld[6];
++		char a_s[18], ap_s[18], sta_s[18];
++		int dir, consumed = 0, ntid_off, n;
++		uint8_t ntids = 0;
++		char *p;
++
++		if (line[0] == '#' || line[0] == '\n')
++			continue;
++
++		n = sscanf(line, "%17s %17s %17s %d %n",
++			   a_s, ap_s, sta_s, &dir, &consumed);
++		if (n < 4)
++			continue;
++
++		if (!hwaddr_aton(a_s, agent) || !hwaddr_aton(ap_s, apmld) ||
++		    !hwaddr_aton(sta_s, stamld))
++			continue;
++
++		/* one file for the whole mesh; take only our agent's lines */
++		if (memcmp(agent, agent_mac, 6))
++			continue;
++
++		if (dir < 0 || dir > 2)
++			continue;
++
++		if (off + 14 + (TTLM_MAX_TIDS * 2) > (int)sizeof(buf))
++			break;
++
++		memcpy(&buf[off], apmld, 6);
++		off += 6;
++		memcpy(&buf[off], stamld, 6);
++		off += 6;
++		buf[off++] = (uint8_t)dir;
++		ntid_off = off++;
++
++		for (p = line + consumed; p && *p; ) {
++			unsigned int tid, map;
++
++			if (sscanf(p, "%u:%u", &tid, &map) != 2)
++				break;
++			if (tid > 7 || map > 255 || ntids >= TTLM_MAX_TIDS)
++				break;
++
++			buf[off++] = (uint8_t)tid;
++			buf[off++] = (uint8_t)map;
++			ntids++;
++
++			p = strchr(p, ' ');
++			while (p && *p == ' ')
++				p++;
++		}
++
++		if (!ntids) {
++			/* rewind this policy: a block with no mapping tells the
++			 * agent nothing and would only cost it a parse */
++			off = ntid_off - 13;
++			continue;
++		}
++
++		buf[ntid_off] = ntids;
++		num++;
++	}
++
++	fclose(f);
++
++	if (!num) {
++		/* info(), not dbg(). On 2026-09-02 the trigger fired seven
++		 * times and no CMDU 0x8023 ever left the box, and there was
++		 * no way to tell whether any line matched this agent. */
++		info("%s: no TTLM policy line for " MACFMT "\n", __func__,
++		     MAC2STR(agent_mac));
++		return 0;
++	}
++
++	buf[0] = num;
++
++	t = cmdu_reserve_tlv(frm, off);
++	if (!t)
++		return -1;
++
++	t->type = MAP_TLV_TID_TO_LINK_MAPPING_POLICY;
++	t->len = off;
++	memcpy(t->data, buf, off);
++
++	ret = cmdu_put_tlv(frm, t);
++	if (ret) {
++		err("%s: cmdu_put_tlv()\n", __func__);
++		return -1;
++	}
++
++	info("%s: %u TTLM policy block(s) for " MACFMT "\n", __func__, num,
++	    MAC2STR(agent_mac));
++
++	return 0;
++}
++#endif
++
+ struct cmdu_buff *cntlr_gen_ap_mld_configuration_request(struct controller *c,
+ 							 uint8_t *agent_mac,
+ 							 struct wifi_wifi7_capabilities *caps)
+@@ -820,6 +959,15 @@
+ 	if (ret)
+ 		goto out;
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* Last of the TLVs: a policy names links of an AP-MLD, and the agent
++	 * applies it after the MLD configuration above, so the order on the
++	 * wire matches the order it is consumed in. */
++	ret = cntlr_gen_tid_to_link_policy(c, resp, agent_mac);
++	if (ret)
++		goto out;
++#endif
++
+ 	memcpy(resp->origin, agent_mac, 6);
+ 	cmdu_put_eom(resp);
+ 	return resp;

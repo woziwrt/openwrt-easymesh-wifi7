@@ -1,0 +1,36 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: tolerate per-band enrich failure in iface_get_mlsta_info
+
+iface_get_mlsta_info() enriches each link of a multi-link station with
+band-specific data from hostapd. When that call fails for one link -- which
+happens whenever the client is not currently readable on that link's band --
+the WARN_ON(ret) return discarded the entire reply, so a client associated on
+a single link was reported as no client at all. The controller sta table then
+stayed empty and steering returned Invalid argument.
+
+Keep the nl80211 data already gathered for the link and skip only the failed
+enrichment, matching the tolerance the sibling iface_get_mlsta_4addr_info()
+already has.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1939,8 +1939,15 @@
+ 				memcpy(sta->bssid, aplinks[j].macaddr, 6);
+ 
+ 				ret = iface_get_sta_info_band(ifname, aplinks[j].band, macaddr, sta);
+-				if (WARN_ON(ret))
+-					return ret;
++				if (ret) {
++					/* Hostapd band enrichment can fail for a link the
++					 * client is not readable on; keep the nl80211 data
++					 * for this link instead of discarding the whole
++					 * multi-link reply. */
++					libwifi_dbg("[%s] %s: band %d enrich failed, keeping nl80211 link data\n",
++						ifname, __func__, aplinks[j].band);
++					break;
++				}
+ 
+ 				if (!(sta->caps.valid & WIFI_CAP_EHT_VALID))
+ 					mlsta->mlo_capable = false;

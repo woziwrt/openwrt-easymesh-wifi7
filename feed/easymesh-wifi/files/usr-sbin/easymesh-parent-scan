@@ -1,0 +1,91 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-parent-scan - which parents this node can hear, and how well.
+#
+# A backhaul picks its parent once, at association, and never looks again.
+# After a cascade of reboots the mesh freezes in whatever shape the boot order
+# gave it: on 2026-09-23 hall hung on the controller at -75 dBm with one leg,
+# three times, while kitchen sat 23 dB closer. Nothing in the system could see
+# it - the controller's scan_result table has always been empty.
+#
+# This is that missing input and nothing more: it measures, it does not move.
+#
+# It scans ONLY the frequencies the backhaul STA is on right now. Every node's
+# AP runs on the same channels as its bSTA, so every candidate parent beacons
+# there and the radio never has to leave its channel. Measured 2026-09-23 on
+# bedroom: all four candidates seen (-50/-55/-76/-86 dBm on 5500), and a 4 Hz
+# ping to the controller across the scan lost 0 of 40. It must be a scan-only
+# request - see scan_once.
+#
+# Writes /tmp/easymesh/parents.json:
+#   {"ts":..,"parent":"<ap-mld>","freqs":"5500,6135",
+#    "cand":[{"bssid":"..","freq":5500,"signal":-55}, ...]}
+# Only BSSs carrying our backhaul SSID. tmpfs on purpose.
+
+PERIOD=${1:-600}
+FIRST=${FIRST:-180}
+OUT=/tmp/easymesh/parents.json
+PIDF=/tmp/easymesh/parent-scan.pid
+
+if [ -r /usr/share/easymesh/boot-window.sh ]; then
+	. /usr/share/easymesh/boot-window.sh
+	is_mesh_node || exit 0
+fi
+
+BSTA=$(uci -q get wireless.sta_mld_1.ifname)
+[ -n "$BSTA" ] || exit 0
+mkdir -p /tmp/easymesh 2>/dev/null
+
+# One instance only - two would interleave scans and overwrite each other's file.
+if read -r _old 2>/dev/null < "$PIDF" && [ "$_old" != "$$" ] &&
+   grep -q easymesh-parent-scan "/proc/$_old/cmdline" 2>/dev/null; then
+	echo "easymesh-parent-scan already runs as pid $_old - read $OUT instead" >&2
+	exit 1
+fi
+echo $$ > "$PIDF"
+
+W="wpa_cli -p /var/run/wpa_supplicant -i $BSTA"
+
+scan_once() {
+	[ "$($W status 2>/dev/null | sed -n 's/^wpa_state=//p')" = COMPLETED ] || return 1
+	parent=$($W status 2>/dev/null | sed -n 's/^ap_mld_addr=//p')
+	freqs=$(iw dev "$BSTA" link 2>/dev/null | awk '$1 == "freq:" { printf "%s%d", s, $2; s = "," }')
+	[ -n "$freqs" ] || return 1
+	ssid=$(uci -q get wireless.sta_mld_1.ssid)
+	[ -n "$ssid" ] || return 1
+
+	# TYPE=ONLY, and first: wpa_supplicant matches it at the start of the
+	# arguments. A plain SCAN hands its results to BSS selection, and on
+	# 2026-09-23 that made corridor - a relay - re-authenticate to the parent
+	# it was already on; the auth failed and corridor dropped off the mesh for
+	# two minutes with kitchen and hall behind it. scan_only_handler only
+	# reports the results and never connects.
+	$W scan type=ONLY freq="$freqs" >/dev/null 2>&1 || return 1
+	# Results arrive in 1-3 s on two channels; wait for them, not longer.
+	i=0
+	while [ $i -lt 10 ]; do
+		sleep 1; i=$((i + 1))
+		$W scan_results 2>/dev/null | awk -F'\t' -v f=",$freqs," \
+			'NR > 1 && index(f, "," $2 ",") { n++ } END { exit !n }' && [ $i -ge 3 ] && break
+	done
+
+	$W scan_results 2>/dev/null | awk -F'\t' -v ssid="$ssid" -v f=",$freqs," \
+		-v ts="$(date +%s)" -v par="$parent" -v fq="$freqs" '
+		NR > 1 && $5 == ssid && index(f, "," $2 ",") {
+			c = c (n++ ? "," : "") sprintf("{\"bssid\":\"%s\",\"freq\":%d,\"signal\":%d}", $1, $2, $3)
+		}
+		END { printf "{\"ts\":%s,\"parent\":\"%s\",\"freqs\":\"%s\",\"cand\":[%s]}\n", ts, par, fq, c }' \
+		> "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+}
+
+if [ "${ONESHOT:-0}" = 1 ]; then
+	scan_once; exit $?
+fi
+
+sleep "$FIRST"
+while :; do
+	scan_once || logger -t easymesh-parent-scan "no scan this round (backhaul not up)"
+	sleep "$PERIOD"
+done

@@ -1,0 +1,24 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: advertise the bsta-mld driver-name token
+
+The default driver matches interfaces by name token. Without "bsta-mld" in
+that list a backhaul STA MLD interface finds no driver, so wifi.bstamld is
+never published and the whole bSTA-MLD chain stops before it starts.
+
+Companion to the map-agent and map-controller backhaul MLD patches. Rescued
+from the 2026-07-16 control-plane work (tag backhaul-mld-controlplane-2026-07-16)
+and re-applied to the current tree on 2026-07-22.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -2187,7 +2187,7 @@
+ 
+ 
+ const struct wifi_driver default_wifi_driver = {
+-	.name = "wlan,phy,bsta,ap-mld",
++	.name = "wlan,phy,bsta,ap-mld,bsta-mld",
+ 	.info = nlwifi_driver_info,
+ 
+ 	/* Radio/phy callbacks */

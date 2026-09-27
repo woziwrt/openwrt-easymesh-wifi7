@@ -1,0 +1,39 @@
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Subject: net: ethernet: mtk_eth_soc: add mdio reset delay
+
+The mdiobus_register will trigger a reset pulse when enabling Bus reset,
+we just need to wait until device ready.
+
+Ported from Sinovoip/MTK 999-2700 (kernel 6.6) to kernel 6.12.
+
+[Petr Wozniak: ported from MTK 999-2700 (Linux 6.6) to Linux 6.12]
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -484,6 +484,16 @@ static int mtk_mdio_read_c45(struct mii_bus *bus, int phy_addr, int devad,
+ 	return _mtk_mdio_read_c45(eth, phy_addr, devad, phy_reg);
+ }
+
++static int mtk_mdio_reset(struct mii_bus *bus)
++{
++	/* The mdiobus_register will trigger a reset pulse when enabling Bus reset,
++	 * we just need to wait until device ready.
++	 */
++	mdelay(150);
++
++	return 0;
++}
++
+ static int mt7621_gmac0_rgmii_adjust(struct mtk_eth *eth,
+ 				     phy_interface_t interface)
+ {
+@@ -1005,6 +1015,7 @@ static int mtk_mdio_init(struct mtk_eth *eth)
+ 	eth->mii_bus->write = mtk_mdio_write_c22;
+ 	eth->mii_bus->read_c45 = mtk_mdio_read_c45;
+ 	eth->mii_bus->write_c45 = mtk_mdio_write_c45;
++	eth->mii_bus->reset = mtk_mdio_reset;
+ 	eth->mii_bus->priv = eth;
+ 	eth->mii_bus->parent = eth->dev;

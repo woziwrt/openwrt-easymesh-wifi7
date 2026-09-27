@@ -1,0 +1,77 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a bSTA record belongs to the radio that names it
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+The last of the five ghost mechanisms, and the only one still open.
+
+A bSTA record is created by handle_backhaul_sta_caps_report() through
+cntlr_add_sta() with no node_add_sta() behind it. So nref stays 0 for the
+life of the record; sta_dec_ref() is the only place that arms the ageout
+timer (sta.c:415-429) and it is never reached. The record cannot expire. Our
+993 sweeps its row out of mapc.db, which is the symptom - the struct sta in
+c->sta_table stays until the process ends.
+
+The temptation is to arm a timer. That is the wrong tool twice over.
+stale_sta_timeout is 20 days on these boxes, so the record would go from
+immortal to three-weeks-old and nothing measurable would change. And a bSTA
+is not a client that walks out of range, where time is the only evidence
+there is: its absence is *stated*. The radio names exactly one bSTA and
+names it again in every Backhaul STA Capability Report, which is the report
+that calls this function.
+
+So the record's owner is the radio, and it is freed where the radio stops
+naming it - the same shape as mapc_sync_bss_sweep(), which drops the rows a
+radio no longer reports. Deterministic, at the moment it becomes true,
+instead of three weeks later.
+
+Guarded twice: only a record marked is_bsta, and only one with nref == 0. If
+anything took a reference in the meantime, it is not ours to free.
+
+NOT covered, and said out loud rather than left to be discovered: a radio
+that stops having a bSTA at all does not call this function, so that record
+still waits for the node to go. Closing that needs the caller to say "no
+bSTA" as clearly as it says "this bSTA" - a follow-up, not a silent gap.
+
+Verify: on a mesh where an agent re-associates its backhaul with a new bSTA
+MAC (a reflash does this), the controller log must show "no longer reports
+bSTA", and `select count(*) from sta where is_bsta=1` must match the number
+of backhaul links actually up - not grow across reflashes as it does today.
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -931,6 +931,36 @@
+ 
+ int cntlr_radio_add_bsta(struct controller *c, struct netif_radio *r, uint8_t *macaddr)
+ {
++	uint8_t *old = r->radio_el->bsta.macaddr;
++
++	/* A radio names exactly one bSTA, and it names it again in every
++	 * Backhaul STA Capability Report. So when the name changes, the record
++	 * for the previous one has lost its owner - and it cannot leave on its
++	 * own: a bSTA is created by cntlr_add_sta() with no node_add_sta()
++	 * behind it, so nref stays 0, sta_dec_ref() is never reached and the
++	 * ageout timer is never armed (sta.c:415-429). The record is immortal.
++	 *
++	 * Waiting for a timer would be the wrong tool even if one were armed.
++	 * stale_sta_timeout is 20 days on these boxes, and unlike a client that
++	 * walks out of range - where time is the only evidence there is - a bSTA
++	 * never disappears quietly: its absence is stated, in the very report
++	 * that carries this call. So drop it where that is said, the way
++	 * mapc_sync_bss_sweep() drops the rows a radio no longer reports.
++	 *
++	 * Guarded twice: only a bSTA, and only one nobody holds. If anything
++	 * took a reference in the meantime it is not ours to free.
++	 */
++	if (!hwaddr_is_zero(old) && memcmp(old, macaddr, 6)) {
++		struct sta *prev = cntlr_find_sta(c->sta_table, old);
++
++		if (prev && prev->is_bsta && prev->nref == 0) {
++			info("%s: radio " MACFMT " no longer reports bSTA "
++			     MACFMT ", dropping it\n", __func__,
++			     MAC2STR(r->radio_el->macaddr), MAC2STR(old));
++			cntlr_del_sta(c->sta_table, prev);
++		}
++	}
++
+ 	memcpy(r->radio_el->bsta.macaddr, macaddr, 6);
+ 	return 0;
+ }

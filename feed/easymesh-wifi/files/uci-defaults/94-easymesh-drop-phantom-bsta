@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Drop the phantom bsta sections a previous generation left in mapagent.
+#
+# What they are
+# -------------
+# config_find_bsta_wireless() matches a wireless section on mode="sta" alone
+# and never looks at `disabled`, so a stale `default_sta_radio0 (ifname=wlan0,
+# disabled=1)` counts as a live bSTA. config_generate_bsta_agent() then writes
+# a mapagent bsta section for it with ifname, device and band -- and no
+# priority, unlike the MLD path, which sets priority, enabled, mld_id and
+# is_mld. The interface never appears, so the section points at nothing, and
+# the missing priority aborts an arithmetic test in /lib/wifi/multiap with
+# "sh: out of range".
+#
+# Missing priority is therefore a reliable marker: map_genconfig always writes
+# one (map_genconfig line 236), and so does the MLD path. Only this generator
+# omits it.
+#
+# Patch 999 stops new ones from being written. This clears the ones already on
+# disk, which keep-config would otherwise carry forward for good.
+#
+# What this deliberately does NOT do
+# ----------------------------------
+# It does not delete /etc/config/wireless. That was tried on hardware on
+# 2026-07-28 and it took the whole mesh down: `wifi config` regenerates a
+# generic default with an AP per radio and no bSTA and no backhaul BSS, and
+# map_genconfig cannot rebuild the mesh layer on top of it -- the backhaul
+# credentials come from the controller over WSC, and without a bSTA the node
+# has no way to onboard and receive them. All three nodes came back with
+# phy0.N-ap0 interfaces, no ap-mld-2, no MAP--BH anywhere, and had to be
+# restored from backup.
+#
+# The lesson worth keeping: regeneration was verified to happen, not to be
+# correct. A wireless config appeared, so the check passed; that it contained
+# nothing usable was only visible by looking at what it held.
+
+[ -x /lib/multiap/map_genconfig ] || exit 0     # not a mesh node
+
+# Boot only. default_postinst re-runs every uci-default a package ships, on
+# upgrade exactly as on install, so without the guard an `apk upgrade` rewrites
+# the mapagent config of a node that is carrying traffic. Clearing an older
+# generation's sections is first-boot work by definition, so there is nothing
+# to do on a node that is already up. See /usr/share/easymesh/boot-window.sh.
+. /usr/share/easymesh/boot-window.sh
+in_boot_window || exit 0
+
+BACKUP_DIR=/etc/config-backup
+STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo flash)"
+mkdir -p "$BACKUP_DIR"
+cp /etc/config/mapagent "$BACKUP_DIR/mapagent.$STAMP" 2>/dev/null
+
+# Keep five generations; a node flashed twenty times should not spend its
+# overlay on its own history.
+ls -1t "$BACKUP_DIR"/mapagent.* 2>/dev/null | tail -n +6 | while read -r f; do rm -f "$f"; done
+
+removed=0
+
+# A bsta section whose wireless counterpart is disabled describes an interface
+# that will never come up. Both facts are in the config, so this is decidable
+# here, before any radio exists -- unlike "is it in /sys/class/net", which at
+# uci-defaults time would call everything a phantom.
+wireless_is_disabled() {
+	_want="$1"
+	[ -n "$_want" ] || return 1
+	for _ws in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)\.ifname=.*/\1/p'); do
+		[ "$(uci -q get "wireless.$_ws.ifname")" = "$_want" ] || continue
+		[ "$(uci -q get "wireless.$_ws.disabled")" = "1" ] && return 0
+		return 1
+	done
+	return 1
+}
+
+# Walk highest index first: deleting renumbers the anonymous sections below it.
+idx=$(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.@bsta\[\([0-9]*\)\]=bsta$/\1/p' | sort -n | tail -1)
+[ -n "$idx" ] || idx=-1
+
+while [ "$idx" -ge 0 ]; do
+	ifname="$(uci -q get "mapagent.@bsta[$idx].ifname")"
+	prio="$(uci -q get "mapagent.@bsta[$idx].priority")"
+	is_mld="$(uci -q get "mapagent.@bsta[$idx].is_mld")"
+
+	# Never touch the MLD bSTA: it is the uplink, it is written by a different
+	# path, and its wireless section spans several radios.
+	if [ "$is_mld" != "1" ] && { [ -z "$prio" ] || wireless_is_disabled "$ifname"; }; then
+		uci -q delete "mapagent.@bsta[$idx]"
+		logger -t easymesh-fresh "dropped phantom bsta section (ifname=${ifname:-?})"
+		removed=$((removed + 1))
+	fi
+
+	idx=$((idx - 1))
+done
+
+if [ "$removed" -gt 0 ]; then
+	uci commit mapagent
+	logger -t easymesh-fresh "removed $removed phantom bsta section(s); backup in $BACKUP_DIR/mapagent.$STAMP"
+else
+	rm -f "$BACKUP_DIR/mapagent.$STAMP"
+	logger -t easymesh-fresh "no phantom bsta sections found"
+fi
+
+exit 0

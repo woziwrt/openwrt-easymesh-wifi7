@@ -1,0 +1,29 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: retract the never-measured GET_STATION hang claim from the skip-probe comment
+
+The skip-probe rationale carried "its GET_STATION dump never returns on
+mt76" - a claim the interface-probe patch itself later retracted as
+never measured and wrong twice over, yet the sentence survived in the
+diff. The skip is still right for the right reason: the probe is
+synchronous on a single-threaded uloop and a slow reply starves the
+1 s-bounded cmdu invoke. Say that, and keep the retraction visible so
+the myth stops resurfacing. Comment-only change.
+--- a/src/i1905_cmdresp.c
++++ b/src/i1905_cmdresp.c
+@@ -1613,10 +1613,12 @@
+ 	}
+ 
+ 	/* Skip the blocking wifi mediainfo/WPS probe in i1905_alloc_interface for a
+-	 * wireless backhaul bSTA (4addr STA): its GET_STATION dump never returns on
+-	 * mt76 and stalls this uloop thread, starving the 1 s-bounded "cmdu" invoke
+-	 * the controller uses to send AP-Autoconfig Response / WSC M2 -> onboarding
+-	 * stalls forever. Single-threaded uloop makes the transient flag race-free. */
++	 * wireless backhaul bSTA (4addr STA): the probe is synchronous on this
++	 * single-threaded uloop, and a slow driver reply starves the 1 s-bounded
++	 * "cmdu" invoke the controller uses to send AP-Autoconfig Response / WSC M2
++	 * -> onboarding stalls. (An earlier version claimed the GET_STATION dump
++	 * never returns on mt76 - never measured; slowness, not a proven hang, is
++	 * the documented risk.) Single-threaded uloop keeps the flag race-free. */
+ 	if (tb[I1905_INTERFACE_WIFI_BACKHAUL])
+ 		priv->add_iface_wifi_backhaul =
+ 			blobmsg_get_bool(tb[I1905_INTERFACE_WIFI_BACKHAUL]);

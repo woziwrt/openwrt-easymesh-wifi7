@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# punct - how many times did this radio rebuild its channel, and how warm is it?
+#
+# Reads what nightwatch already sampled, so it needs no daemon of its own and
+# costs nothing when nobody asks. Written 21. 8. 2026, the day one loose contact
+# turned into a whole morning of hunting for a fault that was not in our code.
+LOG=/etc/mapc/nightwatch.log
+TMP=/etc/mapc/temp.log
+[ -r "$LOG" ] || { echo "nightwatch is not running"; exit 1; }
+
+b=$(tr -d '\000' < "$LOG" | grep -an "NIGHTWATCH START" | tail -1 | cut -d: -f1)
+tr -d '\000' < "$LOG" | tail -n +"${b:-1}" | grep -a 'up=' > /tmp/.pc
+n=$(wc -l < /tmp/.pc)
+[ "$n" -gt 0 ] || { echo "no data since the last start"; exit 0; }
+
+# lines per retune = BSS count, derived from the data instead of assumed
+d=$(grep -aoE 'csa=[0-9]+' /tmp/.pc | cut -d= -f2 | awk '$1>0' | sort -n | uniq | awk '
+	function g(a,b){while(b){t=b;b=a%b;a=t}return a} NR==1{x=$1;next}{x=g(x,$1)}END{print (x?x:1)}')
+s=$(grep -aoE 'csa=[0-9]+' /tmp/.pc | cut -d= -f2 | awk '{x+=$1}END{print x+0}')
+w=$(grep -ac 'csa=?' /tmp/.pc)
+f=$(grep -aoE 'beaconfail=[0-9]+' /tmp/.pc | cut -d= -f2 | awk '{x+=$1}END{print x+0}')
+
+# Beacon loss on the individual MLD links.
+#
+# Nightwatch collects TWO different things, and until now only the first was read:
+#   beaconfail=0                            <- this is what punct reported
+#   beaconloss=link0=none,link1=1           <- and this it ignored
+#
+# On 4. 9. 2026 node .2 had 711 "detect 20 beacon loss" messages in dmesg on
+# the 6GHz backhaul link, repeated every two seconds - and punct reported
+# "beaconfail: 0" and "CLEAN". Meanwhile the nightwatch log held 23x link1=1
+# and 5x link1=2. The watchdog was measuring a metric that is always zero on
+# this board.
+#
+# What is counted is the number of SAMPLES in which some link reported
+# anything other than "none" and "0". Negative values (seen: -1) count too:
+# they mean a wrapped counter, not the absence of a fault.
+bl=$(grep -aoE 'beaconloss=[^ ]+' /tmp/.pc \
+	| sed 's/^beaconloss=//' | tr ',' '\n' \
+	| grep -oE 'link[0-9]+=[^ ,]+' \
+	| awk -F= '$2 != "none" && $2 != "0" && $2 != "" {n++} END{print n+0}')
+# Which links and how often - for the report, so it shows where the problem is.
+bld=$(grep -aoE 'beaconloss=[^ ]+' /tmp/.pc \
+	| sed 's/^beaconloss=//' | tr ',' '\n' \
+	| grep -oE 'link[0-9]+=[^ ,]+' \
+	| awk -F= '$2 != "none" && $2 != "0" && $2 != "" {c[$1]++} END{for(k in c) printf "%s:%dx ", k, c[k]}')
+# The sensor is looked up by NAME, not by position.
+#
+# This used to be `sed -n 3p` - the third line of all hwmon sensors. On the
+# classic board that happened to land on the WiFi module by accident; on the
+# BPI-R4 Pro 8X the order differs and punct reported 135 C while the mt7996
+# was at 55 C. A number that cannot be trusted is worse than none - so rather
+# nothing than a guessed line.
+t=""
+for _h in /sys/class/hwmon/*; do
+	case "$(cat "$_h/name" 2>/dev/null)" in
+	mt7996*|mt76*) t=$(cat "$_h/temp1_input" 2>/dev/null); [ -n "$t" ] && break ;;
+	esac
+done
+# range over the run, once nightwatch records it per minute
+tr=$(grep -aoE 'wifi=[0-9]+C' /tmp/.pc | tr -dc '0-9\n' | awk 'NF{if($1<lo||lo==""){lo=$1};if($1>hi)hi=$1}END{if(lo!="")printf "%s-%s", lo, hi}')
+
+echo "$(uci -q get ieee1905.ieee1905.device_name)  [$(cat /etc/mapc/role 2>/dev/null || echo no-role)]  up $(( $(cut -d. -f1 /proc/uptime) / 60 )) min"
+echo "  retunes      : $((s/d))"
+echo "  minutes seen : $n"
+echo "  beaconfail   : $f"
+if [ "${bl:-0}" -gt 0 ] 2>/dev/null; then
+	echo "  BEACON LOSS: $bl of $n samples  ($bld)"
+fi
+# How much memory the board found on THIS boot.
+#
+# The RAM size is not a constant of the board - it is read from the DTB, where
+# U-Boot writes it according to DDR training. Measured 2026-08-23: the same
+# 8 GB board with the same image came up once with 3917 MB and, after a power
+# cycle, with 7935 MB. Nothing says so, half is just silently gone - and on a
+# node where mapcontroller can bloat to hundreds of MB, that is the difference
+# between "running" and "out of memory", blamed on our code.
+#
+# That is why it belongs here and not in the head of whoever happens to be
+# looking: one sample is an impression, two dated samples are a phenomenon.
+echo "  memory       : $(awk "/MemTotal/{printf \"%d MB\", \$2/1024}" /proc/meminfo)"
+[ "$w" -gt 0 ] && echo "  ! $w min with an overflowed log - the real count is HIGHER"
+[ -n "$t" ] && echo "  wifi module  : $((t/1000)) C${tr:+  (over the run $tr C)}"
+echo
+# The verdict used to rest on the retune count alone, so "CLEAN" only meant
+# "did not retune the channel" - and a node losing beacons on an entire
+# backhaul link passed as fine. Now it has to pass both.
+if [ "$s" -eq 0 ] && [ "${bl:-0}" -eq 0 ]; then
+	echo "  CLEAN"
+else
+	[ "$s" -gt 0 ] && {
+		echo "  RETUNING - latest batches:"
+		grep -a 'csa=[1-9]' /tmp/.pc | tail -5 | sed 's/^/    /'
+	}
+	[ "${bl:-0}" -gt 0 ] && {
+		echo "  LOSING BEACONS - latest samples:"
+		grep -aoE 'beaconloss=[^ ]+' /tmp/.pc | grep -vE 'link[0-9]+=none,link[0-9]+=none' \
+			| tail -5 | sed 's/^/    /'
+	}
+fi
+rm -f /tmp/.pc

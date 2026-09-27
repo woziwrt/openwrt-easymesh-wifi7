@@ -1,0 +1,64 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a name we do not have must not erase the one we do
+
+sta.hostname was written and gone again 59 seconds later.
+
+The sta upsert guards every other column that can arrive unknown:
+est_mac_rate_ul/dl keep the last positive value, rcpi keeps the last real
+reading. hostname was the one left plain - "hostname=excluded.hostname" -
+and nothing on the agent path ever fills it, so each upsert wrote NULL over
+whatever was there.
+
+Measured 2026-09-07 on the lab mesh. The name was put into the row from the
+DHCP leases; 59 s later, after one upsert:
+
+  62:35  hostname=NULL   ipv4=172.16.20.188   last_seen 59 s ago
+  17:82  hostname=iPhone ipv4=172.16.20.166   last_seen 323 s ago
+
+The client whose row had been rewritten had lost its name; the one that had
+not kept it. ipv4 survived on both - and ipv4 is not in this statement at
+all. That is what points at the statement rather than at the writer.
+
+It matters more than a cosmetic column. The only source of a client's name
+is /tmp/dhcp.leases, which is RAM: after a controller restart a name comes
+back only when that client happens to renew its lease, measured at up to 12
+hours. Persisting it is the entire purpose of the column, and this line was
+undoing it every minute.
+
+Same shape as rcpi, est_thput and conn_time: a value that was never measured
+must not outrank one that was.
+
+Verify: write a hostname into sta, wait for the client's next upsert, and
+the name must still be there.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -620,7 +620,25 @@
+ 		"pkts_tx=excluded.pkts_tx, pkts_rx=excluded.pkts_rx, "
+ 		"bytes_tx=excluded.bytes_tx, bytes_rx=excluded.bytes_rx, "
+ 		"errors_tx=excluded.errors_tx, errors_rx=excluded.errors_rx, "
+-		"retrans_count=excluded.retrans_count, hostname=excluded.hostname, "
++		"retrans_count=excluded.retrans_count, "
++		/* A name we do not have must not erase the name we do.
++		 *
++		 * Every other column that can arrive unknown is already guarded
++		 * two lines up - est_mac_rate keeps the last positive value, rcpi
++		 * keeps the last real reading. hostname was the one left plain,
++		 * and nothing on the agent path fills it, so each upsert wrote
++		 * NULL over whatever was there.
++		 *
++		 * Measured 2026-09-07: the name was written into the row and was
++		 * gone 59 s later, at the next upsert, while ipv4 - which is not
++		 * in this statement at all - survived. That is the tell.
++		 *
++		 * It matters because the only source of a client's name is
++		 * /tmp/dhcp.leases, which is RAM: after a controller restart the
++		 * name comes back only when the client happens to renew, measured
++		 * at up to 12 h. The column exists precisely so that does not
++		 * have to be waited for. */
++		"hostname=COALESCE(NULLIF(excluded.hostname,''), sta.hostname), "
+ 		"last_seen=excluded.last_seen, "
+ 		"first_seen=COALESCE(sta.first_seen, excluded.first_seen)";
+ 	struct wifi_sta_element *d = s->de_sta;

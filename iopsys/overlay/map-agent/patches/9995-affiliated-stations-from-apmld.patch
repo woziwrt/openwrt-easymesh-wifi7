@@ -1,0 +1,55 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9995: read affiliated stations from wifi.apmld, not wifi.ap
+
+Patch 987 moved the stage-2 station read for an affiliated AP from
+wifi.apmld.<mld> to wifi.ap.<mld>, on the grounds that the apmld object was
+empty on mt76. That was true when it was written and is no longer true.
+
+The two objects are not interchangeable. Only wl_apmld_stations() emits an
+mlo_links[] array (wifimngr.c:5913, via print_station at :5829); the wifi.ap
+builder wl_dump_stations() has no code path to it at all - its single link_id
+branch (wifimngr.c:2439) is unreachable because the only caller passes NULL for
+the struct wifi_mlo_link (wifimngr.c:2517). So reading wifi.ap yields the
+station but never says which links it holds.
+
+bss_stations_data_cb() needs those links: it matches an affiliated AP by
+mlo_links[].link_bssid and takes the matching link_macaddr, and only the
+fallback path - meant for a client reported without mlo_links - survives
+otherwise. Without them the client is filed as an ordinary station,
+mld->stamldlist stays empty, and agent_gen_associated_sta_mld_config() has
+nothing to iterate, so the Associated STA MLD Configuration Report TLV is never
+generated and sta_mld / affiliated_sta stay empty on the controller.
+
+Measured on hardware 2026-08-02, one MLO client on 8g ap-mld-1, after libwifi
+939 repaired the per-link data:
+
+	ubus call wifi.ap.ap-mld-1    stations   -> client present, mlo_links absent
+	ubus call wifi.apmld.ap-mld-1 stations   -> client present, mlo_links present:
+	    link_id 0  link_macaddr 86:ac:1a:e7:f7:e6  link_bssid 3a:fb:2f:94:51:7b  2.4GHz
+	    link_id 1  link_macaddr a6:96:19:39:3c:1f  link_bssid 3e:fb:2f:94:71:7b  5GHz
+	    link_id 2  link_macaddr b2:d1:73:8b:9e:f9  link_bssid 32:fb:2f:94:91:7b  6GHz
+
+Three distinct links, three distinct per-link client addresses, three distinct
+affiliated BSSIDs - exactly what the callback was written to consume.
+
+Note the two objects can report a different macaddr for the same client: the
+wifi.ap path prints the affiliated link address once hostapd supplies
+mlo_sta_link_addr, the apmld path prints the MLD address. Matching is done on
+link_bssid, so this does not change which AP a station is filed under.
+
+Keep the rest of 987 as it is - the affiliated/non-affiliated split, the method
+name and resolving the object by name are all still right; only the object
+prefix changes.
+
+diff -urN a/src/agent.c b/src/agent.c
+--- a/src/agent.c	2026-08-02 14:56:43.089973002 +0200
++++ b/src/agent.c	2026-08-02 14:56:43.099360327 +0200
+@@ -2990,7 +2990,7 @@
+ 		 * "stations" is empty on mt76 (its apmld assoclist is empty);
+ 		 * wifi.ap.<mld> "stations" returns the MLD clients (libwifi 937),
+ 		 * reporting each client's bssid as the AP-MLD master address. */
+-		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->mld_ifname);
++		snprintf(objname, sizeof(objname), "wifi.apmld.%s", ap->mld_ifname);
+ 		method = "stations";
+ 		obj_id = WIFI_OBJECT_INVALID;	/* resolve MLD netdev by name */
+ 		w2->stations_mld = true;

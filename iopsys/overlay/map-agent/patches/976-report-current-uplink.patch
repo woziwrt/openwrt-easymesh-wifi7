@@ -1,0 +1,110 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 976: report the uplink we actually have, not the first one we ever had
+
+handle_topology_discovery() keeps a->ul_dev current on every discovery, but wrote
+it to /var/run/multiap/multiap.backhaul only when the keys were absent. The first
+parent a node ever associated with was therefore the last one it ever reported.
+Reassociating to a different upstream left the file untouched for the rest of the
+node's uptime.
+
+That file is not internal state. It is what ubus backhaul_info answers from, and
+through that answer it is where the controller's idea of who is whose parent comes
+from. A node that has moved keeps telling everyone it has not.
+
+Measured on hardware 2026-07-31. The node had moved to the other agent and knew it
+- iw reported the new AP MLD and both sides agreed on the 1905 link - while the
+file still named the controller from the previous association:
+
+  /var/run/multiap/multiap.backhaul
+    backhaul_device_id  86:f7:56:41:01:d3     (controller)
+    backhaul_macaddr    86:f7:56:41:01:d4
+  iw dev bsta-mld-3 link
+    Connected to        e6:a9:d2:c1:98:40     (the other agent)
+
+The controller consequently recorded the wrong parent and a depth one hop short,
+and querying could not correct it: every answer repeated the stale value. This is
+the mechanism behind "agent reports the wrong parent", open since 2026-07-29 with
+the symptom described but no cause.
+
+The condition now also fires when the stored value differs from the current one.
+Addresses are compared as addresses, not as text, so formatting or case cannot be
+mistaken for a change of parent; an unparseable stored value counts as stale,
+which is the safe direction - at worst the file is rewritten with what we already
+know to be true.
+
+Note for anyone editing this: the policy order is not the call order. tb[1] is
+backhaul_macaddr and tb[2] is backhaul_device_id, while the helper takes the
+device id first.
+
+The write itself is unchanged and still goes through multiap
+set_uplink_backhaul_info, which holds map.backhaul.lock, so this adds no new
+writer and no new race.
+
+What this does not address: the file is written by the agent process while
+genconfig writes the same tree from two other places. Serialising those is 977;
+this patch only stops the agent from writing something it knows to be false.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/agent_map.c	2026-07-31 19:36:51.941003165 +0200
++++ b/src/agent_map.c	2026-07-31 19:36:51.941240653 +0200
+@@ -739,10 +739,58 @@
+ 	strncpy(ul_ifname, blobmsg_data(tb[0]), IFNAMSIZ - 1);
+ 
+ 	if (!strncmp(ul_ifname, cmdu->dev_ifname, IFNAMSIZ)) {
++		uint8_t file_almac[6] = {0};
++		uint8_t file_hwaddr[6] = {0};
++		int stale;
++
+ 		memcpy(a->ul_dev.ul_almac, almac, 6);
+ 		memcpy(a->ul_dev.ul_hwaddr, hwaddr, 6);
+ 
+-		if (!tb[1] || !tb[2]) {
++		/* Write it out whenever it differs, not only when it is absent.
++		 *
++		 * The two memcpy above keep our own idea of the uplink current, but
++		 * the file is what everyone else reads - ubus backhaul_info, and
++		 * through it the controller's picture of who is whose parent. The
++		 * old condition wrote it only when the keys were missing, so the
++		 * first parent a node ever had was the last one it ever reported.
++		 * Reassociating to a different upstream never updated it.
++		 *
++		 * Measured on hardware 2026-07-31. Node had moved to the other
++		 * agent and knew it - iw showed the new AP MLD, and both sides
++		 * agreed on the 1905 link - while the file still named the
++		 * controller from the previous association:
++		 *
++		 *   /var/run/multiap/multiap.backhaul
++		 *     backhaul_device_id  86:f7:56:41:01:d3   (controller)
++		 *     backhaul_macaddr    86:f7:56:41:01:d4
++		 *   iw dev bsta-mld-3 link
++		 *     Connected to        e6:a9:d2:c1:98:40   (the other agent)
++		 *
++		 * The controller therefore recorded the wrong parent and a depth
++		 * one hop short, and no amount of querying could correct it,
++		 * because the agent kept answering with the stale value.
++		 *
++		 * Note the policy order: tb[1] is backhaul_macaddr and tb[2] is
++		 * backhaul_device_id, which is the reverse of the order they are
++		 * passed to the helper below.
++		 *
++		 * The stored values are compared as addresses rather than as text,
++		 * so a difference in formatting or case cannot be mistaken for a
++		 * change of parent - and an unparseable value counts as stale,
++		 * which is the safe direction: at worst the file is rewritten with
++		 * what we already know to be true.
++		 */
++		stale = !tb[1] || !tb[2] ||
++			!hwaddr_aton(blobmsg_data(tb[2]), file_almac) ||
++			!hwaddr_aton(blobmsg_data(tb[1]), file_hwaddr) ||
++			memcmp(file_almac, a->ul_dev.ul_almac, 6) ||
++			memcmp(file_hwaddr, a->ul_dev.ul_hwaddr, 6);
++
++		if (stale) {
++			dbg("%s: uplink now " MACFMT " via " MACFMT ", updating %s\n",
++			    __func__, MAC2STR(a->ul_dev.ul_almac),
++			    MAC2STR(a->ul_dev.ul_hwaddr), MAP_UPLINK_PATH);
++
+ 			runCmd("/lib/wifi/multiap set_uplink_backhaul_info "
+ 					MACFMT " " MACFMT,
+ 					MAC2STR(a->ul_dev.ul_almac),

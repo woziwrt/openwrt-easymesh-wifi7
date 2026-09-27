@@ -1,0 +1,44 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: a bSTA MLD is reported with 0xE1, not with 0xCB
+
+EasyMesh v6.1, section 6.2 (normative): an agent that operates a bSTA MLD
+"shall include one Backhaul STA MLD Configuration TLV and shall not include
+any Backhaul STA Radio Capabilities TLV" in its Backhaul STA Capability
+Report.
+
+agent_gen_bk_caps_response() did the opposite: one Backhaul STA Radio
+Capabilities TLV (0xCB) per radio, and no Backhaul STA MLD Configuration
+TLV (0xE1) at all. Seen on the wire on 2026-09-03 as 18 x 0xCB against 9 of
+every other TLV - the one direct "shall not" our agent broke.
+
+With a bSTA MLD the report now carries exactly one 0xE1 and nothing else.
+The 0xE1 names every affiliated bSTA with its radio unique identifier and
+MAC - the two facts the per-radio 0xCBs carried - so a controller loses
+nothing. Our controller reads it from this report since 99999999k. An agent
+without a bSTA MLD still sends the per-radio 0xCBs as before.
+
+--- a/src/agent_cmdu.c	2026-09-24 12:46:15.952856678 +0200
++++ b/src/agent_cmdu.c	2026-09-24 12:46:16.170899932 +0200
+@@ -1191,6 +1191,22 @@
+ 
+ 	memcpy(cmdu_data->origin, cmdu->origin, 6);
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* EasyMesh v6.1, 6.2: an agent operating a bSTA MLD "shall include one
++	 * Backhaul STA MLD Configuration TLV and shall not include any Backhaul
++	 * STA Radio Capabilities TLV". This report used to carry one 0xCB per
++	 * radio and no 0xE1 - the forbidden TLV twice, the mandatory one never.
++	 * The 0xE1 names every affiliated bSTA with its radio and MAC, which is
++	 * what the per-radio 0xCBs said. */
++	if (a->bstamld) {
++		if (agent_gen_bsta_mld_config(a, cmdu_data))
++			goto error;
++		trace("%s: Added MAP_TLV_BACKHAUL_STA_MLD_CONFIG\n", __func__);
++		cmdu_put_eom(cmdu_data);
++		return cmdu_data;
++	}
++#endif
++
+ 	/* Define the TLVs */
+ 	list_for_each_entry(re, &a->radiolist, list) {
+ 		/* Backhaul STA radio capabilities TLV */

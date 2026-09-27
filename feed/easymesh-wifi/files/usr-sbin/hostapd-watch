@@ -1,0 +1,140 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Say out loud when hostapd or wpa_supplicant stops answering ubus.
+#
+# 2026-08-16 cost half an afternoon and produced four findings that were not
+# real: the controller's hostapd had wedged, and nothing said so. The APs kept
+# beaconing, the backhaul held, clients stayed associated - from the outside
+# the node looked healthy. Only ubus was silent, and ubus is where every
+# reader of this node's state looks. So the agent "could not see its own BSS",
+# the colocated agent "was blind", the database "was not filling" - three
+# separate diagnoses of one wedged process, and each one sent someone
+# debugging in the wrong direction.
+#
+# It was even being logged the whole time. wifimngr writes "Request timed out"
+# once a minute and nobody reads the system log while chasing a bug. This
+# turns that into one loud line that names what is wrong.
+#
+# REPORTS. DOES NOT REPAIR - and that is deliberate, not unfinished.
+#
+# Restarting hostapd on a live controller is surgery on a working mesh: every
+# client drops, every agent's backhaul goes with it. A detector is allowed to
+# do that only once it has proven it does not cry wolf, and this one has
+# proven nothing yet. First report, then measure how often it fires and
+# whether it was ever right, and only then decide whether it may act.
+
+INTERVAL=60
+TIMEOUT=5
+
+# Three rounds of silence, not one. A daemon busy with a config reload can
+# miss a single probe without anything being wrong; three minutes of it is
+# not a busy daemon.
+THRESHOLD=3
+
+STATE=/tmp/hostapd-watch
+COUNTDIR=/tmp/.hostapd-watch
+
+# Say it twice, and the second time somewhere a reboot cannot take it.
+#
+# 2026-08-20: this watchdog ran through an hour in which both hostapd objects
+# answered nothing, and afterwards there was no way to find out whether it had
+# noticed. logger goes to rsyslog, /var/log/messages begins empty at every boot,
+# and the incident ends in a reboot by definition - so the one record that
+# matters is the one guaranteed to be gone when it is looked for. Nothing reads
+# as no, and a watchdog that cannot be shown to have barked is not a watchdog.
+#
+# /etc/mapc is where node-heartbeat writes for the same reason. Only verdicts
+# land here, never the per-minute polling, so the file stays a page long even
+# after a bad night - which matters on a box whose card is already complaining.
+VERDICTS=/etc/mapc/hostapd-watch.log
+log() {
+	logger -t hostapd-watch "$1"
+	mkdir -p /etc/mapc 2>/dev/null
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$VERDICTS" 2>/dev/null
+}
+
+# Ask each object something the daemon itself has to carry out.
+#
+# Measured 2026-08-17 on the controller: the bare `hostapd` and `hostapd-auth`
+# objects answer rc=253, "method not found", instantly - and they answer it
+# out of ubusd's own object table, which the daemon is not involved in. A
+# reply is therefore not proof of life unless the method is one the daemon
+# must execute. hostapd has get_status. wpa_supplicant has no status method at
+# all, but its control passthrough carries PING, which it answers with PONG.
+#
+# The same measurement is why only dotted objects are watched: those two bare
+# ones would report a permanent fault on a perfectly healthy node - which is
+# exactly the false alarm that disqualifies a detector before it starts.
+#
+# And a wedge is silence, not an error. An interface removed during a
+# reconfiguration answers "not found" immediately, and that is normal; a
+# wedged daemon answers nothing at all and the call burns the whole timeout.
+# So the verdict comes from the clock, not from the return code.
+probe() {
+	local obj="$1" t0 t1 rc
+	t0=$(date +%s)
+	case "$obj" in
+	hostapd.*)        ubus -t "$TIMEOUT" call "$obj" get_status >/dev/null 2>&1 ;;
+	wpa_supplicant.*) ubus -t "$TIMEOUT" call "$obj" control '{"command":"PING"}' >/dev/null 2>&1 ;;
+	*)                return 0 ;;
+	esac
+	rc=$?
+	t1=$(date +%s)
+	[ "$rc" = 0 ] && return 0
+	[ $((t1 - t0)) -ge "$TIMEOUT" ] && return 1
+	return 0
+}
+
+keyfile() { echo "$COUNTDIR/$(echo "$1" | tr './' '__')"; }
+
+while :; do
+	sleep "$INTERVAL"
+
+	mkdir -p "$COUNTDIR" 2>/dev/null
+	watched=$(ubus list 2>/dev/null | grep -E '^(hostapd|wpa_supplicant)\.')
+	[ -n "$watched" ] || continue
+
+	: > "$STATE.new"
+	for obj in $watched; do
+		f=$(keyfile "$obj")
+		n=$(cat "$f" 2>/dev/null); n=${n:-0}
+
+		if probe "$obj"; then
+			# Only worth a line if it had already been declared wedged.
+			# Coming back from one late round is not news.
+			[ "$n" -ge "$THRESHOLD" ] &&
+				log "$obj answers again after $((n * INTERVAL)) s of silence"
+			n=0
+		else
+			n=$((n + 1))
+			# Once, on the round that crosses the line. Saying it every
+			# minute for the rest of the day is how a real warning turns
+			# into noise nobody reads - which is the state we started from.
+			[ "$n" = "$THRESHOLD" ] &&
+				log "$obj has not answered ubus for $((n * INTERVAL)) s and looks wedged. The radios may still be on the air and the links may still hold - but anything reading this node through ubus is reading nothing, so treat findings made now as unproven. Not restarting anything."
+		fi
+
+		echo "$n" > "$f"
+		if [ "$n" -ge "$THRESHOLD" ]; then st=wedged
+		elif [ "$n" = 0 ];         then st=ok
+		else                            st=late
+		fi
+		echo "$obj $st $n" >> "$STATE.new"
+	done
+
+	# An object that left the bus is not a fault, it is an interface that was
+	# taken down. Drop its counter so a later one with the same name starts
+	# from zero instead of inheriting a verdict about a different life.
+	for f in "$COUNTDIR"/*; do
+		[ -e "$f" ] || continue
+		still=""
+		for obj in $watched; do
+			[ "$(keyfile "$obj")" = "$f" ] && { still=1; break; }
+		done
+		[ -n "$still" ] || rm -f "$f"
+	done
+
+	mv "$STATE.new" "$STATE"
+done

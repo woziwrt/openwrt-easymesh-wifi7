@@ -1,0 +1,16 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] arm64: dts: mediatek: mt7988a: add BPI-R4 NVMe root disk overlay
+
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-nvme.dtso
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/dts-v1/;
++/plugin/;
++/ {
++	compatible = "bananapi,bpi-r4", "mediatek,mt7988a";
++};
++
++&{/chosen} {
++	rootdisk-nvme = <&pcie3>;
++};

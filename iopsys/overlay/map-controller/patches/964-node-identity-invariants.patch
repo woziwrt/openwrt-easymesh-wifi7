@@ -1,0 +1,128 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: node identity invariants
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Enforce the two invariants that make half-built nodes impossible.
+
+The duplicate-node defect class exists because node identity is tracked by two
+structures that disagree: mac_table holds exactly one entry per AL-MAC (on
+collision the existing entry wins and e->data is not overwritten), while
+devlist/agentlist accept duplicates. Every path that populates a node goes
+through cntlr_find_node() -> mactable_lookup(); every consumer iterates the
+list. A duplicate is therefore visible to consumers but unreachable by anything
+that would fill it in, and stays permanently half-built - which is how np ends
+up NULL and the controller takes SIGSEGV in cntlr_check_config_diff().
+
+Two invariants, enforced where the state is actually created:
+
+1. A node is never born half-built. cntlr_alloc_node() binds n->np at creation
+   instead of leaving it NULL.
+
+2. Membership in agentlist implies reachability via mac_table. cntlr_mark_agent()
+   refuses to promote a node that is not the object mac_table points at, and
+   refuses one with no policy binding. Such a node stays in devlist where ageout
+   reaps it, instead of becoming visible to consumers that cannot handle it.
+
+cntlr_register_agent() had to be reordered: it promoted the node before creating
+its UCI section, so with invariant 2 in place every freshly onboarded agent would
+trip the check and inflate nodes_without_policy during entirely normal operation.
+That would have destroyed the counter as a signal - it must stay 0 in healthy
+operation or the reliability gate is meaningless. cntlr_resync_config() promotes
+the node itself once np is bound, so the trailing mark is idempotent.
+
+Note this is not the full lockdown originally intended. Making raw alloc
+unreachable from outside was rejected: the only alternative entry point,
+cntlr_add_node(), also emits backhaul- and AP-capability queries, so using it
+from db_restore would make the controller blast queries at nodes that may not be
+online. Instead of making raw alloc uncallable, its result can no longer be
+half-built. Still outstanding: one persistence source (UCI and mapc.db both own
+node identity today) and restore that enriches rather than creates.
+
+Lab-verified both directions:
+  normal onboarding      -> num_nodes=1, nodes_without_policy=0, UCI section created
+  orphan in DB, no UCI   -> nodes_without_policy=1, promotion refused, no SIGSEGV
+
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1025,7 +1025,11 @@
+ 	n->cntlr = c;
+ 	n->depth = -1;
+ 	n->scan_supported = true;
+-	n->np = NULL; //c->cfg.apolicy;
++	/* INVARIANT: a node is never half-built. Bind its policy at birth so no
++	 * consumer can ever meet a node object without one. If the UCI section
++	 * does not exist yet (normal onboarding creates it right after), the
++	 * node stays in devlist and cntlr_mark_agent() refuses to promote it. */
++	n->np = cntlr_config_get_node_by_mac(&c->cfg, almacaddr);
+ 	memcpy(n->almacaddr, almacaddr, 6);
+ 	n->map_profile = MULTIAP_PROFILE_1;
+ 
+@@ -1048,11 +1052,37 @@
+ 
+ void cntlr_mark_agent(struct controller *c, struct node *n)
+ {
++	struct macaddr_entry *e;
+ 	char ev_data[256] = {0};
+ 
+ 	if (node_is_agent(n))
+ 		return;
+ 
++	/* INVARIANT: membership in agentlist implies reachability via mac_table.
++	 * mac_table holds one entry per AL-MAC; a node object that is not the one
++	 * it points at is a duplicate and can never be backfilled (every path that
++	 * populates a node goes through cntlr_find_node -> mactable_lookup). Such
++	 * an object must not enter agentlist: consumers iterate the list, so it
++	 * would be visible but permanently unpopulated. Leave it in devlist and
++	 * let ageout reap it. */
++	e = mactable_lookup(c->mac_table, n->almacaddr, MAC_ENTRY_ALID);
++	if (!e || e->data != (void *)n) {
++		c->nodes_without_policy++;
++		warn("%s: refusing to promote non-owner duplicate " MACFMT " - INVARIANT VIOLATED (count=%u)\n",
++		     __func__, MAC2STR(n->almacaddr), c->nodes_without_policy);
++		return;
++	}
++
++	if (!n->np) {
++		n->np = cntlr_config_get_node_by_mac(&c->cfg, n->almacaddr);
++		if (!n->np) {
++			c->nodes_without_policy++;
++			warn("%s: refusing to promote " MACFMT " without policy - INVARIANT VIOLATED (count=%u)\n",
++			     __func__, MAC2STR(n->almacaddr), c->nodes_without_policy);
++			return;
++		}
++	}
++
+ 	n->is_agent = true;
+ 	list_del(&n->list);
+ 	list_add(&n->list, &c->agentlist);
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -344,14 +344,21 @@
+ {
+ 	char macstr[18] = {0};
+ 
+-	cntlr_mark_agent(c, n);
+-
+-	if (cntlr_config_get_node_by_mac(&c->cfg, n->almacaddr))
+-		return;
++	/* Create the policy section BEFORE promoting. cntlr_mark_agent() now
++	 * refuses nodes without a policy binding, and promoting first would make
++	 * every freshly onboarded agent trip that check on its way through - the
++	 * nodes_without_policy tripwire would then count normal onboarding and
++	 * stop being a usable signal.
++	 *
++	 * cntlr_resync_config() binds np and promotes the node itself, so the
++	 * mark below is a no-op in that case (it is idempotent). */
++	if (!cntlr_config_get_node_by_mac(&c->cfg, n->almacaddr)) {
++		snprintf(macstr, sizeof(macstr), MACFMT, MAC2STR(n->almacaddr)); /* flawfinder: ignore */
++		cntlr_config_add_node(&c->cfg, macstr);
++		cntlr_resync_config(c, true);
++	}
+ 
+-	snprintf(macstr, sizeof(macstr), MACFMT, MAC2STR(n->almacaddr)); /* flawfinder: ignore */
+-	cntlr_config_add_node(&c->cfg, macstr);
+-	cntlr_resync_config(c, true);
++	cntlr_mark_agent(c, n);
+ }
+ 
+ static void cntlr_mark_agent_if_supported(struct controller *c, uint8_t *almacaddr,

@@ -1,0 +1,94 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: fix radio reconcile sweep
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Reconcile stale radios on live Topology Response (mark-and-sweep).
+
+Restored or aged-out radios were never removed from n->radiolist, so a node
+could accumulate radios that no longer exist on the agent (lab: 3 stale + 1
+live = controller reported 4). The DB audit confirmed there is no delete path
+for radio/bss at all.
+
+Mark every radio invalidate=1 before parsing a live Topology Response, clear
+the flag for each radio the agent actually reports, then sweep whatever is
+still marked. The invalidate field is appended to struct netif_radio, so the
+ABI stays compatible.
+
+Found and verified in the qemu-user lab, 2026-07-19 (experiment b).
+
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -126,8 +126,11 @@
+ 	struct wifi_radio_element *radio_el;
+ 	struct list_head iflist;	/** list of struct netif_iface */
+ 	struct list_head list;
++	int invalidate;			/** reconcile marker (DB 1.5); appended = ABI-safe */
+ };
+ 
++void cntlr_node_sweep_radios(struct controller *c, struct node *n);
++
+ enum nodetype {
+ 	NODE_WIFI_EXTENDER,
+ 	NODE_WIFI_REPEATER,
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -957,8 +957,10 @@
+ 	}
+ 
+ 	r = cntlr_find_radio(c, macaddr);
+-	if (r)
++	if (r) {
++		r->invalidate = 0;
+ 		return r;
++	}
+ 
+ 	r = calloc(1, sizeof(*r));
+ 	if (!r)
+@@ -1179,6 +1181,23 @@
+ 		radio_clean_iflist(c, r);
+ 		mactable_del_entry(c->mac_table, r->radio_el->macaddr, MAC_ENTRY_RADIO);
+ 		radio_clean_radio_el(r);
++		list_del(&r->list);
++		free(r);
++	}
++}
++
++/* Remove radios still marked invalidate (not confirmed by the latest live
++ * Topology Response) — reconciles stale restored/aged radios (DB Phase 1.5). */
++void cntlr_node_sweep_radios(struct controller *c, struct node *n)
++{
++	struct netif_radio *r = NULL, *tmp;
++
++	list_for_each_entry_safe(r, tmp, &n->radiolist, list) {
++		if (!r->invalidate)
++			continue;
++		radio_clean_iflist(c, r);
++		mactable_del_entry(c->mac_table, r->radio_el->macaddr, MAC_ENTRY_RADIO);
++		radio_clean_radio_el(r);
+ 		list_del(&r->list);
+ 		free(r);
+ 	}
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -472,6 +472,12 @@
+ 
+ 		offset += 1; /* num_radio */
+ 
++		{
++			struct netif_radio *_rm;
++			list_for_each_entry(_rm, &n->radiolist, list)
++				_rm->invalidate = 1;
++		}
++
+ 		for (i = 0; i < tlv->num_radio; i++) {
+ 			uint8_t num_bss = 0;
+ 			struct netif_radio *r = NULL;
+@@ -522,6 +528,8 @@
+ 				time(&fh->bss->tsp);
+ 			}
+ 		}
++	
++		cntlr_node_sweep_radios(c, n);	/* reconcile stale radios (fix b) */
+ 	}
+ 
+ 	/* map profile info stored for each node */

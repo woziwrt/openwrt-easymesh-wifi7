@@ -1,0 +1,200 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: answer for the client that was asked about
+
+An agent denied having a client it was serving, every ten seconds, for as
+long as that client stayed.
+
+The Associated STA Link Metrics Query carries the address the network knows
+the client by. For an MLO client that is the MLD address, and an MLO
+client's stations are filed under the addresses of its affiliated links -
+the MLD address is on no station. agent_get_sta() therefore missed, and the
+handler took its not-found branch: num_bss = 0 and Error Code 0x02, "STA not
+associated with any BSS".
+
+Read off the wire 2026-09-07 on the bedroom node, for a client with three
+links and 6 GHz at -52 dBm:
+
+  96 0007 baa91b531782 00     Associated STA Link Metrics, num_bss = 0
+  a3 0007 02 baa91b531782     Error Code, reason 0x02
+
+The controller skips a STA whose report names no BSS - "skip the STA's link
+metrics when bss is unknown" - so nothing about that client was refreshed.
+Its rcpi held 152 (-34 dBm), the value taken once at association while the
+phone was close, through every sample for hours; the per-link rows beside it
+were correct at 114 (-53 dBm) the whole time. Zeroing the stored value and
+restarting the controller left it at 0, which is what proved the report, not
+the storage, was empty.
+
+So the lookup falls back to the MLD, and the answer is written under the
+address that was queried. agent_get_sta_by_mld() returns the link that has a
+measurement - a client parked on 6 GHz is heard there and nowhere else, and
+an idle link would say nothing about it. agent_map.c:4742 already resolves an
+MLD address this way; this gives it a name and uses it where the network asks.
+
+One BSS entry is reported, not one per affiliated link. The controller keeps
+only the last entry it reads from the TLV, so several would let an idle link
+erase the measured one. Reporting every affiliated BSS is the fuller answer
+and needs that loop fixed first.
+
+Verify: with an MLO client associated, its sta.rcpi on the controller must
+follow the carrying link instead of holding a constant, and the agent's
+response must no longer carry Error Code 0x02 for it.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -287,6 +287,54 @@
+ 	return NULL;
+ }
+ 
++/* Find an MLO client by the address it is known to the network by.
++ *
++ * An MLO client's stations are filed under the addresses of its affiliated
++ * links; the MLD address itself is on no station. Anything that arrives from
++ * the network - a query, a policy, a steer - carries the MLD address, so a
++ * plain lookup misses and the client looks absent.
++ *
++ * The link returned is the one with a measurement, and the strongest of those
++ * if several have one: a client parked on 6 GHz is heard there and nowhere
++ * else, and answering from an idle link would say nothing about it.
++ */
++struct sta *agent_get_sta_by_mld(struct agent *a, uint8_t *mld)
++{
++	struct wifi_radio_element *re = NULL;
++	struct sta *best = NULL;
++
++	list_for_each_entry(re, &a->radiolist, list) {
++		struct netif_ap *ap = NULL;
++
++		list_for_each_entry(ap, &re->aplist, list) {
++			struct sta *s = NULL;
++
++			list_for_each_entry(s, &ap->stalist, list) {
++				if (!s->is_affiliated_sta)
++					continue;
++				if (memcmp(s->mld_macaddr, mld, 6))
++					continue;
++
++				if (!best) {
++					best = s;
++					continue;
++				}
++				/* rssi_avg[0] is the last sample; 0 means the
++				 * link measured nothing, and a real reading is
++				 * negative. Prefer measured, then strongest. */
++				if (best->rssi_avg[0] == 0 &&
++				    s->rssi_avg[0] != 0)
++					best = s;
++				else if (s->rssi_avg[0] != 0 &&
++					 s->rssi_avg[0] > best->rssi_avg[0])
++					best = s;
++			}
++		}
++	}
++
++	return best;
++}
++
+ struct sta *agent_get_sta(struct agent *a, uint8_t *sta)
+ {
+ 	struct wifi_radio_element *re = NULL;
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -1018,6 +1018,7 @@
+ struct netif_ap *agent_get_ap(struct agent *a, uint8_t *bssid);
+ struct netif_bk *agent_get_bsta_by_ifname(struct agent *a, const char *name);
+ struct sta *agent_get_sta(struct agent *a, uint8_t *sta);
++struct sta *agent_get_sta_by_mld(struct agent *a, uint8_t *mld);
+ struct netif_ap *agent_get_ap_with_sta(struct agent *a, uint8_t *sta);
+ struct wifi_radio_element *agent_get_radio_with_ifname(struct agent *a, char *ifname);
+ int prepare_tunneled_message(void *agent, const char *ifname,
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -1970,6 +1970,21 @@
+ int agent_gen_assoc_sta_link_metrics(struct agent *a,
+ 		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid)
+ {
++	return agent_gen_assoc_sta_link_metrics_as(a, frm, s, bssid,
++						   s->macaddr);
++}
++
++/* Report @s's metrics under @reported_mac.
++ *
++ * For everything but an MLO client the two are the same address. For an MLO
++ * client the metrics live on a link and the network asks about the MLD, so
++ * the answer has to carry the address that was asked about - otherwise it
++ * updates a row nobody queried and leaves the queried one untouched.
++ */
++int agent_gen_assoc_sta_link_metrics_as(struct agent *a,
++		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid,
++		uint8_t *reported_mac)
++{
+ 	int ret, i;
+ 	int offset = 0;
+ 	struct tlv *t;
+@@ -1983,7 +1998,7 @@
+ 	timestamp_update(&curr_ts);
+ 	t->type = MAP_TLV_ASSOCIATED_STA_LINK_METRICS;
+ 	data = (struct tlv_assoc_sta_link_metrics *) t->data;
+-	memcpy(data->macaddr, s->macaddr, 6);
++	memcpy(data->macaddr, reported_mac, 6);
+ 	data->num_bss = 1;
+ 	offset = sizeof(*data);
+ 
+--- a/src/agent_tlv.h
++++ b/src/agent_tlv.h
+@@ -113,6 +113,9 @@
+ 		struct cmdu_buff *frm, uint8_t *mac, struct sta *s);
+ int agent_gen_assoc_sta_link_metrics(struct agent *a,
+ 		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid);
++int agent_gen_assoc_sta_link_metrics_as(struct agent *a,
++		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid,
++		uint8_t *reported_mac);
+ int agent_gen_assoc_sta_ext_link_metric(struct agent *a,
+ 		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid);
+ int agent_gen_ap_radio_identifier(struct agent *a,
+--- a/src/agent_cmdu.c
++++ b/src/agent_cmdu.c
+@@ -481,9 +481,39 @@
+ 	query = (struct tlv_sta_mac *) tv0->data;
+ 
+ 	s = agent_get_sta(a, query->macaddr);
++	if (!s) {
++		/* An MLO client is asked about by its MLD address, and its
++		 * stations are filed under the addresses of its links. Without
++		 * this the agent answered "STA not associated with any BSS"
++		 * about a client it was serving.
++		 *
++		 * Measured 2026-09-07 on the bedroom node, read off the wire:
++		 *
++		 *   96 0007 baa91b531782 00   num_bss = 0
++		 *   a3 0007 02 baa91b531782   error code 0x02
++		 *
++		 * every ten seconds, for a client with three links and 6 GHz
++		 * at -52 dBm. The controller skips a STA whose report names no
++		 * BSS (cntlr_map.c: "skip the STA's link metrics when bss is
++		 * unknown"), so nothing about that client was ever refreshed -
++		 * its rcpi held the value taken once at association, 152
++		 * (-34 dBm), for as long as it stayed.
++		 */
++		s = agent_get_sta_by_mld(a, query->macaddr);
++	}
++
+ 	if (s) {
+-		/* Associated STA Link Metrics TLV */
+-		ret = agent_gen_assoc_sta_link_metrics(a, frm, s, s->bssid);
++		/* Answer about the address that was asked about. For a plain
++		 * client that is its own; for an MLD it is the MLD, carrying
++		 * the metrics of the link that has a measurement.
++		 *
++		 * One BSS entry, not one per link: the controller keeps only
++		 * the last entry it reads, so several would let an idle link
++		 * erase the measured one. Reporting every affiliated BSS is
++		 * the fuller answer and needs that loop fixed first.
++		 */
++		ret = agent_gen_assoc_sta_link_metrics_as(a, frm, s, s->bssid,
++							  query->macaddr);
+ 		if (ret)
+ 			goto error;
+ 

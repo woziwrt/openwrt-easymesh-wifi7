@@ -1,0 +1,101 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9998: take the MLD name from the BSS, and stop asking every second
+
+Follow-up to 9997, from what it exposed on hardware 2026-08-03.
+
+9997 made agent_fetch_ap_stats() address the object by the name it computes
+instead of a stale id. That was right, but it left two things wrong, and the
+named warnings it produced are what made them visible:
+
+	object wifi.ap.wlan0-1 not present!   249x in 232 s
+	object wifi.ap.wlan1-1 not present!   249x
+	object wifi.ap.wlan2-1 not present!   249x
+	object wifi.ap.wlan0   not present!     5x   <- then silent
+	object wifi.ap.bhmld5  not present!     3x
+
+The links that settle (wlan0/1/2) are the ones whose MLD credential exists:
+they resolve to wifi.apmld.ap-mld-1, which is published, and are then cached.
+The ones that never settle have no credential, so objname stays the per-link
+wifi.ap.<ifname>, which is published for no BSS on an MLD node.
+
+First fix: prefer ap->mld_ifname when ap->is_affiliated_ap. That is the same
+source bss_issue_stations() already trusts, filled from the BSS status reply,
+and it reflects what the BSS actually is rather than what the configuration
+intended. cfg->mld_id stays as the fallback - it is absent for links the
+controller attached to an MLD after onboarding, which is exactly the case that
+was failing.
+
+Second fix: a lookup that fails must not repeat once a second. agent_periodic_run
+calls this every tick, so a BSS with no object at all - a configuration section
+with no live counterpart, of which this node has three - warned 60 times a
+minute, forever. STATS_RETRY_TICKS makes that once per 30 s. Still
+self-healing, an order of magnitude quieter, and the log stops drowning the
+first occurrence.
+
+Not fixed here: why three ap sections exist in the mapagent configuration with
+no BSS behind them. They survive a keep-config sysupgrade, so they are older
+than this image. That is a configuration-hygiene question, not a stats one.
+
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -299,6 +299,9 @@
+ 	 *  (0, as calloc leaves it) means "resolve on next use".
+ 	 */
+ 	uint32_t stats_obj_id;
++	/** ticks to wait before retrying a failed stats lookup, so a BSS with
++	 *  no object at all does not warn once per second. */
++	uint8_t stats_retry;
+ 	char ssid[33];
+ 	char standard[32];
+ 	char radio_name[16];
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -4816,6 +4816,12 @@
+ 		timer_set(&a->boot_scan_scheduler, BOOT_UP_SCAN_ITV * 1000);
+ }
+ 
++/* Ticks to wait before retrying a stats object lookup that failed. The
++   caller runs once a second; a BSS whose object does not exist at all -
++   a config section with no live counterpart - would otherwise warn 60x a
++   minute forever. Still self-healing, just an order slower. */
++#define STATS_RETRY_TICKS 30
++
+ static void agent_fetch_ap_stats(struct agent *a)
+ {
+ 	struct wifi_radio_element *re = NULL;
+@@ -4835,7 +4841,15 @@
+ 
+ 			snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);
+ #if (EASYMESH_VERSION >= 6)
+-			if (ap->cfg && ap->cfg->mld_id) {
++			if (ap->is_affiliated_ap && ap->mld_ifname[0]) {
++				/* Runtime truth, from the BSS status reply -
++				 * the same source bss_issue_stations() trusts.
++				 * cfg->mld_id is only the configured intent and
++				 * is absent for links the controller attached
++				 * to an MLD after onboarding. */
++				snprintf(objname, sizeof(objname), "wifi.apmld.%s", ap->mld_ifname);
++				band = band_to_int(re->band);
++			} else if (ap->cfg && ap->cfg->mld_id) {
+ 				struct mld_credential *mldcred;
+ 
+ 				mldcred = agent_get_mld_credential_by_id(&a->cfg,
+@@ -4857,9 +4871,17 @@
+ 			 * folded into the MLD entity, and for an affiliated
+ 			 * link objname names the MLD object anyway.
+ 			 */
+-			if (ap->stats_obj_id == WIFI_OBJECT_INVALID)
++			if (ap->stats_obj_id == WIFI_OBJECT_INVALID) {
++				if (ap->stats_retry) {
++					ap->stats_retry--;
++					blob_buf_free(&bb);
++					continue;
++				}
+ 				ap->stats_obj_id = ubus_get_object(a->ubus_ctx,
+ 								   objname);
++				if (ap->stats_obj_id == WIFI_OBJECT_INVALID)
++					ap->stats_retry = STATS_RETRY_TICKS;
++			}
+ 
+ 			if (ap->stats_obj_id != WIFI_OBJECT_INVALID &&
+ 			    ubus_call_object_args(a->ubus_ctx,

@@ -1,0 +1,87 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: num_sta follows the station list
+
+993 was meant to stop a lying HAL from zeroing the client count, and it did
+not work on hardware. Measured 2026-08-27 on an agent serving two clients,
+in a settled state well after boot:
+
+	iw dev ap-mld-1 station dump           2 stations
+	ubus wifi.ap.ap-mld-1 assoclist        both clients returned
+	ubus wifi.ap.ap-mld-1 status           "num_stations": 0
+	ubus map.agent status, fronthaul BSS   "num_sta": 0, stations: [2 entries]
+
+A BSS holding two stations in its own list while reporting none beside them
+is not a HAL problem any more - the two fields come from the same struct in
+the same dump (agent.c, "num_sta" and "stations" in the same table).
+
+The reason 993 could not help is that its guard sits in parse_ap(), and
+parse_ap() has exactly one user: agent_init_interfaces(). It runs once, at
+init - and stations are only added to ap->stalist afterwards, by
+agent_init_interfaces_post_actions(). So list_empty(&ap->stalist) is always
+true when the guard runs, the first branch always wins, and the branch that
+counts is dead code.
+
+At runtime the two-stage async refresh owns this data, and neither stage
+writes the count:
+
+	stage 1  bss_status_data_cb     channel, bssid, ssid, utilization,
+	                                max_stations - num_stations is not
+	                                even in the policy
+	stage 2  bss_stations_data_cb   maintains ap->stalist: adds via
+	                                wifi_add_sta(), releases after
+	                                STA_ABSENT_MAX missing replies
+
+That leaves the association events (agent.c: num_sta++ / num_sta--) as the
+only writer of a value the refresh path keeps rebuilding beside them. One
+missed event and the count is wrong until the daemon restarts, because
+nothing reconciles it.
+
+It also explains an oddity that looked like the HAL being selectively
+honest: on the same node the backhaul BSS reported num_sta 2 correctly while
+the fronthaul reported 0, though the HAL answered "num_stations": 0 for
+both. The backhaul number came from events that did fire. Nothing about the
+HAL differed.
+
+So count the list where the list is maintained. After the sweep, so a
+released station is already gone, and in the same block that just decided
+who is present. The count is then derived from the entries by construction
+and the two can no longer disagree - which is what 993 set out to do.
+
+The guard in parse_ap() is left in place. It is harmless, and it is correct
+for the case it describes should that function ever be reused at runtime.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3029,6 +3029,7 @@
+ 	 * momentarily empty reply does not drop live clients. */
+ 	{
+ 		struct sta *s, *tmp;
++		uint32_t n = 0;
+ 
+ 		list_for_each_entry_safe(s, tmp, &ap->stalist, list) {
+ 			if (s->absent < STA_ABSENT_MAX)
+@@ -3038,6 +3039,22 @@
+ 			    __func__, ap->ifname, MAC2STR(s->macaddr), s->absent);
+ 			wifi_del_sta(w->a, ap->ifname, s->macaddr);
+ 		}
++
++		/* The list above is the only runtime authority on who is
++		 * associated to this BSS, so derive the count from it here
++		 * rather than leave the two to drift. Nothing else recomputes
++		 * ap->num_sta on this path: stage 1 (bss_status_data_cb) does
++		 * not even parse num_stations, and the guard added by 993 sits
++		 * in parse_ap(), which runs only from agent_init_interfaces()
++		 * - at that moment stalist is still empty, so its else branch
++		 * never executes. That left the association events as the sole
++		 * writer, and a missed event desynchronised the counter for
++		 * good. Counted after the sweep, so a released station is
++		 * already gone. */
++		list_for_each_entry(s, &ap->stalist, list)
++			n++;
++
++		ap->num_sta = n;
+ 	}
+ 
+ 	w->parsed = true;

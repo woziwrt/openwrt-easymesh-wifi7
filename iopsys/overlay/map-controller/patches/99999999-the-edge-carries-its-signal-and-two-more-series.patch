@@ -1,0 +1,165 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: the edge carries its signal, and two more series
+
+Completes the record started by the previous patch. Still no optimiser and no
+actuator - only what is measured and then thrown away.
+
+topology_link_history gains rcpi_at_start. A parent is chosen locally and
+greedily, by signal, one edge ahead; recording what that signal actually was
+at the moment the edge appeared makes the choice reviewable afterwards
+without acting on anything. It is a snapshot, not a series - how the link
+behaved later is what metric_hist is for. The value is reached through
+bstamld, which is the only place a child's AL-MAC and its bSTA address are
+tied together; the edge's own iface_mac is the AL-MAC again when own_iface is
+unset, so it cannot be joined on.
+
+metric_hist gains two more series:
+
+  anpi      radio noise, per radio and per band. leg carries the band rather
+            than an MLO link id, because a radio has no legs and 2.4, 5 and
+            6 GHz must not share a series - their noise floors differ by more
+            than any change worth seeing (measured: 72, 54, 56 on one node,
+            i.e. -74, -83, -82 dBm).
+
+  sta_rcpi  client signal, kept under its own kind so it never averages
+            together with the backhaul: the two answer different questions
+            and move on different time scales.
+
+All three folds run once a minute from the same guard, and all three exclude
+the unknown values (0 and 255) rather than averaging them in. A series that
+folds an unmeasured value is the same defect as a column that cannot tell
+measured from unmeasured, and rcpi_at_start is left NULL rather than 0 when
+the signal is not known - an edge with no recorded signal must not read as an
+edge chosen on a signal of zero.
+
+Channel utilisation, the fourth series that belongs here, is deliberately not
+added: total_utilization is 0 for all 15 radios today. Folding a column
+nobody writes would produce a confident, flat, meaningless line.
+
+Schema 4 -> 5; the added column arrives by ALTER, the tables by the DDL.
+
+Verify: after a re-parent, topology_link_history's new row must carry a
+plausible rcpi_at_start (or NULL, never 0); after an hour, metric_hist must
+hold three kinds with samples > 1 and min <= avg <= max in each.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -16,7 +16,7 @@
+ #define MAPDB_SCHEMA_H
+ 
+ /* Bump when the DDL below changes; drives the schema_version migration gate. */
+-#define MAPDB_SCHEMA_VERSION 4
++#define MAPDB_SCHEMA_VERSION 5
+ 
+ /* schema.sql, verbatim. CREATE TABLE IF NOT EXISTS throughout -> idempotent. */
+ static const char MAPDB_SCHEMA_SQL[] =
+@@ -447,7 +447,15 @@
+ 	"    iface_mac            TEXT,\n"
+ 	"    media_type           INTEGER,\n"
+ 	"    from_ts              INTEGER NOT NULL,   -- epoch, edge appeared\n"
+-	"    to_ts                INTEGER             -- NULL = still up\n"
++	"    to_ts                INTEGER,            -- NULL = still up\n"
++	/* The signal this edge was chosen on, at the moment it appeared.
++	 *
++	 * A parent is picked locally and greedily, by signal, one edge ahead.
++	 * Recording what that signal was makes the choice reviewable after the
++	 * fact - without an optimiser and without acting on anything. It is a
++	 * snapshot, not a series: how the link behaved afterwards is what
++	 * metric_hist is for. */
++	"    rcpi_at_start        INTEGER\n"
+ 	");\n"
+ 	"CREATE INDEX IF NOT EXISTS idx_tlh_open ON topology_link_history(child_almac, to_ts);\n"
+ 	"CREATE INDEX IF NOT EXISTS idx_tlh_window ON topology_link_history(from_ts, to_ts);\n"
+--- a/src/db/mapdb.c
++++ b/src/db/mapdb.c
+@@ -108,6 +108,12 @@
+ 	mapdb_exec(db, "UPDATE sta SET last_seen=strftime('%s','now') "
+ 		       "WHERE last_seen IS NULL");
+ 
++	/* v4 -> v5: the edge carries the signal it was chosen on. The tables
++	 * themselves arrive via the DDL above; only the added column needs an
++	 * ALTER, and it is harmless to re-run. */
++	mapdb_exec(db, "ALTER TABLE topology_link_history "
++		       "ADD COLUMN rcpi_at_start INTEGER");
++
+ 	if (mapdb_prepare(db, "UPDATE schema_version SET version=?, applied_at=?",
+ 			  &st) != MAPDB_OK)
+ 		return MAPDB_ERR;
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -900,9 +900,20 @@
+ 			"     AND t.parent_almac = topology_link_history.parent_almac)";
+ 		static const char *open_sql =
+ 			"INSERT INTO topology_link_history"
+-			"(child_almac, parent_almac, iface_mac, media_type, from_ts) "
++			"(child_almac, parent_almac, iface_mac, media_type, from_ts,"
++			" rcpi_at_start) "
+ 			"SELECT t.child_almac, t.parent_almac, t.iface_mac,"
+-			"       t.media_type, ? FROM topology_link t "
++			"       t.media_type, ?,"
++			/* The child's own backhaul STA, reached through bstamld,
++			 * which is the only place child AL-MAC and bSTA address
++			 * are tied together. NULL when unknown - an edge with no
++			 * recorded signal must not look like an edge chosen on a
++			 * signal of zero. */
++			"       (SELECT s.rcpi FROM sta s"
++			"          JOIN bstamld b ON b.mld_macaddr = s.macaddr"
++			"         WHERE b.agent_almac = t.child_almac"
++			"           AND s.rcpi BETWEEN 1 AND 254 LIMIT 1)"
++			"  FROM topology_link t "
+ 			" WHERE NOT EXISTS ("
+ 			"  SELECT 1 FROM topology_link_history h"
+ 			"   WHERE h.child_almac = t.child_almac"
+@@ -946,10 +957,48 @@
+ 		static time_t last_fold;
+ 		time_t now = time(NULL);
+ 
++		/* Radio noise, per radio and per band. leg carries the band
++		 * rather than an MLO link id: a radio has no legs, and 2.4,
++		 * 5 and 6 GHz must not share a series - their noise floors
++		 * differ by more than any change worth seeing. */
++		static const char *anpi_sql =
++			"INSERT INTO metric_hist"
++			"(subject, kind, leg, ts_hour, min_val, avg_val, max_val, samples) "
++			"SELECT ruid, 'anpi', COALESCE(band,-1), (?/3600)*3600,"
++			"       anpi_noise, anpi_noise, anpi_noise, 1"
++			"  FROM radio WHERE anpi_noise IS NOT NULL"
++			"   AND anpi_noise BETWEEN 1 AND 254 "
++			"ON CONFLICT(subject, kind, leg, ts_hour) DO UPDATE SET "
++			"  min_val = MIN(metric_hist.min_val, excluded.min_val),"
++			"  max_val = MAX(metric_hist.max_val, excluded.max_val),"
++			"  avg_val = (metric_hist.avg_val * metric_hist.samples"
++			"             + excluded.avg_val) / (metric_hist.samples + 1),"
++			"  samples = metric_hist.samples + 1";
++		/* Client signal. Separate kind from the backhaul so the two
++		 * never average together: they answer different questions and
++		 * live on different time scales. */
++		static const char *sta_sql =
++			"INSERT INTO metric_hist"
++			"(subject, kind, leg, ts_hour, min_val, avg_val, max_val, samples) "
++			"SELECT macaddr, 'sta_rcpi', -1, (?/3600)*3600, rcpi, rcpi, rcpi, 1"
++			"  FROM sta WHERE COALESCE(is_bsta,0)=0 AND associated=1"
++			"   AND rcpi IS NOT NULL AND rcpi BETWEEN 1 AND 254 "
++			"ON CONFLICT(subject, kind, leg, ts_hour) DO UPDATE SET "
++			"  min_val = MIN(metric_hist.min_val, excluded.min_val),"
++			"  max_val = MAX(metric_hist.max_val, excluded.max_val),"
++			"  avg_val = (metric_hist.avg_val * metric_hist.samples"
++			"             + excluded.avg_val) / (metric_hist.samples + 1),"
++			"  samples = metric_hist.samples + 1";
++
+ 		if (now - last_fold >= 60) {
++			const char *folds[] = { fold_sql, anpi_sql, sta_sql };
++			size_t i;
++
+ 			last_fold = now;
+-			st = NULL;
+-			if (mapdb_prepare(c->db, fold_sql, &st) == MAPDB_OK) {
++			for (i = 0; i < ARRAY_SIZE(folds); i++) {
++				st = NULL;
++				if (mapdb_prepare(c->db, folds[i], &st) != MAPDB_OK)
++					continue;
+ 				mapdb_bind_int(st, 1, (long long)now);
+ 				stmt_finish(c->db, st);
+ 			}

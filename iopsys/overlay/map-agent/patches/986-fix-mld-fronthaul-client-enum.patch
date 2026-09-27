@@ -1,0 +1,90 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 986 - enumerate MLO fronthaul clients on affiliated APs
+
+The async per-BSS station refresh (patch 970) filtered MLO clients on the
+wrong BSSID. The apmld "stations" reply is per-MLD-client and its top-level
+bssid is the MLD BSSID, while ap->bssid is the affiliated link BSSID, so the
+memcmp never matched and wifi_add_sta() was never called -- fronthaul MLO
+clients were counted (num_sta) but never enumerated into ap->stalist, leaving
+the status stations array and the Associated Clients TLV empty. Descend into
+each station's mlo_links[] and match by link_bssid (taking link_macaddr),
+mirroring the sync wifi_sta_parse_mlo_links path; fall back to the old
+top-level filter when a client is reported without mlo_links.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2866,22 +2866,62 @@
+ 			static const struct blobmsg_policy sp[] = {
+ 				[0] = { .name = "macaddr", .type = BLOBMSG_TYPE_STRING },
+ 				[1] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
++				[2] = { .name = "mlo_links", .type = BLOBMSG_TYPE_ARRAY },
+ 			};
+ 			struct blob_attr *stb[ARRAY_SIZE(sp)];
+-			uint8_t bssid[6];
++			bool matched = false;
+ 
+ 			blobmsg_parse(sp, ARRAY_SIZE(sp), stb,
+ 				      blobmsg_data(cur), blobmsg_data_len(cur));
+-			if (!stb[0] || !stb[1])
+-				continue;
+-			if (!hwaddr_aton(blobmsg_get_string(stb[0]), mac))
+-				continue;
+-			if (!hwaddr_aton(blobmsg_get_string(stb[1]), bssid))
+-				continue;
+-			/* aggregate apmld reply spans links; keep our BSS only
+-			 * (same filter as the sync wifi_get_mld_stations path) */
+-			if (memcmp(bssid, ap->bssid, 6))
++			if (!stb[0])
+ 				continue;
++
++			/* The apmld "stations" reply is per-MLD-client: its
++			 * top-level bssid is the MLD BSSID, not this affiliated
++			 * link's BSSID. The real per-link BSSID lives in
++			 * mlo_links[].link_bssid (mirrors the sync
++			 * wifi_sta_parse_mlo_links path). Match this affiliated
++			 * AP by link_bssid and take the matching link_macaddr. */
++			if (stb[2]) {
++				struct blob_attr *lnk;
++				int lrem;
++
++				blobmsg_for_each_attr(lnk, stb[2], lrem) {
++					static const struct blobmsg_policy lp[] = {
++						[0] = { .name = "link_macaddr", .type = BLOBMSG_TYPE_STRING },
++						[1] = { .name = "link_bssid", .type = BLOBMSG_TYPE_STRING },
++					};
++					struct blob_attr *ltb[ARRAY_SIZE(lp)];
++					uint8_t lbssid[6];
++
++					blobmsg_parse(lp, ARRAY_SIZE(lp), ltb,
++						      blobmsg_data(lnk), blobmsg_data_len(lnk));
++					if (!ltb[0] || !ltb[1])
++						continue;
++					if (!hwaddr_aton(blobmsg_get_string(ltb[1]), lbssid))
++						continue;
++					if (memcmp(lbssid, ap->bssid, 6))
++						continue;
++					if (hwaddr_aton(blobmsg_get_string(ltb[0]), mac)) {
++						matched = true;
++						break;
++					}
++				}
++			}
++
++			/* Fallback: client reported without mlo_links -- keep the
++			 * pre-986 top-level bssid filter so nothing regresses. */
++			if (!matched) {
++				uint8_t bssid[6];
++
++				if (!stb[1] ||
++				    !hwaddr_aton(blobmsg_get_string(stb[1]), bssid))
++					continue;
++				if (memcmp(bssid, ap->bssid, 6))
++					continue;
++				if (!hwaddr_aton(blobmsg_get_string(stb[0]), mac))
++					continue;
++			}
+ 		} else {
+ 			if (!hwaddr_aton(blobmsg_get_string(cur), mac))
+ 				continue;

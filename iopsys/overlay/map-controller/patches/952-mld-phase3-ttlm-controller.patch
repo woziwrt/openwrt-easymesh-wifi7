@@ -1,0 +1,178 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: mld phase3 ttlm controller
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -4243,6 +4243,97 @@
+ 	    n->num_apmld, MAC2STR(n->almacaddr));
+ }
+ 
++/* DB Phase 1.5 (MLD, step 3): byte-walk the TID-to-Link Mapping Policy TLV
++ * (0xE6, WOZIWRT-defined) out of @cmdu into the ttlmlist of each matching
++ * AP-MLD. MUST run AFTER cntlr_parse_ap_mld_config_tlv(), which (re)builds
++ * n->apmld_list and leaves every ttlmlist empty; we match each wire MLD block
++ * to an existing wifi_apmld_element by mld_macaddr and rebuild that element's
++ * ttlmlist wholesale. TLV absent -> no-op (peek returns NULL).
++ *
++ * Wire layout (agent_gen_tid_to_link_mapping / struct
++ * tlv_tid_to_link_mapping_policy):
++ *   num_mlds : u8
++ *   per MLD: mld_macaddr[6], num_mappings u8,
++ *            num_mappings * { tid u8, dir u8, linkid u8 } */
++static void parse_tid_to_link_policy(struct node *n, struct cmdu_buff *cmdu)
++{
++	struct tlv *t;
++	const uint8_t *data;
++	uint16_t len;
++	size_t off = 0;
++	uint8_t num_mlds, i;
++
++	if (!n || !cmdu)
++		return;
++
++	t = cmdu_peek_tlv(cmdu, MAP_TLV_TID_TO_LINK_MAPPING_POLICY);
++	if (!t)
++		return;
++
++	data = t->data;
++	len = tlv_length(t);
++	if (!data || len < 1)
++		return;
++
++	num_mlds = data[off++];
++
++	for (i = 0; i < num_mlds; i++) {
++		struct wifi_apmld_element *mld, *match = NULL;
++		struct wifi_ttlm_element *tt;
++		const uint8_t *mac;
++		uint8_t num_mappings, j;
++
++		/* mld_macaddr(6) + num_mappings(1) */
++		if (off + 7 > len)
++			break;
++		mac = data + off;
++		num_mappings = data[off + 6];
++
++		/* each mapping is 3 bytes */
++		if (off + 7 + (size_t)num_mappings * 3 > len)
++			break;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			if (!memcmp(mld->mld_macaddr, mac, 6)) {
++				match = mld;
++				break;
++			}
++		}
++
++		if (match) {
++			/* wholesale-rebuild this MLD's TID map */
++			while (!list_empty(&match->ttlmlist)) {
++				tt = list_first_entry(&match->ttlmlist,
++						struct wifi_ttlm_element, list);
++				list_del(&tt->list);
++				free(tt);
++			}
++			match->num_ttlm = 0;
++
++			for (j = 0; j < num_mappings; j++) {
++				const uint8_t *m = data + off + 7 + (size_t)j * 3;
++				struct wifi_ttlm_element *e;
++
++				e = calloc(1, sizeof(*e));
++				if (!e)
++					break;
++				e->tid = m[0];
++				e->dir = m[1];
++				e->linkid = m[2];
++				list_add_tail(&e->list, &match->ttlmlist);
++				match->num_ttlm++;
++			}
++			match->ttlm_enabled = (match->num_ttlm > 0);
++
++			dbg("%s: MLD " MACFMT " %u TID-to-Link mapping(s)\n",
++			    __func__, MAC2STR(match->mld_macaddr),
++			    match->num_ttlm);
++		}
++
++		off += 7 + (size_t)num_mappings * 3;
++	}
++}
++
+ /* DB Phase 1.5 (MLD, step 1): handler for AP-MLD Config Response (0x8045).
+  * The AP-MLD Config TLV (0xE0) also rides Topology Response; we pull it
+  * directly with cmdu_peek_tlv() so we do not depend on the CMDU validation
+@@ -4260,6 +4351,11 @@
+ 	t = cmdu_peek_tlv(cmdu, MAP_TLV_AP_MLD_CONFIG);
+ 	if (t)
+ 		cntlr_parse_ap_mld_config_tlv(n, t->data, tlv_length(t));
++
++	/* TID-to-Link Mapping Policy (0xE6, step 3): fold into the ttlmlist
++	 * of the AP-MLD(s) parsed above (matched by MLD MAC). No-op if the
++	 * agent did not attach 0xE6. */
++	parse_tid_to_link_policy(n, cmdu);
+ 
+ 	return 0;
+ }
+@@ -4634,6 +4730,9 @@
+ 				if (mldtlv) {
+ 					cntlr_parse_ap_mld_config_tlv(n,
+ 						mldtlv->data, tlv_length(mldtlv));
++					/* TID-to-Link (0xE6) rides here too; parse
++					 * after 0xE0 so apmld_list exists (step 3). */
++					parse_tid_to_link_policy(n, cmdu);
+ 					mapc_sync_apmld(c, n);
+ 				}
+ 			}
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -539,6 +539,11 @@
+ 		"ON CONFLICT(bssid) DO UPDATE SET mld_macaddr=excluded.mld_macaddr, "
+ 		"ruid=excluded.ruid, link_id=excluded.link_id, "
+ 		"punct_bitmap=excluded.punct_bitmap";
++	static const char *ins_ttlm =
++		"INSERT INTO ttlm(mld_macaddr, tid, direction, link_id) "
++		"VALUES(?,?,?,?) "
++		"ON CONFLICT(mld_macaddr, tid, direction, link_id) "
++		"DO NOTHING";
+ 	struct wifi_apmld_element *mld;
+ 	char almac[18];
+ 
+@@ -609,7 +614,36 @@
+ 				return;
+ 			}
+ 		}
+-		/* ttlm rows: step 3 (TID-to-Link). */
++		/* ttlm rows (TID-to-Link, step 3): child of apmld in the SAME
++		 * txn, inserted after the parent apmld + affiliated_ap rows so
++		 * the FK ttlm.mld_macaddr -> apmld(mld_macaddr) resolves. The
++		 * delete step above already cleared this MLD's stale rows.
++		 * The ttlm PK is (mld_macaddr,tid,direction,link_id) so every
++		 * (tid,link) pair persists (802.11be: one TID -> many links);
++		 * ON CONFLICT DO NOTHING keeps the insert idempotent and
++		 * non-aborting. The full N-TIDs-to-M-Links map also lives in
++		 * mld->ttlmlist (the in-memory source of truth). */
++		{
++			struct wifi_ttlm_element *tt;
++
++			list_for_each_entry(tt, &mld->ttlmlist, list) {
++				st = NULL;
++				if (mapdb_prepare(c->db, ins_ttlm, &st) != MAPDB_OK) {
++					warn("mapc_sync: ttlm ins prepare: %s\n",
++					     mapdb_last_error(c->db));
++					mapdb_rollback(c->db);
++					return;
++				}
++				mapdb_bind_text(st, 1, mldmac);
++				mapdb_bind_int(st, 2, tt->tid);
++				mapdb_bind_int(st, 3, tt->dir);
++				mapdb_bind_int(st, 4, tt->linkid);
++				if (stmt_finish(c->db, st) != MAPDB_OK) {
++					mapdb_rollback(c->db);
++					return;
++				}
++			}
++		}
+ 	}
+ 
+ 	if (mapdb_commit(c->db) != MAPDB_OK) {

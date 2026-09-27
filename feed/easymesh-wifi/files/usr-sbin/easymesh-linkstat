@@ -1,0 +1,404 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-linkstat - which legs of the backhaul MLD are actually alive.
+#
+# The model has never carried this. `bstamld.num_bsta` - what the topology
+# picture draws its MLO marker from - is the number of bSTAs the MLD was BUILT
+# from, and it is 2 on every box in the lab, on the MediaTek box that has one
+# leg, and on the ghost row of a box that left. Measured 2026-09-21: the driver
+# declared a 6 GHz leg lost and the picture kept drawing two.
+#
+# Two independent halves, because either one alone is wrong:
+#
+#   RX  beacons. An AP beacons every 100 ms whether or not anyone is sending,
+#       so this is the only half that works on an idle node. Bytes standing
+#       still mean nothing - the node may simply have nothing to say.
+#
+#   TX  tx_failed. Measured 2026-09-22: beacons arrived on both legs within 2%
+#       of each other while one leg lost 75 nullfunc ACKs in 20 hours. A leg
+#       can hear perfectly and be unable to talk, and a beacon-only test calls
+#       that leg healthy.
+#
+# Everything is a DELTA over one window. Absolute counters cannot tell a leg
+# that joined late from a leg going deaf: on 2026-09-22 the 6 GHz leg of
+# corridor sat at 73% of the expected beacon count, and 91 s of late join
+# explains the whole deficit just as well as an ongoing fault.
+#
+# Deliberately NOT inside map-agent. Two libwifi patches (001, 014) exist
+# because a HAL call that answers late stalls the agent and the mesh with it.
+# This is a separate process with its own clock; if it wedges, it wedges alone.
+#
+# Writes /tmp/easymesh/linkstat.json. tmpfs on purpose: a reboot resets the
+# deltas, which is the correct answer after a reboot.
+
+WIN=${1:-30}
+OUT=/tmp/easymesh/linkstat.json
+PREV=/tmp/easymesh/.linkstat.prev
+
+if [ -r /usr/share/easymesh/boot-window.sh ]; then
+	. /usr/share/easymesh/boot-window.sh
+	is_mesh_node || exit 0
+fi
+
+BSTA=$(uci -q get wireless.sta_mld_1.ifname)
+[ -n "$BSTA" ] || exit 0
+
+mkdir -p /tmp/easymesh 2>/dev/null
+
+# One instance only. The deltas below go through $PREV.new/.now, and a second
+# copy writing the same files shortens the other one's window. Measured
+# 2026-09-23: a copy started by hand over ssh outlived the ssh session (the
+# loop never ends), and hall and corridor reported every leg "degraded" at
+# 40 % of beacons while `beacon rx` showed 9.8 per second on all of them.
+# A pid file needs nothing but the shell and /proc, which every node has.
+PIDF=/tmp/easymesh/linkstat.pid
+if read -r _old 2>/dev/null < "$PIDF" && [ "$_old" != "$$" ] &&
+   grep -q easymesh-linkstat "/proc/$_old/cmdline" 2>/dev/null; then
+	echo "easymesh-linkstat already runs as pid $_old - read $OUT instead" >&2
+	exit 1
+fi
+echo $$ > "$PIDF"
+
+# One line per link:  id  beacon_rx  rx_bytes  tx_bytes  tx_failed  rssi  address
+#                     tx_mbit  rx_mbit  chain_spread
+#
+# The PHY rates and the spread between the receive chains say how good a leg
+# is, which beacons and tx_failed do not: on 2026-09-26 bedroom's 6 GHz leg
+# heard 97 % of its beacons and was "degraded" like every working leg, while
+# it received at MCS 0, one stream, 144 Mbit/s. A chain far below its
+# siblings is an antenna or a connector, not the air.
+#
+# tx packets is NOT read, on purpose. Measured 2026-09-22 on all four agents:
+# mt76 puts the whole MLD's packet count on one leg and zero on the other,
+# while tx BYTES split correctly and sum to the MLD total on all four. A
+# counter that is right for one leg and zero for the other is worse than no
+# counter, because it reads like a measurement.
+sample() {
+	iw dev "$BSTA" station dump 2>/dev/null | awk '
+		function flush() { if (id != "") print id, b, rb, tb, tf, s, a, tr, rr, cs }
+		/^\tLink [0-9]+:/ { flush(); id = $2; sub(":", "", id)
+		                    b = 0; rb = 0; tb = 0; tf = 0; s = 0; a = "-"
+		                    tr = 0; rr = 0; cs = -1; next }
+		id == "" { next }
+		/^\t\taddress:/   { a  = $2 }
+		/^\t\tbeacon rx:/ { b  = $3 }
+		/^\t\trx bytes:/  { rb = $3 }
+		/^\t\ttx bytes:/  { tb = $3 }
+		/^\t\ttx failed:/ { tf = $3 }
+		/^\t\tsignal:/    { s  = $2
+		                    # "-67 [-74, -70, -70] dBm": spread = max - min
+		                    lo = 0; hi = -999; n = 0
+		                    for (i = 3; i <= NF; i++) {
+		                        v = $i; gsub(/[^-0-9]/, "", v)
+		                        if (v == "" || v == "-") continue
+		                        v += 0; n++
+		                        if (n == 1 || v < lo) lo = v
+		                        if (v > hi) hi = v
+		                    }
+		                    cs = (n >= 2) ? hi - lo : -1 }
+		# Only a data-frame rate counts. An idle leg reports the rate of
+		# its last management frame, "6.0 MBit/s" with no MCS: the kitchen
+		# 5 GHz leg at -50 dBm read 6-17 Mbit/s up that way (2026-09-26)
+		# and was marked slow. Such a reading is no sample: 0.
+		/^\t\ttx bitrate:/ { tr = ($0 ~ /MCS/) ? int($3) : 0 }
+		/^\t\trx bitrate:/ { rr = ($0 ~ /MCS/) ? int($3) : 0 }
+		END { flush() }'
+}
+
+# The driver, not iw. `iw ... link` prints every configured leg with one set of
+# numbers; this bitmap is what mac80211 actually holds. RESTORE.md:429 calls it
+# the authority and it is the same field node-heartbeat already samples.
+valid_links() {
+	for f in "/sys/kernel/debug/ieee80211/phy"*"/netdev:$BSTA/mt76_links_info"; do
+		[ -e "$f" ] || continue
+		sed -n 's/^valid links = //p' "$f" | head -1
+		return
+	done
+	echo ""
+}
+
+# The PHY rate is whatever the last frame went out at, and rate control moves
+# it every few frames: bedroom's 6 GHz leg read 144 and 648 Mbit/s a minute
+# apart (2026-09-26), so a single reading made the picture blink between slow
+# and fine. Report the median of the last RATE_N windows per leg instead.
+RATE_N=${RATE_N:-5}
+rate_median() {
+	# $1 leg id  $2 tx_mbit  $3 rx_mbit  ->  "tx rx" medians
+	_h="$PREV.rate.$1"
+	echo "$2 $3" >> "$_h"
+	tail -n "$RATE_N" "$_h" > "$_h.t" && mv "$_h.t" "$_h"
+	# 0 = no data-frame rate in that window; left out of the median.
+	for _c in 1 2; do
+		cut -d' ' -f$_c "$_h" | awk '$1 > 0' | sort -n |
+			awk '{ v[NR] = $1 } END { if (NR) print v[int((NR + 1) / 2)]; else print 0 }'
+	done | tr '\n' ' '
+}
+
+# $(( 0x3 )) is not guaranteed in every POSIX shell and awk's strtonum() is
+# gawk only, so convert by hand. It is a handful of characters and it cannot
+# surprise us on a box we did not test on.
+hex2dec() {
+	_h=${1#0[xX]}
+	_v=0
+	[ -n "$_h" ] || { echo ""; return 1; }
+	while [ -n "$_h" ]; do
+		_c=${_h%"${_h#?}"}
+		_h=${_h#?}
+		case "$_c" in
+		[0-9]) _d=$_c ;;
+		a|A) _d=10 ;; b|B) _d=11 ;; c|C) _d=12 ;;
+		d|D) _d=13 ;; e|E) _d=14 ;; f|F) _d=15 ;;
+		*) echo ""; return 1 ;;
+		esac
+		_v=$(( _v * 16 + _d ))
+	done
+	echo "$_v"
+}
+
+beacon_int() {
+	iw dev "$BSTA" station dump 2>/dev/null |
+		sed -n 's/^[[:space:]]*beacon interval:[[:space:]]*//p' | head -1
+}
+
+# A leg's state, from the two halves. Beacons are the RX half, tx_failed the TX
+# half, and the bitmap overrules both: a leg mac80211 no longer holds is down
+# whatever its stale counters say.
+classify() {
+	# $1 id  $2 dbeacon  $3 dtxfail  $4 expected  $5 valid_mask
+	_id=$1; _db=$2; _dtf=$3; _exp=$4; _mask=$5
+
+	if [ -n "$_mask" ] && [ $(( (_mask >> _id) & 1 )) -eq 0 ]; then
+		echo down; return
+	fi
+	[ "$_db" -le 0 ] 2>/dev/null && { echo down; return; }
+	[ "$_exp" -gt 0 ] 2>/dev/null || { echo unknown; return; }
+	if [ $(( _db * 100 / _exp )) -lt 50 ]; then
+		echo degraded; return
+	fi
+	[ "$_dtf" -gt 0 ] 2>/dev/null && { echo degraded; return; }
+	echo up
+}
+
+pct() {
+	[ "$2" -gt 0 ] 2>/dev/null || { echo 0; return; }
+	p=$(( $1 * 100 / $2 ))
+	[ "$p" -gt 100 ] && p=100
+	[ "$p" -lt 0 ] && p=0
+	echo "$p"
+}
+
+band_of() {
+	# freq -> libwifi enum wifi_band: 1 = 2.4, 2 = 5, 8 = 6 GHz
+	case "$1" in
+	2[0-9][0-9][0-9]) echo 1 ;;
+	5[0-9][0-9][0-9]) echo 2 ;;
+	[67][0-9][0-9][0-9]) echo 8 ;;
+	*) echo 0 ;;
+	esac
+}
+
+# `iw ... link` is used HERE and only here, and only for the frequency of a
+# BSSID. Its numbers are one set for the whole MLD and must never be used for
+# per-leg state - that is what station dump above is for.
+#   Link 0 BSSID 52:55:e2:da:55:fa
+#           freq: 5180.0
+freq_of() {
+	iw dev "$BSTA" link 2>/dev/null |
+		awk -v want="$1" '$1 == "Link" && $3 == "BSSID" { hit = ($4 == want) }
+		                  $1 == "freq:" && hit { print int($2); exit }'
+}
+
+# ---------------------------------------------------------------------------
+# Deaf-association guard - a PATCH OVER A SYMPTOM, not a fix.
+#
+# 2026-09-23 17:09-17:28Z bedroom sat 13 min in wpa_state COMPLETED after its
+# parent (the controller) was reflashed: beacon loss +60 per minute, `beacon rx`
+# standing still on BOTH legs (8/13 -> 10/19 in 12 minutes), no disconnect, no
+# new scan. The rest of the mesh came back; bedroom never did until it was
+# power-cycled. 1 of 7 parent restarts that evening, root cause unknown
+# (suspect: the nullfunc probe from mt76 0118 is ACKed by the returning parent
+# with the same BSSID, so the beacon monitor never gives up).
+#
+# The signature is ALL legs deaf while COMPLETED. One deaf leg is not it: the
+# 6 GHz leg of a card-A node goes to 0-15 % beacons for 30-120 s several times
+# a night while 5 GHz runs normally (6g-flight 2026-09-23/24) - the MLD is
+# alive and a reassociation would only cost the node its link.
+#
+# One action (reassociate), then the NEXT window records whether beacons came
+# back - an attempt is not an outcome. Log in /etc/mapc so it survives the
+# power-cycle this guard exists to avoid.
+# ---------------------------------------------------------------------------
+DEAF_PCT=5		# a leg below this share of expected beacons hears nothing
+DEAF_WINS=3		# consecutive windows (3 x 30 s) before acting
+DEAF_GAP=600		# at most one reassociate per 10 min
+DEAF_LOG=/etc/mapc/deaf-guard.log
+DEAF_OFF=/etc/mapc/deaf-guard-off	# lab switch: detect and log, do not act
+deaf_n=0
+deaf_last=0
+deaf_check=0
+
+deaf_log() {
+	logger -t easymesh-linkstat "deaf-guard: $*"
+	[ -d /etc/mapc ] || return 0
+	echo "$(date -u '+%F %T') $*" >> "$DEAF_LOG"
+	# a guard that fires every 10 min for a week must not fill the flash
+	[ "$(wc -l < "$DEAF_LOG")" -gt 400 ] &&
+		tail -n 200 "$DEAF_LOG" > "$DEAF_LOG.t" && mv "$DEAF_LOG.t" "$DEAF_LOG"
+}
+
+bsta_state() {
+	wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" status 2>/dev/null |
+		sed -n 's/^wpa_state=//p'
+}
+
+bsta_parent() {
+	iw dev "$BSTA" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p'
+}
+
+# Somebody else is moving this bSTA on purpose: a parent trial or a WPS join.
+bsta_busy() {
+	[ -f /etc/easymesh-wps-pending ] && return 0
+	read -r _tp 2>/dev/null < /tmp/easymesh/bh-trial.pid &&
+		grep -q easymesh-bh-trial "/proc/$_tp/cmdline" 2>/dev/null && return 0
+	return 1
+}
+
+# Where the bSTA was, for the day it goes missing.
+#
+# 2026-09-24 kitchen dropped out of the mesh for about twenty minutes: the
+# controller logged its authentication attempts going unacknowledged, and
+# then nothing - no attempt at the parent it had just left, none anywhere.
+# Why it stopped looking could not be answered: the node was reflashed an
+# hour later and its log lived in /tmp. So write down every change of the
+# bSTA state, and while it is not associated, where it is once every five
+# minutes - in /etc/mapc next to the guard's own lines. A settled node
+# writes nothing.
+bsta_last_state=""
+bsta_since=0
+bsta_noted=0
+bsta_watch() {
+	_st=$(bsta_state)
+	_now=$(date +%s)
+	[ -n "$_st" ] || _st=NONE
+	if [ "$_st" != "$bsta_last_state" ]; then
+		[ -n "$bsta_last_state" ] &&
+			deaf_log "bsta $bsta_last_state -> $_st after $((_now - bsta_since)) s, parent $(bsta_parent)"
+		bsta_last_state=$_st
+		bsta_since=$_now
+		bsta_noted=$_now
+		return 0
+	fi
+	[ "$_st" = COMPLETED ] && return 0
+	[ $((_now - bsta_noted)) -ge 300 ] || return 0
+	bsta_noted=$_now
+	deaf_log "bsta still $_st for $((_now - bsta_since)) s: $(wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" status 2>/dev/null |
+		sed -n 's/^\(bssid\|freq\|ssid\)=//p' | tr '\n' ' ')"
+}
+
+# $1 legs seen  $2 deaf legs  $3 per-leg summary for the log
+deaf_guard() {
+	_now=$(date +%s)
+
+	# the first window with real deltas after an action: say what it did.
+	# Right after a reassociation every counter restarts and every leg is
+	# "unknown" - that is no answer yet, so wait (at most 4 windows).
+	if [ "$deaf_check" -gt 0 ] && [ "$1" -eq 0 ] && [ "$deaf_check" -lt 5 ]; then
+		deaf_check=$((deaf_check + 1))
+		return 0
+	fi
+	if [ "$deaf_check" -gt 0 ]; then
+		deaf_check=0
+		if [ "$1" -gt 0 ] && [ "$2" -lt "$1" ]; then
+			deaf_log "after reassociate: beacons back ($3), parent $(bsta_parent), state $(bsta_state)"
+		else
+			deaf_log "after reassociate: STILL deaf ($3), parent $(bsta_parent), state $(bsta_state)"
+		fi
+	fi
+
+	if [ "$1" -eq 0 ] || [ "$2" -lt "$1" ]; then
+		deaf_n=0
+		return 0
+	fi
+	# only now is wpa_cli worth a call: every leg is deaf
+	[ "$(bsta_state)" = COMPLETED ] || { deaf_n=0; return 0; }
+
+	deaf_n=$((deaf_n + 1))
+	[ "$deaf_n" -ge "$DEAF_WINS" ] || return 0
+
+	if bsta_busy; then
+		deaf_n=0
+		return 0
+	fi
+	if [ $((_now - deaf_last)) -lt "$DEAF_GAP" ]; then
+		return 0
+	fi
+
+	deaf_last=$_now
+	deaf_n=0
+	_why="COMPLETED on $(bsta_parent) with every leg deaf for $((DEAF_WINS * WIN)) s ($3)"
+	if [ -e "$DEAF_OFF" ]; then
+		deaf_log "$_why - would reassociate ($DEAF_OFF present)"
+		return 0
+	fi
+	deaf_log "$_why - reassociating"
+	wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" reassociate >/dev/null 2>&1
+	deaf_check=1
+}
+
+while :; do
+	sample > "$PREV.new" 2>/dev/null
+	sleep "$WIN"
+	sample > "$PREV.now" 2>/dev/null
+
+	bint=$(beacon_int); [ -n "$bint" ] || bint=100
+	exp=$(( WIN * 1000 / bint ))
+	mask_hex=$(valid_links)
+	mask=$(hex2dec "$mask_hex") || mask=""
+
+	links=""
+	nlegs=0; ndeaf=0; legsum=""
+	while read -r id b rb tb tf s a tr rr cs; do
+		[ -n "$id" ] || continue
+		prev=$(awk -v k="$id" '$1 == k { print $2, $5; exit }' "$PREV.new")
+		pb=$(echo "$prev" | cut -d' ' -f1)
+		ptf=$(echo "$prev" | cut -d' ' -f2)
+		# A leg that was not in the previous sample has no delta yet.
+		# Saying "unknown" is the honest answer; saying "up" is how a
+		# model starts lying the moment it restarts.
+		if [ -z "$pb" ]; then
+			st=unknown; db=0; dtf=0
+		else
+			db=$(( b - pb )); dtf=$(( tf - ptf ))
+			# A counter that went backwards is a reassociation, not a
+			# measurement. Do not report a negative delta as an outage.
+			[ "$db" -lt 0 ] && { db=0; st=unknown; }
+			[ "$dtf" -lt 0 ] && dtf=0
+			[ -z "$st" ] && st=$(classify "$id" "$db" "$dtf" "$exp" "$mask")
+		fi
+		fr=$(freq_of "$a")
+		set -- $(rate_median "$id" "${tr:-0}" "${rr:-0}"); tr=$1; rr=$2
+		bp=$(pct "$db" "$exp")
+		links="$links${links:+,}{\"id\":$id,\"band\":$(band_of "$fr"),\"bssid\":\"$a\",\"state\":\"$st\",\"beacon_pct\":$bp,\"rx_bytes\":$rb,\"tx_bytes\":$tb,\"tx_failed\":$tf,\"rssi\":$s,\"tx_mbit\":${tr:-0},\"rx_mbit\":${rr:-0},\"chain_spread\":${cs:--1}}"
+		# "unknown" (no delta yet, or a reassociation reset the counter) is
+		# not evidence of deafness and must not count towards the guard.
+		nlegs=$((nlegs + 1))
+		legsum="$legsum${legsum:+ }L$id $st $bp%"
+		case "$st" in
+		down) ndeaf=$((ndeaf + 1)) ;;
+		degraded) [ "$bp" -lt "$DEAF_PCT" ] && ndeaf=$((ndeaf + 1)) ;;
+		unknown) nlegs=$((nlegs - 1)) ;;
+		esac
+		st=""
+	done < "$PREV.now"
+
+	printf '{"ts":%s,"win_s":%s,"bsta":"%s","valid_links":"%s","links":[%s]}\n' \
+		"$(date +%s)" "$WIN" "$BSTA" "${mask_hex:-?}" "$links" > "$OUT.tmp"
+	mv "$OUT.tmp" "$OUT"
+
+	deaf_guard "$nlegs" "$ndeaf" "$legsum"
+	bsta_watch
+
+	mv "$PREV.now" "$PREV.new"
+done

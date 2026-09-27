@@ -1,0 +1,66 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: controller startup retry
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+map-controller: bounded ieee1905 AL-MAC retry at startup (self-heal via procd)
+
+At startup mapcontroller resolves its AL-MAC via cntlr_get_ieee1905_almac() ->
+ubus_invoke(ieee1905, "info", ..., 2000ms). If ieee1905d is momentarily slow
+enumerating interfaces at boot the reply can time out, or the AL-MAC can be zero
+before the AL bridge is up.
+
+The original code returned that error to run_controller(), which did `goto
+out_exit` -> the process exits and procd respawns it -> it succeeds on a later
+attempt once ieee1905d is responsive. That exit-and-respawn is the self-heal.
+
+Ride out a bounded window (~20 x 1s) of transient ieee1905d slowness instead of
+exiting on the very first timeout, but on exhaustion RETURN THE ERROR so
+run_controller() takes `goto out_exit` and procd respawns us. Never loop forever
+in-process on a wedged ieee1905d - that would remove the self-heal entirely and
+make a wedge unrecoverable. Combined with `respawn 3600 5 0` (retry=0 = respawn
+forever) in the init.d this gives both self-heal and never-permanently-dead.
+--- a/src/cntlr_ubus.c
++++ b/src/cntlr_ubus.c
+@@ -1744,18 +1744,35 @@
+ 
+ int cntlr_get_ieee1905_almac(struct controller *c, uint8_t *almacaddr)
+ {
++	static const uint8_t zero[6] = {0};
+ 	uint32_t obj;
+-	int ret;
++	int ret = -1, tries;
+ 
+ 	if (!almacaddr)
+ 		return -1;
+ 
+-	memset(almacaddr, 0, 6);
+-	ret = cntlr_wait_for_object_timeout(c, "ieee1905", -1, &obj);
+-	if (!ret)
+-		ret = ubus_call_object(c, obj, "info", ieee1905_cb_get_almac, almacaddr);
+-
+-	return ret;
++	/* Ride out transient ieee1905d slowness at boot: the 'info' reply can
++	 * time out while ieee1905d is enumerating, and the AL-MAC can be zero
++	 * before the AL bridge is up. Retry with a 1s backoff, but BOUNDED - on
++	 * exhaustion return the error so run_controller() takes 'goto out_exit'
++	 * and procd respawns us (respawn-forever). Never wait forever in-process
++	 * on a wedged ieee1905d - that removed the exit-and-respawn self-heal. */
++	for (tries = 0; tries < 20; tries++) {
++		memset(almacaddr, 0, 6);
++
++		ret = cntlr_wait_for_object_timeout(c, "ieee1905", -1, &obj);
++		if (!ret)
++			ret = ubus_call_object(c, obj, "info", ieee1905_cb_get_almac, almacaddr);
++
++		if (!ret && memcmp(almacaddr, zero, 6) != 0)
++			return 0;
++
++		warn("cntlr: waiting for ieee1905 AL-MAC (try %d/20)...\n", tries + 1);
++		sleep(1);
++	}
++
++	err("cntlr: ieee1905 AL-MAC not ready; exiting for procd respawn\n");
++	return ret ? ret : -1;
+ }
+ 
+ static uint16_t ieee1905_media_str_to_type(const char *media)

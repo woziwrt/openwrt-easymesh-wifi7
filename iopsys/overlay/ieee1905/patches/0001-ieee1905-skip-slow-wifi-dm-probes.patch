@@ -1,0 +1,152 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: ieee1905 skip slow wifi dm probes
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+ieee1905: keep uloop alive with a 4addr/MLD backhaul (skip slow mt76 DM probes)
+
+Three related problems on an MT7996/mt76 mesh node once a 4addr backhaul STA is
+associated and MLD affiliated APs (ap-mld-N) exist:
+
+1) One-time registration: allocating a dynamic 4addr AP/VLAN (wds_sta, e.g.
+   wlan1-1.sta1) or an MLD affiliated AP (ap-mld-1) as a 1905 interface probes it
+   via mediainfo/assoclist, which is slow enough to block ieee1905d's single
+   uloop thread. The cost is the hostapd control socket: get_4addr_parent walks
+   every netdev of the phy with STA-FIRST/STA-NEXT, and get_ccfs0_ccfs1 adds a
+   round trip per interface. Fixed by detecting the AP/VLAN and MLD affiliated
+   AP by name and skipping the probe at alloc; the AF_PACKET socket created
+   later is all we need for RX.
+
+   CORRECTED 2026-08-01. This paragraph used to say the probe "issues an
+   NL80211_CMD_GET_STATION dump that mt76 never terminates". That was never
+   measured - it came from reading the code on 2026-07-11, about a different
+   caller, and was copied into three patch comments where it read as fact for
+   three weeks. It is wrong twice over: on firmware 202607 `iw dev <if> station
+   dump` returns in 0 s on ap-mld-N, bsta-mld-N and ap-mld-N.staM alike, with
+   nothing left in D state; and platform_wifi_get_mediainfo() issues no station
+   dump at all, only GET_INTERFACE. Only assoclist dumps, and it cannot on an
+   AP_VLAN - nlwifi_get_assoclist_band() returns -1 unless the mode is AP.
+
+   The wedge itself is real and measured (2026-07-13, kernel-stack sampling of
+   a live daemon with an 8 s ubus call in flight): do_select / pselect6 on every
+   sample, "never blocks in netlink recvmsg (so NOT a slow mt76 probe)". The
+   bypass stays; only its stated reason was wrong.
+
+2) Periodic 5s data-model self-refresh (i1905_dm_refresh_self): it re-runs the
+   synchronous per-interface WiFi probes unconditionally - assoclist (hostapd
+   wpactrl), per-neighbor GET_STATION link metrics, and mediainfo GET_INTERFACE -
+   each 35-700ms on mt76. With the 4addr backhaul the neighbor set explodes, so a
+   single refresh pass never completes (0 epoll for >20s): the uloop starves,
+   every ieee1905 ubus call times out and 1905 TX stops, so the agent can never
+   onboard (num_nodes stuck at 1).
+
+3) On-demand ubus 'info'/'topology' path: i1905_dump_info() (the handler behind
+   `ubus call ieee1905 info`, the CLI 'info' command, and the topology sub-table)
+   calls platform_wifi_get_4addr_parent() for EVERY local interface. That is a
+   blocking hostapd_cli/wpa_ctrl round-trip (wpa_ctrl waits in select() on the
+   hostapd control socket - hence the daemon samples in do_select, not netlink).
+   With the 4addr AP/VLAN and MLD affiliated APs present it stalls the handler
+   inside the uloop, so `ieee1905 info` times out and mapcontroller never gets its
+   AL-MAC. Gate get_4addr_parent behind skip_wifi_probe (managed interfaces) and
+   IS_MEDIA_WIFI (unmanaged local interfaces): parent_ifname is only meaningful
+   for the very 4addr wds_sta interfaces we already skip, so report "" for them.
+
+These probes are not needed for onboarding or topology (which come from 1905
+CMDUs) and the per-interface RX socket is independent of them. Add a cached
+per-interface flag skip_wifi_probe (set for all WiFi interfaces at alloc) and
+honor it in the refresh path and the on-demand info path. Ethernet interfaces are
+unaffected (flag stays false).
+--- a/src/i1905_dm.h
++++ b/src/i1905_dm.h
+@@ -252,6 +252,7 @@
+ 	bool lo;			/** for cmdu loopback to localhost */
+ 	bool invalid;
+ 	bool is_brif;			/**< whether a bridged (slave) interface */
++	bool skip_wifi_probe;		/**< skip slow mt76 DM probes (uloop starvation) */
+ 	uint32_t brport;		/**< bridge port number when is_brif = true */
+ 	uint32_t br_ifindex;		/**< bridge (master) interface index when is_brif = true */
+ 	int nomaster;			/**< is set to 1 when not enslaved */
+--- a/src/i1905.c
++++ b/src/i1905.c
+@@ -357,6 +357,23 @@
+ 
+ 		info("%s: is WiFi\n", ifname);
+ 		n->mediatype = IF_MEDIA_WIFI;
++		n->skip_wifi_probe = true;
++		/* Dynamic 4addr AP/VLAN (wds_sta) "<ap>.staN" (e.g. wlan1-1.sta1),
++		 * and MLD affiliated APs "ap-mld-N": probing mediainfo/assoclist
++		 * here is slow enough to wedge ieee1905d's single uloop thread, and
++		 * even detecting it via platform_wifi_get_4addr_parent() blocks
++		 * (hostapd_cli). Detect by name (no syscall); the AF_PACKET socket
++		 * created later is all we need to RX their 1905 CMDUs. */
++		if (strstr(ifname, ".sta") || !strncmp(ifname, "ap-mld", 6)) {
++			info("%s: 4addr/MLD affiliated - skip wifi probe\n", ifname);
++			n->media = I1905_MEDIA_UNKNOWN;
++			n->num_mediainfo = 0;
++			n->mediainfo = NULL;
++			n->authenticated = true;
++			n->pbc_supported = false;
++			n->pbc_ongoing = false;
++			goto done;
++		}
+ 		ret = platform_wifi_get_mediainfo(ifname, &i1905_media,
+ 						  &n->num_mediainfo,
+ 						  (void **)&n->mediainfo);
+--- a/src/i1905_al.c
++++ b/src/i1905_al.c
+@@ -132,7 +132,7 @@
+ 			int res = -1;
+ 
+ 			memset(&metric, 0, sizeof(struct i1905_metric));
+-			if (wifi->role == IEEE80211_ROLE_AP) {
++			if (wifi->role == IEEE80211_ROLE_AP && !iface->skip_wifi_probe) {
+ 				res = platform_wifi_get_assoc_sta_metric(iface->ifname, nif->r_macaddr, &metric);
+ 			} else if (wifi->role == IEEE80211_ROLE_STA) {
+ 				res = platform_wifi_get_interface_metric(iface->ifname, &metric);
+@@ -172,6 +172,9 @@
+ 		return 0;
+ 
+ 	/* get associated STAs */
++	if (iface->skip_wifi_probe)
++		return 0;
++
+ 	platform_wifi_get_assoclist(iface->ifname, stas, &numb);
+ 
+ 	/* get neigh entries reachable through this interface */
+@@ -324,6 +327,7 @@
+ 	i1905_dbg(LOG_DM, "Updating mediainfo for '%s'\n", iface->ifname);
+ 	if_getmediatype(iface->ifname, &mtype);
+ 	if (mtype == IF_MEDIA_WIFI) {
++		if (!iface->skip_wifi_probe)
+ 		if (iface->mediainfo) {
+ 			free(iface->mediainfo);
+ 			iface->mediainfo = NULL;
+@@ -332,6 +336,7 @@
+ 		}
+ 
+ 		iface->mediatype = IF_MEDIA_WIFI;
++		if (!iface->skip_wifi_probe)
+ 		platform_wifi_get_mediainfo(iface->ifname,
+ 						  &iface->media,
+ 						  &iface->num_mediainfo,
+--- a/src/i1905_cmdresp.c
++++ b/src/i1905_cmdresp.c
+@@ -317,7 +317,8 @@
+ 
+ 		aaa = blobmsg_open_table(bb, "");
+ 		blobmsg_add_string(bb, "ifname", iface->ifname);
+-		if (!platform_wifi_get_4addr_parent(iface->ifname, parent))
++		if (!iface->skip_wifi_probe &&
++		    !platform_wifi_get_4addr_parent(iface->ifname, parent))
+ 			blobmsg_add_string(bb, "parent_ifname", parent);
+ 		else
+ 			blobmsg_add_string(bb, "parent_ifname", "");
+@@ -499,7 +500,8 @@
+ 
+ 		aaa = blobmsg_open_table(bb, "");
+ 		blobmsg_add_string(bb, "ifname", ifl->ifname);
+-		if (!platform_wifi_get_4addr_parent(ifl->ifname, parent))
++		if (!IS_MEDIA_WIFI(ifl->mediatype) &&
++		    !platform_wifi_get_4addr_parent(ifl->ifname, parent))
+ 			blobmsg_add_string(bb, "parent_ifname", parent);
+ 		else
+ 			blobmsg_add_string(bb, "parent_ifname", "");

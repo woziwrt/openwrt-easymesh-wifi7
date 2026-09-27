@@ -1,0 +1,114 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] relay: key the multicast duplicate check on {origin, MID}, not MID alone
+
+A foreign agent joined our mesh over the backhaul, its 1905 reached our
+agents in both directions - and our CONTROLLER never saw a single frame from
+it. Measured 2026-09-21 with tcpdump on the controller's br-lan
+(ether proto 0x893a, 40 s):
+
+    33x  hall       -> MTK        19x  MTK -> hall
+     5x  MTK -> corridor           5x  MTK -> kitchen
+     0x  controller <-> MTK
+
+The controller is the registrar. Without it the agent never gets its WSC M2,
+so it keeps its own SSID and the mesh is not one network. Nothing about the
+radio or WPS was wrong - the frames were dropped on the way.
+
+Relayed multicast is deduplicated per outgoing interface against the last
+four MIDs seen. A MID is a per-sender counter, so two senders reach the same
+value all the time, and then a perfectly good frame from one is dropped
+because the other used that MID a moment earlier. With a foreign vendor this
+stops being a coincidence: its counter is seeded independently of ours and
+sweeps across our range.
+
+The window makes it worse. Four entries are one per node in a four-node mesh,
+so a single round of Topology Query/Response fills it and everything later is
+matched against a ring that has already turned over.
+
+So key on {origin AL-MAC, MID}, which is what a duplicate means, and give the
+window room. The origin is already in scope: it is handed to i1905_cmdu_tx as
+the source of the relayed frame two lines below.
+
+The hardcoded 4 in the index wrap goes too. It is the same constant only by
+accident, and the next person to widen the window would have found the array
+growing while the ring still turned over after four entries.
+
+Upstream marks this block "#if 1 //TODO: improve" - an acknowledged stub, not
+a considered design.
+
+Measured before the change so there is something to compare against:
+multi-hop relaying works (controller -> hall -> corridor/kitchen, and the
+foreign box reaches every agent). That is what must not regress.
+
+diff -u -r a/src/i1905.c b/src/i1905.c
+--- a/src/i1905.c
++++ b/src/i1905.c
+@@ -785,10 +785,21 @@
+ 		if (ifname && !strncmp(ifname, ifs->ifname, 16))
+ 			continue;
+ 
+-#if 1	//TODO: improve
++		/* A duplicate is the same MID from the same originator. Keyed on
++		 * the MID alone this dropped every frame whose sender had picked
++		 * a MID one of the others used moments earlier - which is how a
++		 * foreign agent's 1905 reached our agents and never reached the
++		 * controller (measured 2026-09-21, tcpdump on br-lan: 33 frames
++		 * hall<->MTK, 0 controller<->MTK).
++		 */
++		{
++		static const uint8_t noorigin[6] = { 0, 0, 0, 0, 0, 0 };
++		const uint8_t *origin = src ? src : noorigin;
++
+ 		dup = false;
+ 		for (i = 0; i < I1905_MID_LOOKBACK_MAX; i++) {
+-			if (ifpriv->lastmid[i] == mid) {
++			if (ifpriv->lastmid[i].mid == mid &&
++			    !memcmp(ifpriv->lastmid[i].origin, origin, 6)) {
+ 				dup = true;
+ 				break;
+ 			}
+@@ -797,9 +808,15 @@
+ 		if (dup)
+ 			continue;
+ 
+-		ifpriv->lastmid[ifpriv->lastmid_idx] = mid;
+-		ifpriv->lastmid_idx = (ifpriv->lastmid_idx + 1) % 4;
+-#endif
++		memcpy(ifpriv->lastmid[ifpriv->lastmid_idx].origin, origin, 6);
++		ifpriv->lastmid[ifpriv->lastmid_idx].mid = mid;
++		/* the wrap used a hardcoded 4; widening the window above would
++		 * otherwise have grown the array while the ring still turned
++		 * over after four entries.
++		 */
++		ifpriv->lastmid_idx =
++			(ifpriv->lastmid_idx + 1) % I1905_MID_LOOKBACK_MAX;
++		}
+ 		ret = i1905_cmdu_tx(ifpriv, ifs->vid, dst, src, type, &mid,
+ 				     frm->data, frm->datalen, false);
+ 		if (ret < 0) {
+diff -u -r a/src/i1905.h b/src/i1905.h
+--- a/src/i1905.h
++++ b/src/i1905.h
+@@ -75,8 +75,20 @@
+ 	bool registrar;
+ 	bool configured;
+ 
+-#define I1905_MID_LOOKBACK_MAX	4
+-	uint16_t lastmid[I1905_MID_LOOKBACK_MAX];
++/* Remembering a MID alone drops good frames: a MID is a per-sender counter,
++ * so two senders collide on it routinely, and a foreign vendor's counter runs
++ * independently of ours. The duplicate that matters is the same MID from the
++ * same originator.
++ *
++ * Four entries were also one per node in a four-node mesh - a single round of
++ * Topology Query/Response turned the ring over. Sixteen costs 128 bytes per
++ * interface and survives a busy round.
++ */
++#define I1905_MID_LOOKBACK_MAX	16
++	struct i1905_relay_seen {
++		uint8_t origin[6];
++		uint16_t mid;
++	} lastmid[I1905_MID_LOOKBACK_MAX];
+ 	int lastmid_idx;
+ 	struct i1905_interface_private_wsc *wsc;
+ 

@@ -1,0 +1,144 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: mld phase2 security parse
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+diff -ruN a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -1667,6 +1667,38 @@
+ 	return 0;
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* DB Phase 1.5 (MLD, step 2): pull the 1905 Security Capabilities TLV (0xA9)
++ * out of a CMDU and store its three bytes into n->sec. The TLV rides both the
++ * AP Capability Report and the Early AP Capability Report; we peek it directly
++ * (cmdu_peek_tlv, the step 1 idiom) so we do not depend on the validate-parse
++ * TLV index table. Wire layout (struct tlv_1905_security_cap, 3 bytes packed):
++ *   protocol u8 -> onboarding_protocol; mic u8 -> integrity; enc u8 -> encryption.
++ * n->sec_valid is set only when a well-formed TLV is seen. */
++static void cntlr_parse_1905_security_cap(struct node *n, struct cmdu_buff *cmdu)
++{
++	struct tlv *t;
++
++	if (!n)
++		return;
++
++	t = cmdu_peek_tlv(cmdu, MAP_TLV_1905_SECURITY_CAPS);
++	if (!t || tlv_length(t) < 3)
++		return;
++
++	/* byte-walk (fixed 3-byte record) - do not cast over the wire. */
++	n->sec.onboarding_protocol = t->data[0];
++	n->sec.integrity           = t->data[1];
++	n->sec.encryption          = t->data[2];
++	n->sec.caps_valid          = true;
++	n->sec_valid               = true;
++
++	dbg("%s: 1905 security caps for " MACFMT ": proto=%u mic=%u enc=%u\n",
++	    __func__, MAC2STR(n->almacaddr), n->sec.onboarding_protocol,
++	    n->sec.integrity, n->sec.encryption);
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ int handle_ap_caps_report(void *cntlr, struct cmdu_buff *cmdu, struct node *n)
+ {
+ 	trace("%s: --->\n", __func__);
+@@ -1702,6 +1734,11 @@
+ 		n->ap_cap = p->cap;
+ 	}
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* 1905 Security Capabilities TLV (0xA9) -> n->sec (step 2). */
++	cntlr_parse_1905_security_cap(n, cmdu);
++#endif
++
+ 	index = 0;
+ 	/* Parse AP Radio Basic Capabilities TLV */
+ 	while (index < TLV_MAXNUM && tv[AP_CAPABILITY_REPORT_AP_RADIO_BASIC_CAPS_IDX][index]) {
+@@ -4014,6 +4051,11 @@
+ 		n->ap_cap = p->cap;
+ 	}
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* 1905 Security Capabilities TLV (0xA9) -> n->sec (step 2). */
++	cntlr_parse_1905_security_cap(n, cmdu);
++#endif
++
+ 	if (tv[EARLY_AP_CAP_REPORT_WIFI7_AGENT_CAPS_IDX][0]) {
+ 		struct tlv_wifi7_agent_caps *agnt_caps =
+ 			(struct tlv_wifi7_agent_caps *)tv[EARLY_AP_CAP_REPORT_WIFI7_AGENT_CAPS_IDX][0]->data;
+@@ -4613,6 +4655,10 @@
+ 			mapc_sync_agent(c, n);
+ 			list_for_each_entry(r, &n->radiolist, list)
+ 				mapc_sync_radio(c, n, r);
++#if (EASYMESH_VERSION >= 6)
++			/* 1905 security caps parsed by the handler above. */
++			mapc_sync_security(c, n);
++#endif
+ 			break;
+ 		case CMDU_OPERATING_CHANNEL_REPORT:
+ 			/* agent first: radio.agent_almac FKs agent(almac), and an
+diff -ruN a/src/db/mapc_sync.c b/src/db/mapc_sync.c
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -619,6 +619,45 @@
+ }
+ #endif /* EASYMESH_VERSION >= 6 */
+ 
++/* ---- ieee1905_security ------------------------------------------------ */
++#if (EASYMESH_VERSION >= 6)
++
++/* Upsert this node's single 1905 security-caps row (keyed by AL-MAC) from
++ * n->sec, populated by cntlr_parse_1905_security_cap() off the AP Capability /
++ * Early AP Capability Report. No-op unless n->sec_valid. Single-row upsert so
++ * no explicit txn (mirrors mapc_sync_agent()); columns onboarding_protocol/
++ * integrity_algorithm/encryption_algorithm <- the three TLV bytes. */
++void mapc_sync_security(struct controller *c, struct node *n)
++{
++	static const char *sql =
++		"INSERT INTO ieee1905_security(id, onboarding_protocol, "
++		"integrity_algorithm, encryption_algorithm) VALUES(?,?,?,?) "
++		"ON CONFLICT(id) DO UPDATE SET "
++		"onboarding_protocol=excluded.onboarding_protocol, "
++		"integrity_algorithm=excluded.integrity_algorithm, "
++		"encryption_algorithm=excluded.encryption_algorithm";
++	char almac[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++	if (!n->sec_valid)
++		return;
++
++	mac2str(n->almacaddr, almac);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: security prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, almac);
++	mapdb_bind_int(st, 2, n->sec.onboarding_protocol);
++	mapdb_bind_int(st, 3, n->sec.integrity);
++	mapdb_bind_int(st, 4, n->sec.encryption);
++	stmt_finish(c->db, st);
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ /* ---- maintenance ------------------------------------------------------ */
+ 
+ void mapc_db_checkpoint(struct controller *c)
+diff -ruN a/src/db/mapc_sync.h b/src/db/mapc_sync.h
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -42,6 +42,10 @@
+ /* Rebuild the 'apmld' + 'affiliated_ap' rows for @n from n->apmld_list, one
+  * txn (DB Phase 1.5, MLD step 1). ttlm is deferred to step 3. */
+ void mapc_sync_apmld(struct controller *c, struct node *n);
++
++/* Upsert the single 'ieee1905_security' row for @n from n->sec (DB Phase 1.5,
++ * MLD step 2). No-op unless n->sec_valid. */
++void mapc_sync_security(struct controller *c, struct node *n);
+ #endif
+ 
+ /* Fold the WAL back into the main DB file (PRAGMA wal_checkpoint(TRUNCATE)). */

@@ -1,0 +1,59 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 995: ask the bSTA MLD for status, or it never bridges
+
+agent_check_bsta_connections() has two phases: the first asks every backhaul
+for its status (which is what fills bk->connected), the second decides bridge
+membership. The first phase walks a->radiolist, so it never reaches the bSTA
+MLD -- that is not a radio -- and the physical_mld block in the second phase
+only calls agent_manage_bsta() on it. Nobody ever queries the MLD.
+
+bk->connected therefore stays 0 forever, and agent_manage_bsta() refuses to
+bridge an uplink that is fully up:
+
+  agent_manage_bsta: bsta-mld-3 has got 4addr mode enabled (1) connected:0 cfg->enabled:1
+
+Measured on hardware 2026-07-27 (bpi-8g, bpi-4g): the MLD STA was associated to
+the backhaul AP-MLD, ubus call wifi.bstamld.bsta-mld-3 status returned full
+per-link data (status=running, AP-MLD bssid, 4addr=true, rssi/channel/band per
+link), and wifi_get_4addr() reported enabled -- yet the interface never became
+a br-lan port and not one byte flowed. Only connected was missing, and only
+because it is never read.
+
+Query the MLD with bstamld_parse, the same parser the affiliated STAs use, in
+the first phase and before the config reload, so the manage pass that follows
+sees a current state.
+
+Companion to 0288f7cde (naming the MLD STA bsta-mld-N so libwifi finds a driver
+for it at all -- without that this status call returns UNKNOWN_ERROR).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/backhaul.c
++++ b/src/backhaul.c
+@@ -569,6 +569,26 @@
+ 		ubus_call_object(a->ubus_ctx, bk->obj_id, "status", cb, bk);
+ 	}
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* The bSTA MLD is not a radio, so the loop above never reaches it (it walks
++	 * a->radiolist), and the physical_mld block below only *manages* it. Nobody
++	 * ever asks the MLD for status, so bk->connected stays 0 for good and
++	 * agent_manage_bsta() refuses to bridge a fully associated uplink:
++	 *
++	 *   agent_manage_bsta: bsta-mld-3 has got 4addr mode enabled (1)
++	 *                      connected:0 cfg->enabled:1
++	 *
++	 * Measured on hardware 2026-07-27: the MLD STA was associated to the
++	 * backhaul AP-MLD and wifi.bstamld.<if> status returned full per-link data,
++	 * yet the interface never became a br-lan port and nothing flowed.
++	 * Query it here with the same parser the affiliated STAs use, before the
++	 * config reload, so the manage pass below sees a current state. */
++	if (a->bstamld && a->cfg.physical_mld &&
++	    a->bstamld->bk.obj_id != WIFI_OBJECT_INVALID)
++		ubus_call_object(a->ubus_ctx, a->bstamld->bk.obj_id, "status",
++				 bstamld_parse, &a->bstamld->bk);
++#endif
++
+ 	/* reloading is costly - only do it once after all parsing is done */
+ 	agent_config_reload(a);
+ 

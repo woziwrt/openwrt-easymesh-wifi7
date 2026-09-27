@@ -1,0 +1,118 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: stop claiming a departed client is associated
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+sta.associated is written as (state != STA_DISCONNECTED), and only for the
+stations a node currently reports. A client that roamed away is never written
+again, so its row keeps associated=1 for as long as it exists. The
+event-driven delete cannot help either: mapc_del_sta() runs only when a
+disassoc event arrives whose BSSID and node both match the stored ones, and a
+roaming client leaves without disassociating at all.
+
+Measured on the live database 2026-08-04: 20 rows, every single one claiming
+to be associated, against three real associations in the whole mesh. bpi-x8
+alone held five while serving no client.
+
+Two additions, and both only ever CLEAR a flag. Nothing is deleted, so sta
+keeps the departed-client history it is meant to keep.
+
+1. Per station, in mapc_sync_sta(). One MAC cannot be associated to two nodes
+   at once, so the moment a node reports a client, rows for that client under
+   a different node are stale by definition. This covers roaming, and it is
+   the only one of the two that can reach a node which has lost ALL of its
+   clients: such a node reports an empty stalist, and the sweep deliberately
+   returns on that so a half-parsed CMDU cannot wipe the table.
+
+2. Per node, in mapc_sync_sta_sweep(). Clients this node no longer reports
+   are marked gone. The existing comment there is right that such rows must
+   not be DELETED on a single snapshot, because the enumeration can
+   transiently under-report. A flag is a different trade: an under-report
+   costs one flip, and the very next Topology Response, which is where this
+   runs, reports the client again and the upsert sets it back to 1.
+
+Same guards as the existing sweep: keyed on agent_almac so only that node's
+rows are touched, and an empty or absurdly wide report returns early.
+
+--- a/src/db/mapc_sync.c	2026-08-04 18:39:08.388531026 +0200
++++ b/src/db/mapc_sync.c	2026-08-04 18:39:08.388579463 +0200
+@@ -549,6 +549,31 @@
+ 			mapdb_bind_null(st, i);
+ 	}
+ 	stmt_finish(c->db, st);
++
++	/* 999992: one MAC cannot be associated to two nodes at once, so the
++	 * moment a node reports this client, every row for it under a DIFFERENT
++	 * node is stale by definition.
++	 *
++	 * This is the roaming case, and it is the one the snapshot sweep cannot
++	 * reach: a node that has lost ALL its clients reports an empty stalist,
++	 * and the sweep deliberately returns on that so a half-parsed CMDU
++	 * cannot wipe the table. Measured 2026-08-04: bpi-x8 held five rows all
++	 * claiming to be associated while serving no client at all.
++	 *
++	 * Safe without a snapshot: keyed on the client, driven by a positive
++	 * report, and it only ever clears a flag. */
++	{
++		static const char *elsewhere =
++			"UPDATE sta SET associated=0 "
++			"WHERE macaddr=? AND agent_almac<>? AND associated<>0";
++		mapdb_stmt *e = NULL;
++
++		if (mapdb_prepare(c->db, elsewhere, &e) == MAPDB_OK) {
++			mapdb_bind_text(e, 1, mac);
++			mapdb_bind_text(e, 2, almac);
++			stmt_finish(c->db, e);
++		}
++	}
+ }
+ 
+ void mapc_del_sta(struct controller *c, struct sta *s)
+@@ -607,6 +632,48 @@
+ 		return;
+ 	}
+ 	mapdb_bind_text(st, 1, almac);
++	i = 2;
++	list_for_each_entry(s, &n->stalist, list) {
++		char m[18];
++		mac2str(s->macaddr, m);
++		mapdb_bind_text(st, i++, m);
++	}
++	stmt_finish(c->db, st);
++
++	/* 999992: the same reconciliation for ordinary clients - but as a flag,
++	 * not a delete.
++	 *
++	 * associated is written as (state != STA_DISCONNECTED) and only for the
++	 * stations a node currently reports, so a client that roamed away is
++	 * never written again and its row keeps associated=1 forever. A roaming
++	 * client leaves without disassociating, and mapc_del_sta() runs only
++	 * when the event's BSSID and node both match the stored ones, so that
++	 * path never fires either. Measured 2026-08-04: 20 rows, every single
++	 * one claiming to be associated, against three real associations in the
++	 * whole mesh.
++	 *
++	 * The comment above is right that these rows must not be DELETED on one
++	 * snapshot. A flag is a different trade: a node that transiently
++	 * under-reports costs one flip, and the very next Topology Response -
++	 * which is where this runs - reports the client again and the upsert
++	 * sets it back to 1. Nothing is lost, and sta keeps its history, which
++	 * is what it is for.
++	 *
++	 * Same guards as the delete above: keyed on agent_almac so only this
++	 * node's rows are touched, and an empty or absurdly wide report has
++	 * already returned. */
++	snprintf(sql, sizeof(sql),
++		 "UPDATE sta SET associated=0 WHERE COALESCE(is_bsta,0)=0 "
++		 "AND agent_almac=? AND associated<>0 AND macaddr NOT IN (");
++	for (i = 0; i < cnt; i++)
++		strcat(sql, i ? ",?" : "?");
++	strcat(sql, ")");
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: sta depart prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, almac);
+ 	i = 2;
+ 	list_for_each_entry(s, &n->stalist, list) {
+ 		char m[18];

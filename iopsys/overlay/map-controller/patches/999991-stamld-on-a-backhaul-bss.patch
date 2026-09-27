@@ -1,0 +1,76 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a STA-MLD on a backhaul BSS is a backhaul
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+sta_mld.is_bsta was hardcoded to 0 on both the insert and the update branch,
+so no STA-MLD was ever recorded as a backhaul. Every backhaul link therefore
+appeared in the client tables as an ordinary station that never leaves.
+
+In a chain they are spread over the nodes that host them; in a star they
+would all pile onto the controller. Either way it is one bogus client per
+hop, and it grows with the mesh.
+
+Nothing new has to be plumbed in: the AP-MLD the station is associated to is
+already bound, and the database already records which BSSes are backhaul.
+
+It has to be looked up through affiliated_ap rather than straight in bss:
+ap_mld_macaddr is an MLD address while bss holds per-LINK BSSIDs, and the two
+coincide only where link 0 happens to carry the MLD address. Measured against
+the live database on 2026-08-04, the direct lookup resolved
+86:f7:56:41:01:d4 and silently returned 0 for ca:8e:1d:ca:bc:af - it would
+have fixed one backhaul and left the other showing as a client. Through
+affiliated_ap both resolve to 1 and the fronthaul client stays 0. The direct
+lookup is kept as a fallback for a plain, non-MLD AP.
+
+Numbered parameters keep the existing bind indices untouched. If the rows
+have not been seen yet the expression yields 0, which is exactly the current
+behaviour, and the next sync corrects it.
+
+--- a/src/db/mapc_sync.c	2026-08-04 18:32:45.963574075 +0200
++++ b/src/db/mapc_sync.c	2026-08-04 18:32:45.963618833 +0200
+@@ -759,12 +759,43 @@
+ 	 * columns do not arbitrate on their own; they record who claimed what
+ 	 * and when, so the caller can tell a fresh claim from a fading one
+ 	 * (and so the DB can finally answer "where is this client"). */
++	/* is_bsta was hardcoded to 0 on both branches, so no STA-MLD was ever
++	 * recorded as a backhaul and every backhaul link showed up in the
++	 * client tables as an ordinary station that never leaves. In a chain
++	 * they are spread over the nodes that host them; in a star they would
++	 * all pile onto the controller. Either way it is one bogus client per
++	 * hop, and it grows with the mesh.
++	 *
++	 * Nothing new has to be plumbed in to know better: the AP-MLD the
++	 * station is associated to is already bound (parameter 7), and the
++	 * database already knows which BSSes are backhaul.
++	 *
++	 * It has to be looked up through affiliated_ap, not straight in bss:
++	 * ap_mld_macaddr is an MLD address while bss holds per-LINK BSSIDs, and
++	 * the two coincide only on the nodes where link 0 happens to carry the
++	 * MLD address. Measured 2026-08-04: 86:f7:56:41:01:d4 was in bss and
++	 * resolved, ca:8e:1d:ca:bc:af was not and silently returned 0 - one
++	 * backhaul fixed, the other still shown as a client. The direct lookup
++	 * stays as a fallback for a plain, non-MLD AP.
++	 *
++	 * Numbered parameters keep the existing bind indices untouched. If the
++	 * rows have not been seen yet this yields 0, exactly today's behaviour,
++	 * and the next sync corrects it. */
+ 	static const char *ins_stamld =
+ 		"INSERT INTO sta_mld(mld_macaddr, is_bsta, emlmr_enabled, "
+ 		"emlsr_enabled, str_enabled, nstr_enabled, num_sta, "
+ 		"ap_mld_macaddr, last_seen) "
+-		"VALUES(?,0,?,?,?,?,?,?,?) "
+-		"ON CONFLICT(mld_macaddr) DO UPDATE SET is_bsta=0, "
++		"VALUES(?1,"
++		"COALESCE((SELECT MAX(b.is_bbss) FROM affiliated_ap a "
++		"JOIN bss b ON b.bssid=a.bssid WHERE a.mld_macaddr=?7),"
++		"(SELECT MAX(is_bbss) FROM bss WHERE bssid=?7),0),"
++		"?2,?3,?4,?5,?6,?7,?8) "
++		"ON CONFLICT(mld_macaddr) DO UPDATE SET "
++		"is_bsta=COALESCE((SELECT MAX(b.is_bbss) FROM affiliated_ap a "
++		"JOIN bss b ON b.bssid=a.bssid "
++		"WHERE a.mld_macaddr=excluded.ap_mld_macaddr),"
++		"(SELECT MAX(is_bbss) FROM bss "
++		"WHERE bssid=excluded.ap_mld_macaddr),0), "
+ 		"emlmr_enabled=excluded.emlmr_enabled, "
+ 		"emlsr_enabled=excluded.emlsr_enabled, "
+ 		"str_enabled=excluded.str_enabled, "

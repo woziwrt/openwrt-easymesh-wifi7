@@ -1,0 +1,32 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 998: default the bSTA priority lookup like its siblings
+
+mapagent_disable_lower_bk() reads a bsta sections priority without a default
+and then uses it in an arithmetic comparison. Any bsta section without an
+explicit priority makes the shell abort the test with
+
+  mapagent[...]: sh: out of range
+
+That this is an oversight rather than intent is visible in the same file: the
+other two priority lookups, at lines 862 and 1226, both pass "2".
+
+Such sections do occur in practice. On a node running an MLD backhaul a
+bsta wlan0 section reappears after every removal, generated without a
+priority, and the message then repeats for every uplink event.
+
+Verified on hardware 2026-07-28: with the default in place the message stops
+immediately. Note this does not by itself keep the agent alive -- the crash
+loop it appears alongside has a different cause, see patch 997 -- so it is
+easy to mistake this for the fault. It is a separate, real defect.
+
+--- a/src/script/multiap
++++ b/src/script/multiap
+@@ -1261,7 +1261,7 @@
+ 		local enabled="1"
+ 
+ 		config_get ifname $1 ifname
+-		config_get priority $1 priority
++		config_get priority $1 priority "2"
+ 
+ 		[ "$ifname" != "$2" -a "$priority" -gt "$3" ] && enabled="0"
+ 

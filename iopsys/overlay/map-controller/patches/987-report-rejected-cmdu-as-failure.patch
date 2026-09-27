@@ -1,0 +1,75 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 987: a CMDU that ieee1905d refused must say so
+
+986 taught send_cmdu() that a message id of zero means the message never went
+out. It left the branch directly above it alone, and that is the branch that
+fires when the transmit is refused outright: send_cmdu_ubus() returns a negative
+value, the reason goes to dbg(), and dbg() is below the default log level. The
+caller gets 0xffff and reports failure, but nothing anywhere says why, so the
+first thing anyone debugging this has to do is rediscover it.
+
+Measured on hardware 2026-07-31. The mesh had formed as a chain,
+controller <- x8 <- 8g, after a simultaneous restart of all three nodes. Asking
+ieee1905d directly, bypassing map-controller entirely:
+
+  ubus call ieee1905 cmdu '{"type":2,"dst":"ca:8e:1d:ca:bc:ae"}'   (8g, two hops)
+    -> { "status": "fail" }
+  ubus call ieee1905 cmdu '{"type":2,"dst":"e6:a9:d2:c1:98:3f"}'   (x8, one hop)
+    -> { "status": "ok", "mid": 63297 }
+
+So ieee1905d will not address a node that is not a direct 1905 neighbour, and
+map-controller is asking correctly. The refusal is one layer down. This patch
+does not fix that - it makes it audible.
+
+Why that is worth a patch of its own: the far node stays in the controller's
+topology the whole time, listed with depth -1, while every query addressed to it
+is dropped here. From the outside the controller looks idle rather than blocked,
+and the same investigation had already been run twice against the wrong layer -
+first against the agent (988, which drops CMDUs from an unknown origin) and then
+against the mid == 0 path (986). Neither can fire in this state. Both were
+written because the failure was silent.
+
+Relayed multicast does reach the far node through the intermediary - 36 frames
+of AP-Autoconfiguration Search carrying its AL-MAC were captured arriving at the
+controller in the same run - so a path exists. Using it for unicast is a change
+in ieee1905d and a design decision about where the topology's source of truth
+lives; it does not belong in a logging fix.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/cntlr_map.c	2026-07-31 09:45:18.434895889 +0200
++++ b/src/cntlr_map.c	2026-07-31 09:45:18.435270520 +0200
+@@ -1087,7 +1087,32 @@
+ 
+ 	ret = send_cmdu_ubus(a, cmdu);
+ 	if (ret < 0) {
+-		dbg("fail to send cmdu %04x over ubus\n", cmdu_get_type(cmdu));
++		/* ieee1905d refused to transmit.
++		 *
++		 * This is the sibling of the mid == 0 case handled below, and
++		 * it is the one that stays quiet. The message never reaches the
++		 * wire, send_cmdu() returns 0xffff, every caller reports failure
++		 * upwards - and dbg() keeps the reason out of the log at the
++		 * default level, so from the outside the controller simply does
++		 * nothing and says nothing about it.
++		 *
++		 * Measured on hardware 2026-07-31. With the mesh formed as a
++		 * chain, controller <- x8 <- 8g, asking ieee1905d directly and
++		 * bypassing this code entirely:
++		 *
++		 *   ubus call ieee1905 cmdu '{"type":2,"dst":"<8g al-mac>"}'
++		 *     -> { "status": "fail" }
++		 *   ubus call ieee1905 cmdu '{"type":2,"dst":"<x8 al-mac>"}'
++		 *     -> { "status": "ok", "mid": 63297 }
++		 *
++		 * ieee1905d will not address a node that is not a direct 1905
++		 * neighbour. The controller is asking correctly; the refusal is
++		 * one layer down. That is worth a line in the log, because the
++		 * node stays in the topology while every query to it is dropped
++		 * here, and nothing else anywhere says why.
++		 */
++		err("%s: cmdu %04x to " MACFMT " REJECTED by ieee1905d (ret %d) - destination is not a direct 1905 neighbour\n",
++		    __func__, cmdu_get_type(cmdu), MAC2STR(cmdu->origin), ret);
+ 		goto error;
+ 	}
+ 

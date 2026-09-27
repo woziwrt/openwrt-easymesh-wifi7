@@ -1,0 +1,344 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: publish wifi.sta from the hostapd ctrl socket
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Nothing publishes the ubus event "wifi.sta" on an OpenWrt hostapd, so
+map-agent never learns of a client association from an event and only finds
+one on its next periodic refresh - minutes later. That single gap is what
+makes a client that roamed to another node keep being reported, and stored,
+under the node it left.
+
+Root cause, measured on 4g (2026-08-04):
+
+  wifimngr: ubus call hostapd.ap-mld-2 event_mask_add {"event":"raw-assoc"}
+            (Method not found)
+  wifimngr: ubus call hostapd.ap-mld-1 event_mask_add {"event":"raw-action"}
+            (Method not found)
+
+  event_mask_add is an iopsys-only hostapd ubus method. Ours is OpenWrt's
+  hostapd: `ubus -v list hostapd.ap-mld-1` offers notify_response and
+  bss_mgmt_enable, and no event_mask_add. The call comes from
+  hostapd_ubus_iface_subscribe_frame() (modules/wpactrl/hostapd_ctrl.c) via
+  wifi_subscribe_frame(), so every raw-frame subscription fails. In all of
+  libwifi only the Broadcom back-end (modules/broadcom/wlctrl.c) ever emits
+  "wifi.sta"; the nl80211 and wpactrl back-ends never did.
+
+  map-agent is not at fault: it subscribes to "wifi.sta"
+  (agent_ubus_events.c) and its handler chain down to wifi_add_sta() is
+  correct. It simply never fires.
+
+  hapdctrl_parse_event() already reads AP-STA-CONNECTED off the hostapd
+  control socket, but only to feed apconn_cache; it never called up.
+
+Fix: emit from that same source. The control sockets are already held and
+drained on uloop, one per affiliated link (ap-mld-1_link0/1/2), so the
+association is known the instant hostapd reports it. The event is published
+in the shape map-agent parses in process_sta_con_dis_evt(), including the
+MLO fields, which makes it drive stamld_update() and so build the per-link
+affiliated-STA model directly rather than by inference.
+
+AP-STA-CONNECTED carries the STA MLD address, so the affiliated per-link
+address is read from "STA <mld>" as peer_addr[link_id]; that array was
+verified identical on all three link sockets, i.e. indexed by link id. The
+link BSSID and AP MLD address come from "STATUS", never change, and are read
+once per socket and cached. A disconnect is named from a small per-socket
+MLD -> affiliated table, because hostapd has dropped the STA by then.
+
+Both queries go through wpa_ctrl_cmd(), which opens its own short-lived
+socket, and NOT through the attached monitor socket: wpa_ctrl_request()
+discards unsolicited messages while waiting for a reply, so querying on the
+monitor socket would swallow events arriving during the query - exactly in
+the association burst this path exists for.
+
+Applies on top of 921-apconn-cache-fix-spin.patch. Touches only the hapdctrl
+source in libwifi/modules/wpactrl/wpactrl.c.
+
+Not addressed here, deliberately:
+  - BTM Response (btm_success stays 0) has the same root cause but needs the
+    "btm-resp" event, which map-agent already handles; separate patch.
+  - Nothing flushes a stale association on the node a client left when it
+    leaves without disassociating; that is ap_max_inactivity territory.
+
+--- a/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 13:59:54.333669457 +0200
++++ b/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 13:59:54.333695686 +0200
+@@ -708,9 +708,25 @@
+  * socket. */
+ #define HAPDCTRL_MAX_SOCK	5
+ 
++/* 922: per-socket cache of STA MLD -> affiliated address mappings. */
++#define HAPDCTRL_STA_MAX	32
++
+ struct hapdctrl_sock {
+ 	struct wpa_ctrl *ctrl;		/* attached handle (NULL == closed) */
+ 	char ifname[16];		/* this socket's ctrl name */
++	/* 922: static link identity, read once from STATUS. link_id stays -1
++	 * on a plain (non-MLD) BSS, which then emits no mlo_* fields. */
++	bool info_valid;
++	int link_id;
++	uint8_t bssid[6];		/* BSSID of THIS link */
++	uint8_t mld_addr[6];		/* AP MLD address */
++	/* 922: a disconnect must still be able to name the leg, but hostapd
++	 * has dropped the STA by then, so the mapping is kept here. */
++	struct {
++		uint8_t mld[6];
++		uint8_t aff[6];
++		bool used;
++	} stamap[HAPDCTRL_STA_MAX];
+ };
+ 
+ /* Persistent handle. One registration may hold several attached sockets (parent
+@@ -800,9 +816,222 @@
+ 	return hwaddr_aton(p, mac) ? 0 : -1;
+ }
+ 
+-/* Parse one hostapd control message and mutate the parent cache (atomic RMW). */
+-static void hapdctrl_parse_event(const char *key, const char *msg)
++/* ---- 922: publish client association from the hostapd ctrl socket -------
++ * On an OpenWrt hostapd NOTHING publishes the ubus event "wifi.sta". libwifi
++ * asks hostapd for raw frames through the iopsys-only ubus method
++ * event_mask_add, which does not exist here, so wifi_subscribe_frame() fails
++ * with "Method not found" and map-agent -- whose subscription and whole
++ * handler chain down to wifi_add_sta() are correct -- never hears about a
++ * client. It then only learns of one from its periodic refresh, minutes late,
++ * which is what makes a roamed client keep showing up under its old node.
++ *
++ * These control sockets are already held and drained here, one per affiliated
++ * link, so the association is known the instant hostapd reports it. Publish it
++ * in the shape map-agent parses in process_sta_con_dis_evt():
++ *
++ *   wifi.sta '{"ifname":"<link>", "event":"connected", "data":{
++ *              "macaddr":"<affiliated STA>", "bssid":"<link BSSID>",
++ *              "mlo_macaddr":"<STA MLD>", "mlo_bssid":"<AP MLD>",
++ *              "mlo_link_id":<id>}}'
++ *
++ * AP-STA-CONNECTED carries the STA *MLD* address, so the affiliated per-link
++ * address is read from "STA <mld>" as peer_addr[link_id]; that array is
++ * identical on every link socket, i.e. indexed by link id. The link BSSID and
++ * the AP MLD address come from "STATUS" and never change, so they are read
++ * once per socket and cached.
++ *
++ * The queries deliberately go through wpa_ctrl_cmd(), which opens its own
++ * short-lived socket, and NOT through the attached monitor socket:
++ * wpa_ctrl_request() discards unsolicited messages while waiting for a reply,
++ * so querying on the monitor socket would swallow events arriving during the
++ * query -- precisely in the association burst this path exists for.
++ *
++ * NOTE on MT7996 link 0's BSSID equals the AP MLD address. It is emitted as
++ * the link BSSID regardless; substituting one for the other on the agent side
++ * is the defect patch 99995 had to fix.
++ */
++#define HAPD_MACFMT	"%02x:%02x:%02x:%02x:%02x:%02x"
++#define HAPD_MACARG(a)	(a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
++
++/* Find "<key>=" at the start of a line in @buf and parse the MAC after it. */
++static int hapdctrl_kv_mac(const char *buf, const char *key, uint8_t *mac)
++{
++	size_t klen = strlen(key);
++	const char *p = buf;
++
++	while (p && *p) {
++		if (!strncmp(p, key, klen) && p[klen] == '=')
++			return hwaddr_aton(p + klen + 1, mac) ? 0 : -1;
++		p = strchr(p, '\n');
++		if (p)
++			p++;
++	}
++	return -1;
++}
++
++/* Same, for an integer value. */
++static int hapdctrl_kv_int(const char *buf, const char *key, int *val)
++{
++	size_t klen = strlen(key);
++	const char *p = buf;
++
++	while (p && *p) {
++		if (!strncmp(p, key, klen) && p[klen] == '=') {
++			*val = atoi(p + klen + 1);
++			return 0;
++		}
++		p = strchr(p, '\n');
++		if (p)
++			p++;
++	}
++	return -1;
++}
++
++/* Cache the static identity of @s: link BSSID, AP MLD address and link id. */
++static int hapdctrl_sock_info(struct hapdctrl_sock *s)
++{
++	char buf[4096] = {0};
++	int link_id;
++
++	if (s->info_valid)
++		return 0;
++
++	if (wpa_ctrl_cmd(buf, sizeof(buf) - 1, s->ifname, "STATUS",
++			 CONFIG_HOSTAPD_CTRL_IFACE_DIR))
++		return -1;
++
++	if (hapdctrl_kv_mac(buf, "bssid[0]", s->bssid))
++		return -1;
++
++	s->link_id = -1;
++	if (!hapdctrl_kv_mac(buf, "mld_addr[0]", s->mld_addr) &&
++	    !hapdctrl_kv_int(buf, "mld_link_id[0]", &link_id))
++		s->link_id = link_id;
++
++	s->info_valid = true;
++	return 0;
++}
++
++/* Affiliated (per-link) address of the STA whose MLD address is @mld. */
++static int hapdctrl_affiliated_mac(struct hapdctrl_sock *s, const uint8_t *mld,
++				   uint8_t *aff)
++{
++	char cmd[32] = {0}, buf[4096] = {0}, key[24] = {0};
++
++	if (s->link_id < 0)
++		return -1;
++
++	snprintf(cmd, sizeof(cmd), "STA " HAPD_MACFMT, HAPD_MACARG(mld));
++	if (wpa_ctrl_cmd(buf, sizeof(buf) - 1, s->ifname, cmd,
++			 CONFIG_HOSTAPD_CTRL_IFACE_DIR))
++		return -1;
++
++	snprintf(key, sizeof(key), "peer_addr[%d]", s->link_id);
++	return hapdctrl_kv_mac(buf, key, aff);
++}
++
++/* Remember the MLD -> affiliated mapping for the matching disconnect. */
++static void hapdctrl_stamap_store(struct hapdctrl_sock *s, const uint8_t *mld,
++				  const uint8_t *aff)
++{
++	int i, slot = -1;
++
++	for (i = 0; i < HAPDCTRL_STA_MAX; i++) {
++		if (!s->stamap[i].used) {
++			if (slot < 0)
++				slot = i;
++			continue;
++		}
++		if (!memcmp(s->stamap[i].mld, mld, 6)) {
++			memcpy(s->stamap[i].aff, aff, 6);
++			return;
++		}
++	}
++
++	/* Full: reuse slot 0. The table only ever loses the ability to name a
++	 * leg on disconnect, which the periodic refresh still reconciles. */
++	if (slot < 0)
++		slot = 0;
++
++	memcpy(s->stamap[slot].mld, mld, 6);
++	memcpy(s->stamap[slot].aff, aff, 6);
++	s->stamap[slot].used = true;
++}
++
++/* Look up the affiliated address for @mld; on @drop also release the slot. */
++static int hapdctrl_stamap_get(struct hapdctrl_sock *s, const uint8_t *mld,
++			       uint8_t *aff, bool drop)
++{
++	int i;
++
++	for (i = 0; i < HAPDCTRL_STA_MAX; i++) {
++		if (!s->stamap[i].used || memcmp(s->stamap[i].mld, mld, 6))
++			continue;
++		memcpy(aff, s->stamap[i].aff, 6);
++		if (drop)
++			s->stamap[i].used = false;
++		return 0;
++	}
++	return -1;
++}
++
++/* Publish one association change as ubus "wifi.sta". wifimngr's default event
++ * branch forwards resp->data verbatim, so the string must be complete here. */
++static void hapdctrl_emit_sta(struct hapdctrl_event *w, struct hapdctrl_sock *s,
++			      const uint8_t *mld, bool add)
++{
++	struct event_response *resp = &w->req.resp;
++	const uint8_t *sta = mld;
++	char mlo[192] = {0};
++	uint8_t aff[6];
++	int len;
++
++	if (!w->req.cb || !resp->data || resp->maxlen < 2)
++		return;
++
++	if (hapdctrl_sock_info(s))
++		return;
++
++	if (s->link_id >= 0) {
++		if (add) {
++			if (!hapdctrl_affiliated_mac(s, mld, aff))
++				hapdctrl_stamap_store(s, mld, aff);
++			else if (hapdctrl_stamap_get(s, mld, aff, false))
++				memcpy(aff, mld, 6);
++		} else if (hapdctrl_stamap_get(s, mld, aff, true)) {
++			memcpy(aff, mld, 6);
++		}
++		sta = aff;
++
++		snprintf(mlo, sizeof(mlo),
++			 ", \"mlo_macaddr\":\"" HAPD_MACFMT "\""
++			 ", \"mlo_bssid\":\"" HAPD_MACFMT "\""
++			 ", \"mlo_link_id\":%d",
++			 HAPD_MACARG(mld), HAPD_MACARG(s->mld_addr),
++			 s->link_id);
++	}
++
++	len = snprintf((char *)resp->data, resp->maxlen,
++		       "wifi.sta '{\"ifname\":\"%s\", \"event\":\"%s\""
++		       ", \"data\":{\"macaddr\":\"" HAPD_MACFMT "\""
++		       ", \"bssid\":\"" HAPD_MACFMT "\"%s}}'",
++		       s->ifname, add ? "connected" : "disconnected",
++		       HAPD_MACARG(sta), HAPD_MACARG(s->bssid), mlo);
++
++	if (len < 0 || (uint32_t)len >= resp->maxlen)
++		return;		/* truncated: publishing half a MAC would lie */
++
++	resp->type = WIFI_EVENT_STA_ASSOC;
++	resp->len = len;
++	w->req.cb(&w->req);
++}
++
++/* Parse one hostapd control message: mutate the parent cache (atomic RMW) and
++ * publish client association changes (922). */
++static void hapdctrl_parse_event(struct hapdctrl_event *w,
++				 struct hapdctrl_sock *s, const char *msg)
+ {
++	const char *key = w->key;
+ 	uint8_t mac[6];
+ 	char *p;
+ 
+@@ -810,11 +1039,18 @@
+ 	    strstr(msg, "EAPOL-4WAY-HS-COMPLETED")) {
+ 		const char *kw = strstr(msg, "AP-STA-CONNECTED") ?
+ 				 "AP-STA-CONNECTED" : "EAPOL-4WAY-HS-COMPLETED";
+-		if (hapdctrl_event_mac(msg, kw, mac) == 0)
++		if (hapdctrl_event_mac(msg, kw, mac) == 0) {
+ 			apconn_cache_sta_add(key, mac);
++			/* The EAPOL completion repeats an association already
++			 * published, so only AP-STA-CONNECTED emits. */
++			if (kw[0] == 'A')
++				hapdctrl_emit_sta(w, s, mac, true);
++		}
+ 	} else if (strstr(msg, "AP-STA-DISCONNECTED")) {
+-		if (hapdctrl_event_mac(msg, "AP-STA-DISCONNECTED", mac) == 0)
++		if (hapdctrl_event_mac(msg, "AP-STA-DISCONNECTED", mac) == 0) {
+ 			apconn_cache_sta_del(key, mac);
++			hapdctrl_emit_sta(w, s, mac, false);
++		}
+ 	} else if (strstr(msg, "AP-ENABLED")) {
+ 		struct hapdctrl_ev ev = { .set_enabled = true, .enabled = true };
+ 
+@@ -1109,7 +1345,7 @@
+ 			if (wpa_ctrl_recv(ctrl, buf, &len) < 0)
+ 				goto recover;
+ 			buf[len] = '\0';
+-			hapdctrl_parse_event(w->key, buf);
++			hapdctrl_parse_event(w, &w->socks[i], buf);
+ 		}
+ 		if (pending < 0)
+ 			goto recover;

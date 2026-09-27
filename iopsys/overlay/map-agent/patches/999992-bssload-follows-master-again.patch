@@ -1,0 +1,26 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: bssload follows the master again
+
+The bootstrap-only guard silenced bssload forever: it is the one field
+in the master status reply with no per-link writer at all (the per-link
+parser does not read utilization), so nothing ever wrote it again and
+every consumer saw zero (2026-08-06 review, finding 5). Until a
+per-link utilization source lands, the master\x27s value is an imperfect
+but honest proxy. channel/ssid/max_sta keep their bootstrap-only rule -
+they DO have per-link owners.
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3166,7 +3166,12 @@
+ 		ap->channel = blobmsg_get_u32(tb[0]);
+ 	if (tb[2] && (!w->status_mld || ap->ssid[0] == '\0'))
+ 		strncpy(ap->ssid, blobmsg_get_string(tb[2]), sizeof(ap->ssid) - 1);
+-	if (tb[3] && !w->status_mld) {
++	/* bssload is the one field with no per-link writer at all (the
++	 * per-link parser does not read utilization), so a bootstrap-only
++	 * guard here silenced it forever. Until a per-link utilization
++	 * source lands, the master's value is an imperfect but honest
++	 * proxy - better than an eternal zero for every steering input. */
++	if (tb[3]) {
+ 		util = blobmsg_get_u32(tb[3]);
+ 		if (util != 0xff)
+ 			ap->bssload = util;

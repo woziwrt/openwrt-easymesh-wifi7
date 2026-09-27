@@ -1,0 +1,92 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 978: tearing down one interface must not delete its whole AP MLD
+
+teardown_iface() runs per interface. The block this patch removes did not:
+given any one interface it deleted the entire MLD that interface belonged to -
+the mapagent mld section, the wireless mld section, and the mld_id of every
+other ap section affiliated with the same MLD. An AP MLD carries up to three
+links, so tearing one link down took all three records with it.
+
+Measured on hardware 2026-07-31. Flashing the controller reproduced it on the
+first try; a watchdog snapshot taken every second across the boot shows the
+window exactly:
+
+  up=9s     mld=2 ap=8 mld_id=5     configuration complete
+  up=33s    mld=0 ap=7 mld_id=0     gone
+  up=34s    mld=0 ap=6 mld_id=0
+  up=181s   mld=2 ap=8 mld_id=5     watchdog put it back -> repairs=1
+
+and the process list captured in that same second names the caller:
+
+  10173 root  {multiap} /bin/sh /lib/wifi/multiap teardown_iface wlan1
+
+reached from wifi_teardown_iface() (agent_map.c:1685) by way of
+wifi_teardown_map_ifaces_by_radio(), which the AP-Autoconfiguration branch calls
+at agent_map.c:2724, 2747 and 2763. That is why it only shows up after a flash -
+a fresh upgrade runs a full autoconfiguration cycle - and why it shows up on the
+controller, which runs a colocated agent and configures itself. Flashing either
+plain agent in the same session left the configuration untouched, repairs=0.
+
+The sections are created by map_genconfig through "multiap conf". Traced on the
+wire in the same boot:
+
+  multiap <- S10boot :: uci set wireless.mld0=wifi-mld
+  multiap <- S10boot :: uci set wireless.ap_mld_1=wifi-iface
+
+so the branch that creates them owns them, and a per-interface teardown is not
+that branch. This is the same correction as 0268: fix ownership rather than add
+a predicate in front of shared state.
+
+It is also a failure we already carry a fix for from the other end. When the mld
+sections go missing the agent finds a->bstamld NULL and enters a crash loop, which
+is what 997 addresses. Deleting them here produces that state deliberately.
+
+What the interface does own is its own affiliation, and that is still removed:
+mapagent_teardown_wireless() drops wireless.<section>.mld for this ifname, and the
+BSS itself is disabled just above. What survives is the MLD record.
+
+How to tell this is wrong: after flashing the controller, mld must stay at 2 for
+the whole boot - mld-watch records it second by second - and repairs must be 0.
+If instead the agent starts crashing, or an MLD is left with no affiliated links,
+then the deletion was load-bearing and the fix belongs on the creating side.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/script/multiap	2026-07-31 10:16:04.905343818 +0200
++++ b/src/script/multiap	2026-07-31 10:16:04.905553628 +0200
+@@ -815,11 +815,30 @@
+ 		config_get mld_id $section mld_id
+ 		uci -q set mapagent.${section}.enabled="0"
+ 
+-		[ "$mld_id" != "" ] && {
+-			config_foreach mapagent_teardown_mld mld $mld_id
+-			(mapagent_teardown_wireless_mld mld${mld_id})
+-		}
+-
++		# The MLD sections are not ours to delete.
++		#
++		# This runs per interface, but the block that used to be here
++		# deleted the whole MLD the interface belonged to - the mapagent
++		# mld section, the wireless mld section and the mld_id of every
++		# other ap section affiliated with it. An AP MLD carries up to
++		# three links; tearing one of them down took all three records
++		# with it.
++		#
++		# The sections are created by map_genconfig through
++		# "multiap conf", measured 2026-07-31 on the wire:
++		#
++		#   multiap <- S10boot :: uci set wireless.mld0=wifi-mld
++		#   multiap <- S10boot :: uci set wireless.ap_mld_1=wifi-iface
++		#
++		# so the branch that creates them owns them. Deleting them from
++		# here is also the exact shape of a failure we already carry a
++		# fix for: when the mld sections go missing the agent finds
++		# a->bstamld NULL and enters a crash loop (997).
++		#
++		# What the interface does own is its own affiliation, and that
++		# is still removed below - mapagent_teardown_wireless() drops
++		# wireless.<section>.mld for this ifname. The BSS is disabled
++		# above. What survives is the MLD record itself.
+ 		(mapagent_teardown_wireless $ifname)
+ 	}
+ 

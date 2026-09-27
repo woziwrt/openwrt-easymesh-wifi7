@@ -1,0 +1,24 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: read the TTLM capability from bits 7-6
+
+diff -urN a/src/agent_tlv.c b/src/agent_tlv.c
+--- a/src/agent_tlv.c	2026-08-31 17:55:10.630835222 +0200
++++ b/src/agent_tlv.c	2026-08-31 17:55:10.632877089 +0200
+@@ -4549,7 +4549,16 @@
+ 	data->max_linknum = ((re->wifi7_caps.max_ap_links << 4) & 0xf0);
+ 	data->max_linknum |= (re->wifi7_caps.max_bsta_links & 0x0f);
+ 	offset++;
+-	data->flag = re->wifi7_caps.ap_ttlm; /* Dont support TID-to-Link Mapping */
++	/* TID-To-Link_Mapping_Capability lives in bits 7-6 of this octet
++	 * (Wi-Fi 7 Agent Capabilities TLV; Table 9-404j [802.11be]), the same
++	 * way max_linknum above packs its two nibbles. Writing the value
++	 * unshifted put it in the reserved bits 1-0 and left 7-6 at zero, which
++	 * on the wire reads as "Agent does not support TID-to-Link mapping" -
++	 * the exact opposite of what this radio reports, and the reason the old
++	 * comment here claimed we do not support it. WIFI7_TID_TO_LINK_CAP_MASK
++	 * was defined for this and used nowhere.
++	 */
++	data->flag = (re->wifi7_caps.ap_ttlm << 6) & WIFI7_TID_TO_LINK_CAP_MASK;
+ 	offset++;
+ 
+ 	offset += 13; /* reserved */

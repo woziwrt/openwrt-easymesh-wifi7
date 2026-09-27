@@ -1,0 +1,102 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] The MLD refresh created the station and left it an orphan
+
+An MLO client with three setup links was reported to the controller with two.
+Measured 2026-08-28 on the 8 GB agent, phone 6e:36:9a:de:cc:3c:
+
+  wifi.apmld.ap-mld-1 stations   mlo_capable true, three mlo_links:
+      link 0  f6:d9:a4:7d:d8:46  bssid 36:91:ac:f9:29:c6   2.4 GHz
+      link 1  46:87:c2:bb:08:85  bssid 32:91:ac:f9:48:c6   5 GHz
+      link 2  82:95:eb:7b:84:7c  bssid 3e:91:ac:f9:68:c6   6 GHz
+
+  map.agent status               2.4 GHz sta f6:d9:...  is_affiliated_sta true
+                                 5   GHz sta 46:87:...  is_affiliated_sta true
+                                 6   GHz sta 82:95:...  is_affiliated_sta FALSE
+                                                        mld_macaddr empty
+
+  controller DB                  sta_mld.num_sta = 2, affiliated_sta 2 rows
+
+The HAL had all three the whole time. The agent had all three as stations. Only
+the third was never told which MLD it belongs to, so it was missing from
+affiliated_sta[], from Num_AffiliatedSTA in the Associated STA MLD
+Configuration Report, and from every row the controller writes from it.
+
+The linkage has exactly one bootstrap: the association event, which calls
+stamld_update() only when the event carries mlo_bssid, mlo_macaddr and
+mlo_link_id together. A leg that appears any other way never gets it, and the
+per-STA periodic path cannot repair it, because it looks the client up with
+
+    wifi_get_mld_station(ap, s->mld_macaddr, s->macaddr, &mlsta)
+
+and s->mld_macaddr is what stamld_update() would have set. A leg that missed
+the bootstrap is looked up by a key it does not have, forever.
+
+apmld_refresh_stations() is the one function positioned to repair it. It reads
+wifi_get_mld_stations(), which returns the MLD address, the MLD bssid and every
+link with its own address and link id - everything stamld_update() needs. It
+used all of that to call wifi_add_sta() and nothing else. So the refresh was
+creating precisely the orphan above: a station on the 6 GHz BSS, counted in
+num_sta, belonging to no MLD.
+
+It also only ever looked at sta[0]. Under an affiliated AP the entry that
+matches ap->bssid is the link on that AP, which is sta[0] only when the client
+associated there first. Walk num_link and match each one.
+
+The guard is the same one the periodic path uses - mlo_capable, and an MLD
+bssid that is not all zeros - so a client that is not MLO, or a reply that came
+back half-filled, is added as a plain station exactly as before and nothing is
+attached. mld_add_sta() is idempotent, so a leg already known costs a memcmp.
+
+This is what the 6 GHz fronthaul AP section made reachable. Before b2df88a5e
+the 6 GHz AP object did not exist, mld->affiliated_ap never named it, and this
+loop could not visit that BSS at all. That fix closed the counting - num_sta
+now sums to the number of links the radio holds, 4 == 4 on hardware this
+morning - and this one closes the reporting.
+
+--- a/src/mld.c	2026-08-28 08:50:37.878293437 +0200
++++ b/src/mld.c	2026-08-28 08:50:37.878362667 +0200
+@@ -266,8 +266,42 @@
+ 			int j;
+ 
+ 			for (j = 0; j < num_mlsta; j++) {
+-				if (!memcmp(mlsta[j].sta->bssid, ap->bssid, 6))
+-					wifi_add_sta(a, ap->ifname, mlsta[j].sta->macaddr);
++				size_t k;
++
++				/* Every link, not sta[0]. The entry that matches
++				 * ap->bssid is the link sitting on this affiliated
++				 * AP, and that is sta[0] only when the client
++				 * happened to associate here first.
++				 */
++				for (k = 0; k < mlsta[j].num_link; k++) {
++					struct wifi_sta *link = &mlsta[j].sta[k];
++					struct sta *s;
++
++					if (memcmp(link->bssid, ap->bssid, 6))
++						continue;
++
++					s = wifi_add_sta(a, ap->ifname,
++							 link->macaddr);
++					if (!s)
++						continue;
++
++					/* Same guard as the per-STA periodic path:
++					 * a non-MLO client, or a reply that came
++					 * back half-filled, stays a plain station.
++					 */
++					if (!mlsta[j].mlo_capable ||
++					    hwaddr_is_zero(mlsta[j].bssid))
++						continue;
++
++					/* Without this the station exists, gets
++					 * counted in num_sta, and belongs to no
++					 * MLD - which is how a client with three
++					 * setup links was reported with two.
++					 */
++					stamld_update(a, ap, mlsta[j].macaddr,
++						      mlsta[j].bssid,
++						      link->mlo_link_id, s);
++				}
+ 			}
+ 		}
+ 	}

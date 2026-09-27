@@ -1,0 +1,92 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: make bSTA-MLD status survive mt76 per-link gaps
+
+iface_mlsta_interface_info() returned an error whenever the per-link query
+failed, and its final "return ret" leaked the return value of the last inner
+loop iteration. Either way wl_mldsta_status() turned it into
+UBUS_STATUS_UNKNOWN_ERROR:
+
+  ubus call wifi.bstamld.sta-mld-3 status -> "Unknown error"
+  map-agent                              -> bstamld_parse() never gets data
+  map-agent                              -> a->bstamld stays empty
+  map-agent                              -> wifi_mod_bridge(add) never called
+  sta-mld-3                              -> never joins br-lan, no data path
+  map-agent                              -> endless "bsta_scan sta-mld-3"
+
+The MLO backhaul itself is fully up the whole time: both links associated and
+authorized, EHT rates on 320 MHz. Only the reporting path is dead -- the same
+failure mode patch 931 described for AP-MLD, and the same endless bsta_scan
+patch 900 fixed for the non-MLD bSTA path.
+
+Three changes, all following the precedent already set in this tree:
+
+1. Tolerate a failing nlwifi_get_mlo_links(): keep the MLD data
+   nlwifi_mlsta_interface_info() already returned instead of discarding the
+   whole reply (same tolerance patch 936 added to iface_get_mlsta_info).
+
+2. Drop supplicant_sta_info() and radio_get_band_maxrate() from the per-link
+   enrichment. Patch 900 removed both from iface_sta_info() because they hang
+   on an mt76 bSTA (~25s and ~10s, wchan=do_select) and stall wifi.bsta status
+   past map-agent timeout; the MLD path kept calling them. The per-link data
+   map-agent needs (macaddr/channel/bandwidth/band/is4addr) comes from nl80211
+   and is already copied above.
+
+3. Return 0 on success instead of whatever the last loop iteration left in ret
+   -- a link whose ctrl-interface lookup failed made the whole call fail even
+   with mlsta fully populated.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -2039,17 +2039,23 @@
+ 
+ 	/* MLO bsta - get all links */
+ 	ret = nlwifi_get_mlo_links(ifname, BAND_ANY, link, &num);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		/* mt76: the per-link query can fail for a bSTA MLD even though
++		 * nlwifi_mlsta_interface_info() above already returned the MLD
++		 * macaddr and num_link. Discarding the whole reply here left
++		 * map-agent believing a fully connected bSTA MLD was down.
++		 * Keep what we have and skip only the enrichment. */
++		libwifi_dbg("[%s] %s: get_mlo_links failed, keeping MLD data\n",
++			    ifname, __func__);
++		num = 0;
++	}
+ 
+ 	for (i = 0; i < mlsta->num_link; i++) {
+ 		struct wifi_sta *sta;
+ 
+ 		sta = &mlsta->sta[i];
+ 		for (j = 0; j < num; j++) {
+-			unsigned long maxrate = 0;
+ 			struct wifi_mlo_link *l;
+-			char *ctrl_iface = NULL;
+ 
+ 			l = &link[j];
+ 
+@@ -2061,21 +2067,10 @@
+ 			sta->bandwidth = l->bandwidth;
+ 			sta->band = l->band;
+ 			sta->is4addr = l->is4addr;
+-
+-			ret = wifi_get_ctrl_interface_band(ifname, sta->band, &ctrl_iface);
+-			if (ret)
+-				continue;
+-
+-			ret = supplicant_sta_info(ctrl_iface, sta);
+-
+-			radio_get_band_maxrate(ifname, sta->band, &maxrate);
+-			sta->maxrate = maxrate;
+-
+-			free(ctrl_iface);
+ 		}
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static int iface_sta_get_stats(const char *ifname, struct wifi_sta_stats *s)

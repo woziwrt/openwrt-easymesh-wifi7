@@ -1,0 +1,78 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: ieee1905 map idempotent register
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+ieee1905/map: idempotent module re-register + client fail-fast (fix onboarding deadlock)
+
+map.controller (and every map plugin client) subscribes to ieee1905.map for CMDU
+delivery via map_subscribe(): ubus_invoke("register") -> register_cb sets oid ->
+ubus_subscribe(oid). At boot the register invoke can RACE ieee1905d's boot-time
+blocking: it succeeds server-side (module added to rmodlist) but register_cb never
+runs, so oid stays -1. The client then ubus_subscribe(-1) -> NOT_FOUND, and retries
+every 1 s -- but map_register_multiap_module() returns -1 for an already-registered
+name, so the client can NEVER obtain the live notify object id. Result: the module
+is registered but is NOT a subscriber; ieee1905d's per-module notify object keeps
+has_subscribers=false, every ubus_notify() of every received CMDU goes to nobody,
+handle_ap_autoconfig_search() never runs, no AP-Autoconfig Response / WSC is sent,
+and num_nodes stays 0. Whether the initial race happens is a matter of chance
+(worked 2026-07-14, deadlocked 2026-07-15) -- exactly the "two clock-independent
+processes rendezvous by luck and then livelock forever" failure mode; it scales
+combinatorially worse with node count.
+
+Fix (self-healing rendezvous):
+ 1. map_module.c: make register idempotent -- on an already-registered name refresh
+    the mask and return the LIVE notify object id (was: return -1), so a retrying
+    client recovers and subscribes to the existing object.
+ 2. maputil.c: on a register invoke that yields no valid oid, return instead of
+    proceeding to ubus_subscribe(stale -1); the caller's retry gets a clean shot.
+    Also bump the register invoke timeout 1000->3000 ms to reduce the initial race.
+
+--- a/src/extensions/map/map_module.c	2026-07-15 19:27:54.974325708 +0200
++++ b/src/extensions/map/map_module.c	2026-07-15 19:27:54.986036782 +0200
+@@ -91,8 +91,18 @@
+ 
+ 	list_for_each_entry(rmod, &p->rmodlist, list) {
+ 		if (!strncmp(rmod->name, name, strlen(rmod->name))) {
+-			fprintf(stderr, "map: %s is already registered\n", name);
+-			return -1;
++			/* 0004: idempotent re-register. A client whose first register
++			 * invoke raced ieee1905d boot-time blocking (register_cb never
++			 * ran -> oid stayed -1) retries every 1 s forever; returning -1
++			 * made its ubus_subscribe(stale oid) fail NOT_FOUND permanently
++			 * -> module registered but never a subscriber -> every CMDU
++			 * notify goes to nobody -> onboarding never starts. Refresh the
++			 * module mask and hand back the LIVE notify object id so the retry
++			 * subscribes to the existing object and CMDUs start flowing. */
++			fprintf(stderr, "map: %s re-register -> id 0x%x\n", name,
++				rmod->notify.id);
++			memcpy(&rmod->module, m, sizeof(*m));
++			return rmod->notify.id;
+ 		}
+ 	}
+ 
+--- a/src/extensions/map/maputil.c	2026-07-15 19:27:54.976392628 +0200
++++ b/src/extensions/map/maputil.c	2026-07-15 19:27:54.986075923 +0200
+@@ -444,7 +444,7 @@
+ 	btostr((unsigned char *)&m, sizeof(struct map_module), data);
+ 	blobmsg_add_string(&bb, "data", data);
+ 	ret = ubus_invoke(bus, *(uint32_t *)publisher, "register", bb.head,
+-			  register_cb, &oid /* mod */, 1000);
++			  register_cb, &oid /* mod */, 3000);
+ 	if (ret) {
+ 		fprintf(stderr, "Error map_subscribe(): err = %s\n",
+ 			ubus_strerror(ret));
+@@ -455,6 +455,14 @@
+ 	fprintf(stderr, "Response ID: 0x%x\n", oid);
+ 	//mapclient_subscribe(modpriv->bus, modpriv, oid);
+ 
++	/* 0004: if the register invoke delivered no valid object id (raced
++	 * ieee1905d boot-time blocking), do NOT proceed to ubus_subscribe() with a
++	 * stale oid=-1 -- that returns NOT_FOUND and churns register/unregister
++	 * every retry. Fail now; the caller's 1 s retry gets a clean shot, and the
++	 * server register is idempotent (returns the live id) as of this patch. */
++	if (ret || oid == (uint32_t)-1)
++		return ret ? ret : UBUS_STATUS_NO_DATA;
++
+ 	mod = calloc(1, sizeof(*mod));
+ 	if (!mod)
+ 		return -1;

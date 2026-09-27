@@ -1,0 +1,79 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 99995: the MLD master status is not the affiliated link's BSSID
+
+Under MLD an affiliated link has no netdev of its own, so 9994 taught stage 1 of
+the BSS refresh to ask wifi.ap.<mld_ifname> on the link's behalf. That reply
+describes the MLD, and bss_status_data_cb() copies its BSSID straight into the
+per-link ap->bssid. Every affiliated link of one AP-MLD therefore ends up
+holding the AP-MLD master address.
+
+Stage 2 then reads the station list and matches each station's real per-link
+BSSID against ap->bssid. Nothing matches, the client counts as absent, and after
+STA_ABSENT_MAX rounds it is released - from the link it is actually sitting on.
+
+Measured on x8 2026-08-04, one client on ap-mld-1, agent log:
+
+	ap: wlan0-2  max_sta: 1023  bssid: 00:0c:43:26:60:10
+	ap: wlan1-1  max_sta: 1023  bssid: 00:0c:43:26:60:10
+	ap: wlan2-2  max_sta: 1023  bssid: 00:0c:43:26:60:10
+	wlan1-1: releasing b8:09:8a:50:f2:2a, absent from 2 replies
+
+The three links really are 0a:0c:43:26:a0:10, 06:0c:43:26:80:10 and
+00:0c:43:26:60:10; only the last one is the master. The client was on
+06:0c:43:26:80:10 and had been associated for 33 minutes, with the kernel and
+libwifi both reporting it the whole time.
+
+mld_parse_ap() writes the correct per-link BSSID, so the two writers alternate
+and the client flickers in and out on a 60s cycle. Sampled over 100s it was
+present; ten minutes earlier the same query returned nothing. That is what makes
+this look like an intermittent or node-specific fault - it is neither. It also
+explains a steer that answers "sta: <mac> not found" and still sends a 1905 ack:
+the request simply landed in a gap.
+
+Take the master address only to bootstrap a link that has no BSSID yet - which
+is what bssid_unset already records - and never let it overwrite a per-link
+BSSID that is already known.
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2851,6 +2851,7 @@
+ 	bool bssid_unset;			/* captured at stage-1 issue */
+ 	bool parsed;				/* stage-1 chained to stage-2 OK */
+ 	bool stations_mld;			/* stage-2 queried apmld "stations" */
++	bool status_mld;			/* stage-1 queried the MLD master */
+ 	int status;
+ };
+ 
+@@ -3119,7 +3120,24 @@
+ 	 * abort the refresh (the sync wifi_ubus_ap_status_cb defaults absent
+ 	 * fields). The BSSID is the one field we truly need -- to filter MLD
+ 	 * stations and for wifi_add_sta() -- and it persists on ap across rounds. */
+-	if (tb[1]) {
++	/* ...with one exception. When stage 1 had to ask the MLD master on this
++	 * affiliated link's behalf, the reply describes the MLD, and its BSSID
++	 * is the AP-MLD master address - not this link's. Writing it here gives
++	 * every affiliated link of an MLD the same BSSID, and stage 2 then
++	 * matches each station's real per-link BSSID against it and finds no
++	 * owner. Measured on x8 2026-08-04, all three links of ap-mld-1:
++	 *
++	 *   ap: wlan0-2  bssid: 00:0c:43:26:60:10   (really 0a:0c:43:26:a0:10)
++	 *   ap: wlan1-1  bssid: 00:0c:43:26:60:10   (really 06:0c:43:26:80:10)
++	 *   ap: wlan2-2  bssid: 00:0c:43:26:60:10   (correct, it is the master)
++	 *   wlan1-1: releasing b8:09:8a:50:f2:2a, absent from 2 replies
++	 *
++	 * mld_parse_ap() sets the per-link BSSID correctly, so the two writers
++	 * alternate and the client flickers in and out with every refresh - a
++	 * steer that lands in a gap answers "sta not found" and still acks.
++	 * Take the master address only to bootstrap a link that has none yet;
++	 * never let it overwrite a per-link BSSID we already know. */
++	if (tb[1] && (!w->status_mld || w->bssid_unset)) {
+ 		if (hwaddr_aton(blobmsg_get_string(tb[1]), ap->bssid) == NULL) {
+ 			w->status = -1;
+ 			return;
+@@ -3383,6 +3401,7 @@
+ 	if (ap->is_affiliated_ap && ap->mld_ifname[0]) {
+ 		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->mld_ifname);
+ 		stage1_obj = WIFI_OBJECT_INVALID;
++		w->status_mld = true;
+ 	} else
+ #endif
+ 		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);

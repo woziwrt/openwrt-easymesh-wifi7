@@ -1,0 +1,281 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-parent-plan - which parent each backhaul SHOULD have.
+#
+# A backhaul picks its parent once, at association, and a cascade of reboots
+# freezes the mesh in whatever shape the boot order gave it. Measured
+# 2026-09-21 on a four-deep chain: 1 hop 418 Mbit/s, 2 hops 89-152, 3 hops
+# 29.7 - a hop costs far more than a few dB of signal. So the rule here is a
+# shortest-path tree from the controller over "who can hear whom", with a
+# floor on signal, and signal only as a tie-break.
+#
+# Input: bh_candidate (easymesh-parent-scan on every agent, collected by
+# easymesh-linkstat-collect) - the 5 GHz BSSID an agent hears is its parent's
+# AP-MLD address, which apmld maps to a node. Current tree: bstamld.
+#
+# A BFS from the controller cannot produce a loop: a node is placed under a
+# node that is already placed one level up, never under its own subtree.
+#
+# It PLANS every PERIOD and writes the plan to $OUT and the log. It ACTS only
+# when /etc/mapc/parent-steer-live exists - see "Acting on the plan" below -
+# and even then the move is decided by a measured trial on the node, not by
+# this plan: on 2026-09-23 one 5 s sample made a right plan look wrong.
+#
+# A move is proposed only when it pays:
+#   - the planned depth is SMALLER than the current one, or
+#   - the depth is the same and the planned parent is >= GAIN_DB louder.
+
+PERIOD=${1:-300}
+DB=/etc/mapc/mapc.db
+OUT=/tmp/easymesh/parent-plan.txt
+FLOOR=${FLOOR:--70}
+GAIN_DB=${GAIN_DB:-10}
+MAXAGE=${MAXAGE:-1500}
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = "controller" ] || exit 0
+command -v sqlite3 >/dev/null || exit 1
+mkdir -p /tmp/easymesh
+
+# db.sh, then names.sh (live_addrs_json) - the order easymesh-linkstat-collect
+# documents. [ -r ] rather than `if ! . file`: sourcing a missing file ends the
+# script outright in ash.
+for _lib in db names; do
+	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
+		logger -t easymesh-parent-plan "cannot read /usr/share/easymesh/$_lib.sh - refusing to start"
+		exit 0
+	}
+	# shellcheck source=/dev/null
+	. "/usr/share/easymesh/$_lib.sh"
+done
+unset _lib
+
+plan_once() {
+	now=$(date +%s)
+	ctrl=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+	[ -n "$ctrl" ] || return 1
+
+	{
+		echo "ROOT $ctrl"
+		# E <child_almac> <heard_node_almac> <signal>   - 5 GHz only, fresh only
+		sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+			SELECT 'E', c.agent_almac, a.agent_almac, c.signal
+			FROM bh_candidate c JOIN apmld a ON a.mld_macaddr = c.bssid
+			WHERE c.freq < 5900 AND c.signal >= $FLOOR
+			  AND ($now - c.scan_ts) <= $MAXAGE
+			  AND a.agent_almac != c.agent_almac;" 2>/dev/null
+		# C <child_almac> <current_parent_almac>
+		sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+			SELECT 'C', b.agent_almac, a.agent_almac
+			FROM bstamld b JOIN apmld a ON a.mld_macaddr = b.ap_mld_macaddr
+			WHERE b.ap_mld_macaddr != '';" 2>/dev/null
+		# S <child_almac> <heard_node_almac> <signal>   - any age, for reporting
+		sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+			SELECT 'S', c.agent_almac, a.agent_almac, c.signal
+			FROM bh_candidate c JOIN apmld a ON a.mld_macaddr = c.bssid
+			WHERE c.freq < 5900;" 2>/dev/null
+	} | awk -v gain="$GAIN_DB" -v now="$now" -v floor="$FLOOR" '
+		$1 == "ROOT" { root = $2; next }
+		$1 == "E" { heard[$2, $3] = $4; kids[$3] = kids[$3] " " $2; agents[$2] = 1; heardany[$2] = 1; next }
+		$1 == "C" { cur[$2] = $3; agents[$2] = 1; next }
+		$1 == "S" { sig[$2, $3] = $4; next }
+		function curdepth(n,   d, guard) {
+			d = 0; guard = 0
+			while (n != root && (n in cur) && guard++ < 16) { n = cur[n]; d++ }
+			return (n == root) ? d : -1
+		}
+		END {
+			# BFS from the controller over "child hears node"
+			depth[root] = 0; level = 0; frontier[root] = 1; placed = 1
+			while (1) {
+				nf = 0
+				for (p in frontier) {
+					split(kids[p], k, " ")
+					for (i in k) {
+						c = k[i]; if (c == "" || (c in depth)) continue
+						s = heard[c, p]
+						if (!(c in best) || s > bests[c]) { best[c] = p; bests[c] = s; cand[c] = 1 }
+					}
+				}
+				for (c in cand) { depth[c] = level + 1; next_f[c] = 1; nf++ }
+				if (!nf) break
+				delete frontier; for (c in next_f) frontier[c] = 1
+				delete next_f; delete cand; level++
+			}
+			n = 0
+			for (a in agents) {
+				cd = curdepth(a); cp = cur[a]
+				if (!(a in depth)) {
+					# Not reachable from the root over "hears" edges. Three
+					# different reasons, and the old single message named only
+					# the last one: seen 2026-09-23 for 15 min after the
+					# controller rebooted, while every agent heard it at -56.
+					if (!(a in heardany))
+						printf "%s: no fresh parent above %s dBm heard - keep %s (depth %d)\n", a, floor, cp, cd
+					else if (kids[root] == "")
+						printf "%s: undecided - nobody is known to hear the controller yet (its BSSIDs not in the DB, or no fresh scans) - keep %s (depth %d)\n", a, cp, cd
+					else
+						printf "%s: undecided - hears only nodes the controller cannot reach in the plan - keep %s (depth %d)\n", a, cp, cd
+					continue
+				}
+				pd = depth[a]; pp = best[a]; ps = bests[a]
+				cs = ((a, cp) in sig) ? sig[a, cp] : "?"
+				if (pp == cp) { printf "%s: keep %s (depth %d, %s dBm) - already the best\n", a, cp, cd, cs; continue }
+				why = ""
+				if (cd < 0) why = "current tree unknown"
+				else if (pd < cd) why = sprintf("depth %d -> %d", cd, pd)
+				else if (pd == cd && cs != "?" && ps - cs >= gain) why = sprintf("same depth, %+d dB", ps - cs)
+				# A current link below the floor is invisible to the BFS
+				# above, so the plan puts the node one hop deeper under a
+				# strong parent and "depth must shrink" never lets it go.
+				# Seen 2026-09-23: hall directly under the controller at
+				# -76 dBm after a power-cycle, and the plan kept it there.
+				# One hop deeper only; the trial on the node measures it and
+				# goes back unless it pays.
+				else if (cs != "?" && cs + 0 < floor && pd == cd + 1)
+					why = sprintf("current link %s dBm below the floor %d, one hop deeper at %d dBm", cs, floor, ps)
+				if (why == "") { printf "%s: keep %s (depth %d, %s dBm) - %s (depth %d, %d dBm) does not pay\n", a, cp, cd, cs, pp, pd, ps; continue }
+				printf "%s: MOVE %s (depth %d, %s dBm) -> %s (depth %d, %d dBm): %s\n", a, cp, cd, cs, pp, pd, ps, why
+				n++
+			}
+			printf "# %d move(s) proposed\n", n
+		}' > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+
+	grep -q " MOVE " "$OUT" && grep " MOVE " "$OUT" | while read -r l; do
+		logger -t easymesh-parent-plan "would $l"
+	done
+	return 0
+}
+
+
+# ---------------------------------------------------------------------------
+# Acting on the plan - only with /etc/mapc/parent-steer-live present.
+#
+# A plan is a guess from a scan; the move itself is decided by a measured
+# trial on the node (easymesh-bh-trial), which keeps it only when it paid and
+# otherwise goes back on its own. Here only the guard rails:
+#   - a move is tried after it was proposed STREAK plans in a row,
+#   - one trial in the whole mesh at a time, with an iperf3 server on this
+#     controller only for its duration,
+#   - a node is tried at most once per COOLDOWN, a refused move not again
+#     within DENY_S.
+# ---------------------------------------------------------------------------
+LIVE=/etc/mapc/parent-steer-live
+ST=/tmp/easymesh/parent-steer
+# What a trial decided has to outlive a reboot of this box. Kept in /tmp,
+# the 24 h deny and the cooldown vanished with every reflash of the
+# controller, and on 2026-09-24 the planner tried kitchen -> controller
+# again at 12:57 - the same move that had come back "reverted" at 05:51 -
+# and the node spent the next twenty minutes looking for a parent. The
+# running trial and the streaks stay in /tmp: neither survives a reboot
+# in any meaningful way.
+MEM=/etc/mapc/parent-steer
+STREAK=${STREAK:-3}
+COOLDOWN=${COOLDOWN:-3600}
+DENY_S=${DENY_S:-86400}
+TRIAL_MAX=${TRIAL_MAX:-420}
+IPERF_PIDF=/tmp/easymesh/parent-steer-iperf.pid
+mkdir -p "$ST" "$MEM"
+
+steer_log() { logger -t easymesh-parent-steer "$*"; }
+
+ask_p() {
+	# ask_p <ip> <method> <json-params>
+	_s=$(curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
+		"http://$1/ubus" 2>/dev/null | sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p')
+	[ -n "$_s" ] || return 1
+	curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$_s\",\"easymesh\",\"$2\",$3]}" \
+		"http://$1/ubus" 2>/dev/null | jsonfilter -e '@.result[1]'
+}
+
+ip_of() {
+	live_addrs_json | tr -d '{}"' | tr ',' '\n' |
+		sed -n "s/^$1:\([0-9.]*\)$/\1/p" | head -1
+}
+
+iperf_stop() {
+	[ -s "$IPERF_PIDF" ] && kill "$(cat "$IPERF_PIDF")" 2>/dev/null
+	rm -f "$IPERF_PIDF"
+}
+
+steer_once() {
+	now=$(date +%s)
+	# 1. a trial in flight: wait for it, record it, let go of the server
+	if [ -s "$ST/running" ]; then
+		read -r child target ip started < "$ST/running"
+		r=$(ask_p "$ip" bh_trial_state '{}')
+		if echo "$r" | grep -q '"verdict"'; then
+			v=$(echo "$r" | jsonfilter -e '@.verdict')
+			steer_log "trial $child -> $target: $v ($r)"
+			[ "$v" = kept ] || echo "$now" > "$MEM/deny.$child.$target"
+			echo "$now" > "$MEM/last.$child"
+			rm -f "$ST/running"; iperf_stop
+		elif [ $((now - started)) -gt "$TRIAL_MAX" ]; then
+			steer_log "trial $child -> $target: no result after ${TRIAL_MAX}s ($r) - giving up"
+			echo "$now" > "$MEM/deny.$child.$target"; echo "$now" > "$MEM/last.$child"
+			rm -f "$ST/running"; iperf_stop
+		fi
+		return 0
+	fi
+
+	# 2. streaks of identical proposals
+	grep " MOVE " "$OUT" 2>/dev/null | sed 's/^\([^ ]*\): MOVE [^ ]* ([^)]*) -> \([^ ]*\) .*/\1 \2/' |
+	while read -r child target; do
+		child=${child%:}
+		prev=$(cat "$ST/streak.$child" 2>/dev/null)
+		set -- $prev
+		if [ "${1:-}" = "$target" ]; then n=$((${2:-0} + 1)); else n=1; fi
+		echo "$target $n" > "$ST/streak.$child"
+	done
+	# drop streaks of nodes no longer proposed
+	for f in "$ST"/streak.*; do
+		[ -e "$f" ] || continue
+		c=${f##*/streak.}
+		grep -q "^$c: MOVE " "$OUT" 2>/dev/null || rm -f "$f"
+	done
+
+	[ -e "$LIVE" ] || return 0
+
+	# 3. pick one ripe move and start its trial
+	for f in "$ST"/streak.*; do
+		[ -e "$f" ] || continue
+		child=${f##*/streak.}
+		read -r parent n < "$f"
+		[ "$n" -ge "$STREAK" ] || continue
+		last=$(cat "$MEM/last.$child" 2>/dev/null); [ $((now - ${last:-0})) -ge "$COOLDOWN" ] || continue
+		den=$(cat "$MEM/deny.$child.$parent" 2>/dev/null); [ $((now - ${den:-0})) -ge "$DENY_S" ] || continue
+		target=$(sqlite3 -cmd ".timeout 3000" "$DB" "
+			SELECT c.bssid FROM bh_candidate c JOIN apmld a ON a.mld_macaddr = c.bssid
+			WHERE c.agent_almac = '$child' AND a.agent_almac = '$parent' AND c.freq < 5900 LIMIT 1;" 2>/dev/null)
+		ip=$(ip_of "$child")
+		ctrl_ip=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }')
+		[ -n "$target" ] && [ -n "$ip" ] && [ -n "$ctrl_ip" ] || continue
+		iperf3 -s -p 5203 -D --pidfile "$IPERF_PIDF" 2>/dev/null
+		r=$(ask_p "$ip" bh_trial "{\"target\":\"$target\",\"controller\":\"$ctrl_ip\"}")
+		# By field, not by text: jsonfilter prints { "started": true } with a
+		# space, and a grep for '"started":true' called every started trial
+		# "refused" - 2026-09-23, the first live one.
+		if [ "$(echo "$r" | jsonfilter -e '@.started' 2>/dev/null)" = true ]; then
+			echo "$child $target $ip $now" > "$ST/running"
+			steer_log "trial started: $child ($ip) -> $parent via $target (proposed $n times)"
+		else
+			steer_log "trial for $child refused: $r"
+			iperf_stop; echo "$now" > "$MEM/last.$child"
+		fi
+		return 0
+	done
+}
+
+if [ "${ONESHOT:-0}" = 1 ]; then
+	plan_once; cat "$OUT"; exit 0
+fi
+if [ "${ONESHOT:-0}" = 2 ]; then
+	plan_once && steer_once; cat "$OUT"; exit 0
+fi
+while :; do
+	plan_once && steer_once
+	sleep "$PERIOD"
+done

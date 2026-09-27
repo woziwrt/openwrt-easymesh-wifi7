@@ -1,0 +1,36 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Date: Sat, 6 Jun 2026 12:00:00 +0200
+Subject: [PATCH] net: phy: as21xxx: extend firmware reset timeout to 30s
+
+The AS21xxx cold-boot firmware initialisation takes 18-74 seconds
+depending on the chip variant.  aeon_wait_reset_complete() uses
+read_poll_timeout() with a 2 s ceiling, so on a cold power-on the
+first config_init() call always times out, falls through to
+aeon_firmware_load(), and the second 2 s wait times out as well,
+returning -ENODEV.
+
+The PHY state machine then retries config_init() only on a link
+event (cable pull/re-insert), which is why the port appears dead
+after reboot until the cable is cycled.
+
+Raise the ceiling to 30 s so the cold-start firmware boot (typically
+~18 s) completes within the first wait_reset_complete() call.  Warm
+resets where firmware is already running respond immediately, so
+there is no practical latency increase for that case.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+ drivers/net/phy/as21xxx.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -1512,7 +1512,7 @@ static int aeon_wait_reset_complete(stru
+ 	int val;
+
+ 	return read_poll_timeout(aeon_ipc_get_fw_version, val,
+-				 val == 0, 10000, 2000000, false, phydev);
++				 val == 0, 10000, 30000000, false, phydev);
+ }
+
+ static int aeon_gen1_config_init(struct phy_device *phydev)

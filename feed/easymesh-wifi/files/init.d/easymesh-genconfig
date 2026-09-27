@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# The one writer of the wireless config on a mesh agent. START=19 on
+# purpose: the final word must be spoken before netifd (START=20) reads
+# /etc/config/wireless - every other writer that scribbles later loses
+# on the next boot, which is exactly the deal.
+START=19
+
+boot() {
+	/usr/sbin/easymesh-genconfig
+}
+
+start() {
+	/usr/sbin/easymesh-genconfig
+}

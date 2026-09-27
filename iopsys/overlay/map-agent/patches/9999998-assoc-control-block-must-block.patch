@@ -1,0 +1,78 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: a block that blocks nothing is worse than no block
+
+Two independent reasons why Client Association Control with mode 0 did
+nothing, both measured on hardware 2026-09-03.
+
+First, assoc_ctrl.c aborted the whole request when every STA in it was
+already associated with the target BSSID. That is not an error case - it
+is the case: "this client is on you, push it off". The Error Code TLV
+that 11.6 asks for is built before the check and goes out with the ACK
+regardless, so nothing is lost by continuing. Measured: a client was back
+on the same BSS 17 seconds into a 300 second block, while mode 2 against
+the same BSSID reached hostapd DENY_ACL and held. That asymmetry is also
+why the built-in steering only ever sends TIMED_BLOCK (steer.c:232) -
+mode 0 has presumably never worked.
+
+Second, wifi_ubus_restrict_sta() passed the AP's band down to
+block_sta. For an affiliated AP that narrows the block to one link:
+mtk_mld_block_sta() filters the MLD's links by band, so DENY_ACL is
+written into a single hostapd BSS and the client just associates over
+another leg of the same MLD. Omit the band for affiliated APs and let
+BAND_ANY cover the whole MLD; a plain BSS keeps sending it.
+
+Neither change touches the non-MLO path, and neither makes the agent
+block anything it was not already told to block.
+
+Verified: compiles clean for aarch64 (EXIT=0).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/assoc_ctrl.c
++++ b/src/assoc_ctrl.c
+@@ -843,10 +843,21 @@
+ 		}
+ 
+ 		if (num_err == data->num_sta) {
+-			/* All STAs are already associated with the BSSID */
+-			agnt_warn(LOG_STEER, "All STAs already associated with given BSSID!\n");
+-			ret = -1;
+-			goto send_ack;
++			/* Every STA in the request is on this BSS - which is
++			 * exactly the "push them off it" case, not a reason to
++			 * abort. 11.6 asks for an Error Code TLV per STA and
++			 * that is already built above; it rides out with the
++			 * ACK either way.
++			 *
++			 * Returning here left the block unapplied, so a
++			 * controller telling an agent to move a client away
++			 * with mode 0 got an ACK and nothing else. Measured
++			 * 2026-09-03: the client was back on the same BSS 17 s
++			 * into a 300 s block, while mode 2 on the same BSSID
++			 * reached hostapd DENY_ACL. That is also why the
++			 * built-in steering never uses mode 0 (steer.c:232).
++			 */
++			agnt_warn(LOG_STEER, "All STAs already associated with given BSSID - blocking anyway\n");
+ 		}
+ 		/* no break - checkpatch ignore */
+ 	case ASSOC_CTRL_TIMED_BLOCK: /* Timed Block */
+--- a/src/wifi_ubus.c
++++ b/src/wifi_ubus.c
+@@ -884,7 +884,16 @@
+ 	blob_buf_init(&bb, 0);
+ 	blobmsg_add_string(&bb, "client", macstr);
+ 	blobmsg_add_u32(&bb, "block", block_sta ? 1 : 0);
+-	if (bandnum)
++	/* On an affiliated AP the band would narrow the block to that one
++	 * link: mtk_mld_block_sta() filters the MLD's links by it, so
++	 * DENY_ACL lands in a single hostapd BSS and the client simply
++	 * associates over one of the others. Leave it out and let BAND_ANY
++	 * cover every link of the MLD. A plain BSS still sends its band. */
++	if (bandnum
++#if (EASYMESH_VERSION >= 6)
++	    && !ap->is_affiliated_ap
++#endif
++	   )
+ 		blobmsg_add_u32(&bb, "band", bandnum);
+ 
+ 	ret = ubus_invoke(ubus_ctx, id, "block_sta", bb.head, NULL, NULL, 1 * 1000);

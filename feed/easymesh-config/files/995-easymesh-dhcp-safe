@@ -1,0 +1,88 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# One DHCP server per mesh.
+#
+# The mesh is a single L2 domain, so a second DHCP server answers clients
+# before the real one and hands itself out as their gateway. The client then
+# has an address, full signal and no route anywhere - a failure that looks
+# exactly like a broken radio. Measured on hardware 2026-07-25.
+#
+# Rule: only the controller serves DHCP. Agents switch it off. A node that
+# already carries an explicit setting is left alone (the user decided).
+#
+# ⚠️ The number matters, and it used to be 91.
+#
+# dhcp.lan.ignore is not only a DHCP setting - it is also one of the three marks
+# that say "somebody made this box a mesh node", read by 89-easymesh-quiet-until-
+# role, 991-multiap-genconfig and the ieee80211 hotplug handler. Unset means
+# factory. Setting it here, at 91, told all of them the opposite two steps before
+# they looked.
+#
+# Traced through the first-boot sequence on hardware 2026-08-17:
+#
+#     start                         ignore unset   mapagent=1 mapcontroller=1
+#     89-easymesh-quiet-until-role  -> daemons off, correctly
+#     91-easymesh-dhcp-safe         -> ignore=1
+#     991-multiap-genconfig         -> gate now passes, so it rewrote wireless
+#                                      and turned both daemons back on
+#
+# The box came up broadcasting MAP--BH again, and it looked like the gates were
+# broken. They were not; they were answered by us. Running after 991 and 994
+# was only ever half the story. The real fix is that the gates no longer read
+# dhcp.lan.ignore at all - a mark this script writes on every non-controller
+# cannot mean "someone chose a mesh role". Running late is kept anyway, so the
+# value is not in place while anything else is still making decisions about it.
+#
+# One reader does sit between the old position and this one:
+# 99-easymesh-no-default-role, which sorts before 995 ('-' is below '5'). It
+# reads dhcp.lan.ignore at its line 29, so the order of the two flipped. Harmless
+# today - 89-easymesh-quiet-until-role has already zeroed the value that reader
+# tests first, so it short-circuits either way - but it is a real dependency and
+# an earlier draft of this comment claimed no such reader existed.
+
+# ⚠️ And then the same mistake a third time, from the other end.
+#
+# "Are you the controller?" is not the question this script needs answered.
+# 89-easymesh-quiet-until-role sets mapcontroller.controller.enabled='0' on every
+# roleless box twenty-three positions earlier, so what this test reads as "an
+# agent, switch DHCP off" is its own gate's work on a factory router.
+#
+# Measured on hardware 2026-08-18, on a box that had just been flashed and had
+# taken no role at all:
+#
+#     OpenWrt-2g/-5g/-6g/-MLD    all four on the air, correctly
+#     dhcp.lan.ignore='1'        set by this script
+#     port 67                    nothing listening
+#
+# A client joins the network the board is supposed to ship with and never gets
+# an address. The stray backhaul was fixed and the box still came up broken,
+# because the question was still the wrong one.
+#
+# 🔑 The same rule as everywhere else in this package: ask whether anyone made
+# this box a mesh node. One DHCP server per mesh only means anything once there
+# is a mesh.
+# [ -r ] first: sourcing a missing file ends the script, and an exit that looks
+# like success here would drop the "one DHCP server per mesh" guard without a
+# word - the exact failure it exists to prevent. Exiting non-zero keeps this file
+# for the next boot instead.
+[ -r /usr/share/easymesh/boot-window.sh ] || {
+	echo "995-easymesh-dhcp-safe: cannot read boot-window.sh - not touching DHCP" >&2
+	exit 1
+}
+. /usr/share/easymesh/boot-window.sh
+# exit 1, not 0: a uci-default that succeeds is deleted. Exiting 0 here would
+# remove the "one DHCP server per mesh" guard permanently at the firstboot of
+# every factory box - so the box that later joins a mesh would never be reached
+# by it, and correctness would rest entirely on easymesh-role, easymesh-api and
+# mesh-role each remembering to set the value themselves. They all do today.
+# Keeping the file costs one uci read per boot.
+is_mesh_node || exit 1
+
+[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] && exit 0
+[ -n "$(uci -q get dhcp.lan.ignore)" ] && exit 0
+
+uci set dhcp.lan.ignore='1'
+uci commit dhcp
+exit 0

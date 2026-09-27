@@ -1,0 +1,94 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 99994: report a client from the link it is held under
+
+The periodic per-STA refresh fetches the whole MLO station and then uses
+mlsta.sta[0] for the metrics. Since libwifi 940 every affiliated link carries
+its own rssi, so reading link 0 alone reports whichever link happens to come
+first - and on an idle link that is an honest zero, which rssi_to_rcpi() turns
+into 255.
+
+Measured on hardware 2026-08-03, iPhone associated with three links on x8:
+
+    kernel                            libwifi (ubus)
+    link 0:  0 [0, 0] dBm             link_id 0  rssi_avg 0
+    link 1:  0 [0, 0, 0] dBm          link_id 1  rssi_avg 0
+    link 2: -46 [-71, -46, -53] dBm   link_id 2  rssi_avg -45
+
+The agent reported rssi 0 for all three link addresses and mapc.db held
+rcpi 255, so every rcpi-based decision - steering thresholds, hysteresis,
+reporting - was made on a number that described nothing. The data was two
+layers below the whole time.
+
+An MLO client sits in ap->stalist under the address of the link it associated
+on, so that link is the one this BSS is entitled to report. Prefer it. If it
+has no measurement, because the client is parked elsewhere and this link is
+idle, fall back to the strongest link that does have one: a client heard at -45
+on some link is not a client at the noise floor. Zero survives only when no
+link measured anything.
+
+Deliberately left alone: stamld_update() above still keys off sta[0]. It records
+which link the MLD is on rather than how well it is heard, and changing it is a
+separate question from the metrics.
+
+Not addressed here: the kernel still reports a last-ack RSSI on links whose
+data-frame signal is zero (-14 and -13 dBm on the two idle links above), which
+is a better source for a link the client is not currently transmitting on.
+libwifi does not surface it yet.
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1527,7 +1527,54 @@
+ 			stamld_update(a, ap, mlsta.macaddr, mlsta.bssid,
+ 				      mlsta.sta[0].mlo_link_id, s);
+ 
+-		update_sta_entry(a, ap, &(mlsta.sta[0]));
++		/* Take the metrics from the link this client is actually held
++		 * under here, not from link 0.
++		 *
++		 * wifi_get_mld_station() returns every affiliated link, and since
++		 * libwifi 940 each one carries its own rssi. Reading sta[0] alone
++		 * reports whichever link happens to be first, which for an idle
++		 * link is an honest zero - and rssi_to_rcpi(0) is 255. Measured on
++		 * hardware 2026-08-03, an iPhone with three links on x8:
++		 *
++		 *     link 0  rssi_avg 0     (idle)
++		 *     link 1  rssi_avg 0     (idle)
++		 *     link 2  rssi_avg -45   (carrying the traffic)
++		 *
++		 * The agent reported 0 for all three and the controller stored 255,
++		 * so every rcpi-based decision was made on a number that described
++		 * nothing.
++		 *
++		 * An MLO client sits in ap->stalist under the address of the link it
++		 * associated on, so that link is the one this BSS is entitled to
++		 * report. If it has no measurement - the client is parked on another
++		 * link and this one is idle - fall back to the strongest link that
++		 * does, because a client heard at -45 somewhere is not a client at
++		 * the noise floor. Zero stays zero only when no link measured
++		 * anything.
++		 */
++		{
++			struct wifi_sta *e = &mlsta.sta[0];
++			int li;
++
++			for (li = 0; li < mlsta.num_link; li++) {
++				if (!memcmp(mlsta.sta[li].macaddr, s->macaddr, 6)) {
++					e = &mlsta.sta[li];
++					break;
++				}
++			}
++
++			if (e->rssi_avg == 0) {
++				for (li = 0; li < mlsta.num_link; li++) {
++					if (mlsta.sta[li].rssi_avg == 0)
++						continue;
++					if (e->rssi_avg == 0 ||
++					    mlsta.sta[li].rssi_avg > e->rssi_avg)
++						e = &mlsta.sta[li];
++				}
++			}
++
++			update_sta_entry(a, ap, e);
++		}
+ 	}
+ #endif
+ 

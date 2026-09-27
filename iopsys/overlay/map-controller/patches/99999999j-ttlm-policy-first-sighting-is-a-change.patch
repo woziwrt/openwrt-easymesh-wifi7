@@ -1,0 +1,77 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a policy seen for the first time is a change
+
+cntlr_check_ttlm_policy_change() deliberately does not treat the first sighting
+of /etc/mapc/ttlm-policy after a start as a change. The reasoning - "the agents
+were configured from this same file the last time round, and pushing on every
+restart would put a CMDU on the air for nothing" - does not hold.
+
+A negotiated TTLM belongs to an association, not to a box. When a backhaul bSTA
+re-associates its map is gone, and nothing re-applies it:
+agent_process_tid_to_link_policy() is reached only from an incoming Service
+Prioritization Request (agent_map.c:7350). Measured 2026-09-22: all four
+backhaul bSTAs re-associated within 16 s of each other at 06:54 (`associated
+at` 1790052884177 / 891116 / 896175 / 900291 ms), which is not a rare event -
+it is a normal morning in this lab.
+
+So after a controller restart the mesh runs with no TID policy, the file on
+disk says it has one, and nothing anywhere says otherwise. There is also no
+second chance: the policy is sent with send_cmdu() and no cookie
+(cntlr_cmdu.c:975), so it is one unicast with no retry and no ack tracking.
+
+Cost of the change: one unicast CMDU per agent NAMED IN THE FILE, once, at
+start. Agents the file does not name cost one cheap read and send nothing
+(cntlr_gen_tid_to_link_policy returns 0). A controller with no policy file at
+all is untouched - the stat() fails and this never runs.
+
+Hit again on 2026-09-23: a policy file written after the controller had
+started sent nothing until it was rewritten; the rewrite then reached the
+radios of both ends in 2 s.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff -urN a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c	2026-09-22 08:01:21.912827496 +0200
++++ b/src/cntlr.c	2026-09-22 08:01:23.291467786 +0200
+@@ -1963,6 +1963,19 @@
+  * Deliberately mtime and not a hash: the producer is mlo-steerd rewriting the
+  * whole file, and a rewrite always moves mtime. Comparing content would cost a
+  * read on every tick to catch a case that cannot happen.
++ *
++ * 2026-09-22: the first sighting after a start IS a change, and used not to be.
++ * The reasoning for skipping it - "the agents were configured from this same
++ * file the last time round" - does not hold. A negotiated TTLM belongs to an
++ * association, not to a box: when a backhaul bSTA re-associates, its map is
++ * gone, and nothing re-applies it (agent_process_tid_to_link_policy is reached
++ * only from an incoming Service Prioritization Request). On 2026-09-22 at 06:54
++ * all four backhaul bSTAs re-associated within 16 s of each other, so the
++ * window in which "they still have it" is true is hours at best.
++ *
++ * The cost of being wrong the other way is one unicast CMDU per named agent,
++ * once, at controller start. The cost of today's behaviour is a mesh that
++ * silently runs with no TID policy after every restart and says nothing.
+  */
+ static bool cntlr_check_ttlm_policy_change(struct controller *c)
+ {
+@@ -1981,15 +1994,14 @@
+ 	if (st.st_mtime == last_mtime)
+ 		return false;
+ 
+-	/* First sighting after a start is not a change - the agents were
+-	 * configured from this same file the last time round, and pushing on
+-	 * every restart would put a CMDU on the air for nothing. */
+-	if (last_mtime) {
++	if (last_mtime)
+ 		info("%s: ttlm-policy changed, sending Service Prioritization Request\n",
+-		    __func__);
+-		changed = true;
+-	}
++		     __func__);
++	else
++		info("%s: ttlm-policy seen for the first time, sending Service Prioritization Request\n",
++		     __func__);
+ 
++	changed = true;
+ 	last_mtime = st.st_mtime;
+ 
+ 	return changed;

@@ -1,0 +1,840 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: phase2 event cache
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/libwifi/modules/wpactrl/wpactrl.h
++++ b/libwifi/modules/wpactrl/wpactrl.h
+@@ -2,6 +2,8 @@
+ #ifndef WPACTRL_H
+ #define WPACTRL_H
+ 
++#include <easy/event.h>	/* struct event_struct */
++
+ #define WPACTRL_TIMEOUT 5
+ 
+ int hostapd_cli_set(const char *ifname, const char *cmd, bool check_ok);
+@@ -12,4 +14,10 @@
+ int wpa_ctrl_iface_get(const char *ifname, const char *cmd, char *out, size_t out_size, bool isHostapd);
+ int wpa_ctrl_get_param(const char *buf, const char *param, char *value, size_t value_max);
+ 
++/* Phase-2 bSTA event source (rides wifimngr's fd_monitor->uloop; no thread).
++ * Same signature family as nlwifi_*_event so wifi.c can dispatch on req->family. */
++int wpactrl_register_event(const char *ifname, struct event_struct *req, void **handle);
++int wpactrl_recv_event(const char *ifname, void *handle);
++int wpactrl_unregister_event(const char *ifname, void *handle);
++
+ #endif
+--- a/libwifi/modules/wpactrl/wpactrl.c
++++ b/libwifi/modules/wpactrl/wpactrl.c
+@@ -24,6 +24,7 @@
+ #include "wifi.h"
+ #include "debug.h"
+ #include "wpactrl.h"
++#include "staconn_cache.h"
+ 
+ #ifdef LIBWIFI_USE_CTRL_IFACE
+ #include "limits.h"
+@@ -380,6 +381,301 @@
+ 	return wpa_ctrl_iface_get(ifname, cmd, out, out_size, false);
+ }
+ 
++/* ---- Phase-2: attach/pending/recv quartet (ported from wpa_supplicant
++ * wpa_ctrl.c, LGPL-compatible) + a persistent event source that feeds the
++ * process-local bSTA connection-state cache.
++ *
++ * Placed here so the file-local statics it reuses (wpa_ctrl_open/close/request,
++ * wpa_cli_get) are already defined above. ------------------------------- */
++
++/* ATTACH/DETACH: after ATTACH wpa_supplicant multicasts "<n>CTRL-EVENT-*".
++ * Reuses the file-local wpa_ctrl_request(), which already skips unsolicited
++ * '<'-prefixed frames and returns the solicited "OK" reply. */
++static int wpa_ctrl_attach_helper(struct wpa_ctrl *ctrl, bool attach)
++{
++	char buf[16] = {};
++	size_t len = sizeof(buf);
++	int ret;
++
++	ret = wpa_ctrl_request(ctrl, attach ? "ATTACH" : "DETACH", 6, buf, &len);
++	if (ret < 0)
++		return ret;
++	if (len >= 2 && !memcmp(buf, "OK", 2))
++		return 0;
++	return -1;
++}
++
++static int wpa_ctrl_attach(struct wpa_ctrl *ctrl)
++{
++	return wpa_ctrl_attach_helper(ctrl, true);
++}
++
++static int wpa_ctrl_detach(struct wpa_ctrl *ctrl)
++{
++	return wpa_ctrl_attach_helper(ctrl, false);
++}
++
++/* >0: a message is queued, 0: none, <0: select error (socket bad). */
++static int wpa_ctrl_pending(struct wpa_ctrl *ctrl)
++{
++	struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
++	fd_set rfds;
++	int res;
++
++	FD_ZERO(&rfds);
++	FD_SET(ctrl->s, &rfds);
++	res = select(ctrl->s + 1, &rfds, NULL, NULL, &tv);
++	if (res < 0)
++		return res;
++	return FD_ISSET(ctrl->s, &rfds) ? 1 : 0;
++}
++
++static int wpa_ctrl_recv(struct wpa_ctrl *ctrl, char *reply, size_t *reply_len)
++{
++	int res;
++
++	res = recv(ctrl->s, reply, *reply_len, 0);
++	if (res < 0)
++		return res;
++	*reply_len = res;
++	return 0;
++}
++
++/* Max consecutive recv/re-open failures before we stop trying (prevents a
++ * dead fd from busy-looping through wifimngr's delete+add re-arm). */
++#define WPACTRL_MAX_FAILS	5
++
++/* Persistent event handle (mirrors nlwifi's per-registration state). */
++struct wpactrl_event {
++	struct event_struct req;	/* copy, like nlwifi_event */
++	struct wpa_ctrl *ctrl;		/* second, attached handle (may be NULL) */
++	char ifname[16];
++	int fails;			/* consecutive recv/reopen failures */
++	bool dead;			/* gave up; do not re-arm-spin */
++};
++
++/* One sync STATUS -> cache. Gated on wpa_state==COMPLETED for the connected
++ * fields; keeps last bssid on the not-yet-completed path. Reuses the transient
++ * wpa_cli_get() socket, so it does not disturb the persistent attached one. */
++static void staconn_seed_from_status(const char *ifname)
++{
++	char buf[1024] = {};
++	char val[128] = {};
++	struct bsta_conn e = {};
++
++	strncpy(e.ifname, ifname, sizeof(e.ifname) - 1);
++
++	if (wpa_cli_get(ifname, "status", buf, sizeof(buf)))
++		return;
++
++	if (wpa_ctrl_get_param(buf, "wpa_state", val, sizeof(val)) ||
++	    strcmp(val, "COMPLETED")) {
++		/* not (yet) associated: preserve last-known bssid, mark down */
++		staconn_cache_get(ifname, &e);
++		strncpy(e.ifname, ifname, sizeof(e.ifname) - 1);
++		e.connected = false;
++		staconn_cache_update(&e);
++		return;
++	}
++
++	e.connected = true;
++
++	if (!wpa_ctrl_get_param(buf, "bssid", val, sizeof(val)))
++		hwaddr_aton(val, e.bssid);
++
++	if (!wpa_ctrl_get_param(buf, "ssid", val, sizeof(val))) {
++		strncpy((char *)e.ssid, val, sizeof(e.ssid) - 1);
++		e.ssidlen = strlen((char *)e.ssid);
++	}
++
++	if (!wpa_ctrl_get_param(buf, "freq", val, sizeof(val))) {
++		e.freq = (uint32_t)atoi(val);
++		if (e.freq) {
++			e.channel = wifi_freq_to_channel(e.freq);
++			e.band = wifi_freq_to_band(e.freq);
++		}
++	}
++
++	staconn_cache_update(&e);
++}
++
++/* Atomic cache mutator for a parsed CTRL-EVENT line. */
++struct staconn_ev {
++	bool connected;
++	bool has_reason;
++	uint16_t reason;
++};
++
++static void staconn_cb_event(struct bsta_conn *e, void *ctx)
++{
++	struct staconn_ev *ev = ctx;
++
++	e->connected = ev->connected;		/* keep last bssid on down */
++	if (ev->has_reason)
++		e->last_reason = ev->reason;
++}
++
++/* Parse one "<n>CTRL-EVENT-*" line and mutate the cache (atomic RMW). */
++static void staconn_parse_event(const char *ifname, const char *msg)
++{
++	struct staconn_ev ev = {};
++	char *p;
++
++	if (strstr(msg, "CTRL-EVENT-CONNECTED")) {
++		ev.connected = true;
++		staconn_cache_apply(ifname, staconn_cb_event, &ev);
++		/* fill ssid/freq/bssid authoritatively, gated on COMPLETED */
++		staconn_seed_from_status(ifname);
++	} else if (strstr(msg, "CTRL-EVENT-DISCONNECTED")) {
++		ev.connected = false;
++		if ((p = strstr(msg, "reason="))) {
++			ev.has_reason = true;
++			ev.reason = (uint16_t)atoi(p + 7);
++		}
++		staconn_cache_apply(ifname, staconn_cb_event, &ev);
++	} else if (strstr(msg, "CTRL-EVENT-ASSOC-REJECT")) {
++		ev.connected = false;
++		if ((p = strstr(msg, "status_code="))) {
++			ev.has_reason = true;
++			ev.reason = (uint16_t)atoi(p + 12);
++		}
++		staconn_cache_apply(ifname, staconn_cb_event, &ev);
++	}
++}
++
++/* Best-effort (re)open + ATTACH of the persistent handle. On success the
++ * stored ctrl and req.fd_monitor are refreshed and the cache is re-seeded.
++ * Closing before re-opening makes the kernel hand back the same fd number in
++ * the common case, so wifimngr's re-arm (which re-adds the old fd number)
++ * transparently picks up the fresh socket. Returns 0 on success, -1 on fail. */
++static int wpactrl_reopen(struct wpactrl_event *w)
++{
++	char cfile[256] = {};
++
++	if (w->ctrl) {
++		wpa_ctrl_close(w->ctrl);
++		w->ctrl = NULL;
++	}
++
++	snprintf(cfile, sizeof(cfile), "%s/%s",
++		 CONFIG_WPA_CTRL_IFACE_DIR, w->ifname);
++	w->ctrl = wpa_ctrl_open(cfile);
++	if (!w->ctrl)
++		return -1;
++
++	if (wpa_ctrl_attach(w->ctrl)) {
++		wpa_ctrl_close(w->ctrl);
++		w->ctrl = NULL;
++		return -1;
++	}
++
++	w->req.fd_monitor = w->ctrl->s;
++	staconn_seed_from_status(w->ifname);
++	return 0;
++}
++
++int wpactrl_register_event(const char *ifname, struct event_struct *req, void **handle)
++{
++	struct wpactrl_event *w;
++
++	libwifi_dbg("%s %s called family %s group %s\n", ifname, __func__,
++		    req->family, req->group);
++
++	w = calloc(1, sizeof(*w));
++	if (!w) {
++		libwifi_err("%s: calloc failed\n", __func__);
++		return -1;
++	}
++	memcpy(&w->req, req, sizeof(struct event_struct));
++	strncpy(w->ifname, ifname, sizeof(w->ifname) - 1);
++
++	/* MAJOR-4: if the bsta ctrl socket is not up yet, do NOT hard-fail --
++	 * register a dormant source. The cache is still populated by the
++	 * nl80211/mlme CONNECT handler + the supplicant STATUS write-through,
++	 * so Engine B is a best-effort optimisation. When dormant we leave
++	 * req->fd_monitor == 0, so wifimngr adds no uloop fd for it; the source
++	 * re-attaches on the next (re)register / supplicant event. */
++	if (wpactrl_reopen(w) != 0)
++		libwifi_warn("%s: %s ctrl socket not ready; wpactrl source dormant\n",
++			     ifname, __func__);
++
++	/* wifimngr reads the caller's req->fd_monitor, not our internal copy. */
++	req->fd_monitor = w->ctrl ? w->ctrl->s : 0;
++
++	*handle = w;
++	return 0;
++}
++
++int wpactrl_recv_event(const char *ifname, void *handle)
++{
++	struct wpactrl_event *w = handle;
++	char buf[4096];
++	size_t len;
++	int pending;
++
++	/* No source or we already gave up: return a non-ENETDOWN negative so
++	 * wifimngr ends its recv loop and does NOT re-arm -> no busy-loop. */
++	if (!w || w->dead)
++		return -EAGAIN;
++
++	if (!w->ctrl) {
++		/* dormant (socket was late) or a prior reopen failed: retry now */
++		if (wpactrl_reopen(w) == 0) {
++			w->fails = 0;
++			return -ENETDOWN;	/* re-arm to monitor the fd */
++		}
++		if (++w->fails >= WPACTRL_MAX_FAILS)
++			w->dead = true;
++		return -EAGAIN;			/* nothing to read; stop */
++	}
++
++	/* EDGE_TRIGGER: drain everything queued in this one wakeup. */
++	while ((pending = wpa_ctrl_pending(w->ctrl)) > 0) {
++		len = sizeof(buf) - 1;
++		if (wpa_ctrl_recv(w->ctrl, buf, &len) < 0)
++			goto recover;
++		buf[len] = '\0';
++		staconn_parse_event(ifname, buf);
++	}
++	if (pending < 0)
++		goto recover;
++
++	w->fails = 0;
++	return -EAGAIN;				/* drained cleanly */
++
++recover:
++	/* MAJOR-3: ctrl socket died (supplicant restart). Drop to the sync/TTL
++	 * fallback, and re-open + re-ATTACH in place (best-effort). A bounded
++	 * failure count turns the source off after WPACTRL_MAX_FAILS so a dead
++	 * fd cannot busy-loop through wifimngr's delete+add re-arm. */
++	staconn_cache_invalidate(ifname);
++	if (++w->fails >= WPACTRL_MAX_FAILS) {
++		w->dead = true;
++		libwifi_err("%s: %s giving up after %d consecutive failures\n",
++			    ifname, __func__, w->fails);
++		return -EAGAIN;			/* stop the re-arm spin */
++	}
++	wpactrl_reopen(w);			/* best-effort; reuses fd number */
++	return -ENETDOWN;			/* let wifimngr re-arm once */
++}
++
++int wpactrl_unregister_event(const char *ifname, void *handle)
++{
++	struct wpactrl_event *w = handle;
++
++	libwifi_dbg("%s %s called\n", ifname, __func__);
++
++	if (!w)
++		return -1;
++
++	if (w->ctrl) {
++		wpa_ctrl_detach(w->ctrl);
++		wpa_ctrl_close(w->ctrl);
++	}
++	free(w);
++	return 0;
++}
++
+ #else
+ int hostapd_cli_set(const char *ifname, const char *cmd, bool check_ok)
+ {
+@@ -474,6 +770,25 @@
+ 	(void) isHostapd;
+ 	return -1;
+ }
++
++/* No ctrl-iface: bSTA event source unavailable. */
++int wpactrl_register_event(const char *ifname, struct event_struct *req, void **handle)
++{
++	(void) ifname; (void) req; (void) handle;
++	return -1;
++}
++
++int wpactrl_recv_event(const char *ifname, void *handle)
++{
++	(void) ifname; (void) handle;
++	return -ENETDOWN;
++}
++
++int wpactrl_unregister_event(const char *ifname, void *handle)
++{
++	(void) ifname; (void) handle;
++	return -1;
++}
+ #endif
+ 
+ /* input:
+--- a/libwifi/modules/wpactrl/supplicant_ctrl.c
++++ b/libwifi/modules/wpactrl/supplicant_ctrl.c
+@@ -24,6 +24,7 @@
+ #include "wifi.h"
+ #include "debug.h"
+ #include "wpactrl.h"
++#include "staconn_cache.h"
+ 
+ int supplicant_cli_get_ssid(const char *ifname, char *ssid, size_t ssid_size)
+ {
+@@ -58,7 +59,36 @@
+ {
+ 	char buf[1024] = {};
+ 	char val[128] = {};
++	struct bsta_conn ce;
++	uint32_t parsed_freq = 0;
+ 
++	/* Phase-2 fast path: a valid, connected, fresh cache entry answers with
++	 * zero I/O. Populated event-driven by wpactrl ATTACH + nl80211/mlme. */
++	if (staconn_cache_get(ifname, &ce) == 0 && ce.connected &&
++	    !hwaddr_is_zero(ce.bssid) &&
++	    staconn_cache_age_ms(&ce) < STACONN_TTL_MS) {
++		memcpy(info->bssid, ce.bssid, sizeof(info->bssid));
++		if (ce.ssidlen) {
++			memcpy(info->ssid, ce.ssid, ce.ssidlen);
++			info->ssid[ce.ssidlen] = '\0';
++			info->ssidlen = ce.ssidlen;
++		}
++		/* channel/band: 0 just means "unknown" (same as the sync path);
++		 * do NOT gate on freq, or a write-through-seeded entry drops
++		 * channel/band on the hot read. */
++		if (!info->channel)
++			info->channel = ce.channel;
++		if (!info->band)
++			info->band = ce.band;
++		/* is4addr: only assert it; don't clobber the caller's
++		 * GET_INTERFACE-derived value with a cache that doesn't know. */
++		if (ce.is4addr)
++			info->is4addr = true;
++		return 0;
++	}
++
++	/* Cold / TTL-expired fallback: the original bounded sync STATUS, plus a
++	 * write-through so the next read is hot again. */
+ 	if (WARN_ON(wpa_cli_get(ifname, "status", buf, sizeof(buf))))
+ 		return -1;
+ 
+@@ -81,6 +111,7 @@
+ 		int freq = atoi(val);
+ 
+ 		if (freq > 0) {
++			parsed_freq = (uint32_t)freq;
+ 			if (!info->channel)
+ 				info->channel = wifi_freq_to_channel(freq);
+ 			if (!info->band)
+@@ -88,6 +119,25 @@
+ 		}
+ 	}
+ 
++	/* write-through: make the next read hot even without a live event source
++	 * (e.g. ieee1905d/map-agent with no registered wpactrl source). */
++	{
++		struct bsta_conn wt = {};
++
++		strncpy(wt.ifname, ifname, sizeof(wt.ifname) - 1);
++		wt.connected = true;
++		memcpy(wt.bssid, info->bssid, sizeof(wt.bssid));
++		if (info->ssidlen && info->ssidlen <= sizeof(wt.ssid) - 1) {
++			memcpy(wt.ssid, info->ssid, info->ssidlen);
++			wt.ssidlen = info->ssidlen;
++		}
++		wt.freq = parsed_freq;		/* keep freq so it is not lost */
++		wt.channel = info->channel;
++		wt.band = info->band;
++		wt.is4addr = info->is4addr;
++		staconn_cache_update(&wt);
++	}
++
+ 	return 0;
+ }
+ 
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -26,6 +26,7 @@
+ #include "nlwifi.h"
+ #include "hostapd_ctrl.h"
+ #include "supplicant_ctrl.h"
++#include "wpactrl.h"
+ 
+ static unsigned long radio_maxrate(struct wifi_radio *radio)
+ {
+@@ -2043,6 +2044,79 @@
+ 	return nlwifi_get_mlo_links(ifname, band, link, num);
+ }
+ 
++/* Event dispatchers: pick the source by req->family so a single driver can
++ * carry both the nl80211 netlink event socket and the Phase-2 wpactrl bSTA
++ * connection-state source. Both set req->fd_monitor; wifimngr adds it to uloop.
++ *
++ * The concrete per-source handles are opaque and their layouts differ (the
++ * nlwifi handle does not lead with its event_struct), so we hand wifimngr a
++ * small tagged wrapper and unwrap it in recv/unregister. */
++enum wifi_evsrc {
++	EVSRC_NL80211,
++	EVSRC_WPACTRL,
++};
++
++struct wifi_evhandle {
++	enum wifi_evsrc src;
++	void *inner;
++};
++
++static int wifi_dispatch_register_event(const char *ifname,
++					struct event_struct *req, void **handle)
++{
++	struct wifi_evhandle *h;
++	int ret;
++
++	h = calloc(1, sizeof(*h));
++	if (!h)
++		return -1;
++
++	if (!strncmp(req->family, "wpactrl", sizeof(req->family))) {
++		h->src = EVSRC_WPACTRL;
++		ret = wpactrl_register_event(ifname, req, &h->inner);
++	} else {
++		h->src = EVSRC_NL80211;
++		ret = nlwifi_register_event(ifname, req, &h->inner);
++	}
++
++	if (ret) {
++		free(h);
++		return ret;
++	}
++
++	*handle = h;
++	return 0;
++}
++
++static int wifi_dispatch_recv_event(const char *ifname, void *handle)
++{
++	struct wifi_evhandle *h = handle;
++
++	if (!h)
++		return -ENETDOWN;
++
++	if (h->src == EVSRC_WPACTRL)
++		return wpactrl_recv_event(ifname, h->inner);
++	return nlwifi_recv_event(ifname, h->inner);
++}
++
++static int wifi_dispatch_unregister_event(const char *ifname, void *handle)
++{
++	struct wifi_evhandle *h = handle;
++	int ret;
++
++	if (!h)
++		return -1;
++
++	if (h->src == EVSRC_WPACTRL)
++		ret = wpactrl_unregister_event(ifname, h->inner);
++	else
++		ret = nlwifi_unregister_event(ifname, h->inner);
++
++	free(h);
++	return ret;
++}
++
+ 
+ const struct wifi_driver default_wifi_driver = {
+ 	.name = "wlan,phy,bsta",
+@@ -2201,7 +2275,7 @@
+ 	.iface.mld_get_ifstatus = get_ifstatus,
+ 
+ 	.radio_list = radio_list,
+-	.register_event = nlwifi_register_event,
+-	.unregister_event = nlwifi_unregister_event,
+-	.recv_event = nlwifi_recv_event,
++	.register_event = wifi_dispatch_register_event,
++	.unregister_event = wifi_dispatch_unregister_event,
++	.recv_event = wifi_dispatch_recv_event,
+ };
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -30,6 +30,7 @@
+ //#include "wext.h"
+ #include "nlwifi.h"
+ #include "nl80211_copy.h"
++#include "staconn_cache.h"
+ 
+ #define C2S(x) case x: return #x;
+ 
+@@ -4781,6 +4782,22 @@
+ 	free(out);
+ }
+ 
++/* Atomic cache mutators for the nl80211/mlme CONNECT/DISCONNECT edges. */
++static void staconn_cb_connect(struct bsta_conn *e, void *ctx)
++{
++	const uint8_t *bssid = ctx;
++
++	if (bssid)
++		memcpy(e->bssid, bssid, 6);
++	e->connected = true;
++}
++
++static void staconn_cb_disconnect(struct bsta_conn *e, void *ctx)
++{
++	e->connected = false;			/* keep last bssid */
++	e->last_reason = *(const uint16_t *)ctx;
++}
++
+ int nlwifi_event_handler(struct nl_msg *msg, void *arg)
+ {
+ 	struct nlwifi_event *wevt = (struct nlwifi_event *)arg;
+@@ -4827,9 +4844,31 @@
+ 		break;
+ 	case NL80211_CMD_CONNECT:
+ 		resp->type = WIFI_EVENT_STA_ASSOC;
++		/* Phase-2: mt76 STA-mode GET_STATION dump is empty, but the
++		 * CONNECT event carries the AP bssid in NL80211_ATTR_MAC.
++		 * Feed the connection-state cache (bssid + connected) via an
++		 * atomic RMW; the wpactrl STATUS-after-CONNECTED fills ssid/band. */
++		{
++			const uint8_t *bssid = NULL;
++
++			if (nlattrs[NL80211_ATTR_MAC] &&
++			    nla_len(nlattrs[NL80211_ATTR_MAC]) >= 6)
++				bssid = nla_data(nlattrs[NL80211_ATTR_MAC]);
++			staconn_cache_apply(ifname, staconn_cb_connect,
++					    (void *)bssid);
++		}
+ 		break;
+ 	case NL80211_CMD_DISCONNECT:
+ 		resp->type = WIFI_EVENT_STA_DISASSOC;
++		{
++			uint16_t reason = 0;
++
++			if (nlattrs[NL80211_ATTR_REASON_CODE])
++				reason = nla_get_u16(
++					nlattrs[NL80211_ATTR_REASON_CODE]);
++			staconn_cache_apply(ifname, staconn_cb_disconnect,
++					    &reason);
++		}
+ 		break;
+ 	case NL80211_CMD_MICHAEL_MIC_FAILURE:
+ 		break;
+--- a/libwifi/CMakeLists.txt
++++ b/libwifi/CMakeLists.txt
+@@ -97,6 +97,7 @@
+ list(APPEND LIBWIFI_SRC
+ 	modules/wpactrl/hostapd_ctrl.c
+ 	modules/wpactrl/supplicant_ctrl.c
++	modules/wpactrl/staconn_cache.c
+ 	modules/wpactrl/wpactrl.c
+ 	modules/nl80211/nlwifi.c
+ 	modules/default/wifi.c
+--- /dev/null
++++ b/libwifi/modules/wpactrl/staconn_cache.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: LGPL-2.1-only */
++/*
++ * staconn_cache.h - process-local, event-driven bSTA connection-state cache.
++ *
++ * Phase 2 (ADR-0009): status reads hit this cache instead of a blocking
++ * wpa_ctrl/hostapd_ctrl round-trip. One entry per STA (backhaul) interface,
++ * keyed by ifname. Populated event-driven (wpactrl ATTACH + nl80211/mlme
++ * CONNECT/DISCONNECT); read take-copy-under-lock so the internal monitor
++ * thread (Engine A) is safe against the single-threaded uloop reader (Engine B).
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project) / IOPSYS Software Solutions AB.
++ */
++#ifndef STACONN_CACHE_H
++#define STACONN_CACHE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <time.h>
++
++#include <easy/easy.h>	/* struct ip_address, ifopstatus_t prereqs */
++#include "wifiutils.h"	/* enum wifi_band, SSID_MAX_LEN */
++
++/* Suggested TTL for the read path (self-heals a dropped event). */
++#define STACONN_TTL_MS		5000
++
++/* One backhaul-STA connection record. Copied out to callers; never aliased. */
++struct bsta_conn {
++	char ifname[16];		/* key */
++	bool valid;			/* entry has been populated at least once */
++	bool connected;			/* wpa_state == COMPLETED */
++
++	uint8_t bssid[6];		/* associated AP bssid (kept on disconnect) */
++	uint8_t ssid[SSID_MAX_LEN + 1];	/* ssid + NUL */
++	uint8_t ssidlen;
++
++	uint32_t freq;			/* operating frequency in MHz */
++	uint8_t channel;		/* control channel */
++	enum wifi_band band;		/* derived from freq */
++	bool is4addr;			/* 4addr (WDS) backhaul */
++
++	uint16_t last_reason;		/* last DISCONNECT/ASSOC-REJECT reason */
++
++	struct timespec ts;		/* CLOCK_MONOTONIC of last update */
++};
++
++/* Copy the entry for @ifname into @out. Returns 0 on hit (valid entry copied),
++ * -1 on miss. Reader computes freshness with staconn_cache_age_ms(out). */
++int staconn_cache_get(const char *ifname, struct bsta_conn *out);
++
++/* Upsert keyed by e->ifname: replaces the record, sets valid=true and stamps
++ * ts=now(MONOTONIC). Use for a full write-through of an authoritative STATUS.
++ * For partial mutations use staconn_cache_apply() (atomic RMW) instead. */
++void staconn_cache_update(const struct bsta_conn *e);
++
++/* Atomic read-modify-write keyed by @ifname. Takes the mutex ONCE, finds or
++ * creates the entry (ifname pre-filled), runs @cb to mutate it, then stamps ts
++ * and sets valid before releasing. This is what makes the Engine-A (internal
++ * pthread) safety claim real: partial updates (bssid-only, connected-only)
++ * never lose a concurrent writer's fields to a get()/update() race. */
++void staconn_cache_apply(const char *ifname,
++			 void (*cb)(struct bsta_conn *e, void *ctx), void *ctx);
++
++/* Mark the entry stale (supplicant restart / ctrl-socket death). Keeps the
++ * record so last-known bssid survives; forces the read path to fall through. */
++void staconn_cache_invalidate(const char *ifname);
++
++/* Age of a copied-out entry in milliseconds (monotonic). Lock-free: operates
++ * on the caller's copy, not the shared table. */
++long staconn_cache_age_ms(const struct bsta_conn *e);
++
++#endif /* STACONN_CACHE_H */
+--- /dev/null
++++ b/libwifi/modules/wpactrl/staconn_cache.c
+@@ -0,0 +1,142 @@
++/* SPDX-License-Identifier: LGPL-2.1-only */
++/*
++ * staconn_cache.c - process-local bSTA connection-state cache (see .h).
++ *
++ * Deliberately tiny: a fixed table of a few STA interfaces, one mutex, four
++ * entry points. No dynamic allocation, no ubus/uloop coupling -- only the
++ * cache is touched, so it is safe to call from Engine A (internal monitor
++ * pthread) and Engine B (uloop) alike.
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project) / IOPSYS Software Solutions AB.
++ */
++#include <string.h>
++#include <pthread.h>
++
++#include "staconn_cache.h"
++
++/* A board carries a handful of backhaul STA vifs at most. */
++#define STACONN_MAX	8
++
++static pthread_mutex_t staconn_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct bsta_conn staconn_tbl[STACONN_MAX];
++
++static void staconn_now(struct timespec *ts)
++{
++	clock_gettime(CLOCK_MONOTONIC, ts);
++}
++
++/* Caller must hold staconn_lock. Returns slot for @ifname, or NULL if absent. */
++static struct bsta_conn *staconn_find(const char *ifname)
++{
++	int i;
++
++	for (i = 0; i < STACONN_MAX; i++) {
++		if (staconn_tbl[i].valid &&
++		    !strncmp(staconn_tbl[i].ifname, ifname, sizeof(staconn_tbl[i].ifname)))
++			return &staconn_tbl[i];
++	}
++	return NULL;
++}
++
++/* Caller must hold staconn_lock. Returns slot for @ifname, allocating a free
++ * one if needed, or NULL when the table is full. */
++static struct bsta_conn *staconn_get_slot(const char *ifname)
++{
++	struct bsta_conn *e;
++	int i;
++
++	e = staconn_find(ifname);
++	if (e)
++		return e;
++
++	for (i = 0; i < STACONN_MAX; i++) {
++		if (!staconn_tbl[i].valid)
++			return &staconn_tbl[i];
++	}
++	return NULL;
++}
++
++int staconn_cache_get(const char *ifname, struct bsta_conn *out)
++{
++	struct bsta_conn *e;
++	int ret = -1;
++
++	if (!ifname || !out)
++		return -1;
++
++	pthread_mutex_lock(&staconn_lock);
++	e = staconn_find(ifname);
++	if (e) {
++		*out = *e;		/* take-copy-under-lock */
++		ret = 0;
++	}
++	pthread_mutex_unlock(&staconn_lock);
++
++	return ret;
++}
++
++void staconn_cache_update(const struct bsta_conn *e)
++{
++	struct bsta_conn *slot;
++
++	if (!e || !e->ifname[0])
++		return;
++
++	pthread_mutex_lock(&staconn_lock);
++	slot = staconn_get_slot(e->ifname);
++	if (slot) {
++		*slot = *e;
++		slot->valid = true;
++		staconn_now(&slot->ts);
++	}
++	pthread_mutex_unlock(&staconn_lock);
++}
++
++void staconn_cache_apply(const char *ifname,
++			 void (*cb)(struct bsta_conn *e, void *ctx), void *ctx)
++{
++	struct bsta_conn *slot;
++
++	if (!ifname || !cb)
++		return;
++
++	pthread_mutex_lock(&staconn_lock);
++	slot = staconn_get_slot(ifname);
++	if (slot) {
++		/* pre-fill the key so a freshly-claimed slot is addressable */
++		strncpy(slot->ifname, ifname, sizeof(slot->ifname) - 1);
++		cb(slot, ctx);
++		slot->valid = true;
++		staconn_now(&slot->ts);
++	}
++	pthread_mutex_unlock(&staconn_lock);
++}
++
++void staconn_cache_invalidate(const char *ifname)
++{
++	struct bsta_conn *e;
++
++	if (!ifname)
++		return;
++
++	pthread_mutex_lock(&staconn_lock);
++	e = staconn_find(ifname);
++	if (e) {
++		/* keep the record (last bssid), just force the read path to
++		 * treat it as stale until the next event/STATUS repopulates. */
++		e->valid = false;
++	}
++	pthread_mutex_unlock(&staconn_lock);
++}
++
++long staconn_cache_age_ms(const struct bsta_conn *e)
++{
++	struct timespec now;
++
++	if (!e)
++		return -1;
++
++	staconn_now(&now);
++	return (now.tv_sec - e->ts.tv_sec) * 1000L +
++	       (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
++}

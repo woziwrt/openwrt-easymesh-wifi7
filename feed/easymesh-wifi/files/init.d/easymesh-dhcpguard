@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Only the LAN's own DHCP server may answer on the mesh bridge.
+# See /usr/sbin/easymesh-dhcpguard. Re-run on every lan ifup by
+# /etc/hotplug.d/iface/60-easymesh-dhcpguard.
+
+START=99
+
+start() {
+	/usr/sbin/easymesh-dhcpguard
+}
+
+stop() {
+	nft delete table bridge em_dhcpguard 2>/dev/null
+}

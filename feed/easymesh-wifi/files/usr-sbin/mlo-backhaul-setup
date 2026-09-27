@@ -1,0 +1,534 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/mlo-backhaul-setup - stand up a real MLO backhaul: an AP-MLD on the
+# serving node and an MLD STA on the leaf, instead of today's single-link 6 GHz
+# backhaul.
+#
+# WHY THIS EXISTS
+# ---------------
+# The goal is full MLO with no legacy on the nodes. Today the backhaul is the
+# opposite of that: three separate per-radio BSSes all called MAP--BH (wlan0-1,
+# wlan1-1, wlan2-1), each with its own key - measured 2026-07-25, the 6 GHz one
+# even has a different PSK from 2.4/5 GHz. hostapd confirms they are not an MLD:
+#
+#   bss[0]=ap-mld-1  ssid=OpenWrt-  mld_addr=3a:fb:...  mld_id=0
+#   bss[1]=MAP--BH   ssid=MAP--BH   (no mld_addr at all)
+#
+# An MLD STA cannot associate to those, because MLO requires an AP-MLD on the
+# other side. So a real MLO backhaul needs a SECOND AP-MLD - the "1+2" topology.
+#
+# There is a second reason, and it is the one that decides the project. Measured
+# 2026-07-25: the only WiFi 7 client in the lab, an iPhone 16, reports
+# max_simul_links=1 and emlsr_support=0 - it is MLSR and never answers a
+# Negotiated TTLM request. No phone will ever give us an MLMR peer. Our own
+# router as an MLD STA (three radios on MT7996) is the only MLMR peer available,
+# so this backhaul is also the only way to demonstrate Neg-TTLM at all.
+#
+# FEASIBILITY - checked in the sources, not assumed
+# -------------------------------------------------
+#   netifd   lib/netifd/wireless.uc keys MLD vifs by ifname (mlo_vifs[ifname]),
+#            so more than one MLD is supported, and mode='sta' with mlo=1 is
+#            explicitly allowed: (wildcard(htmode,'EHT*') || data.mode == 'sta')
+#   hostapd  struct hostapd_mld **mld - no fixed maximum. BSSes join one MLD by
+#            carrying the same bss=<name> across the per-phy configs.
+#   mt76     mt7996 get_own_mld_idx(): group MLD idx 0-15, i.e. up to 16 MLD
+#            groups per chip; remap idx 0-15. We need three.
+#
+# So this is configuration, not a patch.
+#
+# WHY IT IS NOT AUTOMATIC
+# -----------------------
+# Shipping this as a uci-default would change every node on flash and could take
+# the mesh down for an experiment. It ships as a tool with no init.d script - the
+# same conclusion as bssid-pin, where leaving out the rc.d symlink turned out NOT
+# to disable a service, because the image build enables any init script with START=.
+#
+# It also deliberately KEEPS the legacy per-radio MAP--BH BSSes on the serving
+# node and gives the new AP-MLD its own SSID. An agent that still runs a
+# single-link bSTA keeps its uplink, so a failed experiment costs one leaf rather
+# than the mesh.
+
+SSID_MLD="MAP--BH"
+# Our mesh calls its backhaul MAP--BH; a controller that is not ours names
+# its own (MediaTek R3: Multi-AP-1). The name the node was actually given is
+# kept in /etc/mapc/bh-ssid by whoever received it (bh-key-adopt, wps-join),
+# and --ssid overrides both. Without this the backhaul was always built under
+# our name, so a node paired by button to a foreign controller could never
+# find the network it had just been given the key to (2026-09-18).
+[ -s /etc/mapc/bh-ssid ] && SSID_MLD="$(cat /etc/mapc/bh-ssid)"
+AP_SEC="ap_mld_2"
+STA_SEC="sta_mld_1"
+AP_IF="ap-mld-2"
+STA_IF="bsta-mld-3"
+
+# The uci network the backhaul interfaces join. It used to be the literal
+# "lan", which was correct while the mesh WAS br-lan; on a node whose mesh
+# lives on its own bridge (mapagent.agent.al_bridge=br-easymesh), that
+# literal would quietly put a re-run backhaul back into the wrong bridge.
+# map_genconfig derives the network the same way: bridge name minus "br-".
+MESH_NET="$(uci -q get mapagent.agent.al_bridge | sed 's/^br-//')"
+MESH_NET="${MESH_NET:-lan}"
+# Radios carrying the backhaul MLD. 5 GHz + 6 GHz on purpose: 2.4 GHz adds no
+# usable backhaul capacity but costs a BSS on that radio, while 5+6 is exactly
+# the pair worth having - 6 GHz for throughput, 5 GHz for the case the 6 GHz link
+# does not survive a wall. Today's single 6 GHz link has no such fallback.
+RADIOS="radio1 radio2"
+
+usage() {
+	cat <<EOF
+usage: mlo-backhaul-setup <command>
+
+  --status        show what is configured and what is running
+  --dry-run-ap    print the uci commands for the serving node, apply nothing
+  --dry-run-sta   print the uci commands for the leaf node, apply nothing
+  --apply-ap      configure the backhaul AP-MLD on this node (serving side)
+  --apply-sta     configure the MLD STA on this node (leaf side)
+  --revert        remove both sections created here, restore per-radio bSTAs
+  --key <hex>     key to use with --apply-*; required, both sides must match
+  --ssid <name>   backhaul SSID (default /etc/mapc/bh-ssid, else MAP--BH)
+
+Apply, then reboot. Not 'wifi reload': a runtime reload assigns chanctx in an
+order the driver rejects with 'Frequency set failed (EPERM)', which is how the
+MLD came up short a link on 2026-07-24.
+EOF
+}
+
+
+# ---------------------------------------------- mapagent declaration
+# The radios come up from /etc/config/wireless, but map-agent never reads that
+# file: its own /etc/config/mapagent is what tells it which MLDs exist and
+# which of them is the backhaul. map_genconfig would normally derive one from
+# the other, but it only regenerates while the node still looks unprovisioned
+# (mapagent radio sections < wireless wifi-devices), so on a node configured by
+# package install it skips - and the backhaul AP-MLD is broadcasting while the
+# agent has never heard of it.
+#
+# Measured 2026-08-07 on a BPI-R4 (4 GB) node: ap-mld-2 up and beaconing MAP--BH, wifimngr
+# listing it, and `ubus call map.agent status` returning zero MAP--BH entries.
+# The controller therefore had no backhaul BSS for that node, so steer_backhaul
+# had no target and nothing could attach behind it. The node looked healthy
+# from every angle except the one that mattered.
+declare_to_mapagent() {
+	local sec="" id=0 v b r
+
+	uci -q get mapagent >/dev/null 2>&1 || {
+		echo "mlo-backhaul-setup: no /etc/config/mapagent - is map-agent installed?" >&2
+		return 1
+	}
+
+	# Reuse an existing backhaul declaration rather than adding a second one.
+	for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\([^.]*\)=mld$/\1/p'); do
+		[ "$(uci -q get "mapagent.$s.type" 2>/dev/null)" = "backhaul" ] && { sec="$s"; break; }
+		v="$(uci -q get "mapagent.$s.id" 2>/dev/null)"
+		[ -n "$v" ] && [ "$v" -gt "$id" ] 2>/dev/null && id="$v"
+	done
+
+	if [ -n "$sec" ]; then
+		id="$(uci -q get "mapagent.$sec.id" 2>/dev/null)"
+	else
+		sec="apmld_bh"
+		id=$((id + 1))		# must not collide with the fronthaul MLD
+	fi
+
+	uci set "mapagent.$sec=mld"
+	uci set "mapagent.$sec.id=$id"
+	uci set "mapagent.$sec.ifname=$AP_IF"
+	uci set "mapagent.$sec.type=backhaul"
+	uci set "mapagent.$sec.ssid=$SSID_MLD"
+	uci set "mapagent.$sec.encryption=sae"
+	uci -q delete "mapagent.$sec.band"
+
+	for r in $RADIOS; do
+		have_radio "$r" || continue
+		b="$(uci -q get "wireless.$r.band" 2>/dev/null)"
+		b="${b%g}"			# 5g -> 5, 6g -> 6
+		[ -n "$b" ] || continue
+		uci add_list "mapagent.$sec.band=$b"
+
+		# One ap section per band, tied to the MLD by mld_id. Without these
+		# the mld section alone does not bind the MLD to the radios.
+		uci set "mapagent.bhmld_ap_$b=ap"
+		uci set "mapagent.bhmld_ap_$b.type=backhaul"
+		uci set "mapagent.bhmld_ap_$b.device=$r"
+		uci set "mapagent.bhmld_ap_$b.ifname=bhmld$b"
+		uci set "mapagent.bhmld_ap_$b.band=$b"
+		uci set "mapagent.bhmld_ap_$b.enabled=1"
+		uci set "mapagent.bhmld_ap_$b.ssid=$SSID_MLD"
+		uci set "mapagent.bhmld_ap_$b.key=$KEY"
+		uci set "mapagent.bhmld_ap_$b.encryption=sae"
+		uci set "mapagent.bhmld_ap_$b.mld_id=$id"
+
+		# No disallow_bsta_profile here, deliberately.
+		#
+		# This line used to set it to 1, which tells every Multi-AP Profile-1
+		# bSTA that it may not associate with our backhaul. Nobody chose that:
+		# it arrived with an unrelated commit and was never argued for. It is
+		# the narrowest our backhaul can be made, and it shuts out precisely
+		# the older third-party agents we want to interoperate with.
+		#
+		# Leaving the option unset denies nothing, which is the EasyMesh
+		# default. If a profile ever has to be refused, it should be refused
+		# for a stated reason and only that profile.
+	done
+
+	uci commit mapagent
+	echo "mlo-backhaul-setup: declared $AP_IF to map-agent as backhaul MLD id=$id" >&2
+}
+
+# The station half of the declaration above, and the reason this script needs
+# one at all.
+#
+# map_genconfig writes the mapagent station declarations (an `mld` section of
+# type station, plus a `bsta` with is_mld=1) only inside a block gated on the
+# U-Boot variable netmode being "extender". Nothing in any image or package
+# sets that variable - on the boards that carry it, it was typed in by hand -
+# so a node built from packages never gets the block, and its agent comes up
+# with no idea it has an uplink at all: `ubus call map.agent status` returns an
+# empty bsta_mld. It serves clients perfectly and never tells the controller
+# what it hangs off, so its row in the controller topology goes stale and
+# nothing notices. Measured on a BPI-R4 (4 GB) node on 2026-08-09, where the map drew that
+# node underneath a board that had been powered off for nine minutes.
+#
+# Setting netmode is not the fix. With it set, genconfig writes a second set of
+# wireless MLD sections beside the ones this script already made - same ifname,
+# same id, different section name - and the node flaps. Removing either set by
+# hand takes the data path down with it (measured the same day: 100% loss, ARP
+# not resolving; restoring the backup healed it immediately). So the node keeps
+# the sections it is actually running on, and we add only what is missing: the
+# two mapagent declarations. Nothing here touches /etc/config/wireless.
+declare_sta_to_mapagent() {
+	local sec="" bsec="" psec="" id=0 prio=0 idx="" v b r s
+
+	uci -q get mapagent >/dev/null 2>&1 || {
+		echo "mlo-backhaul-setup: no /etc/config/mapagent - is map-agent installed?" >&2
+		return 1
+	}
+
+	# Reuse an existing station declaration rather than adding a second one,
+	# for the same reason the AP side does.
+	for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\([^.]*\)=mld$/\1/p'); do
+		[ "$(uci -q get "mapagent.$s.type" 2>/dev/null)" = "station" ] && { sec="$s"; break; }
+		v="$(uci -q get "mapagent.$s.id" 2>/dev/null)"
+		[ -n "$v" ] && [ "$v" -gt "$id" ] 2>/dev/null && id="$v"
+	done
+
+	if [ -n "$sec" ]; then
+		id="$(uci -q get "mapagent.$sec.id" 2>/dev/null)"
+	else
+		sec="stamld0"
+		id=$((id + 1))		# must not collide with the AP MLDs
+	fi
+
+	uci set "mapagent.$sec=mld"
+	uci set "mapagent.$sec.id=$id"
+	uci set "mapagent.$sec.ifname=$STA_IF"
+	uci set "mapagent.$sec.type=station"
+	uci set "mapagent.$sec.ssid=$SSID_MLD"
+	uci set "mapagent.$sec.encryption=sae"
+	uci -q delete "mapagent.$sec.band"
+
+	# The bsta section is what makes the agent treat this as its uplink; the
+	# mld section alone only describes the interface.
+	for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\([^.]*\)=bsta$/\1/p'); do
+		[ "$(uci -q get "mapagent.$s.is_mld" 2>/dev/null)" = "1" ] && { bsec="$s"; break; }
+	done
+	[ -n "$bsec" ] || bsec="bstamld0"
+
+	uci set "mapagent.$bsec=bsta"
+	uci set "mapagent.$bsec.ifname=$STA_IF"
+	uci set "mapagent.$bsec.device=all"
+	uci set "mapagent.$bsec.is_mld=1"
+	uci set "mapagent.$bsec.mld_id=$id"
+	uci set "mapagent.$bsec.enabled=1"
+	uci set "mapagent.$bsec.onboarded=1"
+	uci set "mapagent.$bsec.priority=0"
+	uci set "mapagent.$bsec.ssid=$SSID_MLD"
+	uci set "mapagent.$bsec.encryption=sae"
+	uci set "mapagent.$bsec.key=$KEY"
+	uci -q delete "mapagent.$bsec.band"
+
+	for r in $RADIOS; do
+		have_radio "$r" || continue
+		b="$(uci -q get "wireless.$r.band" 2>/dev/null)"
+		b="${b%g}"			# 5g -> 5, 6g -> 6
+		[ -n "$b" ] || continue
+		uci add_list "mapagent.$sec.band=$b"
+		uci add_list "mapagent.$bsec.band=$b"
+	done
+
+
+	# Per-radio bsta sections beside the MLD one, and why they are not
+	# redundant.
+	#
+	# map-agent resolves a bsta section to a radio through its `device`. The
+	# MLD section carries device="all", which is deliberately unmappable, so
+	# agent_get_radio_by_name() returns NULL and the fallback
+	# agent_get_radio_with_ifname("bsta-mld-3") fails too - it resolves through
+	# the same "all". The loop then does `continue` (agent.c:4789) and never
+	# reaches netif_init_bsta() (agent.c:4806). Without that the backhaul object
+	# id is never set, the status query is skipped, bk->connected stays 0, and
+	# agent_manage_bsta() refuses to bridge the interface - it even takes it
+	# back out, which is the eviction that cost us 2026-08-09. The `continue`
+	# skips iface_unresolved too, so the agent never schedules a retry.
+	#
+	# A per-radio section does resolve. It passes netif_init_bsta(), sets
+	# re->has_bsta - which gates every radiolist loop in backhaul.c - and
+	# schedules the second pass, in which a->bstamld already exists and the MLD
+	# section finally gets initialised.
+	#
+	# Measured on the first package-built node: with only the MLD section the
+	# interface was evicted every few seconds and the controller saw the node as
+	# silent; with these added it stayed bridged and reported continuously
+	# (10/10 pings, last_seen 2 s).
+	#
+	# The nodes that always worked carry these from node-config.sh, which is why
+	# the gap only surfaced once a node was built purely from packages.
+	prio=0
+	for r in $RADIOS; do
+		have_radio "$r" || continue
+		b="$(uci -q get "wireless.$r.band" 2>/dev/null)"
+		b="${b%g}"
+		[ -n "$b" ] || continue
+		idx="$(echo "$r" | tr -dc 0-9)"
+
+		# Reuse the section for this radio rather than stacking a new one on
+		# every run.
+		psec=""
+		for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\([^.]*\)=bsta$/\1/p'); do
+			[ "$(uci -q get "mapagent.$s.is_mld" 2>/dev/null)" = "1" ] && continue
+			[ "$(uci -q get "mapagent.$s.device" 2>/dev/null)" = "$r" ] && { psec="$s"; break; }
+		done
+		if [ -z "$psec" ]; then
+			uci add mapagent bsta >/dev/null
+			psec="@bsta[-1]"
+		fi
+
+		uci set "mapagent.$psec.device=$r"
+		uci set "mapagent.$psec.ifname=wlan${idx}_0"
+		uci set "mapagent.$psec.band=$b"
+		uci set "mapagent.$psec.priority=$prio"
+		uci set "mapagent.$psec.enabled=1"
+		uci set "mapagent.$psec.encryption=sae"
+		uci set "mapagent.$psec.ssid=$SSID_MLD"
+		uci set "mapagent.$psec.key=$KEY"
+		uci set "mapagent.$psec.onboarded=1"
+		prio=$((prio + 1))
+	done
+	uci commit mapagent
+	echo "mlo-backhaul-setup: declared $STA_IF to map-agent as station MLD id=$id" >&2
+}
+
+# ---------------------------------------------------------------- helpers
+have_radio() {
+	[ -n "$(uci -q get "wireless.$1" 2>/dev/null)" ] && [ "$(uci -q get "wireless.$1.disabled" 2>/dev/null)" != "1" ]
+}
+
+emit_ap() {
+	echo "delete wireless.$AP_SEC"
+	echo "set wireless.$AP_SEC=wifi-iface"
+	for r in $RADIOS; do
+		have_radio "$r" || { echo "# SKIP $r - missing or disabled" >&2; continue; }
+		echo "add_list wireless.$AP_SEC.device=$r"
+		# The backhaul must not be a nontransmitted BSS on 6 GHz: OpenWrt
+		# turns mbssid on there by default, and a backhaul station on mt76
+		# then joins the fronthaul's link now and then (reason 3/7 loops,
+		# measured 2026-09-19). See 96-easymesh-6g-backhaul-no-mbssid.
+		[ "$(uci -q get "wireless.$r.band" 2>/dev/null)" = "6g" ] &&
+			echo "set wireless.$r.mbssid=0"
+	done
+	echo "set wireless.$AP_SEC.ifname=$AP_IF"
+	echo "set wireless.$AP_SEC.network=$MESH_NET"
+	echo "set wireless.$AP_SEC.mode=ap"
+	echo "set wireless.$AP_SEC.mlo=1"
+	echo "set wireless.$AP_SEC.ssid=$SSID_MLD"
+	echo "set wireless.$AP_SEC.encryption=sae"
+	echo "set wireless.$AP_SEC.key=$KEY"
+	echo "set wireless.$AP_SEC.sae_pwe=2"
+	echo "set wireless.$AP_SEC.ieee80211w=2"
+	# Backhaul AP in Multi-AP terms, and 4-address so a bridged bSTA works.
+	echo "set wireless.$AP_SEC.multi_ap=1"
+	echo "set wireless.$AP_SEC.multi_ap_profile=3"
+	echo "set wireless.$AP_SEC.wds_sta=1"
+	echo "set wireless.$AP_SEC.isolate=0"
+	# Without bss_transition hostapd discards every BTM response, so steering
+	# reports nothing at all - it is off by default in OpenWrt.
+	echo "set wireless.$AP_SEC.bss_transition=1"
+	echo "set wireless.$AP_SEC.ieee80211k=1"
+	# hidden=0 is NOT cosmetic. A hidden backhaul BSS on 6 GHz took down the whole
+	# phy on 2026-07-21 (MBSSID x hidden); the root cause was a template that
+	# shipped hidden=1. Never let this one default.
+	echo "set wireless.$AP_SEC.hidden=0"
+	echo "delete wireless.mld1"
+	echo "set wireless.mld1=wifi-mld"
+	echo "set wireless.mld1.ifname=$AP_IF"
+	echo "set wireless.mld1.mode=ap"
+	# macaddr is deliberately NOT set: it is per node, and three MLDs sharing
+	# the factory MT7996 address is a documented way to break attribution.
+}
+
+emit_sta() {
+	echo "delete wireless.$STA_SEC"
+	echo "set wireless.$STA_SEC=wifi-iface"
+	for r in $RADIOS; do
+		have_radio "$r" || { echo "# SKIP $r - missing or disabled" >&2; continue; }
+		echo "add_list wireless.$STA_SEC.device=$r"
+	done
+	echo "set wireless.$STA_SEC.ifname=$STA_IF"
+	# The network option is what puts the interface into the bridge. Measured
+	# 2026-07-25: without it sta-mld-1 came up associated on two links, 4addr
+	# on, and passed no traffic at all - it simply was not a bridge port, so
+	# nothing could reach the backhaul from the bridge that holds the IP. The
+	# per-radio bSTA sections get away with omitting it because map-agent adds
+	# them to the bridge at runtime; a hand-built section has nobody to do that.
+	echo "set wireless.$STA_SEC.network=$MESH_NET"
+	echo "set wireless.$STA_SEC.mode=sta"
+	echo "set wireless.$STA_SEC.mlo=1"
+	echo "set wireless.$STA_SEC.ssid=$SSID_MLD"
+	echo "set wireless.$STA_SEC.encryption=sae"
+	echo "set wireless.$STA_SEC.key=$KEY"
+	echo "set wireless.$STA_SEC.multi_ap=1"
+	echo "set wireless.$STA_SEC.multi_ap_profile=3"
+	echo "set wireless.$STA_SEC.sae_pwe=2"
+	echo "set wireless.$STA_SEC.default_disabled=0"
+	# Give the STA MLD an address of its own, derived exactly the way
+	# map_genconfig derives the AP one (map_genconfig:636) - from the AL-MAC,
+	# the only identifier that is unique per node and survives a power cycle.
+	# The BPI-R4 Pro 8X has no stable hardware MAC, so phy0 is unusable for this.
+	#
+	# Without it the driver falls back to the factory EEPROM address, which
+	# MediaTek ships identical on every MT7996. Link addresses stay unique so
+	# traffic flows, but an MLD is identified by its MLD address, and two
+	# nodes claiming the same one make the controller unable to tell whose
+	# report is whose.
+	#
+	# Measured on a BPI-R4 (4 GB) node, 2026-08-09: this section was the one place nothing
+	# assigned an address - genconfig writes sta_mld_1 but never its macaddr,
+	# and neither did this script. On the nodes that had one it had been typed
+	# in by hand. Offset 3, leaving 1 and 2 to the two AP MLDs.
+	_al="$(uci -q get ieee1905.ieee1905.macaddress 2>/dev/null)"
+	[ -n "$_al" ] && echo "set wireless.$STA_SEC.macaddr=$(printf '%s:%02x' \
+		"${_al%:*}" $(( (0x${_al##*:} + 3) & 255 )))"
+
+	echo "delete wireless.mld2"
+	echo "set wireless.mld2=wifi-mld"
+	echo "set wireless.mld2.ifname=$STA_IF"
+	echo "set wireless.mld2.mode=sta"
+	# The per-radio bSTAs must go down, or two stations on the same phy chase the
+	# same SSID. Their sections are kept, only disabled, so --revert is exact.
+	for s in $(uci -q show wireless | sed -n "s/^wireless\.\(default_sta_radio[0-9]*\)\.mode='sta'$/\1/p"); do
+		echo "set wireless.$s.disabled=1"
+	done
+}
+
+apply() {
+	# uci batch, so a syntax error applies nothing rather than half of it
+	"$1" | grep -v '^#' | uci batch && uci commit wireless
+}
+
+# ---------------------------------------------------------------- status
+status() {
+	echo "== configuration =="
+	for s in "$AP_SEC" "$STA_SEC"; do
+		if [ -n "$(uci -q get "wireless.$s")" ]; then
+			printf '  %-12s ssid=%-14s mlo=%-2s device=%s\n' "$s" \
+				"$(uci -q get "wireless.$s.ssid")" \
+				"$(uci -q get "wireless.$s.mlo")" \
+				"$(uci -q get "wireless.$s.device" | tr '\n' ' ')"
+		else
+			printf '  %-12s (absent)\n' "$s"
+		fi
+	done
+	echo "  per-radio bSTA:"
+	for s in $(uci -q show wireless | sed -n "s/^wireless\.\(default_sta_radio[0-9]*\)\.mode='sta'$/\1/p"); do
+		printf '    %-22s disabled=%s\n' "$s" "$(uci -q get "wireless.$s.disabled")"
+	done
+
+	echo "== running =="
+	for i in $(iw dev 2>/dev/null | awk '/^\tInterface/ { print $2 }'); do
+		case "$i" in
+		"$AP_IF" | "$STA_IF") ;;
+		*) continue ;;
+		esac
+		echo "  $i:"
+		iw dev "$i" info 2>/dev/null | sed -n 's/^\t\( *- link ID.*\)/    \1/p;s/^\t\(   channel.*\)/    \1/p'
+		iw dev "$i" link 2>/dev/null | head -1 | sed 's/^/    /'
+	done
+	[ -z "$(iw dev 2>/dev/null | grep -E "$AP_IF|$STA_IF")" ] && echo "  (no MLD backhaul interface)"
+
+	# The driver's own view, which is the only place the MLD grouping is visible.
+	# A second AP-MLD must show up here as a distinct "group mld id"; if both MLDs
+	# report group 0, they were merged and this did not do what it looks like.
+	echo "== driver: mt76_links_info =="
+	for d in /sys/kernel/debug/ieee80211/phy*/netdev:*/mt76_links_info; do
+		[ -e "$d" ] || continue
+		ifc=$(echo "$d" | sed 's|.*netdev:||;s|/mt76_links_info||')
+		echo "  --- $ifc ---"
+		sed -n '1,6p' "$d" 2>/dev/null | sed 's/^/    /'
+		grep -E 'link\[|band_idx' "$d" 2>/dev/null | sed 's/^/    /'
+	done
+}
+
+# ---------------------------------------------------------------- main
+KEY=
+cmd="${1:-}"
+shift 2>/dev/null
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--key) KEY="$2"; shift 2 ;;
+	--ssid) SSID_MLD="$2"; shift 2 ;;
+	*) shift ;;
+	esac
+done
+
+case "$cmd" in
+--status)
+	status
+	;;
+--dry-run-ap)
+	KEY="${KEY:-<KEY>}"; emit_ap
+	;;
+--dry-run-sta)
+	KEY="${KEY:-<KEY>}"; emit_sta
+	;;
+--apply-ap)
+	[ -n "$KEY" ] || { echo "missing --key <hex> (both sides must use the same one)" >&2; exit 2; }
+	apply emit_ap && declare_to_mapagent && \
+		echo "AP-MLD backhaul configured. Now REBOOT, not wifi reload."
+	;;
+--apply-sta)
+	[ -n "$KEY" ] || { echo "missing --key <hex> (both sides must use the same one)" >&2; exit 2; }
+	apply emit_sta && declare_sta_to_mapagent && \
+		echo "MLD STA configured. Now REBOOT, not wifi reload."
+	;;
+--declare-sta)
+	# Retrofit for a node whose MLD STA is already up and running: add the
+	# two mapagent declarations and touch nothing else. /etc/config/wireless
+	# is left exactly as it is, which is the whole point - the sections a
+	# running node carries are the ones its data path depends on, and
+	# rewriting them is how 2026-08-09 went wrong.
+	# Called from mld-config-check at boot with no arguments, so the key
+	# has to be discoverable: the running STA section already carries it.
+	[ -n "$KEY" ] || KEY="$(uci -q get "wireless.$STA_SEC.key" 2>/dev/null)"
+	[ -n "$KEY" ] || { echo "missing --key <hex> and wireless.$STA_SEC.key does not exist" >&2; exit 2; }
+	declare_sta_to_mapagent && \
+		echo "Declaration added. Restart map-agent, or REBOOT."
+	;;
+--revert)
+	uci -q delete "wireless.$AP_SEC"
+	uci -q delete "wireless.$STA_SEC"
+	for s in $(uci -q show wireless | sed -n "s/^wireless\.\(default_sta_radio[0-9]*\)\.mode='sta'$/\1/p"); do
+		# radio2 (6 GHz) was the single-link uplink before this experiment
+		case "$s" in
+		default_sta_radio2) uci set "wireless.$s.disabled=0" ;;
+		esac
+	done
+	uci commit wireless
+	echo "Reverted to per-radio bSTA. Now REBOOT."
+	;;
+*)
+	usage
+	exit 2
+	;;
+esac

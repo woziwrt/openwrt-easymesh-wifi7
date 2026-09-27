@@ -1,0 +1,66 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 99993: subscribe to frames on the MLD, so they actually arrive
+
+The agent asks for three frame types per fronthaul BSS - association request,
+reassociation request, and action - by the configured interface name. On an MLD
+node wifi.ap.<per-link> is published for no BSS, so every one of those requests
+fails and the agent receives none of them:
+
+	[wlan0-1] wifi_ubus_subscribe_unsubscribe_frame ret 4
+	[wlan1-1] wifi_ubus_subscribe_unsubscribe_frame ret 4
+	[wlan2-1] wifi_ubus_subscribe_unsubscribe_frame ret 4
+
+Measured on hardware 2026-08-03. Two consequences, both of which looked like
+separate problems until the subscription was traced:
+
+  - A client that associates is not noticed until the next BSS refresh, which
+    is once a minute. Measured today: HAL had the client at least 37 s before
+    the agent did, and the controller a further 27 s after that. The event that
+    should have made this immediate was never subscribed.
+
+  - Action frames carry the BTM Response. Without them the agent never learns
+    whether a steer was accepted, so btm_success stays 0 even for a steer the
+    client demonstrably obeyed - verified today, client moved between nodes and
+    the counter did not move.
+
+Same shape as 9997, 9998, 9999 and 99992: a name that exists per link is used
+where the entity is an MLD.
+
+Not fixed here: disassociation is subtype 10 and is not in this subscription
+list at all, so a client leaving is still noticed only by the periodic sweep
+added in 99991. Making departure immediate needs that frame subscribed too, or
+the hostapd event consumed - a separate change, and one that wants its own
+measurement rather than being folded in here.
+
+Also unaddressed: the same MLD name is now subscribed once per affiliated link,
+so three identical subscriptions per MLD instead of one. Subscribing twice to
+the same object is expected to be idempotent; if it turns out not to be, the
+guard belongs on mlo_link_id == 0, mirroring the primary-link convention
+already used for the master BSSID in bss_stations_data_cb().
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -4630,8 +4630,22 @@
+ 		strncpy(bss->ssid, fn->ssid, sizeof(bss->ssid) - 1);
+ 		bss->enabled = fn->enabled;
+ 
+-		for (k = 0; k < num_subfr; k++)
+-			wifi_subscribe_frame(f->name, subfr[k].type, subfr[k].stype);
++		for (k = 0; k < num_subfr; k++) {
++			const char *subifname = f->name;
++
++#if (EASYMESH_VERSION >= 6)
++			/* wifi.ap.<per-link> is published for no BSS on an MLD
++			 * node, so subscribing by the configured name fails
++			 * (ret 4) and the agent never receives the frames it
++			 * asked for: association and reassociation requests,
++			 * and action frames - which is where a BTM Response
++			 * arrives. Subscribe on the MLD entity, as the stats
++			 * and BTM paths already do. */
++			if (fn->is_affiliated_ap && fn->mld_ifname[0])
++				subifname = fn->mld_ifname;
++#endif
++			wifi_subscribe_frame(subifname, subfr[k].type, subfr[k].stype);
++		}
+ 
+ 		blob_buf_init(&bb, 0);
+ #if (EASYMESH_VERSION >= 6)

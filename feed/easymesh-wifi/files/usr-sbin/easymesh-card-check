@@ -1,0 +1,129 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-card-check - which boxes hear their own radio card.
+#
+# Some BE14 cards are noisier than others (why is not known; an unshielded
+# amplifier is a guess). Their receiver sits 7-13 dB
+# above everybody else's on the same channel, it follows the box when the box
+# is moved, and on 5/6 GHz such a card deafens its own 6 GHz reception while it
+# sends on 5 GHz - measured 2026-09-24/25 (368 -> 2 Mbit/s). A box like that
+# should stay at the end of the chain, never relay, and a user should be told
+# that a slow link is the card and not the mesh. Petr expects about half the
+# cards out there to be like this.
+#
+# The controller already has what it takes: every agent reports the noise of
+# each radio (ANPI, dBm = value / 2 - 110) in its AP Metrics, and all boxes of a
+# mesh sit on one channel per band. So a box is compared with the others on the
+# same band, sample by sample, and called SUSPECT only when its median excess
+# over the last HIST samples is at least EXCESS_DB on 5 or 6 GHz - one noisy
+# snapshot (a neighbour's burst, a microwave oven) does not do it. 2.4 GHz is
+# shown but not judged: it is too crowded to tell a card from the air.
+#
+# This names a suspect; it does not prove STR is impossible (the STR test does,
+# see /etc/mapc/str-ok, which stays a list of cards that PASSED the test).
+#
+# Output: /etc/mapc/card-suspect, one line per suspect:
+#   <almac> <band> <median excess dB> <samples>
+# rewritten only when it changes, and /tmp/easymesh/card-check/ for history.
+
+TICK=${1:-300}
+DB=/etc/mapc/mapc.db
+OUT=/etc/mapc/card-suspect
+ST=/tmp/easymesh/card-check
+HIST=${HIST:-12}          # samples in the window (12 x 5 min = 1 h)
+EXCESS_DB=${EXCESS_DB:-6}
+CLEAR_DB=${CLEAR_DB:-3}     # a suspect card is cleared only below this - no blinking around 6 dB
+LIVE_S=${LIVE_S:-180}     # a box not heard from for this long is left out
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = "controller" ] || exit 0
+command -v sqlite3 >/dev/null || exit 1
+mkdir -p "$ST"
+log() { logger -t card-check "$*"; }
+
+sample() {
+	now=$(date +%s)
+	# almac band noise_dbm, for live boxes with a noise reading
+	sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+		SELECT r.agent_almac, r.band, r.anpi_noise
+		FROM radio r JOIN agent a ON a.almac = r.agent_almac
+		WHERE r.anpi_noise > 0 AND a.last_seen >= $now - $LIVE_S;" 2>/dev/null |
+	awk '{ printf "%s %s %.1f\n", $1, $2, $3 / 2 - 110 }' > "$ST/now"
+
+	# excess of each box over the median of the OTHER boxes on its band
+	awk '{ al[NR] = $1; b[NR] = $2; n[NR] = $3 } END {
+		for (i = 1; i <= NR; i++) {
+			k = 0
+			for (j = 1; j <= NR; j++) if (j != i && b[j] == b[i]) v[++k] = n[j]
+			if (k < 2) continue
+			for (x = 1; x <= k; x++) for (y = x + 1; y <= k; y++) if (v[y] < v[x]) { t = v[x]; v[x] = v[y]; v[y] = t }
+			med = (k % 2) ? v[(k + 1) / 2] : (v[k / 2] + v[k / 2 + 1]) / 2
+			printf "%s %s %.1f\n", al[i], b[i], n[i] - med
+		}
+	}' "$ST/now" | while read -r al band ex; do
+		h="$ST/hist.$al.$band"
+		echo "$ex" >> "$h"
+		tail -n "$HIST" "$h" > "$h.t" && mv "$h.t" "$h"
+	done
+}
+
+verdict() {
+	: > "$ST/new"
+	: > "$ST/judged.new"
+	judged=0
+	for h in "$ST"/hist.*; do
+		[ -r "$h" ] || continue
+		k=${h#"$ST"/hist.}; al=${k%.*}; band=${k##*.}
+		case "$band" in 2|8) ;; *) continue ;; esac
+		n=$(wc -l < "$h")
+		[ "$n" -ge $((HIST / 2)) ] || continue       # not enough history yet
+		judged=$((judged + 1))
+		echo "$al" >> "$ST/judged.new"
+		med=$(sort -n "$h" | awk '{ v[NR] = $1 } END { print (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2 }')
+		# Hysteresis: once suspect, a card stays suspect until its median
+		# drops to CLEAR_DB. Measured medians wander a few dB (kitchen 5 GHz
+		# +13.5 and +8.5 within minutes), and a flag that comes and goes
+		# helps nobody.
+		thr=$EXCESS_DB
+		grep -q "^$al $band " "$OUT" 2>/dev/null && thr=$CLEAR_DB
+		awk -v m="$med" -v e="$thr" 'BEGIN { exit !(m >= e) }' &&
+			echo "$al $band $med $n" >> "$ST/new"
+	done
+	# The history lives in /tmp. After a controller restart there is no
+	# evidence either way for half an hour, and an empty list written then
+	# would say "no suspect cards" when nothing had been looked at. Keep the
+	# last verdict until there is enough history to replace it.
+	# Which boxes have enough history to be judged at all. Without it the
+	# Nodes page called a box that was paired ten minutes ago "normal" - a
+	# verdict nobody had reached (pair-as-a-user test, finding #57). Lives in /tmp
+	# like the history it describes: after a restart nobody is judged, which
+	# is the truth.
+	sort -u "$ST/judged.new" > "$ST/judged"
+	rm -f "$ST/judged.new"
+	if [ "$judged" -eq 0 ]; then
+		rm -f "$ST/new"
+		return
+	fi
+	{
+		echo "# easymesh-card-check: boxes whose radio is >= ${EXCESS_DB} dB noisier than the others (median of the last ${HIST} samples)"
+		echo "# almac band(2=5GHz,8=6GHz) excess_dB samples"
+		sort "$ST/new"
+	} > "$ST/new.f"
+	# Log only when WHO is suspect changes; the excess and the sample count
+	# move a little on every pass and would fill the log every 5 minutes.
+	was=$(grep -v '^#' "$OUT" 2>/dev/null | awk '{ print $1, $2 }')
+	is=$(grep -v '^#' "$ST/new.f" | awk '{ print $1, $2 }')
+	cmp -s "$ST/new.f" "$OUT" 2>/dev/null || mv "$ST/new.f" "$OUT"
+	[ "$was" = "$is" ] ||
+		log "suspect radio cards: $(grep -v '^#' "$OUT" | awk '{ printf "%s%s %s GHz +%s dB", s, $1, ($2 == 8 ? 6 : 5), $3; s = ", " }' | sed 's/^$/none/')"
+	rm -f "$ST/new" "$ST/new.f"
+}
+
+while :; do
+	sample
+	verdict
+	echo "$(date +%s)" > "$ST/alive"
+	[ "${ONESHOT:-0}" = 1 ] && break
+	sleep "$TICK"
+done

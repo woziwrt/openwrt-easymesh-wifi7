@@ -1,0 +1,107 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 986: a CMDU that was never sent must not report success
+
+send_cmdu() returns the message id it got back from ieee1905d, and every caller
+treats only 0xffff as a failure. Zero is a failure too, and it is the one that
+actually happens.
+
+ieee1905d allocates a fresh mid for multicast destinations - the multicast branch
+of its transmit path does "if (!mid) mid = cmdu_get_next_mid()" - but the unicast
+branch does not. There the destination is resolved through the neighbour cache,
+and a node that is not a direct 1905 neighbour has no entry in it. The ubus call
+still succeeds, so send_cmdu_ubus() returns 0 rather than a negative value, and
+nothing distinguishes that from a successful send.
+
+Measured on hardware 2026-07-30 with the mesh formed as a chain,
+controller <- x8 <- 8g. Three Topology Queries addressed to the far node:
+
+  ubus call map.controller send_topology_query '{"agent":"ca:8e:1d:ca:bc:ae"}'
+  { "status": "ok", "mid": 0 }        x3
+
+and tcpdump on all five of the controller's interfaces caught not one frame of
+type 0x0002. The same call to the directly attached node returned a real mid and
+produced exactly one frame. So the failure is reliable, and it is silent.
+
+What that costs is not a lost query. The controller keeps whatever it last
+recorded about the far node - its parent, its affiliated bSTA count - and serves
+it as current, because from its own side the query succeeded and an answer that
+never comes is indistinguishable from one that has not come yet. On the measured
+run the far node had been misfiled for its entire uptime: recorded as attached to
+the controller while it was attached to the other agent, reporting one affiliated
+bSTA while running two, and absent from topology_link altogether. Every other
+health check was green.
+
+Say so instead. This does not make the controller able to reach a node behind
+another node - that belongs in ieee1905d's unicast path, which cannot pick an
+interface for a destination it has no neighbour entry for. It makes the failure
+visible, which is the difference between a mesh that reports a gap and one that
+reports a mesh.
+
+Note the same "0xffff is the only failure" test appears 21 times in
+cntlr_commands_impl.c, once per command. Only the one measured here is changed;
+the rest are the same defect waiting for someone to measure them.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -u -r a/src/cntlr_commands_impl.c b/src/cntlr_commands_impl.c
+--- a/src/cntlr_commands_impl.c	2026-07-30 19:05:33.006392611 +0200
++++ b/src/cntlr_commands_impl.c	2026-07-30 19:05:33.007035888 +0200
+@@ -236,12 +236,19 @@
+ 	mid = send_cmdu(c, cmdu);
+ 	cmdu_free(cmdu);
+ 
+-	/* reply with mid */
+-	blobmsg_add_string(bb, "status", mid != 0xffff ? "ok" : "fail");
+-	if (mid != 0xffff)
++	/* reply with mid
++	 *
++	 * Zero is a failure too: ieee1905d returns it when it cannot resolve the
++	 * destination, and the ubus call itself succeeds, so only 0xffff was
++	 * being treated as an error. Reporting "ok" for a CMDU that was never
++	 * transmitted is how a stale node stayed invisible - see send_cmdu().
++	 */
++	blobmsg_add_string(bb, "status",
++			   (mid != 0xffff && mid != 0) ? "ok" : "fail");
++	if (mid != 0xffff && mid != 0)
+ 		blobmsg_add_u32(bb, "mid", mid);
+ 
+-	return mid != 0xffff ? 0 : -1;
++	return (mid != 0xffff && mid != 0) ? 0 : -1;
+ }
+ 
+ int COMMAND(scan)(void *priv, void *args, void *out)
+diff -u -r a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c	2026-07-30 19:05:33.006260019 +0200
++++ b/src/cntlr_map.c	2026-07-30 19:05:33.006814780 +0200
+@@ -1093,6 +1093,31 @@
+ 
+ 	msgid = ret;
+ 
++	/* A message id of zero means nothing went out.
++	 *
++	 * ieee1905d allocates a fresh mid for multicast destinations
++	 * ("if (!mid) mid = cmdu_get_next_mid()"), but the unicast branch does
++	 * not: it resolves the destination through the neighbour cache, and a
++	 * node that is not a direct 1905 neighbour has no entry there. The ubus
++	 * call still succeeds, so send_cmdu_ubus() returns 0 rather than a
++	 * negative value and this looked like a successful send.
++	 *
++	 * Measured on hardware 2026-07-30. With the mesh formed as a chain
++	 * (controller <- x8 <- 8g), three Topology Queries addressed to the far
++	 * node each returned "status: ok, mid: 0" and produced no frame on any
++	 * of the controller's five interfaces, while the same call to the
++	 * directly attached node returned a real mid and exactly one frame.
++	 *
++	 * The consequence is not a lost query. The controller keeps whatever it
++	 * last recorded about that node - parent, affiliated bSTA count - and
++	 * presents it as current, because from its side the query "succeeded"
++	 * and no answer is simply an answer that has not arrived yet. That node
++	 * had been stale for the whole uptime and nothing anywhere said so.
++	 */
++	if (msgid == 0)
++		err("%s: cmdu %04x to " MACFMT " was NOT sent (mid 0) - destination is not a direct 1905 neighbour\n",
++		    __func__, cmdu_get_type(cmdu), MAC2STR(cmdu->origin));
++
+ 	old_mid = cmdu_get_mid(cmdu);
+ 	if (old_mid == 0)
+ 		cmdu_set_mid(cmdu, msgid);

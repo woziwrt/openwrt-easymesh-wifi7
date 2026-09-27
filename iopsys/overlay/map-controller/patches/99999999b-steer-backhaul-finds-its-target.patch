@@ -1,0 +1,319 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: steer_backhaul finds its target, its bSTA and its channel
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+steer_backhaul rejected every request we made on the lab mesh on 2026-09-17
+with a bare "Invalid argument", before anything went on the air:
+
+ - a target BSSID was looked up only in the mac_table, which can lose an entry
+   while 'status' still lists the BSS under its radio. Fall back to walking
+   the radio lists.
+ - target_agent + band took the first BSS flagged backhaul and, when none
+   matched, went on with the list cursor. Prefer a backhaul-only BSS, then any
+   backhaul BSS, and fail loudly when there is none.
+ - without an explicit bsta, the band path needed a per-radio bSTA MAC, which
+   only a Backhaul STA Radio Capabilities report provides. An agent whose
+   backhaul is an MLO bSTA never reports one, so the call failed for our own
+   nodes as well. Fall back to the station entry marked as that agent's bSTA
+   (preferring the wanted band) and then to the agent's bSTA MLD address.
+ - opclass and channel went out as 0/0. Take them from the target radio's
+   current 20 MHz operating class, widest one as fallback.
+
+Every EINVAL now says why at warn level; callers that already worked get the
+same request as before, except for the filled-in opclass and channel.
+
+--- a/src/cntlr_commands_impl.c
++++ b/src/cntlr_commands_impl.c
+@@ -1917,6 +1917,123 @@
+ 	return mid != 0xffff ? 0 : -1;
+ }
+ 
++/* Find a BSS the controller knows of by its BSSID.
++ *
++ * The mac_table is the fast path, but it can lose an entry while the BSS is
++ * still listed under its radio (two objects with the same BSSID delete each
++ * other's table entry on sweep), and 'status' shows the radio lists, not the
++ * table. Walking the lists as a fallback keeps a target that status shows
++ * reachable.
++ */
++static struct netif_iface *steer_find_target_bss(struct controller *c,
++						 uint8_t *bssid)
++{
++	struct netif_iface *p;
++	struct netif_radio *r;
++	struct node *n;
++
++	p = cntlr_find_bss(c, bssid);
++	if (p)
++		return p;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		list_for_each_entry(r, &n->radiolist, list) {
++			list_for_each_entry(p, &r->iflist, list) {
++				if (p->bss && !memcmp(p->bss->bssid, bssid, 6))
++					return p;
++			}
++		}
++	}
++
++	return NULL;
++}
++
++/* Operating class and channel of the target BSS for the Backhaul Steering
++ * Request TLV. The TLV names the channel the bSTA has to find the BSS on, so
++ * the 20 MHz (control channel) entry of the radio's current opclasses is
++ * preferred; the widest entry is the fallback. 0/0 is left when the radio
++ * never reported its operating channel.
++ */
++static void steer_target_opclass_channel(struct netif_iface *tbss,
++					 uint8_t *opclass, uint8_t *channel)
++{
++	struct wifi_radio_element *re;
++	int i;
++
++	*opclass = 0;
++	*channel = 0;
++
++	if (!tbss || !tbss->radio || !tbss->radio->radio_el)
++		return;
++
++	re = tbss->radio->radio_el;
++	for (i = 0; i < re->cur_opclass.num_opclass; i++) {
++		struct wifi_radio_opclass_entry *e = &re->cur_opclass.opclass[i];
++
++		if (wifi_opclass_get_bw(e->id) == 20 && e->num_channel > 0) {
++			*opclass = e->id;
++			*channel = e->channel[0].channel;
++			return;
++		}
++	}
++
++	wifi_get_widest_opclass_and_channel(re, opclass, channel);
++}
++
++/* bSTA of @n to steer when the caller did not name one.
++ *
++ * The per-radio bSTA MAC comes only from a Backhaul STA Radio Capabilities
++ * report, and an agent whose backhaul is an MLO bSTA never reports one for
++ * its radios (the MLD has no radio of its own). Fall back to what the
++ * controller learned otherwise: a station entry marked as this agent's bSTA,
++ * preferring one associated in the wanted band, and finally the agent's bSTA
++ * MLD address, which our agent accepts as the steer target.
++ */
++static bool steer_find_bsta(struct controller *c, struct node *n,
++			    enum wifi_band band, uint8_t *bsta)
++{
++	struct netif_radio *r;
++	struct sta *s, *any = NULL;
++	int i;
++
++	r = cntlr_find_radio_in_node_by_band(c, n, band);
++	if (r && r->radio_el && !hwaddr_is_zero(r->radio_el->bsta.macaddr)) {
++		memcpy(bsta, r->radio_el->bsta.macaddr, 6);
++		return true;
++	}
++
++	for (i = 0; i < STA_HASHTABLE_SIZE; i++) {
++		hlist_for_each_entry(s, &c->sta_table[i], hlist) {
++			struct netif_iface *p;
++
++			if (!s->is_bsta ||
++			    memcmp(s->bsta_agent_almacaddr, n->almacaddr, 6))
++				continue;
++
++			p = cntlr_find_bss(c, s->bssid);
++			if (p && p->band == band) {
++				memcpy(bsta, s->macaddr, 6);
++				return true;
++			}
++
++			if (!any)
++				any = s;
++		}
++	}
++
++	if (any) {
++		memcpy(bsta, any->macaddr, 6);
++		return true;
++	}
++
++	if (n->bstamld && !hwaddr_is_zero(n->bstamld->mld_macaddr)) {
++		memcpy(bsta, n->bstamld->mld_macaddr, 6);
++		return true;
++	}
++
++	return false;
++}
++
+ int COMMAND(steer_backhaul)(void *priv, void *args, void *out)
+ {
+ 	struct controller *c = (struct controller *)priv;
+@@ -1944,8 +2061,10 @@
+ 	}
+ 
+ 	strncpy(agentstr, blobmsg_data(tb[BSTA_STEER_ATTR_AGENT]), sizeof(agentstr) - 1);
+-	if (!hwaddr_aton(agentstr, agent))
++	if (!hwaddr_aton(agentstr, agent)) {
++		warn("%s: invalid agent address '%s'\n", __func__, agentstr);
+ 		return -EINVAL;
++	}
+ 
+ 	if (tb[BSTA_STEER_ATTR_TARGET_BAND]) {
+ 		int b;
+@@ -1957,18 +2076,27 @@
+ 			band = BAND_5;
+ 		else if (b == 6)
+ 			band = BAND_6;
+-		else
++		else {
++			warn("%s: invalid target_band %d (2, 5 or 6)\n", __func__, b);
+ 			return -EINVAL;
++		}
+ 	}
+ 
+ 	if (tb[BSTA_STEER_ATTR_TARGET_BSSID]) {
+ 		strncpy(tbssidstr, blobmsg_data(tb[BSTA_STEER_ATTR_TARGET_BSSID]), sizeof(tbssidstr) - 1);
+-		if (!hwaddr_aton(tbssidstr, tbssid))
++		if (!hwaddr_aton(tbssidstr, tbssid)) {
++			warn("%s: invalid target_bssid '%s'\n", __func__, tbssidstr);
+ 			return -EINVAL;
++		}
+ 
+-		tbss = cntlr_find_iface(c, tbssid);
+-		if (!tbss && !hwaddr_is_zero(tbssid) && !hwaddr_is_bcast(tbssid))
+-			return -EINVAL;
++		if (!hwaddr_is_zero(tbssid) && !hwaddr_is_bcast(tbssid)) {
++			tbss = steer_find_target_bss(c, tbssid);
++			if (!tbss) {
++				warn("%s: target BSS " MACFMT " is not known in the mesh\n",
++				     __func__, MAC2STR(tbssid));
++				return -EINVAL;
++			}
++		}
+ 
+ 		if (band == BAND_UNKNOWN && tbss)
+ 			band = tbss->band;
+@@ -1977,57 +2105,81 @@
+ 		struct netif_radio *r;
+ 		uint8_t tagent[6] = {0};
+ 
++		struct netif_iface *p;
++
+ 		strncpy(agentstr, blobmsg_data(tb[BSTA_STEER_ATTR_TARGET_AGENT]), sizeof(agentstr) - 1);
+-		if (!hwaddr_aton(agentstr, tagent))
++		if (!hwaddr_aton(agentstr, tagent)) {
++			warn("%s: invalid target_agent '%s'\n", __func__, agentstr);
+ 			return -EINVAL;
++		}
+ 
+ 		n = cntlr_find_node(c, tagent);
+-		if (!n)
++		if (!n) {
++			warn("%s: target agent " MACFMT " not found\n",
++			     __func__, MAC2STR(tagent));
+ 			return -EINVAL;
++		}
+ 
+ 		r = cntlr_find_radio_in_node_by_band(c, n, band);
+-		if (!r)
++		if (!r) {
++			warn("%s: target agent " MACFMT " has no radio in band %d\n",
++			     __func__, MAC2STR(tagent), band);
+ 			return -EINVAL;
++		}
+ 
+-		list_for_each_entry(tbss, &r->iflist, list) {
+-			if (tbss->bss->is_bbss) {
+-				memcpy(tbssid, tbss->bss->bssid, 6);
++		/* A BSS that is backhaul only is the right target; one that
++		 * carries both roles is the next best. tbss is set only on a
++		 * match - after an unmatched list walk the cursor points at the
++		 * list head, not at an interface. */
++		list_for_each_entry(p, &r->iflist, list) {
++			if (p->bss && p->bss->is_bbss && !p->bss->is_fbss) {
++				tbss = p;
+ 				break;
+ 			}
+ 		}
++		if (!tbss) {
++			list_for_each_entry(p, &r->iflist, list) {
++				if (p->bss && p->bss->is_bbss) {
++					tbss = p;
++					break;
++				}
++			}
++		}
+ 
+-		if (hwaddr_is_zero(tbssid))
++		if (!tbss) {
++			warn("%s: target agent " MACFMT " has no backhaul BSS in band %d\n",
++			     __func__, MAC2STR(tagent), band);
+ 			return -EINVAL;
++		}
++		memcpy(tbssid, tbss->bss->bssid, 6);
+ 	} else {
+-		dbg("%s: Error must provide either target BSSID or target agent AND band\n", __func__);
++		warn("%s: Error must provide either target BSSID or target agent AND band\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (tb[BSTA_STEER_ATTR_BSTA]) {
+ 		strncpy(bstastr, blobmsg_data(tb[BSTA_STEER_ATTR_BSTA]), sizeof(bstastr) - 1);
+-		if (!hwaddr_aton(bstastr, bsta))
++		if (!hwaddr_aton(bstastr, bsta)) {
++			warn("%s: invalid bsta '%s'\n", __func__, bstastr);
+ 			return -EINVAL;
++		}
+ 	} else if (band != BAND_UNKNOWN) {
+ 		struct node *n;
+-		struct netif_radio *r;
+ 
+ 		n = cntlr_find_node(c, agent);
+-		if (!n)
+-			return -EINVAL;
+-
+-		r = cntlr_find_radio_in_node_by_band(c, n, band);
+-		if (!r || !r->radio_el)
++		if (!n) {
++			warn("%s: agent " MACFMT " not found\n",
++			     __func__, MAC2STR(agent));
+ 			return -EINVAL;
++		}
+ 
+-		if (hwaddr_is_zero(r->radio_el->bsta.macaddr)) {
+-			dbg("%s: Error no bSTA known on agent's radio for band %d\n",
+-			    __func__, band);
++		if (!steer_find_bsta(c, n, band, bsta)) {
++			warn("%s: no bSTA known on agent " MACFMT " for band %d\n",
++			     __func__, MAC2STR(agent), band);
+ 			return -EINVAL;
+ 		}
+-
+-		memcpy(bsta, r->radio_el->bsta.macaddr, 6);
+ 	} else {
+-		dbg("%s: Error must provide either bSTA or band\n", __func__);
++		warn("%s: Error must provide either bSTA or band\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -2035,15 +2187,16 @@
+ 		timeout = (int)blobmsg_get_u32(tb[BSTA_STEER_ATTR_TIMEOUT]);
+ 
+ 	if (!hwaddr_is_zero(tbssid) && !hwaddr_is_zero(bsta)) {
+-		uint8_t opclass = 0;	//TODO
+-		uint8_t channel = 0;	//TODO
+-		/* TODO: find opclass and channel from target bssid. */
++		uint8_t opclass = 0;
++		uint8_t channel = 0;
++
++		steer_target_opclass_channel(tbss, &opclass, &channel);
+ 
+ 		/* prepare Backhaul-Steer request */
+ 		cmdu = cntlr_gen_backhaul_steer_request(c, agent, bsta, tbssid,
+ 							opclass, channel);
+ 		if (!cmdu) {
+-			dbg("%s: Error generating CMDU\n", __func__);
++			warn("%s: Error generating CMDU\n", __func__);
+ 			return -EINVAL;
+ 		}
+ 	}

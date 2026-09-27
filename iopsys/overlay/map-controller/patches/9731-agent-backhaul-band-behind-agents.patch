@@ -1,0 +1,58 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: resolve the backhaul band for agents behind agents
+
+973 derives backhaul_band through the parent's backhaul BSS:
+
+    topology_link.parent_iface_mac -> bss.bssid -> radio.band
+
+That join only lands for a node whose parent is the controller. Measured
+2026-09-01 on a four-node mesh: the controller's own backhaul BSS
+7e:1c:ba:52:88:ee is in bss, but 42:91:e4:1b:01:3f - the backhaul MLD of an
+AGENT, and the parent of both depth-2 nodes - is not there at all, so the view
+returned NULL and the topology printed "? -> <bssid> . 2 hop(s)" for every node
+past the first hop.
+
+Recover it from the child's own side, which the database does have: the two
+ends of a link share a channel, so the band of the leg a bSTA connects with is
+the band of the link. affiliated_bsta carries the ruid of that leg for every
+agent and radio maps ruid to band. Verified on the same mesh: all three agents
+resolve to bands 2,8 (5 + 6 GHz), matching what the radios report.
+
+While here, expose backhaul_bands. A backhaul MLD has more than one leg and a
+single value cannot say so - the depth-1 node showed "5 GHz" while it was in
+fact carrying 5 and 6 GHz at once. backhaul_band keeps its old meaning (one
+number, the lowest band) so existing readers are unaffected.
+
+DROP before CREATE: the schema is applied on every start and CREATE VIEW IF NOT
+EXISTS leaves the old definition in place on an already-populated database,
+which is every node we would upgrade.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -373,6 +373,7 @@
+ 	"--     Band values are libwifi enum wifi_band: 1=2.4, 2=5, 8=6 GHz.\n"
+ 	"--     NULL means no wireless backhaul was resolved - the controller root\n"
+ 	"--     has no upstream at all, which is why its whole row is NULL.\n"
++	"DROP VIEW IF EXISTS agent_backhaul;\n"
+ 	"CREATE VIEW IF NOT EXISTS agent_backhaul AS\n"
+ 	"  SELECT a.almac            AS almac,\n"
+ 	"         a.depth            AS depth,\n"
+@@ -381,7 +382,15 @@
+ 	"         t.parent_iface_mac AS upstream_bssid,\n"
+ 	"         t.media_type       AS media_type,\n"
+ 	"         t.wifi_hops        AS wifi_hops,\n"
+-	"         r.band             AS backhaul_band\n"
++	"         COALESCE(r.band,\n"
++	"           (SELECT MIN(r2.band) FROM bstamld bm\n"
++	"              JOIN affiliated_bsta ab ON ab.mld_macaddr = bm.mld_macaddr\n"
++	"              JOIN radio r2          ON r2.ruid        = ab.ruid\n"
++	"             WHERE bm.agent_almac = a.almac)) AS backhaul_band,\n"
++	"         (SELECT group_concat(DISTINCT r3.band) FROM bstamld bm2\n"
++	"            JOIN affiliated_bsta ab2 ON ab2.mld_macaddr = bm2.mld_macaddr\n"
++	"            JOIN radio r3           ON r3.ruid         = ab2.ruid\n"
++	"           WHERE bm2.agent_almac = a.almac) AS backhaul_bands\n"
+ 	"  FROM agent a\n"
+ 	"  LEFT JOIN topology_link t ON t.child_almac = a.almac\n"
+ 	"  LEFT JOIN bss b           ON b.bssid = t.parent_iface_mac\n"

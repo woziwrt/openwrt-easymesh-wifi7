@@ -1,0 +1,100 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-genconfig - the one writer of the wireless config on a
+# mesh agent.
+#
+# Four independent writers fought over /etc/config/wireless on 2026-08-11 -
+# the per-band WSC translator spawning legacy BSSes, the image defaults, the
+# standalone-router canon, and our own tools - and whoever woke last won.
+# This script ends the fight by having the final word: it runs before the
+# network comes up on every boot, derives the wireless config from the
+# credential layer, and deletes every wifi-iface section it does not own.
+#
+# Rules (agreed 2026-08-11):
+#  - same SSID across bands = ONE MLD section; legacy BSSes are never created
+#  - image-default and foreign sections are deleted, not disabled
+#  - no credentials, no opinion: an unprovisioned box keeps what it has
+# Scope (phase A): agents only. The controller's wireless is authored by the
+# founding wizard and nothing regenerates over it.
+
+# A join in progress owns the wireless config, not this writer.
+#
+# Phase 1 of easymesh-wps-join deletes every BSS, writes one station section
+# and reboots to get a clean radio. This runs at START=19 on that very boot,
+# sees a formed agent with credentials, and deletes the station again as
+# "scaffolding from failed joins" - twenty seconds before phase 2 starts
+# waiting for it. Measured 2026-09-21 on kitchen: "waiting for the radio"
+# forever, with /etc/config/wireless rewritten 21 s after boot.
+#
+# The doctrine below is "no credentials, no opinion". This is the same rule
+# one step further: no settled config to author yet, so no opinion. A box
+# that has never joined is safe by accident (both gates below send it home);
+# a box being RE-paired is not, and that is the whole bug - it could not be
+# re-paired by button at all.
+#
+# The note is removed when the join finishes or fails, so this bows out for
+# exactly as long as there is a join to bow out for.
+[ -f /etc/easymesh-wps-pending ] && exit 0
+
+# Role gate: mapcontroller enabled = controller; controller_select.local='0'
+# is the mark easymesh-role leaves on an agent (the factory never writes it).
+[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] && exit 0
+[ "$(uci -q get mapagent.@controller_select[0].local)" = "0" ] || exit 0
+
+# The credential layer: mapagent ap sections, filled by WSC (wired) or the
+# WPS join (over the air). Per-band entries with one SSID collapse into one
+# fronthaul; the backhaul pair keys the MLD AP and STA sections.
+fh_ssid=""; fh_key=""; bh_ssid=""; bh_key=""
+i=0
+while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+	t=$(uci -q get mapagent.@ap[$i].type)
+	s=$(uci -q get mapagent.@ap[$i].ssid)
+	k=$(uci -q get mapagent.@ap[$i].key)
+	case "$t" in
+	fronthaul) [ -n "$s" ] && [ -n "$k" ] && { fh_ssid="$s"; fh_key="$k"; } ;;
+	backhaul)  [ -n "$s" ] && [ -n "$k" ] && { bh_ssid="$s"; bh_key="$k"; } ;;
+	esac
+	i=$((i + 1))
+done
+[ -n "$bh_key" ] || exit 0
+
+changed=0
+
+own() {
+	# own <section> <ssid> <key> - update one owned MLD section in place.
+	# Sections are created by the join (mlo-backhaul-setup); a box without
+	# them is not a formed agent yet and this writer leaves it alone.
+	uci -q get "wireless.$1" >/dev/null || return 0
+	[ "$(uci -q get wireless.$1.ssid)" = "$2" ] &&
+	[ "$(uci -q get wireless.$1.key)" = "$3" ] &&
+	[ -z "$(uci -q get wireless.$1.disabled)" ] && return 0
+	uci set "wireless.$1.ssid=$2"
+	uci set "wireless.$1.key=$3"
+	uci -q delete "wireless.$1.disabled"
+	changed=1
+}
+
+[ -n "$fh_ssid" ] && own ap_mld_1 "$fh_ssid" "$fh_key"
+own ap_mld_2 "$bh_ssid" "$bh_key"
+own sta_mld_1 "$bh_ssid" "$bh_key"
+
+# Everything else is squatting: image defaults, legacy per-band spawns,
+# scaffolding from failed joins. Deleted, not disabled - a disabled section
+# resurrects on the next writer's whim.
+for sec in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^=.]*\)=wifi-iface.*/\1/p'); do
+	case "$sec" in
+	ap_mld_1|ap_mld_2|sta_mld_1) ;;
+	*) uci delete "wireless.$sec"; changed=1 ;;
+	esac
+done
+
+for r in radio0 radio1 radio2; do
+	[ -n "$(uci -q get wireless.$r.disabled)" ] && { uci -q delete "wireless.$r.disabled"; changed=1; }
+done
+
+[ "$changed" = "1" ] || exit 0
+uci commit wireless
+logger -t easymesh-genconfig "wireless authored from mesh credentials (fh='$fh_ssid' bh='$bh_ssid')"
+exit 0

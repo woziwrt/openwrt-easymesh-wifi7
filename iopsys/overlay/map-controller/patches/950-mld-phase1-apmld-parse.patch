@@ -1,0 +1,441 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: mld phase1 apmld parse
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+diff -ruN a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c	2026-07-13 17:32:47.231362729 +0200
++++ b/src/cntlr.c	2026-07-13 17:37:45.319075944 +0200
+@@ -1029,6 +1029,10 @@
+ 
+ 	INIT_LIST_HEAD(&n->stalist);
+ 	INIT_LIST_HEAD(&n->radiolist);
++#if (EASYMESH_VERSION >= 6)
++	INIT_LIST_HEAD(&n->apmld_list);
++	n->num_apmld = 0;
++#endif
+ 	n->sta_count = 0;
+ 	list_add(&n->list, &c->devlist);
+ 	c->num_devs++;
+@@ -1584,6 +1588,31 @@
+ 	timer_set(&c->signal_handler, 1 * 1000);
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Free the AP-MLD model attached to a node: each apmld plus its affiliated-AP
++ * and TID-to-Link child lists (DB Phase 1.5). Safe to call on an empty list. */
++void cntlr_free_apmld_list(struct node *n)
++{
++	struct wifi_apmld_element *mld = NULL, *mtmp;
++	struct wifi_affiliated_ap_element *ap = NULL, *atmp;
++	struct wifi_ttlm_element *tt = NULL, *ttmp;
++
++	list_for_each_entry_safe(mld, mtmp, &n->apmld_list, list) {
++		list_for_each_entry_safe(ap, atmp, &mld->aplist, list) {
++			list_del(&ap->list);
++			free(ap);
++		}
++		list_for_each_entry_safe(tt, ttmp, &mld->ttlmlist, list) {
++			list_del(&tt->list);
++			free(tt);
++		}
++		list_del(&mld->list);
++		free(mld);
++	}
++	n->num_apmld = 0;
++}
++#endif
++
+ static bool cntlr_clean_node(struct controller *c, struct node *n)
+ {
+ 	struct netif_radio *r = NULL, *temp;
+@@ -1600,6 +1629,9 @@
+ 	node_clean_stalist(c, n);
+ 	cntlr_clean_radiolist(c, n);
+ 	mactable_del_entry(c->mac_table, n->almacaddr, MAC_ENTRY_ALID);
++#if (EASYMESH_VERSION >= 6)
++	cntlr_free_apmld_list(n);
++#endif
+ 
+ 	info("%s: Node " MACFMT " removed due to ageout\n",
+ 	     __func__, MAC2STR(n->almacaddr));
+diff -ruN a/src/cntlr.h b/src/cntlr.h
+--- a/src/cntlr.h	2026-07-13 17:32:47.230027447 +0200
++++ b/src/cntlr.h	2026-07-13 17:37:45.318027514 +0200
+@@ -193,6 +193,17 @@
+ 	struct list_head radiolist;        /** list of netif_radio */
+ 	struct list_head stalist;          /** list of sta */
+ 	struct list_head list;
++
++#if (EASYMESH_VERSION >= 6)
++	/* DB Phase 1.5 (MLD) - APPEND ONLY, at the very END of struct node.
++	 * Prebuilt plugin .so's dereference struct node opaquely; inserting a
++	 * field mid-struct shifts offsets -> SIGILL respawn loop. Never move
++	 * these above 'list'. */
++	int num_apmld;                     /** number of AP-MLDs on this agent */
++	struct list_head apmld_list;       /** list of struct wifi_apmld_element */
++	struct ieee1905_security_caps sec; /** 1905 security caps (step 2) */
++	bool sec_valid;                    /** @sec populated (step 2) */
++#endif
+ };
+ 
+ static inline bool node_is_agent(const struct node *n)
+@@ -200,6 +211,11 @@
+ 	return n->is_agent;
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Free @n->apmld_list and its child lists (DB Phase 1.5). */
++void cntlr_free_apmld_list(struct node *n);
++#endif
++
+ #define node_for_each_bss(p, r, n)				\
+ 		list_for_each_entry(r, &n->radiolist, list)	\
+ 			list_for_each_entry(p, &r->iflist, list)
+diff -ruN a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c	2026-07-13 17:32:47.232380105 +0200
++++ b/src/cntlr_map.c	2026-07-13 17:37:45.320176202 +0200
+@@ -4103,6 +4103,126 @@
+ 	return 0;
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* DB Phase 1.5 (MLD, step 1): byte-walk the AP-MLD Config TLV (0xE0) payload
++ * into @n->apmld_list. The record is variable-length (SSID precedes the MLD
++ * MAC), so we walk the bytes with a running offset and bounds-check every
++ * field instead of casting struct tlv_ap_mld_config over the wire.
++ *
++ * Wire layout (agent_gen_ap_mld_config / struct tlv_ap_mld_config):
++ *   num_mlds : u8
++ *   per MLD: flag u8, ssidlen u8, ssid[ssidlen], mld_macaddr[6], flag2 u8,
++ *            rsvd[20], num_ap u8
++ *   per affiliated AP (32 bytes): flag u8, ruid[6], bssid[6], linkid u8,
++ *            rsvd[18]
++ *
++ * Wholesale rebuild: the stale model is flushed first so removed MLDs/links
++ * do not linger. TTLM is NOT carried in this TLV (step 3). */
++static void cntlr_parse_ap_mld_config_tlv(struct node *n, const uint8_t *data,
++					  uint16_t len)
++{
++	size_t off = 0;
++	uint8_t num_mlds, i;
++
++	/* Flush + rebuild (mirror handle_early_ap_cap_report's authoritative
++	 * overwrite of the live model). */
++	cntlr_free_apmld_list(n);
++
++	if (!data || len < 1)
++		return;
++
++	num_mlds = data[off++];
++
++	for (i = 0; i < num_mlds; i++) {
++		struct wifi_apmld_element *mld;
++		uint8_t ssidlen, flag2, num_ap, j;
++		const uint8_t *mac;
++		size_t need;
++
++		/* flag(1) + ssidlen(1) */
++		if (off + 2 > len)
++			break;
++		ssidlen = data[off + 1];
++
++		/* fixed MLD portion: flag(1)+ssidlen(1)+ssid+mac(6)+flag2(1)+
++		 * rsvd(20)+num_ap(1) = 30 + ssidlen */
++		need = (size_t)30 + ssidlen;
++		if (off + need > len)
++			break;
++
++		mac = data + off + 2 + ssidlen;
++		flag2 = mac[6];
++		num_ap = mac[6 + 1 + 20];	/* after flag2 + rsvd[20] */
++
++		/* affiliated APs: fixed 32 bytes each */
++		if (off + need + (size_t)num_ap * 32 > len)
++			break;
++
++		mld = calloc(1, sizeof(*mld));
++		if (!mld)
++			break;
++		INIT_LIST_HEAD(&mld->aplist);
++		INIT_LIST_HEAD(&mld->stamldlist);
++		INIT_LIST_HEAD(&mld->ttlmlist);
++
++		memcpy(mld->mld_macaddr, mac, 6);
++		mld->ssidlen = ssidlen > 32 ? 32 : ssidlen;
++		memcpy(mld->ssid, data + off + 2, mld->ssidlen);
++		mld->ssid[mld->ssidlen] = '\0';
++		mld->enabled = true;
++		mld->str_enabled   = !!(flag2 & AP_MLD_CONFIG_STR);
++		mld->nstr_enabled  = !!(flag2 & AP_MLD_CONFIG_NSTR);
++		mld->emlsr_enabled = !!(flag2 & AP_MLD_CONFIG_EMLSR);
++		mld->emlmr_enabled = !!(flag2 & AP_MLD_CONFIG_EMLMR);
++		mld->ttlm_enabled  = false;	/* not carried in 0xE0 (step 3) */
++		mld->num_ap = num_ap;
++
++		list_add_tail(&mld->list, &n->apmld_list);
++		n->num_apmld++;
++
++		for (j = 0; j < num_ap; j++) {
++			const uint8_t *ap_p = data + off + need + (size_t)j * 32;
++			struct wifi_affiliated_ap_element *ap;
++
++			ap = calloc(1, sizeof(*ap));
++			if (!ap)
++				break;
++			memcpy(ap->ruid, ap_p + 1, 6);
++			memcpy(ap->bssid, ap_p + 1 + 6, 6);
++			ap->linkid = ap_p[1 + 6 + 6];
++			/* punct_bitmap not carried in this TLV -> left zero */
++			list_add_tail(&ap->list, &mld->aplist);
++		}
++
++		off += need + (size_t)num_ap * 32;
++	}
++
++	dbg("%s: parsed %d AP-MLD(s) for " MACFMT "\n", __func__,
++	    n->num_apmld, MAC2STR(n->almacaddr));
++}
++
++/* DB Phase 1.5 (MLD, step 1): handler for AP-MLD Config Response (0x8045).
++ * The AP-MLD Config TLV (0xE0) also rides Topology Response; we pull it
++ * directly with cmdu_peek_tlv() so we do not depend on the CMDU validation
++ * policy (which additionally requires an EHT Operations TLV). */
++int handle_ap_mld_config_response(void *cntlr, struct cmdu_buff *cmdu,
++				  struct node *n)
++{
++	struct tlv *t;
++
++	trace("%s:--->\n", __func__);
++
++	if (!n)
++		return -1;
++
++	t = cmdu_peek_tlv(cmdu, MAP_TLV_AP_MLD_CONFIG);
++	if (t)
++		cntlr_parse_ap_mld_config_tlv(n, t->data, tlv_length(t));
++
++	return 0;
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ int cntlr_send_ap_mld_configuration_request(struct controller *c, struct node *n)
+ {
+ 	struct cmdu_buff *cmdu;
+@@ -4335,6 +4455,11 @@
+ 	[0x43] = {
+ 		.handle = handle_early_ap_cap_report,
+ 	},
++	/* AP-MLD Config Response (0x8045); registering here also lets it
++	 * through is_cmdu_for_us() (which gates on a non-NULL handler). */
++	[0x45] = {
++		.handle = handle_ap_mld_config_response,
++	},
+ 	[0x4d] = {
+ 		.handle = handle_bss_config_extended_report,
+ 	},
+@@ -4457,7 +4582,30 @@
+ 				list_for_each_entry(bss, &r->iflist, list)
+ 					mapc_sync_bss(c, bss);
+ 			}
++#if (EASYMESH_VERSION >= 6)
++			/* AP-MLD Config TLV (0xE0) rides Topology Response too;
++			 * re-parse for a periodic refresh, then persist. */
++			{
++				struct tlv *mldtlv =
++					cmdu_peek_tlv(cmdu, MAP_TLV_AP_MLD_CONFIG);
++
++				if (mldtlv) {
++					cntlr_parse_ap_mld_config_tlv(n,
++						mldtlv->data, tlv_length(mldtlv));
++					mapc_sync_apmld(c, n);
++				}
++			}
++#endif
+ 			break;
++#if (EASYMESH_VERSION >= 6)
++		case CMDU_AP_MLD_CONFIG_RESPONSE:
++			/* handle_ap_mld_config_response() already parsed 0xE0
++			 * into n->apmld_list; agent first for the FK on
++			 * apmld.agent_almac -> agent(almac). */
++			mapc_sync_agent(c, n);
++			mapc_sync_apmld(c, n);
++			break;
++#endif
+ 		case CMDU_AP_CAPABILITY_REPORT:
+ #if (EASYMESH_VERSION > 5)
+ 		case CMDU_EARLY_AP_CAPABILITY_REPORT:
+diff -ruN a/src/db/mapc_sync.c b/src/db/mapc_sync.c
+--- a/src/db/mapc_sync.c	2026-07-13 17:32:47.233404428 +0200
++++ b/src/db/mapc_sync.c	2026-07-13 17:37:45.321241412 +0200
+@@ -12,9 +12,10 @@
+  * the txn (if any) is rolled back, and the controller continues. The DB is a
+  * warm-cache recovery graph, never a hard dependency (design doc s5).
+  *
+- * Only the 7 tables with a live producer are written here: network, agent,
+- * radio, radio_caps, operating_class, bss, topology_link. Columns with no
+- * in-memory producer are left NULL (see the per-column notes below).
++ * Tables with a live producer are written here: network, agent, radio,
++ * radio_caps, operating_class, bss, topology_link, and (R6/MLD Phase 1.5)
++ * apmld + affiliated_ap. Columns with no in-memory producer are left NULL
++ * (see the per-column notes below).
+  *
+  * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+  */
+@@ -483,6 +484,141 @@
+ 	}
+ }
+ 
++/* ---- apmld (+ affiliated_ap) ------------------------------------------ */
++#if (EASYMESH_VERSION >= 6)
++
++/* Drop this agent's AP-MLD rows in FK-child-first order (foreign_keys=ON):
++ * ttlm + affiliated_ap both reference apmld(mld_macaddr), so they go before
++ * apmld itself. Bound by agent_almac (via apmld) so only this node's rows
++ * are touched. Returns MAPDB_OK / MAPDB_ERR (caller rolls the txn back). */
++static int apmld_delete_agent_rows(struct controller *c, const char *almac)
++{
++	static const char *dels[3] = {
++		"DELETE FROM ttlm WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM apmld WHERE agent_almac=?)",
++		"DELETE FROM affiliated_ap WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM apmld WHERE agent_almac=?)",
++		"DELETE FROM apmld WHERE agent_almac=?",
++	};
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		mapdb_stmt *st = NULL;
++
++		if (mapdb_prepare(c->db, dels[i], &st) != MAPDB_OK) {
++			warn("mapc_sync: apmld del prepare: %s\n",
++			     mapdb_last_error(c->db));
++			return MAPDB_ERR;
++		}
++		mapdb_bind_text(st, 1, almac);
++		if (stmt_finish(c->db, st) != MAPDB_OK)
++			return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++/* Wholesale-rebuild this node's AP-MLD tables from n->apmld_list, one txn.
++ * FK insert order: apmld (parent) -> affiliated_ap (child). ttlm rows are
++ * deferred to step 3 (TID-to-Link). punct_bitmap is not carried by TLV 0xE0
++ * -> persisted NULL. */
++void mapc_sync_apmld(struct controller *c, struct node *n)
++{
++	static const char *ins_mld =
++		"INSERT INTO apmld(mld_macaddr, agent_almac, ssid, enabled, "
++		"emlmr_enabled, emlsr_enabled, str_enabled, nstr_enabled, "
++		"ttlm_enabled, num_ap) VALUES(?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(mld_macaddr) DO UPDATE SET "
++		"agent_almac=excluded.agent_almac, ssid=excluded.ssid, "
++		"enabled=excluded.enabled, emlmr_enabled=excluded.emlmr_enabled, "
++		"emlsr_enabled=excluded.emlsr_enabled, str_enabled=excluded.str_enabled, "
++		"nstr_enabled=excluded.nstr_enabled, ttlm_enabled=excluded.ttlm_enabled, "
++		"num_ap=excluded.num_ap";
++	static const char *ins_aff =
++		"INSERT INTO affiliated_ap(bssid, mld_macaddr, ruid, link_id, "
++		"punct_bitmap) VALUES(?,?,?,?,?) "
++		"ON CONFLICT(bssid) DO UPDATE SET mld_macaddr=excluded.mld_macaddr, "
++		"ruid=excluded.ruid, link_id=excluded.link_id, "
++		"punct_bitmap=excluded.punct_bitmap";
++	struct wifi_apmld_element *mld;
++	char almac[18];
++
++	if (!c->db)
++		return;
++
++	mac2str(n->almacaddr, almac);
++
++	if (mapdb_begin(c->db) != MAPDB_OK) {
++		warn("mapc_sync: apmld begin: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++
++	if (apmld_delete_agent_rows(c, almac) != MAPDB_OK) {
++		mapdb_rollback(c->db);
++		return;
++	}
++
++	list_for_each_entry(mld, &n->apmld_list, list) {
++		struct wifi_affiliated_ap_element *ap;
++		char mldmac[18];
++		mapdb_stmt *st = NULL;
++
++		mac2str(mld->mld_macaddr, mldmac);
++
++		/* parent apmld first (affiliated_ap.mld_macaddr FKs it). */
++		if (mapdb_prepare(c->db, ins_mld, &st) != MAPDB_OK) {
++			warn("mapc_sync: apmld ins prepare: %s\n",
++			     mapdb_last_error(c->db));
++			mapdb_rollback(c->db);
++			return;
++		}
++		mapdb_bind_text(st, 1, mldmac);
++		mapdb_bind_text(st, 2, almac);
++		mapdb_bind_text(st, 3, mld->ssidlen ? mld->ssid : NULL);
++		mapdb_bind_int(st, 4, mld->enabled);
++		mapdb_bind_int(st, 5, mld->emlmr_enabled);
++		mapdb_bind_int(st, 6, mld->emlsr_enabled);
++		mapdb_bind_int(st, 7, mld->str_enabled);
++		mapdb_bind_int(st, 8, mld->nstr_enabled);
++		mapdb_bind_int(st, 9, mld->ttlm_enabled);
++		mapdb_bind_int(st, 10, mld->num_ap);
++		if (stmt_finish(c->db, st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++
++		list_for_each_entry(ap, &mld->aplist, list) {
++			char bssid[18], ruid[18];
++
++			mac2str(ap->bssid, bssid);
++			mac2str(ap->ruid, ruid);
++
++			st = NULL;
++			if (mapdb_prepare(c->db, ins_aff, &st) != MAPDB_OK) {
++				warn("mapc_sync: affiliated_ap ins prepare: %s\n",
++				     mapdb_last_error(c->db));
++				mapdb_rollback(c->db);
++				return;
++			}
++			mapdb_bind_text(st, 1, bssid);
++			mapdb_bind_text(st, 2, mldmac);
++			mapdb_bind_text(st, 3, ruid);
++			mapdb_bind_int(st, 4, ap->linkid);
++			mapdb_bind_null(st, 5);	/* punct_bitmap: not in TLV 0xE0 */
++			if (stmt_finish(c->db, st) != MAPDB_OK) {
++				mapdb_rollback(c->db);
++				return;
++			}
++		}
++		/* ttlm rows: step 3 (TID-to-Link). */
++	}
++
++	if (mapdb_commit(c->db) != MAPDB_OK) {
++		warn("mapc_sync: apmld commit: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++	}
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ /* ---- maintenance ------------------------------------------------------ */
+ 
+ void mapc_db_checkpoint(struct controller *c)
+diff -ruN a/src/db/mapc_sync.h b/src/db/mapc_sync.h
+--- a/src/db/mapc_sync.h	2026-07-13 17:32:47.234430047 +0200
++++ b/src/db/mapc_sync.h	2026-07-13 17:37:45.322303975 +0200
+@@ -38,6 +38,12 @@
+ /* Rebuild the 'topology_link' edge set from c->topology.dev_list, one txn. */
+ void mapc_sync_topology(struct controller *c);
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Rebuild the 'apmld' + 'affiliated_ap' rows for @n from n->apmld_list, one
++ * txn (DB Phase 1.5, MLD step 1). ttlm is deferred to step 3. */
++void mapc_sync_apmld(struct controller *c, struct node *n);
++#endif
++
+ /* Fold the WAL back into the main DB file (PRAGMA wal_checkpoint(TRUNCATE)). */
+ void mapc_db_checkpoint(struct controller *c);
+ 

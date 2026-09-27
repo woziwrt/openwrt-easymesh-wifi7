@@ -1,0 +1,212 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 989: a link of an AP-MLD does not get a BSS of its own
+
+uci_apply_wps_credentials() is the only place in map-agent that creates a
+wireless section, and it creates one for every AP it applies M2 credentials
+to. On a node whose fronthaul and backhaul are AP-MLDs that is wrong twice
+over: the network is already on the air as a link of the MLD, and the extra
+BSS takes a slot the MLD needs for an affiliated AP.
+
+Two symptoms that cost a full day each turned out to be this one line.
+
+1. Legacy per-radio BSSes came back on the controller after every clean
+   flash, although map_genconfig had been fixed to stop generating them.
+   The producer is identifiable from the order of the options it writes:
+
+     map_genconfig:  device, ifname, mode, disabled, ...
+     map-agent:      ifname, ieee80211k, bss_transition, ...
+
+   The sections that reappeared had the second fingerprint. The genconfig
+   fix worked; it was simply not the producer.
+
+2. The bhmld placeholders - mapagent 'ap' sections that exist so that
+   apmld_parse() runs for the backhaul MLD, and that name interfaces which
+   are not meant to exist as netdevs - materialised as real, transmitting
+   BSSes on some nodes and not others:
+
+     4g   0 bhmld BSSes      8g   1        x8   2
+
+   Not a property of the node. wifi_get_first_available_ifname() hands the
+   credentials to the first torn-down 'ap' section on the radio, so whether
+   a placeholder is picked depends on whether a legacy backhaul section on
+   that radio absorbed the M2 first. 4g still had legacy sections on both
+   radios, 8g on one, x8 on neither - which is exactly 0, 1 and 2. The
+   fault looked like it wandered between nodes because the outcome depends
+   on config order, not on the node.
+
+   Note the coupling: removing the legacy sections (1) frees the slot, so
+   the placeholders would then be picked on every node. The two fixes only
+   make sense together.
+
+Keep writing the mapagent 'ap' section - the mesh layer needs it for mld_id
+and the AP-MLD Config TLV, and it is what carries the credentials into the
+AP-MLD - and skip only the wireless section. This is the same split, and the
+same reasoning, that map_genconfig already applies on its side.
+
+The fronthaul asks the wireless config whether an AP-MLD already serves this
+SSID on this radio, not the mapagent MLD list. Measured 2026-07-29 with an
+earlier version of this patch that asked the mapagent list: on a boot where
+map_genconfig had left mapagent without a single 'mld' section, the lookup
+found nothing and both per-radio fronthaul BSSes went back on the air. The
+wireless section is what hostapd runs, so it is there for as long as the MLD
+is, which is exactly the condition being asked about.
+
+Verified on hardware 2026-07-28 in the state this patch reproduces from a
+clean flash: three nodes, ap-mld-1 and ap-mld-2 and nothing else on the air,
+all six MLDs reporting non-zero num_ap, both backhauls two-legged, and the
+state still holding after ten hours untouched.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -urN a/src/config.c b/src/config.c
+--- a/src/config.c	2026-07-29 07:18:27.328430523 +0200
++++ b/src/config.c	2026-07-29 07:18:27.330189931 +0200
+@@ -924,6 +924,89 @@
+ }
+ 
+ /* TODO: batch the changes arther than commit oneby one */
++/* Is this network already on the air as a link of an AP-MLD?
++ *
++ * In the single-netdev MLO model the AP-MLD has one wireless section spanning
++ * every participating radio (ap-mld-1 with a device list), and its affiliated
++ * APs have no wireless section of their own. A per-radio BSS created here
++ * would advertise the same network a second time and, worse, take a BSS slot
++ * the MLD needs for an affiliated AP.
++ *
++ * Measured on hardware 2026-07-28: the node that came up with four such BSSes
++ * reported num_ap=0 for both its MLDs, while nodes with one reported 2 and 3.
++ * Deleting them by hand and rebooting brought all three nodes to non-zero
++ * num_ap for the first time that day. Which node got the most varied from boot
++ * to boot, so the defect looked like it moved between nodes.
++ *
++ * Ask the wireless config, not the mapagent MLD list. The wireless section is
++ * what hostapd actually runs, so it is present for as long as the MLD is on
++ * the air; the mapagent 'mld' sections are written by map_genconfig and can be
++ * absent exactly when the credentials arrive. Measured 2026-07-29: a boot that
++ * left mapagent without a single mld section put both per-radio fronthaul
++ * BSSes back on the air, because the lookup had nothing to find.
++ *
++ * The backhaul asks neither - it asks mapagent.agent.mld_backhaul, the switch
++ * map_genconfig already uses for this same decision. That also covers a band
++ * the backhaul MLD does not span (2.4 GHz), where a per-radio backhaul BSS is
++ * not a duplicate but is unwanted all the same: two backhauls bridged into
++ * br-lan are an L2 loop, measured at 56k pkt/s on 2026-07-28.
++ *
++ * Opt-in either way: a mesh without an MLD backhaul, or with no AP-MLD serving
++ * this SSID on this radio, is unaffected.
++ */
++static bool wireless_ap_mld_covers(struct uci_context *ctx,
++				   struct uci_package *pkg,
++				   const char *ssid, const char *device)
++{
++	struct uci_element *e;
++
++	uci_foreach_element(&pkg->sections, e) {
++		struct uci_section *s = uci_to_section(e);
++		struct uci_element *d;
++		struct uci_option *o;
++		const char *val;
++
++		if (strcmp(s->type, UCI_WLAN_IFACE))
++			continue;
++
++		val = uci_lookup_option_string(ctx, s, "mlo");
++		if (!val || atoi(val) != 1)
++			continue;
++
++		val = uci_lookup_option_string(ctx, s, "ssid");
++		if (!val || strcmp(val, ssid))
++			continue;
++
++		o = uci_lookup_option(ctx, s, "device");
++		if (!o)
++			continue;
++
++		if (o->type == UCI_TYPE_STRING)
++			return !strcmp(o->v.string, device);
++
++		uci_foreach_element(&o->v.list, d) {
++			if (!strcmp(d->name, device))
++				return true;
++		}
++	}
++
++	return false;
++}
++
++static bool mld_serves_network(struct agent_config *cfg, struct uci_context *ctx,
++			       struct uci_package *pkg, char *ssid,
++			       char *device, uint8_t multi_ap)
++{
++#if (EASYMESH_VERSION >= 6)
++	if (multi_ap == 0x01)
++		return cfg->mld_backhaul;
++
++	return wireless_ap_mld_covers(ctx, pkg, ssid, device);
++#else
++	return false;
++#endif
++}
++
+ struct netif_apcfg *uci_apply_wps_credentials(struct agent_config *cfg, char *ifname,
+ 				 char *device, struct wps_credential *out,
+ 				 struct wsc_ext *exts)
+@@ -1092,6 +1175,19 @@
+ 		char section_name[32] = {0};
+ 		char *psep;
+ 
++		/* The mapagent 'ap' section written above stays: the mesh layer
++		 * needs it for mld_id and the AP-MLD Config TLV. Only the
++		 * wireless section - the thing that would actually go on the air
++		 * as a BSS of its own - is skipped.
++		 */
++		if (mld_serves_network(cfg, ctx, pkg, ssid, device, multi_ap)) {
++			agnt_dbg(LOG_APCFG, "%s: %s is a link of an AP-MLD, "
++				 "no BSS of its own\n", __func__, ifname);
++			uci_unload(ctx, pkg);
++			uci_free_context(ctx);
++			return ap;
++		}
++
+ 		snprintf(section_name, sizeof(section_name),
+ 				 "%s_ap", ifname);
+ 
+@@ -2321,6 +2417,7 @@
+ 		A_MLD_AP_PREFIX,
+ 		A_MLD_STA_PREFIX,
+ 		A_PHYSICAL_MLD,
++		A_MLD_BACKHAUL,
+ #endif
+ 		A_ASSOC_CTRL_FILE,
+ 		NUM_POLICIES
+@@ -2365,6 +2462,7 @@
+ 		[A_MLD_AP_PREFIX] = { .name = "mld_ap_prefix", .type = UCI_TYPE_STRING },
+ 		[A_MLD_STA_PREFIX] = { .name = "mld_sta_prefix", .type = UCI_TYPE_STRING },
+ 		[A_PHYSICAL_MLD] = { .name = "physical_mld", .type = UCI_TYPE_STRING },
++		[A_MLD_BACKHAUL] = { .name = "mld_backhaul", .type = UCI_TYPE_STRING },
+ #endif
+ 		[A_ASSOC_CTRL_FILE] = { .name = "assoc_ctrl_file", .type = UCI_TYPE_STRING },
+ 	};
+@@ -2542,6 +2640,11 @@
+ 		a->physical_mld = !!atoi(tb[A_PHYSICAL_MLD]->v.string);
+ 	else
+ 		a->physical_mld = true;
++
++	if (tb[A_MLD_BACKHAUL])
++		a->mld_backhaul = !!atoi(tb[A_MLD_BACKHAUL]->v.string);
++	else
++		a->mld_backhaul = false;
+ #endif
+ 
+ 	if (tb[A_ASSOC_CTRL_FILE]) {
+diff -urN a/src/config.h b/src/config.h
+--- a/src/config.h	2026-07-29 07:18:27.328704704 +0200
++++ b/src/config.h	2026-07-29 07:18:27.328833942 +0200
+@@ -316,6 +316,7 @@
+ 	char mld_ap_prefix[IFNAMSIZ - 1]; /* AP prefix + %1d */
+ 	char mld_sta_prefix[IFNAMSIZ - 1]; /* STA prefix + %1d */
+ 	bool physical_mld;
++	bool mld_backhaul;   /* backhaul is an AP-MLD, not per-radio BSSes */
+ #endif
+ 	atimer_t metric_report_timer;
+ };

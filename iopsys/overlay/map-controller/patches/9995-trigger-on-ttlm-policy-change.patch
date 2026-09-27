@@ -1,0 +1,116 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 9995: give the TTLM policy file a trigger
+
+Patch 9994 generates the TID-to-Link Mapping policy into the AP MLD Config
+Request. Tried on hardware for the first time today, it never sent one.
+
+cntlr_renew_nodes_configuration() pushes the request when
+
+	node->last_apmld_ack < cfg.last_apmld_change
+
+and last_apmld_change only moves inside the CONFIG_DIFF_AP_MLD branch of the
+config reload (config.c:3749, :3759). A plain file cannot produce a UCI diff, so
+writing a policy moved nothing, `ubus call map.controller reconf` answered
+"Configuration reloaded, no changes detected", and cntlr_gen_tid_to_link_policy()
+was never reached. Restarting the controller does not help either: with an
+unchanged config there is no diff, so last_apmld_change stays zero and the
+comparison is false for every node.
+
+The code was right and unreachable. This makes it reachable: watch the file's
+mtime on the periodic tick and move that same timestamp when it changes. The
+existing machinery then sends to every agent and re-sends until each one
+acknowledges - no new path and no new retry logic.
+
+mtime rather than a content hash on purpose: the producer is mlo-steerd
+rewriting the file, and a rewrite always moves mtime. Hashing would cost a read
+on every tick to catch a case that cannot occur.
+
+The first sighting after a start is not treated as a change. The agents were
+configured from this same file last time round, and pushing on every restart
+would put a CMDU on the air for nothing.
+
+A removed file is not a teardown. The agents keep what they were last told;
+tearing a mapping down is a policy line of its own, not the absence of one.
+
+diff -urN a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c	2026-08-01 19:44:52.959819702 +0200
++++ b/src/cntlr.c	2026-08-01 19:44:52.959967432 +0200
+@@ -24,6 +24,7 @@
+ #include <map_module.h>
+ #include <signal.h>
+ #include <stdint.h>
++#include <sys/stat.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -1801,6 +1802,57 @@
+ 		timer_set(&c->son_timer, 0);
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Make a change to the TTLM policy file push itself.
++ *
++ * Patch 9994 puts the policy into the AP MLD Config Request, and the request is
++ * sent by cntlr_renew_nodes_configuration() below when
++ *
++ *	node->last_apmld_ack < cfg.last_apmld_change
++ *
++ * The catch, found the first time it was tried on hardware: last_apmld_change
++ * only ever moves inside the CONFIG_DIFF_AP_MLD branch of the config reload
++ * (config.c). A plain file cannot produce a UCI diff, so writing a policy moved
++ * nothing, `reconf` answered "no changes detected", and the generator was never
++ * called - correct code, unreachable.
++ *
++ * Watching the file's mtime and moving the same timestamp is all it takes: the
++ * existing machinery then sends the request to every agent and keeps re-sending
++ * until each one acknowledges. No new path, no new retry logic.
++ *
++ * Deliberately mtime and not a hash: the producer is mlo-steerd rewriting the
++ * whole file, and a rewrite always moves mtime. Comparing content would cost a
++ * read on every tick to catch a case that cannot happen.
++ */
++static void cntlr_check_ttlm_policy_change(struct controller *c)
++{
++	static time_t last_mtime;
++	struct stat st;
++
++	if (stat("/etc/mapc/ttlm-policy", &st)) {
++		/* File removed: nothing to push, and the agents keep whatever
++		 * they were last told. Tearing a mapping down is a policy line
++		 * of its own, not the absence of one. */
++		last_mtime = 0;
++		return;
++	}
++
++	if (st.st_mtime == last_mtime)
++		return;
++
++	/* First sighting after a start is not a change - the agents were
++	 * configured from this same file the last time round, and pushing on
++	 * every restart would put a CMDU on the air for nothing. */
++	if (last_mtime) {
++		dbg("%s: ttlm-policy changed, scheduling AP MLD Config Request\n",
++		    __func__);
++		timestamp_update(&c->cfg.last_apmld_change);
++	}
++
++	last_mtime = st.st_mtime;
++}
++#endif
++
+ static void cntlr_renew_nodes_configuration(struct controller *c)
+ {
+ 	trace("%s: --->\n", __func__);
+@@ -1808,6 +1860,12 @@
+ 	struct node *node = NULL;
+ 	char ev_data[256] = {0};
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* before the loop, so a policy written since the last tick is already
++	 * visible to the per-node comparison below */
++	cntlr_check_ttlm_policy_change(c);
++#endif
++
+ 	/* When at least one running node was configured with older config, */
+ 	/* send autoconfig renew */
+ 	list_for_each_entry(node, &c->agentlist, list) {

@@ -1,0 +1,245 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: one unplaced node does not freeze the tree
+
+A single node the backhaul tree could not place kept the whole tree
+invalid, and mapc_sync_topology() does not run on an invalid tree. So one
+node that cannot report its uplink - a MediaTek R3 agent, which answers
+neither Link Metric Query nor sends our 0xE1 TLV, or any wired agent -
+froze topology_link for the entire mesh at whatever it held last. Seen on
+hardware 2026-09-17: the MTK box at depth -1 in dump_topology and our agent
+behind it still drawn directly under the controller from a stale edge.
+
+The tree is now valid once it is built. A node without a place keeps
+depth UNKNOWN and every reader already checks that per node. The reason
+the gate was added no longer holds: find_backhaul_upstream() takes the
+tree path only when bh.own_iface is set, and nothing sets own_iface since
+the neighbour walker went (9999993), so the bBSS fallback runs anyway.
+
+What the DB gets for an unplaced node:
+- no new edge: it has no parent to name, and naming the controller in its
+  place is how phantom "-> controller" edges are made;
+- its previous edge and depth are kept for NODE_UNPLACED_GRACE_S (180 s,
+  monotonic), so a node that drops out for a few seconds after a restart
+  or reconnect does not churn topology_link_history;
+- after that the edge is dropped, which closes its history interval, and
+  agent.depth becomes -1: the DB no longer claims an uplink it cannot back.
+
+Verify: with a node that never reports an uplink in the mesh, placed
+nodes still get fresh topology_link rows; the unplaced node has none (or
+its old one for at most 180 s) and agent.depth -1 after that.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -228,6 +228,11 @@ struct node {
+ 	 * See cntlr_bstamld_requery_due() for why re-asking is needed. */
+ 	uint64_t bstamld_requery_at;
+ #endif
++
++	/* CLOCK_MONOTONIC seconds since the tree first failed to place this
++	 * node, 0 while it is placed (topology.c). APPEND ONLY - see the
++	 * note above. */
++	time_t unplaced_since;
+ };
+ 
+ static inline bool node_is_agent(const struct node *n)
+@@ -362,6 +367,32 @@ struct node *cntlr_add_node(struct contr
+ struct node *cntlr_alloc_node(struct controller *c, uint8_t *almacaddr);
+ void cntlr_mark_agent(struct controller *c, struct node *n);
+ struct node *cntlr_find_node(struct controller *c, uint8_t *almacaddr);
++
++/* How long a node that has lost its place in the backhaul tree keeps its
++ * last known edge and depth in the DB.
++ *
++ * A node drops out of the tree whenever its uplink is momentarily unknown -
++ * right after a controller restart, or between a reconnect and the next link
++ * metrics report - and comes back seconds later. Removing its edge at once
++ * would open and close topology_link_history intervals for nothing. A node
++ * that stays out longer than this has really lost its known uplink, and its
++ * old edge would be a claim the DB can no longer back, so it goes.
++ * Same order of magnitude as the node ageout. */
++#define NODE_UNPLACED_GRACE_S	180
++
++static inline time_t node_mono_now(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec;
++}
++
++static inline bool node_unplaced_expired(const struct node *n, time_t now)
++{
++	return n->unplaced_since &&
++	       now - n->unplaced_since >= NODE_UNPLACED_GRACE_S;
++}
+ struct node *cntlr_find_node_with_bssid(struct controller *c, uint8_t *bssid);
+ struct node *cntlr_find_node_with_sta(struct controller *c, uint8_t *stamacaddr);
+ 
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -112,7 +112,8 @@ void mapc_sync_agent(struct controller *
+ 		"ON CONFLICT(almac) DO UPDATE SET "
+ 		"is_agent=excluded.is_agent, node_type=excluded.node_type, "
+ 		"profile=excluded.profile, multiap_caps=excluded.multiap_caps, "
+-		"depth=CASE WHEN excluded.depth>=0 THEN excluded.depth ELSE depth END, "
++		"depth=CASE WHEN excluded.depth>=0 THEN excluded.depth "
++		"WHEN excluded.depth=-2 THEN -1 ELSE depth END, "
+ 		"uplink_type=excluded.uplink_type, "
+ 		"upstream_bssid=excluded.upstream_bssid, est_thput_ul=excluded.est_thput_ul, "
+ 		"est_thput_dl=excluded.est_thput_dl, scan_supported=excluded.scan_supported, "
+@@ -139,6 +140,12 @@ void mapc_sync_agent(struct controller *
+ 	tdev = c->topology.valid ? topology_find_device(&c->topology, n->almacaddr)
+ 				 : NULL;
+ 	depth = tdev ? tdev->bh.depth : n->depth;
++	/* -1 keeps the last good depth (a node is often unplaced for a few
++	 * seconds); -2 tells the upsert that the node has been out of the tree
++	 * past the grace period, so its old depth is no longer true. */
++	if (tdev && depth == UNKNOWN_TREE_LEVEL &&
++	    node_unplaced_expired(n, node_mono_now()))
++		depth = -2;
+ 	bytes2hex(&n->ap_cap, 1, caps, sizeof(caps));	/* multiap AP-capability byte */
+ 
+ 	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
+@@ -820,6 +827,7 @@ void mapc_sync_topology(struct controlle
+ 		"depth=excluded.depth, wifi_hops=excluded.wifi_hops";
+ 	struct bh_topology_dev *dev = NULL;
+ 	mapdb_stmt *st = NULL;
++	time_t now_mono;
+ 
+ 	if (!c->db)
+ 		return;
+@@ -833,9 +841,49 @@ void mapc_sync_topology(struct controlle
+ 		return;
+ 	}
+ 
+-	/* Rebuild the edge set wholesale: cheap and keeps stale edges from lingering
+-	 * after a re-parent. */
+-	if (mapdb_exec(c->db, "DELETE FROM topology_link;") != MAPDB_OK) {
++	/* Rebuild the edge set: cheap and keeps stale edges from lingering after
++	 * a re-parent.
++	 *
++	 * Edges of placed devices are all rewritten below. A device the tree
++	 * could not place gets no edge from this sync - it has no parent to
++	 * name, and naming the controller instead is how phantom
++	 * "-> controller" edges are made. Its previous edge is kept while the
++	 * node is inside the grace period (NODE_UNPLACED_GRACE_S), so a
++	 * momentary gap does not churn topology_link_history, and dropped
++	 * after that, which closes its history interval. */
++	if (mapdb_exec(c->db, "CREATE TEMP TABLE IF NOT EXISTS topo_keep"
++			      "(almac TEXT PRIMARY KEY);") != MAPDB_OK ||
++	    mapdb_exec(c->db, "DELETE FROM topo_keep;") != MAPDB_OK) {
++		warn("mapc_sync: topology keep: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++		return;
++	}
++	now_mono = node_mono_now();
++	list_for_each_entry(dev, &c->topology.dev_list, list) {
++		struct node *dn;
++		char keep[18];
++
++		if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
++			continue;
++		dn = cntlr_find_node(c, (uint8_t *)dev->al_macaddr);
++		if (!dn || node_unplaced_expired(dn, now_mono))
++			continue;
++
++		mac2str(dev->al_macaddr, keep);
++		st = NULL;
++		if (mapdb_prepare(c->db, "INSERT OR IGNORE INTO topo_keep(almac) "
++				  "VALUES(?)", &st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++		mapdb_bind_text(st, 1, keep);
++		if (stmt_finish(c->db, st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++	}
++	if (mapdb_exec(c->db, "DELETE FROM topology_link WHERE child_almac "
++			      "NOT IN (SELECT almac FROM topo_keep);") != MAPDB_OK) {
+ 		warn("mapc_sync: topology clear: %s\n", mapdb_last_error(c->db));
+ 		mapdb_rollback(c->db);
+ 		return;
+@@ -849,6 +897,9 @@ void mapc_sync_topology(struct controlle
+ 		/* Skip the controller root - it has no upstream BH link. */
+ 		if (!memcmp(dev->al_macaddr, c->almacaddr, 6))
+ 			continue;
++		/* No place in the tree, or no parent to name: no edge (above). */
++		if (dev->bh.depth == UNKNOWN_TREE_LEVEL || !dev->bh.parent)
++			continue;
+ 
+ 		downstream_mac = dev->bh.own_iface ? dev->bh.own_iface->macaddr
+ 						   : dev->al_macaddr;
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -83,6 +83,7 @@ void topology_build_tree_from_assoc(stru
+ 	struct bh_topology_dev *root, *dev;
+ 	struct node *n;
+ 	bool progress;
++	time_t now;
+ 
+ 	topology_remove_all_devices(topology);
+ 
+@@ -139,31 +140,39 @@ void topology_build_tree_from_assoc(stru
+ 		}
+ 	} while (progress);
+ 
+-	/* Only claim the tree is valid once every device actually found a
+-	 * place in it. Anything else closes a loop we cannot get out of.
++	/* The tree is valid once it is built, even if some devices found no
++	 * place in it. A device without a place simply has depth UNKNOWN; the
++	 * readers of the tree (mapc_sync_topology, mapc_sync_agent,
++	 * cntlr_send_max_wifi_bh_hops_policy) check that per device.
+ 	 *
+-	 * find_backhaul_upstream() (cntlr.c) consults the topology first and
+-	 * only falls back to a bBSS lookup when the topology is *not* valid -
+-	 * and that fallback is the sole thing that ever fills
+-	 * node::upstream_bssid, which is precisely this function's input. So
+-	 * declaring a tree we failed to build valid shuts the fallback off
+-	 * permanently: no upstream_bssid, hence no tree, hence no
+-	 * upstream_bssid.
++	 * Until 2026-09-17 a single unplaced device kept the whole tree
++	 * invalid, and mapc_sync_topology() refuses to run on an invalid tree:
++	 * one node that cannot report its uplink - a MediaTek R3 agent, which
++	 * answers neither Link Metric Query nor sends our 0xE1 TLV, or any
++	 * wired agent - froze topology_link for the entire mesh at whatever it
++	 * held last. Seen on hardware: the MTK box at depth -1 and our agent
++	 * behind it still drawn directly under the controller.
+ 	 *
+-	 * Measured on a three-node mesh 2026-07-28: every node had
+-	 * upstream_bssid all-zero and depth -1, while topology->valid was
+-	 * true and topology_link held correct parents from another path.
+-	 *
+-	 * Leaving valid=false here is self-healing rather than a failure mode:
+-	 * the next link metrics report takes the bBSS fallback, fills in
+-	 * upstream_bssid, and the following rebuild places the node.
++	 * The reason that gate was put here no longer holds.
++	 * find_backhaul_upstream() only takes the tree path when
++	 * bh.own_iface is set, and nothing assigns own_iface since the
++	 * neighbour walker was removed (patch 9999993), so the bBSS fallback
++	 * that fills node::upstream_bssid runs whatever this flag says.
+ 	 */
+ 	topology->valid = true;
++	now = node_mono_now();
+ 	list_for_each_entry(dev, &topology->dev_list, list) {
+-		if (dev->bh.depth == UNKNOWN_TREE_LEVEL) {
+-			topology->valid = false;
+-			break;
+-		}
++		struct node *dn;
++
++		if (!memcmp(dev->al_macaddr, ctrl_al_macaddr, 6))
++			continue;
++		dn = cntlr_find_node(c, dev->al_macaddr);
++		if (!dn)
++			continue;
++		if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
++			dn->unplaced_since = 0;
++		else if (!dn->unplaced_since)
++			dn->unplaced_since = now;
+ 	}
+ 
+ 	mapc_sync_topology(c);

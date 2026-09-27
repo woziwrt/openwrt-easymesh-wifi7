@@ -1,0 +1,41 @@
+#!/bin/sh
+
+# Nothing to generate on a box that is not part of a mesh.
+#
+# This runs once, at first boot - before anyone has decided what the box is
+# for. The hotplug handler beside it (11-multiap-genconfig) has carried this
+# gate since 2026-08-17; this file did not, and that alone was enough to undo
+# it. Measured the same day on a freshly flashed production image: no role, no
+# dhcp.lan.ignore, every mesh worker disabled, and the board still came up
+# broadcasting 'OpenWrt-' and 'MAP--BH' instead of the OpenWrt-2g/5g/6g
+# networks it is meant to offer. Gating one caller and not the other gates
+# nothing.
+#
+# The three tests below are deliberately identical to the hotplug handler's,
+# where the reasoning for each of them is written out in full. Only the last
+# word differs, and has to: that file is sourced, so it says return; this one
+# is executed, so it says exit.
+#
+# In short: /etc/mapc/role is what easymesh-role writes before it touches
+# anything else, and /etc/easymesh-wps-pending covers a join in progress,
+# whose config has to be built before the role exists. If one of them
+# changes, both files change together.
+#
+# Exiting here removes this script, and that is correct: it is a first-boot
+# default, not a policy. A box that later becomes a mesh node has the hotplug
+# handler, which fires on every radio at every boot, and easymesh-role, which
+# builds the configuration itself when a role is assigned.
+#
+# 2026-08-17, later the same day: dhcp.lan.ignore was removed from this test.
+# It had been included as the mark carried by nodes configured before
+# /etc/mapc/role existed. It cannot serve that purpose - easymesh-dhcp-safe
+# writes dhcp.lan.ignore='1' on every box that is not a controller, factory ones
+# included, so the mark appeared on untouched routers and reopened this gate one
+# boot later. Three builds in a row came up with a backhaul on the air because of
+# it. Older nodes now get the real marker from 88-easymesh-role-marker instead.
+#
+# A mark only means "someone decided" if nothing but a decision can produce it.
+[ -f /etc/mapc/role ] ||
+	[ -f /etc/easymesh-wps-pending ] || exit 0
+
+/lib/wifi/multiap conf

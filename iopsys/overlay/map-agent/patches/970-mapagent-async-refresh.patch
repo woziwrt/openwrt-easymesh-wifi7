@@ -1,0 +1,730 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: make periodic wifi refresh timers asynchronous (onboarding blocker #2, Layer 2)
+
+The map-agent uloop is single-threaded. The periodic per-BSS refresh timers
+refresh_bssinfo() (bss_timer) and refresh_neighbor_list() (nbr_timer) called the
+synchronous wifi HAL via blocking ubus_invoke(..., timeout):
+
+  refresh_bssinfo      -> wifi_ap_status() / wifi_get_mld_stations() /
+                          wifi_get_assoclist()
+  refresh_neighbor_list-> sync_neighbor_lists() -> wifi_{get,add,del}_neighbor()
+
+On mt76 affiliated-MLD / dynamic-4addr BSS the station-dump round-trip
+(wifi_get_mld_stations -> nl80211 GET_STATION) can block for the full timeout.
+Because the loop is single-threaded, that stalls uloop -> the map.agent ubus
+object stops dispatching -> "map.agent status" times out at 3s -> no operational
+BSS TLV is emitted -> the controller shows the node with radios:[] -> onboarding
+never completes and nothing is persisted.
+
+Convert both timers to asynchronous requests, mirroring the in-tree template
+agent_init_wifi_radios() / ubus_call_object_async() / async_radio_status_success()
+/ async_radio_timeout(): issue with ubus_invoke_async(), do the identical
+post-processing in the data callback, and never wait on the loop.
+
+Correctness:
+  - per-BSS in-flight flags (bss_refresh_inflight / nbr_refresh_inflight) prevent
+    the periodic timer from re-issuing while a previous async round is still
+    outstanding (no double-issue, no state corruption);
+  - completion and timeout are mutually exclusive (complete_cb does
+    timer_del(&timeout); timeout aborts the request), so each request is freed
+    exactly once, and out-of-order completion of the two chained bss stages is
+    handled explicitly (stage-1 hands the terminal reschedule to stage-2);
+  - every terminal path re-resolves the ap by ifname (agent_get_ap_by_ifname)
+    instead of trusting a captured pointer, so a BSS torn down while a request is
+    in flight is never dereferenced after free;
+  - stage-2 selects object+method per BSS class exactly as the sync HAL does:
+    "assoclist" on wifi.ap.<ifname> for a plain BSS, "stations" on
+    wifi.apmld.<mld_ifname> only when is_affiliated_ap (the conditional used by
+    wifi_ubus_get_assoclist/get_stas); this avoids the latent sync bug in
+    wifi_ubus_get_mld_sta_links() that returns nothing for a non-MLD BSS on EM>=6;
+  - the status data cb applies each field only when present (a missing optional
+    field never aborts the station refresh) and only requires a usable BSSID;
+  - on timeout/error we log and reschedule the timer -- the loop never wedges.
+
+This is Layer 2 of the reliability fix. Layer 1 (libwifi warm cache)
+makes the answers arrive fast; this layer makes map-agent not block its own loop
+while waiting. Both are required for deterministic onboarding.
+
+Supersedes the tactical skip in
+patches/.../0004-mapagent-skip-wifi-probe-refresh-uloop-wedge.patch (drop 0004
+when adopting this). Orthogonal to 0005 (bounded init loops) -- keep 0005.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -303,5 +303,7 @@
+ 	atimer_t nbr_timer; /** refresh neighbor list timer */
+ 	atimer_t bss_timer; /** refresh own bss timer */
++	bool bss_refresh_inflight; /** async bss refresh outstanding (blocker #2) */
++	bool nbr_refresh_inflight; /** async neighbor sync outstanding (blocker #2) */
+ 
+ 	/* Channel utilization threshold timer */
+ 	atimer_t util_threshold_timer;
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2641,56 +2641,527 @@
+ 	a->connected = true;
+ }
+ 
+-static void sync_neighbor_lists(struct netif_ap *ap)
++/*
++ * onboarding blocker #2 (Layer 2): the periodic bss_timer / nbr_timer
++ * callbacks used to call the *synchronous* wifi HAL (wifi_ap_status /
++ * wifi_get_mld_stations / wifi_get_assoclist and neighbor list/add/del) via
++ * blocking ubus_invoke(). On mt76 affiliated-MLD / dynamic-4addr BSS those
++ * round-trips can block for the full timeout and, because map-agent runs a
++ * single-threaded uloop, they stall the loop -> the map.agent object stops
++ * dispatching -> "map.agent status" times out -> onboarding wedges.
++ *
++ * These helpers convert the two refresh timers to *asynchronous* requests,
++ * mirroring the in-tree template agent_init_wifi_radios() /
++ * ubus_call_object_async() / async_radio_status_success() /
++ * async_radio_timeout(): issue with ubus_invoke_async(), post-process in the
++ * data callback (which is where the template invokes its success_cb, see
++ * parse_radio()), and never wait on the loop. Correctness:
++ *   - a per-BSS in-flight flag guards against the periodic timer re-issuing
++ *     while a previous round is still outstanding (no double-issue);
++ *   - completion and timeout are mutually exclusive (complete_cb does
++ *     timer_del(&timeout); timeout aborts the request) so the request struct
++ *     is freed exactly once;
++ *   - every terminal path re-resolves the ap by ifname (agent_get_ap_by_ifname)
++ *     instead of trusting a captured pointer, so a BSS torn down while a
++ *     request is in flight can never be dereferenced after free.
++ */
++
++/* Generic async issuer for an arg-less method. Mirrors ubus_call_object_async()
++ * but lets the caller pick the completion/timeout handlers, so terminal
++ * bookkeeping (reschedule + clear in-flight) is guaranteed even on a fast
++ * error reply that carries no data. */
++static int agent_wifi_async(struct agent *a, struct agent_async_request *areq,
++			    const char *objname, uint32_t obj_id,
++			    const char *method,
++			    void (*data_cb)(struct ubus_request *, int, struct blob_attr *),
++			    void (*complete_cb)(struct ubus_request *, int),
++			    void (*timeout_cb)(atimer_t *),
++			    void *priv, int timeout_ms)
+ {
+-	struct nbr nbr[64] = {};
+-	int nbr_num = 64;
+-	struct neighbor *n = NULL;
+-	bool found;
++	struct blob_buf bb = {};
++	uint32_t id = obj_id;
+ 	int ret;
+-	int i;
+ 
+-	/* Update new & changed nbr entries in driver */
+-	list_for_each_entry(n, &ap->nbrlist, list) {
++	if (id == WIFI_OBJECT_INVALID && objname) {
++		id = ubus_get_object(a->ubus_ctx, objname);
++		if (id == WIFI_OBJECT_INVALID) {
++			warn("%s: object %s not present\n", __func__,
++			     objname ? objname : "");
++			return -1;
++		}
++	}
+ 
+-		if (n->flags & NBR_FLAG_DRV_UPDATED)
+-			continue;
++	blob_buf_init(&bb, 0);
++	ret = ubus_invoke_async(a->ubus_ctx, id, method, bb.head, &areq->ubus_req);
++	if (ret) {
++		blob_buf_free(&bb);
++		return -1;
++	}
+ 
+-		/* update nbr in wifi driver */
+-		dbg("[%s] Update neighbor " \
+-		    MACFMT " entry in driver\n",
+-		    ap->ifname,
+-		    MAC2STR(n->nbr.bssid));
+-		wifi_del_neighbor(ap->ifname, n->nbr.bssid);
+-		wifi_add_neighbor(ap->ifname, &n->nbr);
+-		n->flags |= NBR_FLAG_DRV_UPDATED;
++	snprintf(areq->name, sizeof(areq->name), "%s->%s",
++		 objname ? objname : "", method);
++	areq->ubus_req.priv = priv;
++	areq->ubus_req.data_cb = data_cb;
++	areq->ubus_req.complete_cb = complete_cb;
++	areq->timeout_cb = timeout_cb;
++	timer_init(&areq->timeout, timeout_cb);
++	timer_set(&areq->timeout, timeout_ms);
++	ubus_complete_request_async(a->ubus_ctx, &areq->ubus_req);
++	list_add(&areq->list, &a->pending_asynclist);
++	blob_buf_free(&bb);
++	return 0;
++}
++
++/* Fire-and-forget async invoke that carries arguments (neighbor add/del). */
++static void agent_wifi_fire_complete(struct ubus_request *req, int type)
++{
++	struct agent_async_request *r =
++		container_of(req, struct agent_async_request, ubus_req);
++
++	timer_del(&r->timeout);
++	list_del(&r->list);
++	free(r);
++}
++
++static void agent_wifi_fire_timeout(atimer_t *t)
++{
++	struct agent_async_request *r =
++		container_of(t, struct agent_async_request, timeout);
++
++	ubus_abort_request(r->ubus_req.ctx, &r->ubus_req);
++	list_del(&r->list);
++	free(r);
++}
++
++static int agent_wifi_fire(struct agent *a, uint32_t obj_id,
++			   const char *objname, const char *method,
++			   struct blob_buf *bb)
++{
++	struct agent_async_request *r;
++	uint32_t id = obj_id;
++	int ret;
++
++	if (id == WIFI_OBJECT_INVALID && objname) {
++		id = ubus_get_object(a->ubus_ctx, objname);
++		if (id == WIFI_OBJECT_INVALID)
++			return -1;
++	}
++
++	r = calloc(1, sizeof(*r));
++	if (!r)
++		return -1;
++
++	ret = ubus_invoke_async(a->ubus_ctx, id, method, bb->head, &r->ubus_req);
++	if (ret) {
++		free(r);
++		return -1;
++	}
++
++	snprintf(r->name, sizeof(r->name), "%s->%s", objname ? objname : "", method);
++	r->ubus_req.complete_cb = agent_wifi_fire_complete;
++	timer_init(&r->timeout, agent_wifi_fire_timeout);
++	timer_set(&r->timeout, 1 * 1000);
++	ubus_complete_request_async(a->ubus_ctx, &r->ubus_req);
++	list_add(&r->list, &a->pending_asynclist);
++	return 0;
++}
++
++/* ------- refresh_bssinfo: async status -> async stations/assoclist ------- */
++
++struct bss_refresh_req {
++	struct agent_async_request areq;	/* MUST be the first member */
++	struct agent *a;
++	char ifname[16];
++	int stage;				/* 1 = status, 2 = stations */
++	bool bssid_unset;			/* captured at stage-1 issue */
++	bool parsed;				/* stage-1 chained to stage-2 OK */
++	bool stations_mld;			/* stage-2 queried apmld "stations" */
++	int status;
++};
++
++static void bss_refresh_finalize(struct agent *a, const char *ifname)
++{
++	struct netif_ap *ap = agent_get_ap_by_ifname(a, ifname);
++
++	if (ap) {
++		ap->bss_refresh_inflight = false;
++		timer_set(&ap->bss_timer, BSS_REFRESH_INTERVAL);
++	}
++}
++
++static void bss_refresh_complete(struct ubus_request *req, int type)
++{
++	struct bss_refresh_req *w = (struct bss_refresh_req *)
++		container_of(req, struct agent_async_request, ubus_req);
++
++	timer_del(&w->areq.timeout);
++	list_del(&w->areq.list);
++
++	/* A stage-1 (status) request that successfully chained to stage-2
++	 * leaves the reschedule/clear to stage-2; every other terminal path
++	 * (stage-1 error/no-data, stage-2 complete) finalizes here. */
++	if (!(w->stage == 1 && w->parsed))
++		bss_refresh_finalize(w->a, w->ifname);
++
++	free(w);
++}
++
++static void bss_refresh_timeout(atimer_t *t)
++{
++	struct agent_async_request *areq =
++		container_of(t, struct agent_async_request, timeout);
++	struct bss_refresh_req *w = (struct bss_refresh_req *)areq;
++
++	ubus_abort_request(areq->ubus_req.ctx, &areq->ubus_req);
++	list_del(&areq->list);
++	bss_refresh_finalize(w->a, w->ifname);
++	free(w);
++}
++
++static void bss_stations_data_cb(struct ubus_request *req, int type,
++				 struct blob_attr *msg)
++{
++	struct bss_refresh_req *w = (struct bss_refresh_req *)
++		container_of(req, struct agent_async_request, ubus_req);
++	static const struct blobmsg_policy mld_pol[] = {
++		[0] = { .name = "stations", .type = BLOBMSG_TYPE_ARRAY },
++	};
++	static const struct blobmsg_policy assoc_pol[] = {
++		[0] = { .name = "assoclist", .type = BLOBMSG_TYPE_ARRAY },
++	};
++	struct blob_attr *tb[1];
++	struct blob_attr *cur;
++	struct netif_ap *ap;
++	int rem;
++
++	w->parsed = false;
++
++	ap = agent_get_ap_by_ifname(w->a, w->ifname);
++	if (!ap)
++		return;
++
++	/* Two reply shapes, chosen in bss_issue_stations() to match the object
++	 * we queried: the apmld "stations" array (per-sta macaddr + bssid) for
++	 * an affiliated-MLD BSS, or the wifi.ap "assoclist" array (bare MAC
++	 * strings) for a plain BSS. */
++	if (w->stations_mld)
++		blobmsg_parse(mld_pol, 1, tb, blob_data(msg), blob_len(msg));
++	else
++		blobmsg_parse(assoc_pol, 1, tb, blob_data(msg), blob_len(msg));
++	if (!tb[0])
++		return;
++
++	blobmsg_for_each_attr(cur, tb[0], rem) {
++		uint8_t mac[6];
++
++		if (w->stations_mld) {
++			static const struct blobmsg_policy sp[] = {
++				[0] = { .name = "macaddr", .type = BLOBMSG_TYPE_STRING },
++				[1] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
++			};
++			struct blob_attr *stb[ARRAY_SIZE(sp)];
++			uint8_t bssid[6];
++
++			blobmsg_parse(sp, ARRAY_SIZE(sp), stb,
++				      blobmsg_data(cur), blobmsg_data_len(cur));
++			if (!stb[0] || !stb[1])
++				continue;
++			if (!hwaddr_aton(blobmsg_get_string(stb[0]), mac))
++				continue;
++			if (!hwaddr_aton(blobmsg_get_string(stb[1]), bssid))
++				continue;
++			/* aggregate apmld reply spans links; keep our BSS only
++			 * (same filter as the sync wifi_get_mld_stations path) */
++			if (memcmp(bssid, ap->bssid, 6))
++				continue;
++		} else {
++			if (!hwaddr_aton(blobmsg_get_string(cur), mac))
++				continue;
++		}
++
++		wifi_add_sta(w->a, ap->ifname, mac);
++	}
++
++	w->parsed = true;
++}
++
++static int bss_issue_stations(struct bss_refresh_req *w1, struct netif_ap *ap)
++{
++	struct bss_refresh_req *w2;
++	char objname[64] = {};
++	const char *method;
++	uint32_t obj_id;
++
++	w2 = calloc(1, sizeof(*w2));
++	if (!w2)
++		return -1;
++
++	w2->a = w1->a;
++	w2->stage = 2;
++	w2->status = -1;
++	snprintf(w2->ifname, sizeof(w2->ifname), "%s", w1->ifname);
++
++	/* Select object + method exactly as the sync HAL does per BSS class.
++	 * The station list lives on wifi.ap.<ifname> (method "assoclist") for a
++	 * plain BSS, and only on the aggregate wifi.apmld.<mld_ifname> (method
++	 * "stations") for an affiliated-MLD BSS -- the same conditional used by
++	 * wifi_ubus_get_assoclist()/wifi_ubus_get_stas() (wifi_ubus.c:1678/2090).
++	 * NB: wifi_ubus_get_mld_sta_links() (the literal wifi_get_mld_stations
++	 * impl) hard-codes apmld, which returns nothing for a non-MLD BSS on
++	 * EM>=6 -- a latent sync bug; the async path follows the correct
++	 * conditional so non-MLD stations are not lost. */
++#if (EASYMESH_VERSION >= 6)
++	if (ap->is_affiliated_ap) {
++		snprintf(objname, sizeof(objname), "wifi.apmld.%s", ap->mld_ifname);
++		method = "stations";
++		obj_id = WIFI_OBJECT_INVALID;	/* resolve apmld by name */
++		w2->stations_mld = true;
++	} else
++#endif
++	{
++		snprintf(objname, sizeof(objname), "wifi.ap.%s", w2->ifname);
++		method = "assoclist";
++		obj_id = ap->obj_id;
++		w2->stations_mld = false;
++	}
++
++	if (agent_wifi_async(w2->a, &w2->areq, objname, obj_id, method,
++			     bss_stations_data_cb, bss_refresh_complete,
++			     bss_refresh_timeout, w2, 2 * 1000)) {
++		free(w2);
++		return -1;
++	}
++	return 0;
++}
++
++static void bss_status_data_cb(struct ubus_request *req, int type,
++			       struct blob_attr *msg)
++{
++	struct bss_refresh_req *w = (struct bss_refresh_req *)
++		container_of(req, struct agent_async_request, ubus_req);
++	static const struct blobmsg_policy pol[] = {
++		[0] = { .name = "channel", .type = BLOBMSG_TYPE_INT32 },
++		[1] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
++		[2] = { .name = "ssid", .type = BLOBMSG_TYPE_STRING },
++		[3] = { .name = "utilization", .type = BLOBMSG_TYPE_INT32 },
++		[4] = { .name = "max_stations", .type = BLOBMSG_TYPE_INT32 },
++	};
++	struct blob_attr *tb[ARRAY_SIZE(pol)];
++	struct netif_ap *ap;
++	uint32_t util;
++
++	w->parsed = false;
++
++	blobmsg_parse(pol, ARRAY_SIZE(pol), tb, blob_data(msg), blob_len(msg));
++
++	ap = agent_get_ap_by_ifname(w->a, w->ifname);
++	if (!ap) {
++		w->status = -1;
++		return;
+ 	}
+ 
+-	/* Trigger removal of dead entries from list in driver */
+-	ret = wifi_get_neighbor_list(ap->ifname, nbr, &nbr_num);
+-	if (ret)
++	/* Apply each field only when present; a missing OPTIONAL field must not
++	 * abort the refresh (the sync wifi_ubus_ap_status_cb defaults absent
++	 * fields). The BSSID is the one field we truly need -- to filter MLD
++	 * stations and for wifi_add_sta() -- and it persists on ap across rounds. */
++	if (tb[1]) {
++		if (hwaddr_aton(blobmsg_get_string(tb[1]), ap->bssid) == NULL) {
++			w->status = -1;
++			return;
++		}
++		if (w->bssid_unset && !hwaddr_is_zero(ap->bssid)) {
++			/* bssid got set, update STA restrictions */
++			assoc_ctrl_sync_from_file(w->a, ap);
++		}
++	}
++	if (tb[0])
++		ap->channel = blobmsg_get_u32(tb[0]);
++	if (tb[2])
++		strncpy(ap->ssid, blobmsg_get_string(tb[2]), sizeof(ap->ssid) - 1);
++	if (tb[3]) {
++		util = blobmsg_get_u32(tb[3]);
++		if (util != 0xff)
++			ap->bssload = util;
++	}
++	if (tb[4])
++		ap->max_sta = blobmsg_get_u32(tb[4]);
++
++	/* Need a usable BSSID (from this reply or a previous round) to proceed. */
++	if (hwaddr_is_zero(ap->bssid)) {
++		w->status = -1;
++		return;
++	}
++	w->status = 0;
++
++	dbg("%s: ap: %s  max_sta: %d  bssid: " MACFMT \
++	    "  channel: %d  bssload: %d\n",
++	    __func__, ap->ifname, ap->max_sta,
++	    MAC2STR(ap->bssid), ap->channel, ap->bssload);
++
++	/* chain: fetch stations/assoclist without blocking the loop */
++	if (bss_issue_stations(w, ap) == 0)
++		w->parsed = true;	/* stage-2 owns the terminal reschedule */
++}
++
++/* ---------- refresh_neighbor_list: async driver neighbor sync ---------- */
++
++struct nbr_list_req {
++	struct agent_async_request areq;	/* MUST be the first member */
++	struct agent *a;
++	char ifname[16];
++};
++
++static void nbr_refresh_finalize(struct agent *a, const char *ifname)
++{
++	struct netif_ap *ap = agent_get_ap_by_ifname(a, ifname);
++
++	if (ap)
++		ap->nbr_refresh_inflight = false;
++}
++
++static void nbr_list_complete(struct ubus_request *req, int type)
++{
++	struct nbr_list_req *w = (struct nbr_list_req *)
++		container_of(req, struct agent_async_request, ubus_req);
++
++	timer_del(&w->areq.timeout);
++	list_del(&w->areq.list);
++	nbr_refresh_finalize(w->a, w->ifname);
++	free(w);
++}
++
++static void nbr_list_timeout(atimer_t *t)
++{
++	struct agent_async_request *areq =
++		container_of(t, struct agent_async_request, timeout);
++	struct nbr_list_req *w = (struct nbr_list_req *)areq;
++
++	ubus_abort_request(areq->ubus_req.ctx, &areq->ubus_req);
++	list_del(&areq->list);
++	nbr_refresh_finalize(w->a, w->ifname);
++	free(w);
++}
++
++static void nbr_list_data_cb(struct ubus_request *req, int type,
++			     struct blob_attr *msg)
++{
++	struct nbr_list_req *w = (struct nbr_list_req *)
++		container_of(req, struct agent_async_request, ubus_req);
++	static const struct blobmsg_policy pol[] = {
++		[0] = { .name = "neighbors", .type = BLOBMSG_TYPE_ARRAY },
++	};
++	struct blob_attr *tb[ARRAY_SIZE(pol)];
++	struct blob_attr *cur;
++	struct netif_ap *ap;
++	int rem;
++
++	ap = agent_get_ap_by_ifname(w->a, w->ifname);
++	if (!ap)
+ 		return;
+ 
+-	for (i = 0; i < nbr_num; i++) {
+-		found = false;
+-		n = NULL;
++	blobmsg_parse(pol, ARRAY_SIZE(pol), tb, blob_data(msg), blob_len(msg));
++	if (!tb[0])
++		return;
++
++	/* Prune driver neighbor entries no longer present in FH's nbrlist
++	 * (same as the sync tail of sync_neighbor_lists), deleting async. */
++	blobmsg_for_each_attr(cur, tb[0], rem) {
++		static const struct blobmsg_policy np[] = {
++			[0] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
++		};
++		struct blob_attr *ntb[ARRAY_SIZE(np)];
++		struct neighbor *n = NULL;
++		uint8_t bssid[6];
++		bool found = false;
++
++		blobmsg_parse(np, ARRAY_SIZE(np), ntb,
++			      blobmsg_data(cur), blobmsg_data_len(cur));
++		if (!ntb[0])
++			continue;
++		if (!hwaddr_aton(blobmsg_get_string(ntb[0]), bssid))
++			continue;
++
+ 		list_for_each_entry(n, &ap->nbrlist, list) {
+-			if (!memcmp(nbr[i].bssid, n->nbr.bssid, 6)) {
++			if (!memcmp(bssid, n->nbr.bssid, 6)) {
+ 				found = true;
+ 				break;
+ 			}
+ 		}
+ 
+ 		if (!found) {
+-			/* Remove dead entry from driver list */
+-			dbg("[%s] Delete neighbor " \
+-			    MACFMT " entry in driver\n",
+-			    ap->ifname, MAC2STR(nbr[i].bssid));
+-			wifi_del_neighbor(ap->ifname, nbr[i].bssid);
++			struct blob_buf bb = {};
++			char bssidstr[18] = {};
++
++			hwaddr_ntoa(bssid, bssidstr);
++			blob_buf_init(&bb, 0);
++			blobmsg_add_string(&bb, "bssid", bssidstr);
++			agent_wifi_fire(w->a, ap->obj_id, NULL,
++					"del_neighbor", &bb);
++			blob_buf_free(&bb);
+ 		}
+ 	}
+ }
+ 
++static void sync_neighbor_lists(struct netif_ap *ap)
++{
++	struct agent *a = ap->agent;
++	struct neighbor *n = NULL;
++	struct nbr_list_req *w;
++	char objname[64] = {};
++
++	/* Update new & changed nbr entries in driver (async del + add). */
++	list_for_each_entry(n, &ap->nbrlist, list) {
++		struct blob_buf bb = {};
++		char bssidstr[18] = {};
++		char bssid_infostr[12] = {};
++
++		if (n->flags & NBR_FLAG_DRV_UPDATED)
++			continue;
++
++		dbg("[%s] Update neighbor " MACFMT " entry in driver\n",
++		    ap->ifname, MAC2STR(n->nbr.bssid));
++
++		hwaddr_ntoa(n->nbr.bssid, bssidstr);
++
++		/* del first (mirrors the sync del+add pair) */
++		blob_buf_init(&bb, 0);
++		blobmsg_add_string(&bb, "bssid", bssidstr);
++		agent_wifi_fire(a, ap->obj_id, NULL, "del_neighbor", &bb);
++		blob_buf_free(&bb);
++
++		snprintf(bssid_infostr, sizeof(bssid_infostr), "%u",
++			 n->nbr.bssid_info);
++		blob_buf_init(&bb, 0);
++		blobmsg_add_string(&bb, "bssid", bssidstr);
++		blobmsg_add_u32(&bb, "channel", n->nbr.channel);
++		blobmsg_add_string(&bb, "bssid_info", bssid_infostr);
++		blobmsg_add_u32(&bb, "reg", n->nbr.reg);
++		blobmsg_add_u32(&bb, "phy", n->nbr.phy);
++		agent_wifi_fire(a, ap->obj_id, NULL, "add_neighbor", &bb);
++		blob_buf_free(&bb);
++
++		n->flags |= NBR_FLAG_DRV_UPDATED;
++	}
++
++	/* Dump the driver neighbor list asynchronously; dead entries are
++	 * pruned in nbr_list_data_cb(). */
++	w = calloc(1, sizeof(*w));
++	if (!w) {
++		ap->nbr_refresh_inflight = false;
++		return;
++	}
++	w->a = a;
++	snprintf(w->ifname, sizeof(w->ifname), "%s", ap->ifname);
++	snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);
++
++	if (agent_wifi_async(a, &w->areq, objname, ap->obj_id, "list_neighbor",
++			     nbr_list_data_cb, nbr_list_complete,
++			     nbr_list_timeout, w, 1 * 1000)) {
++		ap->nbr_refresh_inflight = false;
++		free(w);
++	}
++}
++
+ static void refresh_neighbor_list(atimer_t *t)
+ {
+ 	struct netif_ap *ap = container_of(t, struct netif_ap, nbr_timer);
+@@ -64,8 +535,17 @@
+ 				tsp, NBR_AGEOUT_INTERVAL, NULL,
+ 				ap->nbr_nr);
+ 
+-	/* Now update list in driver so that it matches FH's nbrlist */
+-	sync_neighbor_lists(ap);
++	/* Now update the driver list to match FH's nbrlist. Done asynchronously
++	 * so a slow/wedged wifi HAL can never stall the single-threaded uloop
++	 * (onboarding blocker #2). The in-flight guard stops a second dump from
++	 * being issued while a previous one is still outstanding. */
++	if (!ap->nbr_refresh_inflight) {
++		ap->nbr_refresh_inflight = true;
++		sync_neighbor_lists(ap);
++	} else {
++		dbg("%s: %s neighbor sync in-flight, skip\n",
++		    __func__, ap->ifname);
++	}
+ 
+ 	/* Check again in couple of minutes */
+ 	timer_set(&ap->nbr_timer, NBR_REFRESH_INTERVAL);
+@@ -74,53 +554,44 @@
+ static void refresh_bssinfo(atimer_t *t)
+ {
+ 	struct netif_ap *ap = container_of(t, struct netif_ap, bss_timer);
+-	struct agent *a = ap->agent;
+-	struct wifi_ap_status ap_status = {};
+-	bool bssid_unset = !!hwaddr_is_zero(ap->bssid);
+-	int i;
++	struct bss_refresh_req *w;
++	char objname[64] = {};
+ 
+ 	trace("%s: ap = %s\n", __func__, ap->ifname);
+ 
+-	if (!wifi_ap_status(ap->ifname, &ap_status)) {
+-#if (EASYMESH_VERSION >= 6)
+-		struct wifi_mlsta mlsta[128] = {0};
+-		int num_mlsta = 128;
+-#else
+-		uint8_t sta[128 * 6] = {};
+-		int num_sta = 128;
+-#endif
+-		ap->channel = ap_status.ap.bss.channel;
+-		memcpy(ap->bssid, ap_status.ap.bss.bssid, 6);
+-		if (bssid_unset && !hwaddr_is_zero(ap->bssid)) {
+-			/* bssid got set, update STA restrictions */
+-			assoc_ctrl_sync_from_file(a, ap);
+-		}
+-		memcpy(ap->ssid, ap_status.ap.bss.ssid, 32);
+-		/* others.. */
+-		if (ap_status.ap.bss.load.utilization != 0xff)
+-			ap->bssload = ap_status.ap.bss.load.utilization;
+-		ap->max_sta = ap_status.ap.assoclist_max;
+-
+-		dbg("%s: ap: %s  max_sta: %d  bssid: " MACFMT \
+-		    "  channel: %d  bssload: %d\n",
+-			__func__, ap->ifname, ap->max_sta,
+-			MAC2STR(ap->bssid), ap->channel, ap->bssload);
+-#if (EASYMESH_VERSION >= 6)
+-		if (!wifi_get_mld_stations(ap, mlsta, &num_mlsta)) {
+-			for (i = 0; i < num_mlsta; i++) {
+-				if (!memcmp(mlsta[i].sta->bssid, ap->bssid, 6))
+-					wifi_add_sta(a, ap->ifname, mlsta[i].sta->macaddr);
+-			}
+-		}
+-#else
+-		if (!wifi_get_assoclist(ap, sta, &num_sta)) {
+-			for (i = 0; i < num_sta; i++)
+-				wifi_add_sta(a, ap->ifname, &sta[i * 6]);
+-		}
+-#endif
++	/* Double-issue guard: never run two refresh rounds for the same BSS.
++	 * A previous async round is still outstanding -> just reschedule. */
++	if (ap->bss_refresh_inflight) {
++		dbg("%s: %s refresh in-flight, reschedule\n",
++		    __func__, ap->ifname);
++		timer_set(&ap->bss_timer, BSS_REFRESH_INTERVAL);
++		return;
+ 	}
+ 
+-	timer_set(&ap->bss_timer, BSS_REFRESH_INTERVAL);
++	w = calloc(1, sizeof(*w));
++	if (!w) {
++		timer_set(&ap->bss_timer, BSS_REFRESH_INTERVAL);
++		return;
++	}
++	w->a = ap->agent;
++	w->stage = 1;
++	w->status = -1;
++	w->bssid_unset = !!hwaddr_is_zero(ap->bssid);
++	snprintf(w->ifname, sizeof(w->ifname), "%s", ap->ifname);
++
++	snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);
++	ap->bss_refresh_inflight = true;
++
++	/* Stage 1: async AP status. On success bss_status_data_cb() applies the
++	 * fields and chains stage 2 (stations/assoclist). Terminal reschedule +
++	 * in-flight clear happen in bss_refresh_complete/bss_refresh_timeout. */
++	if (agent_wifi_async(w->a, &w->areq, objname, ap->obj_id, "status",
++			     bss_status_data_cb, bss_refresh_complete,
++			     bss_refresh_timeout, w, 2 * 1000)) {
++		ap->bss_refresh_inflight = false;
++		free(w);
++		timer_set(&ap->bss_timer, BSS_REFRESH_INTERVAL);
++	}
+ }
+ 
+ static bool radio_diag_valid(struct wifi_radio_diagnostic *diag)

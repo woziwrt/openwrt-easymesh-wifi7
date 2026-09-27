@@ -1,0 +1,104 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99997: a leg has no struct sta, so stop requiring one
+
+handle_sta_link_metrics_response() starts by resolving the reported address in
+sta_table and returns early when that fails. For an MLD client that lookup can
+never succeed: the client is in sta_table once, under its MLD address, while the
+agent reports metrics per leg, keyed by the leg's own address.
+
+So every per-link measurement was discarded on the first line of the handler,
+before 99996's writer could see it.
+
+Measured on hardware 2026-08-04, MLO client on the colocated controller:
+
+	agent   leg ae:64:a9:d9:06:b3 on 76:04:1c:81:bc:2e   rssi -43
+	        leg 4e:0f:4f:00:d6:5f on 7a:04:1c:81:9c:2e   rssi 0
+	        leg b6:f6:c2:8f:c2:65 on 7e:04:1c:81:7c:2e   rssi 0
+
+	sta     7a:6f:6d:db:82:92 only - the MLD address, no legs
+	log     No STA found in Assoc-Link-Metrics-Resp        5x
+	db      affiliated_sta.rcpi = 0 on all three legs
+
+The agent measures the right leg and reports it correctly. Nothing was wrong
+with the measurement, the emission, the persistence or the writer 99996 added -
+the report simply died on a lookup that cannot succeed for the entity being
+reported.
+
+Walk the BSS entries whether or not a struct sta was found, hand every entry to
+the affiliated element, and keep the struct sta updates behind a null check.
+The zeros on the idle legs are honest and are handled by the same rule as
+everywhere else: an unmeasured value does not overwrite a measured one.
+
+Note for the record: this was predicted as an agent-side defect (the "strongest
+link" fallback being unreachable). It is not - the agent had -43 on the correct
+leg the whole time. The block was on this side.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -3016,9 +3016,21 @@
+ 
+ 		idx++;
+ 
++		/* A leg of an MLD client has no entry in sta_table - the client
++		 * is there once, under its MLD address - so bailing out here
++		 * threw away every per-link measurement before anything could
++		 * look at it. Measured 2026-08-04 with an MLO client on 4g:
++		 *
++		 *   agent   leg ae:64:a9:d9:06:b3 on 76:04:1c:81:bc:2e  rssi -43
++		 *   sta     only 7a:6f:6d:db:82:92 (the MLD address)
++		 *   log     "No STA found in Assoc-Link-Metrics-Resp"  5x
++		 *
++		 * The agent measures the right leg and says so; the report died
++		 * on a lookup that cannot succeed for legs. Keep walking the BSS
++		 * entries even without a struct sta, and let the affiliated
++		 * element take the reading.
++		 */
+ 		s = cntlr_find_sta(c->sta_table, p->macaddr);
+-		if (!s)
+-			continue;
+ 
+ 		offset = sizeof(*p);
+ 		for (i = 0; i < p->num_bss; i++) {
+@@ -3032,6 +3044,19 @@
+ 				continue;
+ 			}
+ 
++#if (EASYMESH_VERSION >= 6)
++			/* Independent of sta_table: this is keyed by the leg. */
++			cntlr_affiliated_sta_metrics(c, p->macaddr, b->bssid,
++						     b->ul_rcpi,
++						     BUF_GET_BE32(b->dl_thput),
++						     BUF_GET_BE32(b->ul_thput));
++#endif
++
++			if (!s) {
++				offset += sizeof(*b);
++				continue;
++			}
++
+ 			if (memcmp(s->bssid, b->bssid, 6)) {
+ 				cntlr_dbg(LOG_STA,
+ 					  "%s: Ignore STA " MACFMT " link-metrics with different bssid\n",
+@@ -3053,22 +3078,10 @@
+ 			else if (!s->de_sta->rcpi)
+ 				s->de_sta->rcpi = b->ul_rcpi;
+ 
+-#if (EASYMESH_VERSION >= 6)
+-			/* For a leg of an MLD client this is a per-link
+-			 * measurement, and the row that gets persisted is the
+-			 * affiliated element, not this struct sta. Nothing
+-			 * copied between the two, so affiliated_sta.rcpi stayed
+-			 * NULL however well the agent measured. */
+-			cntlr_affiliated_sta_metrics(c, p->macaddr, b->bssid,
+-						     b->ul_rcpi,
+-						     BUF_GET_BE32(b->dl_thput),
+-						     BUF_GET_BE32(b->ul_thput));
+-#endif
+-
+ 			offset += sizeof(*b);
+ 		}
+ 
+-		if (iidx < INFORM_STA_MAXNUM - 1)
++		if (s && iidx < INFORM_STA_MAXNUM - 1)
+ 			memcpy(&inform_stalist[6 * iidx++], s->de_sta->macaddr, 6);
+ 	}
+ 

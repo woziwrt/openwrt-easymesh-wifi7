@@ -1,0 +1,172 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 979: an AP MLD Config TLV must not rename the local MLD sections
+
+mlo_process_ap_mld_config() deletes every UCI mld section before applying what
+the controller sent, with the comment "reset UCI mld sections so IDs are
+reassigned cleanly". It does not do that.
+
+uci_apply_agent_mld_config() is find-or-create: config_get_section() looks the
+section up by its id option and config_add_section() adds one only when there is
+none - passing NULL for the name. A section recreated after the wipe is
+therefore anonymous, @mld[0], while map_genconfig writes named ones, apmld0 and
+apmld1. The wipe does not reassign ids, it renames the sections, and everything
+that refers to them by name stops finding them.
+
+Measured on the colocated controller 2026-07-30. After a flash the node came up,
+this handler ran, apmld0 was gone, and at t+180s:
+
+  mld-report-check: mapagent is missing its MLD configuration - regenerating
+                    before restart
+  mld-report-check: AP-MLD ap-mld-1 runs 3 links but reports 0 affiliated APs
+                    - restarting map-agent (1/3)
+  mld-report-check: AP-MLD ap-mld-1 now reports 5 of 3 affiliated APs
+
+The watchdog recovers it, but a map-agent restart is not free: it costs a
+deauth/reassoc storm on every associated backhaul, and an agent that associates
+during that window can be handed an AID another station still holds. So the
+whole chain that ends in "associated, authorized, two links, moves no traffic"
+starts here, with a section that was renamed rather than reassigned.
+
+The empty-TLV guard a few lines above already states the principle this breaks:
+local MLD configuration is owned by map_genconfig, not by the controller.
+
+Stop wiping. Since the writer finds the section by id, the named sections are
+updated in place and keep their names. Sections for MLDs the controller no
+longer sends still have to go, so sweep those at the end of the handler instead,
+once cfg->mldlist holds exactly the received set - the inverse of
+uci_delete_mld_config(), and the only part of the wipe that was doing real work.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -u -r a/src/agent_map.c b/src/agent_map.c
+--- a/src/agent_map.c	2026-07-30 12:21:01.924392685 +0200
++++ b/src/agent_map.c	2026-07-30 12:21:01.925145013 +0200
+@@ -2101,8 +2101,27 @@
+ 		return 0;
+ 	}
+ 
+-	/* reset UCI mld sections so IDs are reassigned cleanly */
+-	uci_delete_mld_config(&a->cfg);
++	/* Do not wipe the UCI mld sections here.
++	 *
++	 * uci_apply_agent_mld_config() below is find-or-create: it looks the
++	 * section up by its id option and only adds one when there is none
++	 * (config.c, config_get_section() then config_add_section()). The add
++	 * passes NULL for the name, so a section recreated after a wipe is
++	 * anonymous - @mld[0] - while map_genconfig writes named ones, apmld0
++	 * and apmld1. Wiping therefore does not "reassign ids cleanly", it
++	 * renames the sections, and everything that refers to them by name
++	 * stops finding them.
++	 *
++	 * Measured on the colocated controller 2026-07-30: after a flash the
++	 * agent came up, this handler ran, apmld0 was gone, and mld-report-check
++	 * regenerated the whole configuration and restarted map-agent at t+180s
++	 * - a restart that costs a deauth/reassoc storm on every associated
++	 * backhaul. Same principle the empty-TLV guard above already states:
++	 * local MLD configuration is owned by map_genconfig.
++	 *
++	 * Sections for MLDs the controller no longer sends still have to go;
++	 * that is done at the end, once the received set is known.
++	 */
+ 	clean_all_mlds(&a->cfg);
+ 
+ 	/* 1: mark affiliated APs as torndown; keep mld_id as a hint for step 2 */
+@@ -2317,6 +2336,10 @@
+ 		}
+ 	}
+ 
++	/* Now that cfg->mldlist holds exactly what the controller sent, drop the
++	 * UCI sections for anything that is no longer in it. */
++	uci_sweep_stale_mld_config(&a->cfg);
++
+ 	wifi_clean_torndown_ifaces(a);
+ 	agent_exec_platform_scripts("write_credentials");
+ 	return 0;
+diff -u -r a/src/config.c b/src/config.c
+--- a/src/config.c	2026-07-30 12:21:01.924237945 +0200
++++ b/src/config.c	2026-07-30 12:21:01.925637696 +0200
+@@ -4485,6 +4485,74 @@
+ 	return 0;
+ }
+ 
++/* Delete the UCI mld sections whose id is not in cfg->mldlist.
++ *
++ * The counterpart of uci_delete_mld_config(): that one removes the sections
++ * listed in cfg->mldlist, this one removes the sections that are not. Called
++ * after an AP MLD Config TLV has been applied, so that an MLD the controller
++ * has stopped sending does not linger in the configuration, without taking the
++ * surviving sections - and their names - down with it.
++ */
++void uci_sweep_stale_mld_config(struct agent_config *cfg)
++{
++	struct uci_context *ctx = NULL;
++	struct uci_package *pkg_map, *pkg_wifi;
++	struct uci_element *e, *tmp;
++
++	pkg_map = uci_load_pkg(&ctx, UCI_AGENT);
++	if (!pkg_map)
++		return;
++
++	if (uci_load(ctx, UCI_WIRELESS, &pkg_wifi) != UCI_OK) {
++		uci_unload(ctx, pkg_map);
++		uci_free_context(ctx);
++		return;
++	}
++
++	uci_foreach_element_safe(&pkg_map->sections, tmp, e) {
++		struct uci_section *s = uci_to_section(e);
++		struct uci_ptr ptr = {0};
++		struct uci_element *we, *wtmp;
++		char mldname[16] = {0};
++		const char *idstr;
++		int id;
++
++		if (strcmp(s->type, "mld"))
++			continue;
++
++		idstr = uci_lookup_option_string(ctx, s, "id");
++		if (!idstr)
++			continue;
++
++		id = atoi(idstr);
++		if (agent_get_mld_credential_by_id(cfg, id))
++			continue;
++
++		dbg("%s: dropping stale mld section id %d\n", __func__, id);
++
++		snprintf(mldname, sizeof(mldname), "mld%d", id);
++		uci_foreach_element_safe(&pkg_wifi->sections, wtmp, we) {
++			struct uci_section *ws = uci_to_section(we);
++
++			if (!strcmp(ws->type, "wifi-mld") &&
++			    !strcmp(ws->e.name, mldname)) {
++				ptr = (struct uci_ptr){ .p = pkg_wifi, .s = ws };
++				uci_delete(ctx, &ptr);
++				break;
++			}
++		}
++
++		ptr = (struct uci_ptr){ .p = pkg_map, .s = s };
++		uci_delete(ctx, &ptr);
++	}
++
++	uci_commit(ctx, &pkg_map, false);
++	uci_commit(ctx, &pkg_wifi, false);
++	uci_unload(ctx, pkg_map);
++	uci_unload(ctx, pkg_wifi);
++	uci_free_context(ctx);
++}
++
+ void uci_delete_mld_config(struct agent_config *cfg)
+ {
+ 	struct mld_credential *mld;
+diff -u -r a/src/config.h b/src/config.h
+--- a/src/config.h	2026-07-30 12:21:01.924340211 +0200
++++ b/src/config.h	2026-07-30 12:21:01.925739584 +0200
+@@ -453,5 +453,6 @@
+ void clean_mld_credential(struct mld_credential *mld);
+ int clean_all_mlds(struct agent_config *cfg);
+ void uci_delete_mld_config(struct agent_config *cfg);
++void uci_sweep_stale_mld_config(struct agent_config *cfg);
+ #endif
+ #endif

@@ -1,0 +1,115 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: the poll must attach a leg to its MLD too
+
+996 fixed this for apmld_refresh_stations(). The 60s BSS poll is the
+other writer of the station list and it was left behind: it walks
+mlo_links[], takes the link address, calls wifi_add_sta() - and stops
+there. stb[0] and stb[1], which carry the MLD address and the AP-MLD
+BSSID, are parsed and thrown away.
+
+Without stamld_update() the station exists, is counted in num_sta, and
+belongs to no MLD. is_affiliated_sta stays 0, and three things follow
+from that one flag:
+
+  agent_tlv.c:3628   the leg is not skipped, so it goes up in the
+                     Associated Clients TLV under its LINK address
+  agent_cmdu.c:287   same for Associated STA Link Metrics
+  agent_tlv.c:3730   stamldlist stays empty, so no STA-MLD is reported
+
+Measured 2026-09-03 on a three-node mesh: a phone associated to an agent
+arrived at the controller as TWO separate clients, under the addresses
+of its two legs, with no sta_mld row and no MLD address anywhere. The
+same phone on the controller itself was reported correctly, because
+there the event path had run.
+
+That is the asymmetry this fixes. The event path
+(agent_ubus_events.c:606) does it right, but it bails out early when the
+AP-MLD object does not exist yet - a client that associates before the
+MLD is built is never re-announced, and from then on the poll is the only
+writer. So the poll has to be able to stand alone.
+
+Guard is the one apmld_refresh_stations() uses: a client reported without
+a usable MLD BSSID, or whose MLD address equals the address we matched,
+stays a plain station. Non-MLO clients take the fallback branch and never
+reach this code.
+
+Verified: compiles clean for aarch64 (EXIT=0).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2948,6 +2948,10 @@
+ 	blobmsg_for_each_attr(cur, tb[0], rem) {
+ 		uint8_t mac[6];
+ 		struct sta *added;
++		uint8_t mldmac[6] = {0};
++		uint8_t mldbssid[6] = {0};
++		uint8_t link_id = 0;
++		bool have_mld = false;
+ 
+ 		if (w->stations_mld) {
+ 			static const struct blobmsg_policy sp[] = {
+@@ -2977,6 +2981,7 @@
+ 					static const struct blobmsg_policy lp[] = {
+ 						[0] = { .name = "link_macaddr", .type = BLOBMSG_TYPE_STRING },
+ 						[1] = { .name = "link_bssid", .type = BLOBMSG_TYPE_STRING },
++						[2] = { .name = "link_id", .type = BLOBMSG_TYPE_INT32 },
+ 					};
+ 					struct blob_attr *ltb[ARRAY_SIZE(lp)];
+ 					uint8_t lbssid[6];
+@@ -2991,6 +2996,8 @@
+ 						continue;
+ 					if (hwaddr_aton(blobmsg_get_string(ltb[0]), mac)) {
+ 						matched = true;
++						if (ltb[2])
++							link_id = blobmsg_get_u32(ltb[2]);
+ 						break;
+ 					}
+ 				}
+@@ -3015,14 +3022,44 @@
+ 				if (!hwaddr_aton(blobmsg_get_string(stb[0]), mac))
+ 					continue;
+ 			}
++
++			/* Remember who this leg belongs to. stb[0]/stb[1] carry
++			 * the MLD address and the AP-MLD BSSID; mac is the link
++			 * address when we matched through mlo_links. Same guard
++			 * as apmld_refresh_stations(): a client reported without
++			 * a usable MLD BSSID stays a plain station. */
++			if (matched && stb[1] &&
++			    hwaddr_aton(blobmsg_get_string(stb[0]), mldmac) &&
++			    hwaddr_aton(blobmsg_get_string(stb[1]), mldbssid) &&
++			    memcmp(mldmac, mac, 6) &&
++			    !hwaddr_is_zero(mldbssid))
++				have_mld = true;
+ 		} else {
+ 			if (!hwaddr_aton(blobmsg_get_string(cur), mac))
+ 				continue;
+ 		}
+ 
+ 		added = wifi_add_sta(w->a, ap->ifname, mac);
+-		if (added)
++		if (added) {
+ 			added->absent = 0;
++#if (EASYMESH_VERSION >= 6)
++			/* Attach the leg to its MLD. Without this the station
++			 * exists, gets counted in num_sta, and belongs to no
++			 * MLD - so is_affiliated_sta stays 0, the leg is not
++			 * skipped in agent_tlv.c and goes up in the Associated
++			 * Clients TLV under its LINK address, and stamldlist
++			 * stays empty so no STA-MLD is reported at all.
++			 *
++			 * Measured 2026-09-03: a phone on two legs arrived at
++			 * the controller as two separate clients under link
++			 * addresses, with no sta_mld row. The event path
++			 * (agent_ubus_events.c) does this correctly; this poll
++			 * is the other writer and did not. */
++			if (have_mld)
++				stamld_update(w->a, ap, mldmac, mldbssid,
++					      link_id, added);
++#endif
++		}
+ 	}
+ 
+ 	/* Sweep. STA_ABSENT_MAX gives one refresh of tolerance so a lost or

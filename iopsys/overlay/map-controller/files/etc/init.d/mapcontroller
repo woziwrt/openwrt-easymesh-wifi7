@@ -1,0 +1,263 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+STOP=20
+
+USE_PROCD=1
+
+IS_CFG_VALID=1
+
+handle_controller_select() {
+	local section="$1"
+
+	config_get_bool local_ctrl "$section" local 0
+	return 1
+}
+
+validate_controller_section() {
+	uci_validate_section mapcontroller controller "controller" \
+		'enabled:bool:true' \
+		'registrar:string' \
+		'debug:range(0,16)' \
+		'bcn_metrics_max_num:range(1,256)' \
+		'resend_num:uinteger:0' \
+		'allow_bgdfs:range(0,2629744)' \
+		'stale_sta_timeout:string' \
+		'channel_plan:range(0,2629744)' \
+		'enable_ts:bool:false'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapcontroller" "Validation of controller section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_sta_steering_section() {
+	local section="$1"
+
+	uci_validate_section mapcontroller $section "${1}" \
+		'steer_module:string' \
+		'enabled:bool:true' \
+		'enable_sta_steer:bool:false' \
+		'enable_bsta_steer:bool:false' \
+		'use_bcn_metrics:bool:false' \
+		'use_usta_metrics:bool:false' \
+		'bandsteer:bool:false' \
+		'diffsnr:range(0,100)' \
+		'rcpi_threshold_2g:range(0,220)' \
+		'rcpi_threshold_5g:range(0,220)' \
+		'rcpi_threshold_6g:range(0,220)' \
+		'report_rcpi_threshold_2g:range(0,220)' \
+		'report_rcpi_threshold_5g:range(0,220)' \
+		'report_rcpi_threshold_6g:range(0,220)'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapcontroller" "Validation of sta_steering section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_ap_section() {
+	local section="$1"
+
+	uci_validate_section mapcontroller $section "${1}" \
+			'band:or("2", "5", "6")' \
+			'ssid:string' \
+			'encryption:or("sae", "sae+aes", "psk2",
+				"psk2+aes", "sae-mixed", "sae-mixed+aes",
+				"none", "psk-mixed", "psk-mixed+aes",
+				"psk", "psk+aes", "wpa", "wpa2", "wpa-mixed",
+				"owe")' \
+			'key:string' \
+			'vid:range(1,65535):1' \
+			'type:or("backhaul", "fronthaul", "combined")' \
+			'disallow_bsta:list(range(0,255)):0' \
+			'enabled:bool:true'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapcontroller" "Validation of ap section $section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_node_section() {
+	local section="$1"
+
+	uci_validate_section mapcontroller $section "${1}" \
+			'agent_id:macaddr' \
+			'backhaul_ul_macaddr:macaddr' \
+			'backhaul_dl_macaddr:macaddr' \
+			'backhaul_type:or("none")' \
+			'primary_vid:range(0,255):1' \
+			'primary_pcp:range(0,255):0' \
+			'report_sta_assocfails:bool:false' \
+			'report_sta_assocfails_rate:uinteger' \
+			'report_metric_periodic:range(0,255)' \
+			'report_scan:bool:false' \
+			'steer_exclude:list(macaddr)' \
+			'steer_exclude_btm:list(macaddr)' \
+			'steer_disallow:bool:false' \
+			'coordinated_cac:bool:false' \
+			'traffic_separation:bool:false' \
+			'sta_steer:bool:false'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapcontroller" "Validation of node section $section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_radio_section() {
+	local section="$1"
+
+	uci_validate_section mapcontroller $section "${1}" \
+			'agent_id:macaddr' \
+			'macaddr:macaddr' \
+			'band:or("2", "5", "6")' \
+			'steer_policy:range(0,2)' \
+			'util_threshold:range(0,255)' \
+			'rcpi_threshold:range(0,255)' \
+			'report_rcpi_threshold:range(0,255)' \
+			'report_util_threshold:range(0,255)' \
+			'report_rcpi_hysteresis_margin:range(0,255)' \
+			'include_sta_stats:bool:false' \
+			'include_sta_metric:bool:false'
+
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapcontroller" "Validation of radio section $section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_controller_config() {
+	IS_CFG_VALID=1
+
+	validate_controller_section &&
+		config_foreach validate_sta_steering_section sta_steering &&
+		config_foreach validate_ap_section ap &&
+		config_foreach validate_node_section node &&
+		config_foreach validate_radio_section radio
+
+	[ "$IS_CFG_VALID" -ne 1 ] && {
+		logger -s -t "mapcontroller" "Validation of mapcontroller UCI file failed"
+		return 1
+	}
+	return 0
+}
+
+create_dir() {
+	mkdir -p /etc/multiap
+}
+
+start_service() {
+	local enabled role
+
+	# Role guard (A6). A node whose marker says it is not the controller must
+	# not run one, even when its own UCI still says enabled=1. A half-finished
+	# role switch or a hand edit is enough to get there, and until now nothing
+	# below this line ever asked what the box is supposed to be.
+	#
+	# Fail OPEN on a missing or empty marker, deliberately. Returning from
+	# start_service without declaring an instance does not decline to start -
+	# rc.common wraps this in procd_open_service/procd_close_service, and
+	# closing a service drops every instance that did not re-register, so an
+	# early return STOPS a controller that is running. base-files
+	# default_postinst runs `start` on every apk upgrade, and after a
+	# sysupgrade the marker is not carried over from the old root: it is
+	# written during the next boot by 88-easymesh-role-marker. Reading "no
+	# marker" as "not a controller" would stop a live controller in exactly
+	# that window. See easymesh-wifi's boot-window.sh, where the same trap
+	# already cost a node 25 minutes on 2026-08-08.
+	role=$(cat /etc/mapc/role 2>/dev/null)
+	[ -n "$role" ] && [ "$role" != "controller" ] && {
+		logger -s -t "mapcontroller" "role is '$role', refusing to start a controller"
+		return
+	}
+
+	config_load "mapcontroller"
+	validate_controller_config || return 1;
+
+	config_get_bool enabled controller enabled 1
+	[ "$enabled" -eq 0 ] && return
+
+	create_dir
+
+	# Reliability gate: wait until ieee1905 is up and has a valid (non-zero)
+	# AL-MAC before starting. Bounded and gentle - poll the lightweight 'id'
+	# method (not the heavy 'info' dump) every 3s, ~30s max; if it is still
+	# slow we start ANYWAY. The daemon's own bounded retry (patch 940) then
+	# rides out any residual slowness and, on exhaustion, exits so procd
+	# respawns it (self-heal). Never a second infinite wait here.
+	ubus -t 30 wait_for ieee1905.map 2>/dev/null
+	local _i=0 _almac=""
+	while [ $_i -lt 10 ]; do
+		_almac=$(ubus -S call ieee1905 id 2>/dev/null | jsonfilter -e '@.ieee1905id' 2>/dev/null)
+		case "$_almac" in ""|"00:00:00:00:00:00") ;; *) break ;; esac
+		sleep 3; _i=$((_i+1))
+	done
+
+	procd_open_instance
+	# Log to a plain file, never a fifo.
+	#
+	# "-o /tmp/mapcontroller.log -f" wrote to a named pipe that nothing ever read,
+	# so everything this daemon said was lost. Attaching a reader afterwards
+	# does not recover it: the daemon opens the fifo at startup, finds no
+	# reader, and stays silent for good - measured 2026-09-02, "cat | logger"
+	# on the live pipe produced nothing at all. procd stdout/stderr capture
+	# does not deliver this text to logread either.
+	#
+	# Truncated on start, because -d is chatty and /tmp is RAM. If it ever
+	# grows fast enough to matter between restarts, it needs real rotation.
+	rm -f /tmp/mapcontroller.log
+	procd_set_param command "/usr/sbin/mapcontroller" "-d" "-o" "/tmp/mapcontroller.log"
+
+	if [ -f /etc/config/mapagent ]; then
+	        local local_ctrl=0
+
+	        config_load "mapagent"
+	        config_foreach handle_controller_select controller_select
+	        [ "$local_ctrl" -eq 0 ] && procd_append_param command "-w"
+	fi
+
+	procd_set_param respawn 3600 5 0
+#	procd_set_param stdout 1
+#	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "mapcontroller"
+}
+
+reload_service() {
+	local enabled
+
+	config_load "mapcontroller"
+	config_get_bool enabled controller enabled 1
+	if [ "$enabled" -eq 0 ]; then
+		stop
+		# Start but without instance so reload trigger works.
+		start
+		return
+	fi
+
+	pidof "/usr/sbin/mapcontroller" > /dev/null
+	if [[ $? -ne 0 ]] ; then
+		start
+		return
+	fi
+
+	procd_send_signal "mapcontroller"
+}

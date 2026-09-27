@@ -1,0 +1,121 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a BTM report speaks in links, steering bookkeeping in MLDs
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+An MLO client answers a BTM request with link-level identities: its own
+affiliated MAC, the link BSSID it sits on, and the link BSSID it was told
+to move to. The controller's steering bookkeeping is MLD-level - the
+attempt history records the AP-MLD source and target, and sta_table knows
+the client by its MLD address.
+
+handle_sta_steer_btm_report() fed the raw link identities into
+cntlr_find_sta() and sta_lookup_steer_attempt(), so every MLO report died
+as "unknown STA" (or an unmatched attempt) and btm_success stayed 0
+forever. Measured 2026-08-05 07:03:52: response status=0 visible as a
+btm-resp event on the node, btm_attempts=2, btm_success=0.
+
+Resolve all three identities through the MLD model before matching. The
+same wrong-entity class as 9999 (steer the MLD, not the link), 99994 and
+99995 - this is the response-side twin of the request-side fix.
+
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -3529,6 +3529,64 @@
+ 	return 0;
+ }
+ 
++/* 999993: the client answers a BTM request with link-level identities -
++ * its own affiliated MAC, the link BSSID it sits on and the link BSSID it
++ * was told to move to. The controller records steering attempts at the MLD
++ * level, so resolve all three through the MLD model before matching, or
++ * every MLO steer report dies as "unknown STA" and btm_success stays 0
++ * forever (measured 2026-08-05: response status=0 on air, counter 0).
++ * The model is rebuilt on every Topology Response; when a resolution finds
++ * nothing, the identity is used as reported. */
++static uint8_t *steer_report_resolve_apmld(struct controller *c, uint8_t *bssid)
++{
++	struct node *n;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		struct wifi_apmld_element *mld;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			struct wifi_affiliated_ap_element *ap;
++
++			if (!memcmp(mld->mld_macaddr, bssid, 6))
++				return mld->mld_macaddr;
++
++			list_for_each_entry(ap, &mld->aplist, list) {
++				if (!memcmp(ap->bssid, bssid, 6))
++					return mld->mld_macaddr;
++			}
++		}
++	}
++
++	return bssid;
++}
++
++static uint8_t *steer_report_resolve_stamld(struct controller *c, uint8_t *macaddr)
++{
++	struct node *n;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		struct wifi_apmld_element *mld;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			struct wifi_stamld_element *sm;
++
++			list_for_each_entry(sm, &mld->stamldlist, list) {
++				struct wifi_affiliated_sta_element *as;
++
++				if (!memcmp(sm->mld_macaddr, macaddr, 6))
++					return sm->mld_macaddr;
++
++				list_for_each_entry(as, &sm->stalist, list) {
++					if (!memcmp(as->macaddr, macaddr, 6))
++						return sm->mld_macaddr;
++				}
++			}
++		}
++	}
++
++	return macaddr;
++}
++
+ int handle_sta_steer_btm_report(void *cntlr, struct cmdu_buff *cmdu,
+ 				struct node *n)
+ {
+@@ -3540,6 +3598,7 @@
+ 	struct tlv *tv[STEERING_BTM_REPORT_NUM_OF_TLV_TYPES][TLV_MAXNUM] = {0};
+ 	char ev_data[512] = {0};
+ 	struct sta *s;
++	uint8_t *sta_macaddr, *src_bssid, *dst_bssid;
+ 
+ 	if (!cntlr || !cmdu)
+ 		return -1;
+@@ -3557,7 +3616,13 @@
+ 
+ 	resp = (struct tlv_steer_btm_report *)tv[STEERING_BTM_REPORT_BTM_REPORT_IDX][0]->data;
+ 
+-	s = cntlr_find_sta(c->sta_table, resp->sta_macaddr);
++	/* 999993: see the resolvers above - the report speaks in links,
++	 * the steering bookkeeping speaks in MLDs. */
++	sta_macaddr = steer_report_resolve_stamld(c, resp->sta_macaddr);
++	src_bssid = steer_report_resolve_apmld(c, resp->bssid);
++	dst_bssid = steer_report_resolve_apmld(c, resp->target_bssid[0]);
++
++	s = cntlr_find_sta(c->sta_table, sta_macaddr);
+ 	if (!s) {
+ 		cntlr_warn(LOG_STEER,
+ 			   "%s: Received Steer BTM Report from unknown STA "MACFMT"\n",
+@@ -3577,8 +3642,8 @@
+ 	cntlr_notify_event(c, CNTLR_EVENT_CLIENT_STEER_REPORT, ev_data);
+ 
+ 
+-	attempt = sta_lookup_steer_attempt(s, resp->bssid,
+-					   resp->status == 0 ? resp->target_bssid[0] : NULL);
++	attempt = sta_lookup_steer_attempt(s, src_bssid,
++					   resp->status == 0 ? dst_bssid : NULL);
+ 
+ 	if (!attempt) {
+ 		cntlr_warn(LOG_STEER,

@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /etc/uci-defaults/97-mapc-db-keep
+#
+# The EasyMesh controller keeps its persistent state in /etc/mapc/mapc.db.
+# Nothing in the default sysupgrade keep list covers that path, so a firmware
+# upgrade would silently discard the recovery database. Add it once.
+#
+# The same goes for the names the owner typed into the controller. A node
+# reports its own name over 1905 and that one survives anything, but a name
+# typed with the pencil is an override the controller keeps for itself, and
+# losing it means a picture that silently reverts to what the boxes call
+# themselves. Nothing announces that - the names just quietly change back.
+
+grep -qxF /etc/mapc/ /etc/sysupgrade.conf 2>/dev/null || echo /etc/mapc/ >> /etc/sysupgrade.conf
+grep -qxF /etc/mesh-node-names /etc/sysupgrade.conf 2>/dev/null || echo /etc/mesh-node-names >> /etc/sysupgrade.conf

@@ -1,0 +1,940 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: ap mld event cache
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+diff --git a/libwifi/CMakeLists.txt b/libwifi/CMakeLists.txt
+index 917be86..f0d994b 100644
+--- a/libwifi/CMakeLists.txt
++++ b/libwifi/CMakeLists.txt
+@@ -98,6 +98,7 @@ list(APPEND LIBWIFI_SRC
+ 	modules/wpactrl/hostapd_ctrl.c
+ 	modules/wpactrl/supplicant_ctrl.c
+ 	modules/wpactrl/staconn_cache.c
++	modules/wpactrl/apconn_cache.c
+ 	modules/wpactrl/wpactrl.c
+ 	modules/nl80211/nlwifi.c
+ 	modules/default/wifi.c
+diff --git a/libwifi/modules/default/wifi.c b/libwifi/modules/default/wifi.c
+index 72d0f47..844d7d0 100644
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -27,6 +27,7 @@
+ #include "hostapd_ctrl.h"
+ #include "supplicant_ctrl.h"
+ #include "wpactrl.h"
++#include "apconn_cache.h"
+ 
+ static unsigned long radio_maxrate(struct wifi_radio *radio)
+ {
+@@ -1002,6 +1003,55 @@ static int iface_link_measure(const char *ifname, uint8_t *sta)
+ 	return hostapd_cli_rrm_lm_req(ifname, sta);
+ }
+ 
++/* ---- Layer 1: apconn_cache write-through helpers. The AP-status / assoclist
++ * reads below are cache-first (zero blocking I/O when fresh) and write through
++ * their bounded-hostapd result so the next read is hot. See apconn_cache.{c,h}
++ * and the reliability design notes (warm cache = layer 1 of 3). ----------- */
++struct apconn_ap_ctx {
++	bool enabled;
++	uint8_t channel;
++	enum wifi_band band;
++	uint8_t bw;
++};
++
++static void apconn_cb_set_ap(struct apconn *e, void *ctx)
++{
++	struct apconn_ap_ctx *c = ctx;
++
++	e->enabled = c->enabled;
++	if (c->channel)
++		e->channel = c->channel;
++	if (c->band)
++		e->band = c->band;
++	if (c->bw)
++		e->bandwidth = c->bw;
++}
++
++struct apconn_stas_ctx {
++	const uint8_t *stas;
++	int nsta;
++};
++
++/* Replace the cached station SET authoritatively (bounded hostapd reconcile). */
++static void apconn_cb_set_stas(struct apconn *e, void *ctx)
++{
++	struct apconn_stas_ctx *c = ctx;
++	int n = c->nsta < APCONN_STA_MAX ? c->nsta : APCONN_STA_MAX;
++	int i;
++
++	for (i = 0; i < n; i++)
++		memcpy(e->stations[i], &c->stas[i * 6], 6);
++	e->nsta = n;
++	e->enabled = true;
++}
++
++static void apconn_writethrough_stas(const char *ifname, const uint8_t *stas, int nsta)
++{
++	struct apconn_stas_ctx c = { .stas = stas, .nsta = nsta };
++
++	apconn_cache_apply(ifname, apconn_cb_set_stas, &c);
++}
++
+ /* ap interface ops */
+ static int iface_ap_info_band(const char *ifname, enum wifi_band band, struct wifi_ap *ap)
+ {
+@@ -1102,6 +1152,22 @@ static int iface_ap_info_band(const char *ifname, enum wifi_band band, struct wi
+ 
+ 	free(ctrl_iface);
+ 
++	/* Layer-1 write-through: keep the AP liveness fields (enabled/channel/
++	 * band/bw) hot in apconn_cache. ap_info stays authoritative here (its
++	 * security/caps contract exceeds the cache and it never calls the wedging
++	 * nl80211 station dump), so this is a side-populate, not an early-return;
++	 * the full cache-first fast path lives on the assoclist read. */
++	{
++		struct apconn_ap_ctx c = {
++			.enabled = ap->enabled,
++			.channel = bss->channel,
++			.band = bss->band,
++			.bw = (uint8_t)bss->curr_bw,
++		};
++
++		apconn_cache_apply(ifname, apconn_cb_set_ap, &c);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1257,6 +1323,8 @@ static int iface_get_assoclist_band(const char *ifname, enum wifi_band band, uin
+ 		*num_stas = nums;
+ 
+ 		remove_mac_duplicates(stas, num_stas);
++		/* Layer-1 write-through: refresh the parent cache station set. */
++		apconn_writethrough_stas(ifname, stas, *num_stas);
+ 		return 0;
+ 	}
+ 
+@@ -1267,6 +1335,10 @@ static int iface_get_assoclist_band(const char *ifname, enum wifi_band band, uin
+ 	ret = hostapd_iface_get_assoclist(ctrl_iface, stas, num_stas);
+ 	free(ctrl_iface);
+ 
++	/* Layer-1 write-through: refresh the parent cache station set. */
++	if (!ret)
++		apconn_writethrough_stas(ifname, stas, *num_stas);
++
+ 	return ret;
+ }
+ 
+@@ -1284,46 +1356,34 @@ static int iface_get_channel(const char *ifname, struct wifi_channel *ch)
+ 
+ static int iface_get_assoclist(const char *ifname, uint8_t *stas, int *num_stas)
+ {
+-#define NUM_STA_MAX	256
+-
+-	uint8_t stamacs[NUM_STA_MAX * 6] = {0};
+-	int num = NUM_STA_MAX;
++	struct apconn ce;
+ 	int limit = *num_stas;
+-	int ret = -1;
+-
+-	ret = nlwifi_get_assoclist(ifname, stas, num_stas);
+-	if (WARN_ON(ret)) {
+-		*num_stas = 0;
+-		return ret;
+-	}
+-
+-	/* union with hostapad's view of assoclist */
+-	ret = iface_get_assoclist_band(ifname, BAND_ANY, stamacs, &num);
+-	if (!ret) {
+-		int num_f = *num_stas;
+-
+-		for (int i = 0; i < num; i++) {
+-			int has = 0;
+-
+-			for (int j = 0; j < *num_stas; j++) {
+-				if (!memcmp(&stas[j * 6], &stamacs[i * 6], 6)) {
+-					has = 1;
+-					break;
+-				}
+-			}
+-
+-			if (!has) {
+-				if (num_f < limit) {
+-					memcpy(&stas[num_f * 6], &stamacs[i * 6], 6);
+-					num_f++;
+-				}
+-			}
+-		}
++	int ret;
+ 
+-		*num_stas = num_f;
++	/* Layer-1 fast path: a fresh, valid AP cache entry answers the station
++	 * set with ZERO blocking I/O. This is what replaces the mt76 nl80211
++	 * GET_STATION dump (nlwifi_get_assoclist) that "never returns NLMSG_DONE"
++	 * and wedges the single-threaded map-agent uloop. The set is populated
++	 * event-driven by the hapdctrl source (AP-STA-CONNECTED/DISCONNECTED on the
++	 * parent + affiliated-MLD link ctrl sockets) and by the bounded all_sta
++	 * seed/reconcile below -- NEVER the nl80211 dump. */
++	if (apconn_cache_get(ifname, &ce) == 0 &&
++	    apconn_cache_age_ms(&ce) < APCONN_TTL_MS) {
++		int n = ce.nsta < limit ? ce.nsta : limit;
++		int i;
++
++		for (i = 0; i < n; i++)
++			memcpy(&stas[i * 6], ce.stations[i], 6);
++		*num_stas = n;
++		return 0;
+ 	}
+ 
+-#undef NUM_STA_MAX
++	/* Cold / TTL-expired fallback: the bounded hostapd all_sta walk
++	 * (iface_get_assoclist_band, which handles the MLD per-link fan-out and
++	 * write-through) -- deliberately NOT nlwifi_get_assoclist. */
++	ret = iface_get_assoclist_band(ifname, BAND_ANY, stas, num_stas);
++	if (ret)
++		*num_stas = 0;
+ 
+ 	return ret;
+ }
+@@ -2054,6 +2114,7 @@ static int iface_get_mlo_links(const char *ifname, enum wifi_band band,
+ enum wifi_evsrc {
+ 	EVSRC_NL80211,
+ 	EVSRC_WPACTRL,
++	EVSRC_HAPDCTRL,		/* Layer-1 AP/MLD warm-cache source */
+ };
+ 
+ struct wifi_evhandle {
+@@ -2074,6 +2135,9 @@ static int wifi_dispatch_register_event(const char *ifname,
+ 	if (!strncmp(req->family, "wpactrl", sizeof(req->family))) {
+ 		h->src = EVSRC_WPACTRL;
+ 		ret = wpactrl_register_event(ifname, req, &h->inner);
++	} else if (!strncmp(req->family, "hapdctrl", sizeof(req->family))) {
++		h->src = EVSRC_HAPDCTRL;
++		ret = hapdctrl_register_event(ifname, req, &h->inner);
+ 	} else {
+ 		h->src = EVSRC_NL80211;
+ 		ret = nlwifi_register_event(ifname, req, &h->inner);
+@@ -2097,6 +2161,8 @@ static int wifi_dispatch_recv_event(const char *ifname, void *handle)
+ 
+ 	if (h->src == EVSRC_WPACTRL)
+ 		return wpactrl_recv_event(ifname, h->inner);
++	if (h->src == EVSRC_HAPDCTRL)
++		return hapdctrl_recv_event(ifname, h->inner);
+ 	return nlwifi_recv_event(ifname, h->inner);
+ }
+ 
+@@ -2110,6 +2176,8 @@ static int wifi_dispatch_unregister_event(const char *ifname, void *handle)
+ 
+ 	if (h->src == EVSRC_WPACTRL)
+ 		ret = wpactrl_unregister_event(ifname, h->inner);
++	else if (h->src == EVSRC_HAPDCTRL)
++		ret = hapdctrl_unregister_event(ifname, h->inner);
+ 	else
+ 		ret = nlwifi_unregister_event(ifname, h->inner);
+ 
+diff --git a/libwifi/modules/wpactrl/apconn_cache.c b/libwifi/modules/wpactrl/apconn_cache.c
+new file mode 100644
+index 0000000..d93b6f5
+--- /dev/null
++++ b/libwifi/modules/wpactrl/apconn_cache.c
+@@ -0,0 +1,205 @@
++/* SPDX-License-Identifier: LGPL-2.1-only */
++/*
++ * apconn_cache.c - process-local AP + affiliated-MLD warm cache (see .h).
++ *
++ * Deliberately tiny: a fixed table of a few BSS/link interfaces, one mutex, the
++ * get/update/apply/invalidate/age_ms quintet plus two atomic station-set
++ * mutators. No dynamic allocation, no ubus/uloop coupling -- only the cache is
++ * touched, so it is safe to call from Engine A (internal monitor pthread) and
++ * Engine B (uloop) alike.
++ *
++ * Clone of phase2 staconn_cache.c, extended with the station SET (a list) that
++ * the assoclist / MLD-station reads answer from.
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project) / IOPSYS Software Solutions AB.
++ */
++#include <string.h>
++#include <pthread.h>
++
++#include "apconn_cache.h"
++
++/* A board carries a handful of fronthaul/backhaul/affiliated-MLD BSSes. */
++#define APCONN_MAX	16
++
++static pthread_mutex_t apconn_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct apconn apconn_tbl[APCONN_MAX];
++
++static void apconn_now(struct timespec *ts)
++{
++	clock_gettime(CLOCK_MONOTONIC, ts);
++}
++
++/* Caller must hold apconn_lock. Returns slot for @ifname, or NULL if absent. */
++static struct apconn *apconn_find(const char *ifname)
++{
++	int i;
++
++	for (i = 0; i < APCONN_MAX; i++) {
++		if (apconn_tbl[i].valid &&
++		    !strncmp(apconn_tbl[i].ifname, ifname, sizeof(apconn_tbl[i].ifname)))
++			return &apconn_tbl[i];
++	}
++	return NULL;
++}
++
++/* Caller must hold apconn_lock. Returns slot for @ifname, allocating a free one
++ * if needed, or NULL when the table is full. */
++static struct apconn *apconn_get_slot(const char *ifname)
++{
++	struct apconn *e;
++	int i;
++
++	e = apconn_find(ifname);
++	if (e)
++		return e;
++
++	for (i = 0; i < APCONN_MAX; i++) {
++		if (!apconn_tbl[i].valid)
++			return &apconn_tbl[i];
++	}
++	return NULL;
++}
++
++int apconn_cache_get(const char *ifname, struct apconn *out)
++{
++	struct apconn *e;
++	int ret = -1;
++
++	if (!ifname || !out)
++		return -1;
++
++	pthread_mutex_lock(&apconn_lock);
++	e = apconn_find(ifname);
++	if (e) {
++		*out = *e;		/* take-copy-under-lock */
++		ret = 0;
++	}
++	pthread_mutex_unlock(&apconn_lock);
++
++	return ret;
++}
++
++void apconn_cache_update(const struct apconn *e)
++{
++	struct apconn *slot;
++
++	if (!e || !e->ifname[0])
++		return;
++
++	pthread_mutex_lock(&apconn_lock);
++	slot = apconn_get_slot(e->ifname);
++	if (slot) {
++		*slot = *e;
++		slot->valid = true;
++		apconn_now(&slot->ts);
++	}
++	pthread_mutex_unlock(&apconn_lock);
++}
++
++void apconn_cache_apply(const char *ifname,
++			void (*cb)(struct apconn *e, void *ctx), void *ctx)
++{
++	struct apconn *slot;
++
++	if (!ifname || !cb)
++		return;
++
++	pthread_mutex_lock(&apconn_lock);
++	slot = apconn_get_slot(ifname);
++	if (slot) {
++		/* pre-fill the key so a freshly-claimed slot is addressable */
++		strncpy(slot->ifname, ifname, sizeof(slot->ifname) - 1);
++		cb(slot, ctx);
++		slot->valid = true;
++		apconn_now(&slot->ts);
++	}
++	pthread_mutex_unlock(&apconn_lock);
++}
++
++/* Caller must hold apconn_lock. Index of @mac in the set, or -1. */
++static int apconn_sta_index(const struct apconn *e, const uint8_t *mac)
++{
++	int i;
++
++	for (i = 0; i < e->nsta; i++) {
++		if (!memcmp(e->stations[i], mac, 6))
++			return i;
++	}
++	return -1;
++}
++
++void apconn_cache_sta_add(const char *ifname, const uint8_t *mac)
++{
++	struct apconn *slot;
++
++	if (!ifname || !mac)
++		return;
++
++	pthread_mutex_lock(&apconn_lock);
++	slot = apconn_get_slot(ifname);
++	if (slot) {
++		strncpy(slot->ifname, ifname, sizeof(slot->ifname) - 1);
++		/* dedup; no-op when full (bounded reconcile will pick it up) */
++		if (apconn_sta_index(slot, mac) < 0 && slot->nsta < APCONN_STA_MAX) {
++			memcpy(slot->stations[slot->nsta], mac, 6);
++			slot->nsta++;
++		}
++		slot->valid = true;
++		apconn_now(&slot->ts);
++	}
++	pthread_mutex_unlock(&apconn_lock);
++}
++
++void apconn_cache_sta_del(const char *ifname, const uint8_t *mac)
++{
++	struct apconn *slot;
++	int idx;
++
++	if (!ifname || !mac)
++		return;
++
++	pthread_mutex_lock(&apconn_lock);
++	slot = apconn_find(ifname);
++	if (slot) {
++		idx = apconn_sta_index(slot, mac);
++		if (idx >= 0) {
++			/* compact: move the last entry into the hole */
++			slot->nsta--;
++			if (idx != slot->nsta)
++				memcpy(slot->stations[idx],
++				       slot->stations[slot->nsta], 6);
++			memset(slot->stations[slot->nsta], 0, 6);
++			apconn_now(&slot->ts);
++		}
++	}
++	pthread_mutex_unlock(&apconn_lock);
++}
++
++void apconn_cache_invalidate(const char *ifname)
++{
++	struct apconn *e;
++
++	if (!ifname)
++		return;
++
++	pthread_mutex_lock(&apconn_lock);
++	e = apconn_find(ifname);
++	if (e) {
++		/* keep the record (last station set), just force the read path to
++		 * treat it as stale until the next event/seed repopulates it. */
++		e->valid = false;
++	}
++	pthread_mutex_unlock(&apconn_lock);
++}
++
++long apconn_cache_age_ms(const struct apconn *e)
++{
++	struct timespec now;
++
++	if (!e)
++		return -1;
++
++	apconn_now(&now);
++	return (now.tv_sec - e->ts.tv_sec) * 1000L +
++	       (now.tv_nsec - e->ts.tv_nsec) / 1000000L;
++}
+diff --git a/libwifi/modules/wpactrl/apconn_cache.h b/libwifi/modules/wpactrl/apconn_cache.h
+new file mode 100644
+index 0000000..c21c7c0
+--- /dev/null
++++ b/libwifi/modules/wpactrl/apconn_cache.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: LGPL-2.1-only */
++/*
++ * apconn_cache.h - process-local, event-driven AP + affiliated-MLD warm cache.
++ *
++ * Layer 1 (warm-cache reliability): AP status / assoclist / MLD-station reads
++ * hit this cache instead of the mt76 nl80211 GET_STATION dump that wedges the
++ * single-threaded map-agent uloop. One entry per BSS (fronthaul / backhaul /
++ * affiliated-MLD link), keyed by ifname. Populated event-driven (hostapd
++ * AP-STA-CONNECTED/DISCONNECTED + AP-ENABLED/DISABLED + AP-CSA-FINISHED on the
++ * per-link ctrl sockets) and seeded/reconciled by a bounded hostapd all_sta
++ * (STA-FIRST/STA-NEXT) walk -- NEVER the nl80211 dump. Read take-copy-under-lock
++ * so the internal monitor (Engine A) is safe against the uloop reader (Engine B).
++ *
++ * Clone of the shipped, strace-proven phase2 staconn_cache (STA class), extended
++ * to the AP/MLD class: the record additionally carries a station SET (a list,
++ * not a scalar), mutated atomically by apconn_cache_sta_add/del().
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project) / IOPSYS Software Solutions AB.
++ */
++#ifndef APCONN_CACHE_H
++#define APCONN_CACHE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <time.h>
++
++#include <easy/easy.h>	/* hwaddr helpers, ifopstatus_t prereqs */
++#include "wifiutils.h"	/* enum wifi_band */
++
++/* Suggested TTL for the read path (self-heals a dropped/missed event: after
++ * this the read falls back to the bounded hostapd all_sta reconcile). */
++#define APCONN_TTL_MS		5000
++
++/* Per-BSS station-set capacity. A single MT7996 BSS carries far fewer than this;
++ * headroom covers a busy fronthaul without truncating the assoclist. */
++#define APCONN_STA_MAX		64
++
++/* One AP/BSS record. Copied out to callers; never aliased. */
++struct apconn {
++	char ifname[16];			/* key (bss/link ctrl ifname) */
++	bool valid;				/* populated at least once */
++	bool enabled;				/* AP-ENABLED seen / all_sta ok */
++
++	uint8_t channel;			/* control channel */
++	enum wifi_band band;			/* operating band */
++	uint8_t bandwidth;			/* enum wifi_bw (curr_bw), 0=unknown */
++
++	bool is_mld;				/* affiliated-MLD BSS */
++	char mld_ifname[16];			/* parent MLD ifname (== key today) */
++
++	uint8_t stations[APCONN_STA_MAX][6];	/* associated STA MACs */
++	int nsta;				/* valid entries in stations[] */
++
++	struct timespec ts;			/* CLOCK_MONOTONIC of last update */
++};
++
++/* Copy the entry for @ifname into @out. Returns 0 on hit (valid entry copied),
++ * -1 on miss. Reader computes freshness with apconn_cache_age_ms(out). */
++int apconn_cache_get(const char *ifname, struct apconn *out);
++
++/* Upsert keyed by e->ifname: replaces the record, sets valid=true and stamps
++ * ts=now(MONOTONIC). Use for a full write-through of an authoritative status.
++ * For partial mutations use apconn_cache_apply() (atomic RMW) instead. */
++void apconn_cache_update(const struct apconn *e);
++
++/* Atomic read-modify-write keyed by @ifname. Takes the mutex ONCE, finds or
++ * creates the entry (ifname pre-filled), runs @cb to mutate it, then stamps ts
++ * and sets valid before releasing. This is what makes the Engine-A (internal
++ * pthread) safety claim real: partial updates (enabled-only, channel-only,
++ * station add/del) never lose a concurrent writer's fields to a get()/update()
++ * race. */
++void apconn_cache_apply(const char *ifname,
++			void (*cb)(struct apconn *e, void *ctx), void *ctx);
++
++/* Atomic station-set mutators (RMW under the same one lock). _add dedups and is
++ * a no-op when the set is full; _del removes and compacts. Both create the entry
++ * if absent (so an event can arrive before the first status read) and re-stamp
++ * ts. Keyed by @ifname (the parent/bss key the read path uses). */
++void apconn_cache_sta_add(const char *ifname, const uint8_t *mac);
++void apconn_cache_sta_del(const char *ifname, const uint8_t *mac);
++
++/* Mark the entry stale (hostapd restart / ctrl-socket death). Keeps the record
++ * so the last-known station set survives; forces the read path to fall through
++ * to the bounded hostapd reconcile until the next event/seed repopulates it. */
++void apconn_cache_invalidate(const char *ifname);
++
++/* Age of a copied-out entry in milliseconds (monotonic). Lock-free: operates on
++ * the caller's copy, not the shared table. */
++long apconn_cache_age_ms(const struct apconn *e);
++
++#endif /* APCONN_CACHE_H */
+diff --git a/libwifi/modules/wpactrl/wpactrl.c b/libwifi/modules/wpactrl/wpactrl.c
+index 0c409e5..536ede2 100644
+--- a/libwifi/modules/wpactrl/wpactrl.c
++++ b/libwifi/modules/wpactrl/wpactrl.c
+@@ -25,6 +25,8 @@
+ #include "debug.h"
+ #include "wpactrl.h"
+ #include "staconn_cache.h"
++#include "hostapd_ctrl.h"	/* hostapd_iface_get_assoclist (bounded seed) */
++#include "apconn_cache.h"
+ 
+ #ifdef LIBWIFI_USE_CTRL_IFACE
+ #include "limits.h"
+@@ -676,6 +678,340 @@ int wpactrl_unregister_event(const char *ifname, void *handle)
+ 	return 0;
+ }
+ 
++/* ---- Layer 1: hostapd-side AP + affiliated-MLD event source. Hostapd-dir twin
++ * of the wpactrl bSTA quartet above; reuses the same file-local ported helpers
++ * (wpa_ctrl_open/close, wpa_ctrl_attach/detach/pending/recv). Feeds the
++ * process-local apconn_cache so wifi.c AP-status / assoclist / MLD-station reads
++ * answer with zero blocking I/O instead of the mt76 nl80211 GET_STATION dump.
++ *
++ * MLD stations surface on the per-link ctrl sockets (<ifname>_link0/_link1), NOT
++ * the parent netdev (HW-verified 2026-07-15), so one registration fans out to
++ * every affiliated link socket; all of them key the SAME parent cache entry so a
++ * single assoclist read on the parent answers for the whole MLD. ------------- */
++
++/* Up to WIFI_NUM_LINK_PER_MLD affiliated links + the bare (parent/regular)
++ * socket. */
++#define HAPDCTRL_MAX_SOCK	5
++
++struct hapdctrl_sock {
++	struct wpa_ctrl *ctrl;		/* attached handle (NULL == closed) */
++	char ifname[16];		/* this socket's ctrl name */
++};
++
++/* Persistent handle. One registration may hold several attached sockets (parent
++ * + affiliated-MLD links); wifimngr monitors the primary fd (socks[0]), and each
++ * wakeup drains ALL held sockets. Missed events on a non-primary link are healed
++ * by the read-path TTL fallback (bounded hostapd all_sta + write-through). */
++struct hapdctrl_event {
++	struct event_struct req;	/* copy, like nlwifi_event */
++	char ifname[16];		/* registration ifname */
++	char key[16];			/* parent cache key (strip _linkN) */
++	struct hapdctrl_sock socks[HAPDCTRL_MAX_SOCK];
++	int nsocks;
++	int fails;			/* consecutive recv/reopen failures */
++	bool dead;			/* gave up; do not re-arm-spin */
++};
++
++/* Parent cache key: strip a trailing "_linkN" so every affiliated link keys the
++ * one BSS entry the read path (iface_get_assoclist on the parent ifname) uses. */
++static void hapdctrl_parent_key(const char *ifname, char *key, size_t keylen)
++{
++	char *p;
++
++	strncpy(key, ifname, keylen - 1);
++	key[keylen - 1] = '\0';
++	p = strstr(key, "_link");
++	if (p)
++		*p = '\0';
++}
++
++/* Cache mutators for the parsed hostapd control events. */
++struct hapdctrl_ev {
++	bool set_enabled;
++	bool enabled;
++	bool set_chan;
++	uint8_t channel;
++	enum wifi_band band;
++	bool set_mld;
++	char mld_ifname[16];
++};
++
++static void hapdctrl_cb_event(struct apconn *e, void *ctx)
++{
++	struct hapdctrl_ev *ev = ctx;
++
++	if (ev->set_enabled)
++		e->enabled = ev->enabled;
++	if (ev->set_chan) {
++		e->channel = ev->channel;
++		e->band = ev->band;
++	}
++	if (ev->set_mld) {
++		e->is_mld = true;
++		strncpy(e->mld_ifname, ev->mld_ifname, sizeof(e->mld_ifname) - 1);
++	}
++}
++
++/* Bounded hostapd all_sta seed/reconcile via STA-FIRST/STA-NEXT (HW-proven
++ * bounded on parent AND affiliated links) -> add every station to the parent
++ * cache entry. NEVER the nl80211 dump. */
++static void hapdctrl_seed_from_all_sta(const char *key, const char *sock_ifname)
++{
++	uint8_t stamacs[256 * 6] = {};
++	int n = 256;
++	int i;
++
++	if (hostapd_iface_get_assoclist(sock_ifname, stamacs, &n))
++		return;
++
++	for (i = 0; i < n; i++)
++		apconn_cache_sta_add(key, &stamacs[i * 6]);
++}
++
++/* Extract the MAC that follows an "AP-STA-*" keyword ("<3>AP-STA-CONNECTED
++ * aa:bb:cc:dd:ee:ff ..."). Returns 0 on success. */
++static int hapdctrl_event_mac(const char *msg, const char *kw, uint8_t *mac)
++{
++	const char *p;
++
++	p = strstr(msg, kw);
++	if (!p)
++		return -1;
++	p += strlen(kw);
++	while (*p == ' ')
++		p++;
++	if (strlen(p) < 17)
++		return -1;
++	return hwaddr_aton(p, mac) ? 0 : -1;
++}
++
++/* Parse one hostapd control message and mutate the parent cache (atomic RMW). */
++static void hapdctrl_parse_event(const char *key, const char *msg)
++{
++	uint8_t mac[6];
++	char *p;
++
++	if (strstr(msg, "AP-STA-CONNECTED") ||
++	    strstr(msg, "EAPOL-4WAY-HS-COMPLETED")) {
++		const char *kw = strstr(msg, "AP-STA-CONNECTED") ?
++				 "AP-STA-CONNECTED" : "EAPOL-4WAY-HS-COMPLETED";
++		if (hapdctrl_event_mac(msg, kw, mac) == 0)
++			apconn_cache_sta_add(key, mac);
++	} else if (strstr(msg, "AP-STA-DISCONNECTED")) {
++		if (hapdctrl_event_mac(msg, "AP-STA-DISCONNECTED", mac) == 0)
++			apconn_cache_sta_del(key, mac);
++	} else if (strstr(msg, "AP-ENABLED")) {
++		struct hapdctrl_ev ev = { .set_enabled = true, .enabled = true };
++
++		apconn_cache_apply(key, hapdctrl_cb_event, &ev);
++	} else if (strstr(msg, "AP-DISABLED")) {
++		struct hapdctrl_ev ev = { .set_enabled = true, .enabled = false };
++
++		apconn_cache_apply(key, hapdctrl_cb_event, &ev);
++	} else if (strstr(msg, "AP-CSA-FINISHED")) {
++		struct hapdctrl_ev ev = {};
++
++		if ((p = strstr(msg, "freq="))) {
++			uint32_t freq = (uint32_t)atoi(p + 5);
++
++			if (freq) {
++				ev.set_chan = true;
++				ev.channel = wifi_freq_to_channel(freq);
++				ev.band = wifi_freq_to_band(freq);
++				apconn_cache_apply(key, hapdctrl_cb_event, &ev);
++			}
++		}
++	}
++}
++
++/* Try to ATTACH one hostapd ctrl socket; on success record it in @w. */
++static int hapdctrl_open_one(struct hapdctrl_event *w, const char *sock_ifname)
++{
++	struct wpa_ctrl *ctrl;
++	char cfile[256] = {};
++	struct hapdctrl_sock *s;
++
++	if (w->nsocks >= HAPDCTRL_MAX_SOCK)
++		return -1;
++
++	snprintf(cfile, sizeof(cfile), "%s/%s",
++		 CONFIG_HOSTAPD_CTRL_IFACE_DIR, sock_ifname);
++	ctrl = wpa_ctrl_open(cfile);
++	if (!ctrl)
++		return -1;
++
++	if (wpa_ctrl_attach(ctrl)) {
++		wpa_ctrl_close(ctrl);
++		return -1;
++	}
++
++	s = &w->socks[w->nsocks++];
++	s->ctrl = ctrl;
++	strncpy(s->ifname, sock_ifname, sizeof(s->ifname) - 1);
++
++	/* seed this socket's stations into the shared parent cache entry */
++	hapdctrl_seed_from_all_sta(w->key, sock_ifname);
++	return 0;
++}
++
++/* Best-effort (re)open + ATTACH of every socket for this registration: the bare
++ * ifname plus any <ifname>_link0.._linkN affiliated MLD sockets. Sets the
++ * primary fd (socks[0]) into req->fd_monitor. Returns 0 if at least one socket
++ * is attached, -1 otherwise. Close-then-open reuses fd numbers so wifimngr's
++ * re-arm rides the fresh primary socket (same trick as wpactrl_reopen). */
++static int hapdctrl_reopen(struct hapdctrl_event *w)
++{
++	struct hapdctrl_ev ev = {};
++	char link[16];
++	int i;
++
++	for (i = 0; i < w->nsocks; i++) {
++		if (w->socks[i].ctrl) {
++			wpa_ctrl_detach(w->socks[i].ctrl);
++			wpa_ctrl_close(w->socks[i].ctrl);
++		}
++	}
++	memset(w->socks, 0, sizeof(w->socks));
++	w->nsocks = 0;
++
++	/* the bare (parent / regular-BSS) socket */
++	hapdctrl_open_one(w, w->ifname);
++
++	/* affiliated-MLD link sockets: <ifname>_link0 .. _link(N-1) */
++	for (i = 0; i < WIFI_NUM_LINK_PER_MLD; i++) {
++		snprintf(link, sizeof(link), "%s_link%d", w->ifname, i);
++		hapdctrl_open_one(w, link);
++	}
++
++	if (!w->nsocks)
++		return -1;
++
++	/* if any affiliated link attached, this is an MLD BSS */
++	if (w->nsocks > 1) {
++		ev.set_mld = true;
++		strncpy(ev.mld_ifname, w->key, sizeof(ev.mld_ifname) - 1);
++	}
++	ev.set_enabled = true;
++	ev.enabled = true;
++	apconn_cache_apply(w->key, hapdctrl_cb_event, &ev);
++
++	w->req.fd_monitor = w->socks[0].ctrl->s;
++	return 0;
++}
++
++int hapdctrl_register_event(const char *ifname, struct event_struct *req, void **handle)
++{
++	struct hapdctrl_event *w;
++
++	libwifi_dbg("%s %s called family %s group %s\n", ifname, __func__,
++		    req->family, req->group);
++
++	w = calloc(1, sizeof(*w));
++	if (!w) {
++		libwifi_err("%s: calloc failed\n", __func__);
++		return -1;
++	}
++	memcpy(&w->req, req, sizeof(struct event_struct));
++	strncpy(w->ifname, ifname, sizeof(w->ifname) - 1);
++	hapdctrl_parent_key(ifname, w->key, sizeof(w->key));
++
++	/* MAJOR-4: if no hostapd ctrl socket is up yet (BSS/MLD not created during
++	 * onboarding), do NOT hard-fail -- register a dormant source. The cache is
++	 * still filled by the read-path write-through, so Layer 1 is best-effort.
++	 * When dormant we leave req->fd_monitor == 0, so wifimngr adds no uloop fd;
++	 * the source re-attaches on the next recv/register attempt. */
++	if (hapdctrl_reopen(w) != 0)
++		libwifi_warn("%s: %s hostapd ctrl socket(s) not ready; source dormant\n",
++			     ifname, __func__);
++
++	/* wifimngr reads the caller's req->fd_monitor, not our internal copy. */
++	req->fd_monitor = w->nsocks ? w->socks[0].ctrl->s : 0;
++
++	*handle = w;
++	return 0;
++}
++
++int hapdctrl_recv_event(const char *ifname, void *handle)
++{
++	struct hapdctrl_event *w = handle;
++	char buf[4096];
++	size_t len;
++	int pending;
++	int i;
++
++	/* No source or we already gave up: return a non-ENETDOWN negative so
++	 * wifimngr ends its recv loop and does NOT re-arm -> no busy-loop. */
++	if (!w || w->dead)
++		return -EAGAIN;
++
++	if (!w->nsocks) {
++		/* dormant (sockets late) or a prior reopen failed: retry now */
++		if (hapdctrl_reopen(w) == 0) {
++			w->fails = 0;
++			return -ENETDOWN;	/* re-arm to monitor the fd */
++		}
++		if (++w->fails >= WPACTRL_MAX_FAILS)
++			w->dead = true;
++		return -EAGAIN;			/* nothing to read; stop */
++	}
++
++	/* EDGE_TRIGGER: drain everything queued on every held socket (parent +
++	 * affiliated links) in this one wakeup. */
++	for (i = 0; i < w->nsocks; i++) {
++		struct wpa_ctrl *ctrl = w->socks[i].ctrl;
++
++		if (!ctrl)
++			continue;
++		while ((pending = wpa_ctrl_pending(ctrl)) > 0) {
++			len = sizeof(buf) - 1;
++			if (wpa_ctrl_recv(ctrl, buf, &len) < 0)
++				goto recover;
++			buf[len] = '\0';
++			hapdctrl_parse_event(w->key, buf);
++		}
++		if (pending < 0)
++			goto recover;
++	}
++
++	w->fails = 0;
++	return -EAGAIN;				/* drained cleanly */
++
++recover:
++	/* MAJOR-3: a ctrl socket died (hostapd restart). Invalidate the cache
++	 * (read path drops to the bounded hostapd reconcile) and re-open + re-
++	 * ATTACH all sockets in place (best-effort). Bounded fails/WPACTRL_MAX_FAILS
++	 * + dead flag guarantees a dead fd can never busy-loop the re-arm. */
++	apconn_cache_invalidate(w->key);
++	if (++w->fails >= WPACTRL_MAX_FAILS) {
++		w->dead = true;
++		libwifi_err("%s: %s giving up after %d consecutive failures\n",
++			    ifname, __func__, w->fails);
++		return -EAGAIN;			/* stop the re-arm spin */
++	}
++	hapdctrl_reopen(w);			/* best-effort; reuses fd number */
++	return -ENETDOWN;			/* let wifimngr re-arm once */
++}
++
++int hapdctrl_unregister_event(const char *ifname, void *handle)
++{
++	struct hapdctrl_event *w = handle;
++	int i;
++
++	libwifi_dbg("%s %s called\n", ifname, __func__);
++
++	if (!w)
++		return -1;
++
++	for (i = 0; i < w->nsocks; i++) {
++		if (w->socks[i].ctrl) {
++			wpa_ctrl_detach(w->socks[i].ctrl);
++			wpa_ctrl_close(w->socks[i].ctrl);
++		}
++	}
++	free(w);
++	return 0;
++}
++
+ #else
+ int hostapd_cli_set(const char *ifname, const char *cmd, bool check_ok)
+ {
+@@ -789,6 +1125,25 @@ int wpactrl_unregister_event(const char *ifname, void *handle)
+ 	(void) ifname; (void) handle;
+ 	return -1;
+ }
++
++/* No ctrl-iface: AP/MLD event source unavailable. */
++int hapdctrl_register_event(const char *ifname, struct event_struct *req, void **handle)
++{
++	(void) ifname; (void) req; (void) handle;
++	return -1;
++}
++
++int hapdctrl_recv_event(const char *ifname, void *handle)
++{
++	(void) ifname; (void) handle;
++	return -ENETDOWN;
++}
++
++int hapdctrl_unregister_event(const char *ifname, void *handle)
++{
++	(void) ifname; (void) handle;
++	return -1;
++}
+ #endif
+ 
+ /* input:
+diff --git a/libwifi/modules/wpactrl/wpactrl.h b/libwifi/modules/wpactrl/wpactrl.h
+index 42593aa..8b39c3b 100644
+--- a/libwifi/modules/wpactrl/wpactrl.h
++++ b/libwifi/modules/wpactrl/wpactrl.h
+@@ -20,4 +20,13 @@ int wpactrl_register_event(const char *ifname, struct event_struct *req, void **
+ int wpactrl_recv_event(const char *ifname, void *handle);
+ int wpactrl_unregister_event(const char *ifname, void *handle);
+ 
++/* Layer-1 AP/MLD event source (same signature family; hostapd-side twin of the
++ * wpactrl bSTA quartet). ATTACHes to the hostapd ctrl dir and, for an MLD
++ * parent, additionally to its <ifname>_link0/_link1 affiliated sockets, feeding
++ * the process-local AP + affiliated-MLD warm cache (apconn_cache). Dispatched by
++ * wifi.c on req->family == "hapdctrl". */
++int hapdctrl_register_event(const char *ifname, struct event_struct *req, void **handle);
++int hapdctrl_recv_event(const char *ifname, void *handle);
++int hapdctrl_unregister_event(const char *ifname, void *handle);
++
+ #endif

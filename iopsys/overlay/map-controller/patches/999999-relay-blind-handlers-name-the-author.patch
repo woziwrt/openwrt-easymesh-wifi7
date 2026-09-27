@@ -1,0 +1,97 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 999999: every self-attributing handler leaves the author in cmdu->origin
+
+99994 built the mechanism: a handler that discovers `origin` was only the
+relay corrects cmdu->origin, and the dispatch tail resolves the author
+once for every mapc_sync_*() write and for node expiry. It rolled it out
+to one handler - Topology Response. The blind review of 2026-08-04
+(finding 1.3/1.15) counted the rest: any CMDU that arrives through a
+1905 relay is still persisted under the relay.
+
+Roll the idiom out to the remaining self-attributing handlers:
+
+  - handle_topology_notification: the AL MAC TLV names the author
+    outright; the handler already rebinds its local n and forgot to tell
+    the caller. This is the roaming path - a client association event
+    persisted under the relay is why the DB shows the wrong owner for
+    minutes after a roam when the event crossed a hop.
+
+  - handle_ap_caps_report: no TLV names an AL address, but every radio
+    TLV names a radio and a radio belongs to exactly one node; rebind to
+    the owner of the first named radio.
+
+  - handle_ap_metrics_response: same through the BSSID every AP Metrics
+    TLV names. Rebinding n here also fixes n->est_thput_dl bookkeeping,
+    which was charged to the relay.
+
+The pattern is one lookup at the top of the handler, no behaviour change
+when the frame arrived directly (owner == n).
+
+Verify on hardware, mesh chained controller <- 8g <- x8: roam a client
+between 8g and x8 and watch "is from ... relayed by ..." in the
+controller log for CMDU 0x0001 (notification), then sta.agent_almac in
+mapc.db - it must name the node the client actually sits on, within
+seconds, even when the event crossed two hops.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -204,6 +204,14 @@
+ 		return -1;
+ 	}
+ 
++	/* The AL MAC TLV names the author. Correcting our local n is not
++	 * enough (the 99994 lesson): the caller persists the node it
++	 * resolved from the frame source, so leave the author where the
++	 * caller reads it back. Roaming lives here - the client association
++	 * event must be persisted under the agent that saw it, not under
++	 * the relay it arrived through. */
++	memcpy(cmdu->origin, almacaddr, 6);
++
+ 	if (!map_cmdu_validate_parse(cmdu, tv, ARRAY_SIZE(tv), n->map_profile)) {
+ 		warn("%s: map_cmdu_validate_parse failed,  err = (%d) '%s'\n",
+ 		     __func__, map_error, map_strerror(map_error));
+@@ -1890,6 +1898,23 @@
+ 	 *  debug_ap_caps_report() does this.
+ 	 */
+ 
++	/* No TLV here names the author by AL address, but every radio TLV
++	 * names a radio and a radio belongs to exactly one node. When the
++	 * frame came through a relay, n is the relay: rebind to the radio
++	 * owner and leave it in cmdu->origin for the caller (99994 idiom). */
++	if (tv[AP_CAPABILITY_REPORT_AP_RADIO_BASIC_CAPS_IDX][0]) {
++		uint8_t *ruid =
++			(uint8_t *)tv[AP_CAPABILITY_REPORT_AP_RADIO_BASIC_CAPS_IDX][0]->data;
++		struct netif_radio *nr = cntlr_find_radio(c, ruid);
++
++		if (nr && nr->agent && nr->agent != n) {
++			dbg("%s: AP Caps Report is about " MACFMT ", relayed by " MACFMT "\n",
++			    __func__, MAC2STR(nr->agent->almacaddr), MAC2STR(n->almacaddr));
++			n = nr->agent;
++			memcpy(cmdu->origin, n->almacaddr, 6);
++		}
++	}
++
+ 	/* AP Capability TLV */
+ 	if (tv[AP_CAPABILITY_REPORT_AP_CAPABILITY_IDX][0]) {
+ 		struct tlv_ap_cap *p =
+@@ -2434,6 +2459,21 @@
+ 		return -1;
+ 	}
+ 
++	/* Same relay problem, resolved through the BSSID every AP Metrics
++	 * TLV names: a BSS belongs to exactly one node. Rebinding n also
++	 * fixes the per-node est_thput bookkeeping below. */
++	if (tv[0][0]) {
++		struct tlv_ap_metrics *p0 = (struct tlv_ap_metrics *)tv[0][0]->data;
++		struct netif_iface *bss0 = cntlr_find_bss(c, p0->bssid);
++
++		if (bss0 && bss0->agent && bss0->agent != n) {
++			dbg("%s: AP Metrics Response is about " MACFMT ", relayed by " MACFMT "\n",
++			    __func__, MAC2STR(bss0->agent->almacaddr), MAC2STR(n->almacaddr));
++			n = bss0->agent;
++			memcpy(cmdu->origin, n->almacaddr, 6);
++		}
++	}
++
+ 	/* AP Metrics TLV */
+ 	idx = 0;
+ 	while (idx < TLV_MAXNUM && tv[0][idx]) {

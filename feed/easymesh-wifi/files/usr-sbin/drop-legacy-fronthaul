@@ -1,0 +1,93 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Remove per-radio fronthaul BSSes on a node that has an AP-MLD.
+#
+# Decided 2026-07-17 (hardware, iPhone 6s): the AP-MLD IS the fronthaul and its
+# links are ordinary BSSes, so a legacy client attaches to one of them. A
+# per-radio AP with the same purpose adds nothing and advertises the fronthaul
+# twice on every radio. Worse, the extra BSSes consume the BSS slots the MLD
+# interfaces need - measured 2026-08-07 on a node built from packages, where
+# ap-mld-2 and bsta-mld-3 simply never appeared until these were gone.
+#
+# WHY THIS RUNS AT BOOT AND NOWHERE ELSE
+# --------------------------------------
+# map_genconfig is a hotplug handler on ieee80211 add events, so it runs while
+# the driver registers the phys - after a package install has already finished.
+# A uci-default therefore cleans up before the sections it is meant to remove
+# exist: measured the same day, the install cleaned nothing and the first boot
+# came up with seven legacy BSSes and no backhaul at all.
+#
+# genconfig only regenerates while mapagent has fewer radio sections than
+# wireless has wifi-devices, so the second boot is usually quiet - but "usually"
+# is not a guarantee worth a dead backhaul, and this is cheap.
+#
+# Runs before netifd brings wifi up, so a removed BSS never goes on the air.
+#
+# The uci-default that used to call this as well is gone (2026-08-12). On a
+# package install it did find sections - the ones the image's own first boot
+# had created - and deleted them from underneath a running hostapd. The config
+# and the air then disagreed until something reloaded asynchronously about a
+# minute later, and whether that landed before or after the wizard decided how
+# the node came out: four identical runs that day produced three clean nodes
+# and one carrying six legacy BSSes.
+#
+# The rule this leaves behind: write /etc/config/wireless only when a reboot
+# immediately follows. The wizard qualifies - it writes and then asks for the
+# restart. An install does not, and bracketing the write with wifi down/up is
+# no answer either: on MT7996 that reload is what wedges the MCU and takes the
+# node off the air for good.
+
+# Boot only, enforced. base-files default_postinst runs "start" on every
+# init script a package ships, on upgrade exactly as on install, so an
+# apk upgrade would run this against a node that is carrying traffic.
+# Measured on a BPI-R4 (4 GB) node, 2026-08-09. See boot-window.sh.
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+in_boot_window || {
+	logger -t drop-legacy-fronthaul "started outside the boot window - skipping; this rewrites configuration a running node depends on"
+	exit 0
+}
+
+mld_if="$(uci -q get wireless.ap_mld_1.ifname 2>/dev/null)"
+[ -n "$mld_if" ] || exit 0
+
+changed=0
+
+drop() {
+	logger -t drop-legacy-fronthaul "removing $1 (ifname=$(uci -q get "wireless.$1.ifname" 2>/dev/null) ssid=$(uci -q get "wireless.$1.ssid" 2>/dev/null)) - AP-MLD $mld_if is the fronthaul"
+	uci -q delete "wireless.$1"
+	changed=1
+}
+
+for s in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+	[ "$(uci -q get "wireless.$s.mode" 2>/dev/null)" = "ap" ] || continue
+
+	# Never touch the MLD interfaces themselves.
+	ifn="$(uci -q get "wireless.$s.ifname" 2>/dev/null)"
+	[ "$ifn" = "$mld_if" ] && continue
+	case "$(uci -q get "wireless.$s.mlo" 2>/dev/null)" in 1) continue ;; esac
+
+	# Three classes reach this point, and each was learned the hard way:
+	# genconfig's per-radio fronthauls carry multi_ap=2, its per-radio
+	# LEGACY BACKHAULS carry multi_ap=1 (found 2026-08-10: three wlanX_1_ap
+	# sections took the BSS slots on a clean-image node and netifd gave up
+	# with retry_setup_failed - this cleaner walked right past them), and
+	# the stock OpenWrt default_radio* sections carry no multi_ap at all.
+	# The MLD backhaul AP is safe here: it carries mlo=1 and was skipped
+	# above before classes are even considered.
+	case "$(uci -q get "wireless.$s.multi_ap" 2>/dev/null)" in
+	1|2) drop "$s"; continue ;;
+	esac
+	case "$s" in
+	default_radio*) drop "$s" ;;
+	esac
+done
+
+[ "$changed" = 1 ] && uci commit wireless
+exit 0

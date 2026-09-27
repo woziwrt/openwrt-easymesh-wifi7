@@ -1,0 +1,170 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] info() and not dbg(). On 2026-09-02 the policy was written, its mtime moved
+four times, and nothing went out: 452 1905 frames on the wire in 45 s and not
+one CMDU 0x8022. Whether this check even saw the change was impossible to tell,
+because dbg sits below the default level and the level could not be raised from
+outside - "-d" means "do not daemonize" rather than verbosity, "-v" made no
+difference, and uci debug=6 changed nothing either. A line that speaks only when
+a policy actually changes is cheap enough to keep at info.
+
+diff -urN a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c	2026-08-31 17:47:38.955114089 +0200
++++ b/src/cntlr.c	2026-08-31 17:47:38.957056135 +0200
+@@ -1870,32 +1870,35 @@
+  * whole file, and a rewrite always moves mtime. Comparing content would cost a
+  * read on every tick to catch a case that cannot happen.
+  */
+-static void cntlr_check_ttlm_policy_change(struct controller *c)
++static bool cntlr_check_ttlm_policy_change(struct controller *c)
+ {
+ 	static time_t last_mtime;
+ 	struct stat st;
++	bool changed = false;
+ 
+ 	if (stat("/etc/mapc/ttlm-policy", &st)) {
+ 		/* File removed: nothing to push, and the agents keep whatever
+ 		 * they were last told. Tearing a mapping down is a policy line
+ 		 * of its own, not the absence of one. */
+ 		last_mtime = 0;
+-		return;
++		return false;
+ 	}
+ 
+ 	if (st.st_mtime == last_mtime)
+-		return;
++		return false;
+ 
+ 	/* First sighting after a start is not a change - the agents were
+ 	 * configured from this same file the last time round, and pushing on
+ 	 * every restart would put a CMDU on the air for nothing. */
+ 	if (last_mtime) {
+-		dbg("%s: ttlm-policy changed, scheduling AP MLD Config Request\n",
++		info("%s: ttlm-policy changed, sending Service Prioritization Request\n",
+ 		    __func__);
+-		timestamp_update(&c->cfg.last_apmld_change);
++		changed = true;
+ 	}
+ 
+ 	last_mtime = st.st_mtime;
++
++	return changed;
+ }
+ #endif
+ 
+@@ -1963,14 +1966,22 @@
+ 
+ #if (EASYMESH_VERSION >= 6)
+ 	/* before the loop, so a policy written since the last tick is already
+-	 * visible to the per-node comparison below */
+-	cntlr_check_ttlm_policy_change(c);
++	 * visible to the per-node pass below */
++	bool ttlm_changed = cntlr_check_ttlm_policy_change(c);
+ #endif
+ 
+ 	/* When at least one running node was configured with older config, */
+ 	/* send autoconfig renew */
+ 	list_for_each_entry(node, &c->agentlist, list) {
+ #if (EASYMESH_VERSION >= 6)
++		/* Deliberately before the chain below and not an arm of it: a
++		 * TTLM policy is unicast, carries no MLD configuration, and
++		 * must not make the node look unconfigured. Nodes the policy
++		 * file does not name cost one cheap read and send nothing. */
++		if (ttlm_changed)
++			cntlr_send_tid_to_link_policy(c, node);
++#endif
++#if (EASYMESH_VERSION >= 6)
+ 		/* Deliberately not an arm of the chain below.
+ 		 *
+ 		 * The AP-MLD arm holds for a node until that node acks, and the
+diff -urN a/src/cntlr_cmdu.c b/src/cntlr_cmdu.c
+--- a/src/cntlr_cmdu.c	2026-08-31 17:47:38.950423394 +0200
++++ b/src/cntlr_cmdu.c	2026-08-31 17:47:38.951399418 +0200
+@@ -918,7 +918,58 @@
+ 	dbg("%s: %u TTLM policy block(s) for " MACFMT "\n", __func__, num,
+ 	    MAC2STR(agent_mac));
+ 
+-	return 0;
++	return num;
++}
++
++/* Send the TID-to-Link Mapping policy for one agent.
++ *
++ * The policy used to ride the AP MLD Config Request. That was wrong on three
++ * counts, all three measured on hardware 2026-08-31: EasyMesh 6.1 section
++ * 17.1.47 puts this TLV on the Service Prioritization Request, the AP MLD
++ * request is sent to every agent (so one node's policy re-applied the MLD
++ * configuration mesh-wide and tore the backhaul down - three times out of
++ * three), and it is retried until acknowledged, which a node behind a second
++ * hop never does.
++ *
++ * A Service Prioritization Request is unicast to the one agent named by the
++ * policy and touches nothing else. Upstream ieee1905 already permits the TLV
++ * here (r6.c, CMDU_SERVICE_PRIORITIZATION_REQUEST[3]), so no policy patch of
++ * ours is needed any more.
++ *
++ * Returns 0 when there is nothing to send for this agent, which is the normal
++ * case for most nodes and must stay cheap.
++ */
++int cntlr_send_tid_to_link_policy(struct controller *c, struct node *n)
++{
++	struct cmdu_buff *cmdu;
++	uint16_t mid = 0;
++	int num;
++
++	if (!c || !n)
++		return -1;
++
++	cmdu = cmdu_alloc_simple(CMDU_SERVICE_PRIORITIZATION_REQUEST, &mid);
++	if (!cmdu) {
++		err("%s: -ENOMEM\n", __func__);
++		return -1;
++	}
++
++	num = cntlr_gen_tid_to_link_policy(c, cmdu, n->almacaddr);
++	if (num < 0)
++		info("%s: could not build the policy for " MACFMT "\n",
++		     __func__, MAC2STR(n->almacaddr));
++	if (num <= 0) {
++		/* no policy for this agent, or the frame could not be built */
++		cmdu_free(cmdu);
++		return num;
++	}
++
++	memcpy(cmdu->origin, n->almacaddr, 6);
++	cmdu_put_eom(cmdu);
++	send_cmdu(c, cmdu);
++	cmdu_free(cmdu);
++
++	return num;
+ }
+ #endif
+ 
+@@ -959,15 +1007,6 @@
+ 	if (ret)
+ 		goto out;
+ 
+-#if (EASYMESH_VERSION >= 6)
+-	/* Last of the TLVs: a policy names links of an AP-MLD, and the agent
+-	 * applies it after the MLD configuration above, so the order on the
+-	 * wire matches the order it is consumed in. */
+-	ret = cntlr_gen_tid_to_link_policy(c, resp, agent_mac);
+-	if (ret)
+-		goto out;
+-#endif
+-
+ 	memcpy(resp->origin, agent_mac, 6);
+ 	cmdu_put_eom(resp);
+ 	return resp;
+diff -urN a/src/cntlr_cmdu.h b/src/cntlr_cmdu.h
+--- a/src/cntlr_cmdu.h	2026-08-31 17:47:38.953164148 +0200
++++ b/src/cntlr_cmdu.h	2026-08-31 17:47:38.954144861 +0200
+@@ -74,6 +74,9 @@
+ struct cmdu_buff *cntlr_gen_ap_mld_configuration_request(struct controller *c,
+ 		uint8_t *agent_mac, struct wifi_wifi7_capabilities *caps);
+ int cntlr_send_ap_mld_configuration_request(struct controller *c, struct node *n);
++#if (EASYMESH_VERSION >= 6)
++int cntlr_send_tid_to_link_policy(struct controller *c, struct node *n);
++#endif
+ struct cmdu_buff *cntlr_gen_bss_config_extended_request(struct controller *c, struct node *n);
+ int cntlr_send_bss_config_extended_request(struct controller *c, struct node *n);
+ #endif

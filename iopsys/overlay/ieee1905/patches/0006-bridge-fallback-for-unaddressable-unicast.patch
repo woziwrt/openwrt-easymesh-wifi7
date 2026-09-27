@@ -1,0 +1,118 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905 0006: let the bridge deliver a unicast we cannot address
+
+i1905_do_cmdu_tx() resolves a unicast destination through the neighbour cache and
+then through txpaths, and drops the CMDU when neither knows it. The neighbour
+cache only ever learns direct neighbours, so on a chained mesh every node beyond
+the first is unreachable this way - even though the L2 path to it exists and
+carries data at full rate.
+
+IEEE 1905.1 does not define any forwarding for unicast. Table 6-4 says a received
+unicast CMDU is processed and "not transmitted on any of its interfaces", and the
+forwarding entity is explicitly out of scope, required only to "be interoperable
+with IEEE 802.1 bridging" (P1905.1 WG presentation to IEEE 802.1, Jul 2012,
+slides 10 and 23). A unicast CMDU addressed to a device several hops away is
+therefore expected to be delivered by the bridge. Refusing to send it is our own
+addition, and it is the one that fails.
+
+Measured on hardware 2026-07-31. Mesh formed as controller <- agentA <- agentB
+after a simultaneous restart, agentB two hops out:
+
+  ubus call ieee1905 cmdu '{"type":2,"dst":"<agentB al-mac>"}'
+    -> {"status":"fail"}
+
+  same call with "ifname":"br-lan"
+    -> {"status":"ok","mid":19391}
+    -> tcpdump on agentB: 3 frames with DA = its own AL MAC arrived,
+       3x type 0x0002 Topology Query in and 3x 0x0003 Topology Response out
+    -> controller went from num_nodes 2 to 3
+
+The bridge delivers it. The destination AL MAC is in no forwarding database -
+it belongs to no netdev of ours, and never appears as a source address, so it
+cannot be learned - and an unknown unicast destination is flooded, which reaches
+the far node through the intermediary. The same call pinned to the wireless
+interface facing the intermediary was accepted and went nowhere: it arrived at
+the intermediary and stopped there, which is what a unicast to an unlearned
+address does when it is not flooded.
+
+This cannot loop. A CMDU that arrives is processed and never retransmitted, per
+the same table, and the bridge applies its own split horizon.
+
+Other open Multi-AP stacks do this unconditionally - no neighbour lookup on
+the transmit path at all: the send path resolves the AL MAC to a local netdev
+and hands the frame to the kernel, treating the Linux bridge as the
+authoritative source of forwarding behaviour. The Broadband Forum reference
+implementation makes the same assumption.
+
+What this does not fix: the far node is now reachable and answers, but the
+controller still records depth -1 for it. Delivery was only the first of two
+problems; placing the node in the topology tree from a Topology Response it did
+receive is separate and untouched here.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/i1905_cmdresp.c	2026-07-31 15:58:41.548137614 +0200
++++ b/src/i1905_cmdresp.c	2026-07-31 15:58:41.548215594 +0200
+@@ -1074,6 +1074,62 @@
+ 				i1905_warn(LOG_TX, "%s: cmdu tx failed\n", __func__);
+ 			}
+ 		}
++
++		/* Last resort: hand it to the bridge.
++		 *
++		 * Neither the neighbour cache nor the txpaths know this AL MAC, and
++		 * up to now that meant the CMDU was dropped. But 1905.1 defines no
++		 * forwarding for unicast at all - Table 6-4 says a received unicast
++		 * CMDU is processed and "not transmitted on any of its interfaces" -
++		 * and the forwarding entity is explicitly out of scope, required only
++		 * to "be interoperable with IEEE 802.1 bridging". A unicast CMDU to a
++		 * device several hops away is therefore expected to be delivered by
++		 * the bridge, not routed by us. Refusing to send it is our own
++		 * addition, and it is the one that fails.
++		 *
++		 * The neighbour cache only ever learns direct neighbours, so on a
++		 * chained mesh every node beyond the first is unreachable by this
++		 * path even though the L2 route exists and carries data at full rate.
++		 *
++		 * Measured on hardware 2026-07-31, mesh formed as
++		 * controller <- agentA <- agentB:
++		 *
++		 *   ubus call ieee1905 cmdu '{"type":2,"dst":"<agentB al-mac>"}'
++		 *     -> {"status":"fail"}                      (this branch)
++		 *   same call with "ifname":"br-lan"
++		 *     -> {"status":"ok","mid":19391}
++		 *     -> tcpdump on agentB: 3 frames with DA = its AL MAC arrived,
++		 *        3x type 0x0002 Topology Query in, 3x 0x0003 Response out,
++		 *        controller went from num_nodes 2 to 3.
++		 *
++		 * So the bridge delivers it. The destination AL MAC is not in the
++		 * forwarding database - it belongs to no netdev of ours - and an
++		 * unknown unicast destination is flooded, which reaches the far node
++		 * through the intermediary. That is also why this cannot loop: the
++		 * bridge applies its own split horizon, and a CMDU that does arrive
++		 * is processed and never retransmitted.
++		 *
++		 * Other open 1905 stacks do this unconditionally - no
++		 * neighbour lookup on the transmit path at all - and the
++		 * Broadband Forum reference implementation assumes it.
++		 */
++		if (ret) {
++			list_for_each_entry(iface, &priv->dm.self.iflist, list) {
++				if (iface->exclude || !if_isbridge(iface->ifname))
++					continue;
++
++				ret = i1905_cmdu_tx(iface->priv, vid, dst, src,
++						    type, &mid, data, data_len,
++						    true);
++				if (!ret) {
++					i1905_warn(LOG_TX,
++						   "%s: cmdu %04x to " MACFMT " handed to bridge %s\n",
++						  __func__, type, MAC2STR(dst),
++						  iface->ifname);
++					goto done;
++				}
++			}
++		}
+ 	}
+ 
+ done:

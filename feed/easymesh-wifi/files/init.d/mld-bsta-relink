@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# The backhaul MLD STA loses its 5 GHz leg to the AP's DFS CAC: the agent
+# associates while the channel is still being checked for radar and stays
+# single-linked. See /usr/sbin/mld-bsta-relink for the measurement.
+#
+# The helper does its own waiting (CAC is 60 s and starts ~30 s into boot), so
+# this only needs to launch it in the background.
+
+START=99
+
+start() {
+	/usr/sbin/mld-bsta-relink >/dev/null 2>&1 &
+}
+
+stop() {
+	return 0
+}

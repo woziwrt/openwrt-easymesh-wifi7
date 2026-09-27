@@ -1,0 +1,113 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Put every backhaul MLD STA on the bridge its wireless section asks for.
+#
+# netifd can bring bsta-mld-* up without ever setting its bridge master, while
+# still listing it as a bridge member. The two views never reconcile - netifd
+# sees nothing to fix - so the node keeps a perfectly healthy association with
+# no data path behind it, and the mesh simply stops seeing it. Nothing logs an
+# error; the only tells are "no master" on the node and a packet count on the
+# parent that stops climbing.
+#
+# Measured 2026-08-07 on a node built by installing packages onto a stock
+# image: bsta-mld-3 associated on 6 GHz, wpa_state COMPLETED, ssid_verified,
+# and no master - the controller counted three nodes instead of four. It
+# repeated on every single boot.
+#
+# WHY THIS IS A POLLED SERVICE AND NOT ONLY A HOTPLUG RULE
+# -------------------------------------------------------
+# The hotplug rule shipped alongside this script is a fast path, not the
+# guarantee. Measured the same day: a hotplug rule for bsta-mld-3 with correct
+# logic - it attached the interface immediately when run by hand - never fired
+# once across three boots, under either variable name the platform uses
+# (DEVICENAME for the MediaTek flowtable hook, INTERFACE for our own MT7996
+# txpower hook). The event does not reach /etc/hotplug.d/net for this
+# interface. So the mesh cannot depend on it.
+#
+# Polling also covers the case the event never could: netifd tearing the
+# membership back down during a later wireless reconfigure, which is the
+# documented trigger for this whole failure mode.
+#
+# Deliberately narrow: only bsta-mld-* interfaces, only when they currently
+# have no master at all, and only onto the bridge named by the network their
+# own wireless section declares. An interface netifd placed correctly, or one
+# that belongs somewhere else, is never touched.
+
+# Which bridge does this interface's wireless section ask for? Empty means
+# "no opinion", and no opinion means hands off.
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+wanted_bridge() {
+	local dev="$1" section network bridge
+
+	for section in $(uci show wireless 2>/dev/null | \
+			sed -n "s/^wireless\.\([^.]*\)\.ifname='$dev'\$/\1/p"); do
+		network="$(uci -q get "wireless.$section.network")"
+		[ -n "$network" ] && break
+	done
+	[ -n "$network" ] || return 1
+
+	bridge="$(uci -q get "network.$network.device")"
+	case "$bridge" in
+	br-*) ;;
+	*) return 1 ;;	# not a bridge - the interface is meant to stand alone
+	esac
+
+	[ -d "/sys/class/net/$bridge" ] || return 1
+	echo "$bridge"
+}
+
+check_once() {
+	local dev bridge attached=0
+
+	for dev in /sys/class/net/bsta-mld-*; do
+		[ -e "$dev" ] || continue
+		dev="${dev##*/}"
+
+		# Already bridged - nothing to do, and nothing to second-guess.
+		[ -e "/sys/class/net/$dev/master" ] && continue
+
+		bridge="$(wanted_bridge "$dev")" || continue
+
+		local err
+		if err=$(ip link set "$dev" master "$bridge" 2>&1); then
+			logger -t mld-bsta-bridge \
+				"attached $dev to $bridge (netifd left it unbridged)"
+			attached=$((attached + 1))
+		else
+			# On 2026-08-10 a node sat 18 minutes with a healthy
+			# association and no bridge master while this loop ran the
+			# whole time - and the discarded stderr was the only witness.
+			# A failed attach is the story; tell it.
+			logger -t mld-bsta-bridge \
+				"cannot attach $dev to $bridge: $err"
+		fi
+	done
+
+	return 0
+}
+
+case "$1" in
+once)
+	check_once
+	;;
+watch)
+	# The interface appears late: association on 6 GHz completes around 100 s
+	# after boot on this hardware, so an early single check would find nothing
+	# and a node would sit dead until someone noticed.
+	while :; do
+		check_once
+		sleep 30
+	done
+	;;
+*)
+	echo "usage: mld-bsta-bridge {once|watch}"
+	exit 1
+	;;
+esac

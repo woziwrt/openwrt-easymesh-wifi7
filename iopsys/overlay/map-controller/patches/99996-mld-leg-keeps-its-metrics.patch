@@ -1,0 +1,286 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99996: give an MLD leg somewhere to keep its metrics
+
+affiliated_sta.rcpi has read NULL since the table existed, and the reason turned
+out to be three separate gaps on the same path rather than one missing parse.
+
+Measured on hardware 2026-08-04. The agent measures per link correctly and says
+so - libwifi reported -26 dBm on the active leg and map-agent forwarded it - but
+the value had nowhere to land:
+
+1. handle_sta_link_metrics_response() wrote the measurement into the leg's
+   struct sta. What gets persisted is the wifi_affiliated_sta_element under the
+   STA-MLD. An MLD client is carried in both, and nothing copied between them.
+
+2. ins_affsta bound only macaddr, mld_macaddr and bssid. Even with the value in
+   memory, the measured columns were never part of the statement.
+
+3. parse_associated_sta_mld_config() rebuilds the leg list wholesale on every
+   Associated STA MLD Config TLV - which rides every Topology Response. Anything
+   written to a leg survived at most one round.
+
+So: connect the two halves, bind the columns, and carry measured values across
+the rebuild for legs that are still on the same BSS. A leg that moved to another
+BSS starts clean, because its old reading describes a different link.
+
+Throughout, 99993's rule holds per link: a report carrying nothing - 0, or the
+255 that means "never measured" - must not overwrite a real reading. It is
+applied both in the C path and in the ON CONFLICT clause.
+
+Also, one line in the AP Metrics Response path. cntlr_find_radio() resolves the
+radio by RUID, so the metrics always land on the right radio_el, but the node
+passed alongside is whoever the frame came from - the relay, across a wireless
+backhaul:
+
+	new radio metrics node ca:8e:1d:ca:bc:ae radio 00:0c:43:26:60:10
+
+That radio is x8's and that node is 8g's. cntlr_acs_radio_metrics() hands the
+node on to cntlr_dfs_radio_cleanup(), so a DFS or ACS action meant for x8's
+radio would have been addressed to 8g. The radio knows its owner; ask it.
+
+This is the same defect shape as 99994 and 99995, on a third path: state that
+two places describe, where only one of them is right.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2582,8 +2582,23 @@
+ 
+ 		radio = cntlr_find_radio(c, p->radio);
+ 		if (radio) {
+-			/* Kick ACS code */
+-			cntlr_acs_radio_metrics(n, radio, p->noise, p->receive_other,
++			/* cntlr_find_radio() resolves the radio by RUID, so it is
++			 * always the right one - but `n` is whoever the frame came
++			 * from, and across a wireless backhaul that is the relay.
++			 * Measured 2026-08-04 on the chain 4g <- 8g <- x8:
++			 *
++			 *   new radio metrics node ca:8e:1d:ca:bc:ae
++			 *                          radio 00:0c:43:26:60:10
++			 *
++			 * The radio is x8's, the node is 8g's. The metrics land on
++			 * the right radio_el either way, but cntlr_acs_radio_metrics()
++			 * passes `n` on to cntlr_dfs_radio_cleanup() - so a DFS or
++			 * ACS action for x8's radio would be sent to 8g.
++			 *
++			 * The radio knows who owns it; ask it rather than the frame.
++			 */
++			cntlr_acs_radio_metrics(radio->agent ? radio->agent : n,
++						radio, p->noise, p->receive_other,
+ 						p->transmit, p->receive_self);
+ 
+ 			radio->radio_el->anpi = p->noise;
+@@ -2908,6 +2923,68 @@
+ 	return 0;
+ }
+ 
++#if (EASYMESH_VERSION >= 6)
++/* Record a per-link measurement on the affiliated leg it belongs to.
++ *
++ * An MLD client is carried twice: as one struct sta per leg in sta_table, and
++ * as a wifi_affiliated_sta_element under its STA-MLD. Metrics arrive keyed by
++ * the leg's address and were written only to the former; mapc_sync persists
++ * the latter. So affiliated_sta.rcpi read NULL no matter how well the agent
++ * measured - the two halves were never connected.
++ *
++ * Matched on leg address AND BSSID: the same address on a different BSS is a
++ * different link and must not inherit the reading.
++ */
++static void cntlr_affiliated_sta_metrics(struct controller *c,
++					 const uint8_t *macaddr,
++					 const uint8_t *bssid,
++					 uint8_t rcpi,
++					 uint32_t dl_rate, uint32_t ul_rate)
++{
++	struct node *n;
++
++	if (!c || !macaddr || !bssid)
++		return;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		struct wifi_apmld_element *mld;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			struct wifi_stamld_element *sm;
++
++			list_for_each_entry(sm, &mld->stamldlist, list) {
++				struct wifi_affiliated_sta_element *as;
++
++				list_for_each_entry(as, &sm->stalist, list) {
++					if (memcmp(as->macaddr, macaddr, 6) ||
++					    memcmp(as->bssid, bssid, 6))
++						continue;
++
++					/* 99993's rule, per link: an unmeasured
++					 * report must not erase a measurement. */
++					if (rcpi && rcpi != 255)
++						as->rcpi = rcpi;
++					else if (!as->rcpi)
++						as->rcpi = rcpi;
++
++					if (dl_rate)
++						as->dl_rate = dl_rate;
++					if (ul_rate)
++						as->ul_rate = ul_rate;
++
++					dbg("%s: leg " MACFMT " on " MACFMT
++					    " rcpi %u dl %u ul %u\n", __func__,
++					    MAC2STR(as->macaddr),
++					    MAC2STR(as->bssid), as->rcpi,
++					    as->dl_rate, as->ul_rate);
++					return;
++				}
++			}
++		}
++	}
++}
++#endif
++
+ int handle_sta_link_metrics_response(void *cntlr, struct cmdu_buff *cmdu,
+ 				     struct node *n)
+ {
+@@ -2976,6 +3053,18 @@
+ 			else if (!s->de_sta->rcpi)
+ 				s->de_sta->rcpi = b->ul_rcpi;
+ 
++#if (EASYMESH_VERSION >= 6)
++			/* For a leg of an MLD client this is a per-link
++			 * measurement, and the row that gets persisted is the
++			 * affiliated element, not this struct sta. Nothing
++			 * copied between the two, so affiliated_sta.rcpi stayed
++			 * NULL however well the agent measured. */
++			cntlr_affiliated_sta_metrics(c, p->macaddr, b->bssid,
++						     b->ul_rcpi,
++						     BUF_GET_BE32(b->dl_thput),
++						     BUF_GET_BE32(b->ul_thput));
++#endif
++
+ 			offset += sizeof(*b);
+ 		}
+ 
+@@ -4588,6 +4677,19 @@
+ 		const uint8_t *data, *sta_mac, *ap_mac;
+ 		uint8_t flag, num_aff, j;
+ 		uint16_t len;
++		/* measured per-link values carried across the rebuild below;
++		 * an MLD has at most MAX_NUM_MLO_LINKS legs, 8 is slack. */
++		struct {
++			uint8_t macaddr[6];
++			uint8_t bssid[6];
++			uint8_t rcpi;
++			uint32_t dl_rate;
++			uint32_t ul_rate;
++			uint64_t tx_bytes;
++			uint64_t rx_bytes;
++		} kept[8];
++		int nkept = 0;
++		int k;
+ 
+ 		if (t->type != MAP_TLV_STA_MLD_CONFIG)
+ 			continue;
+@@ -4640,7 +4742,40 @@
+ 		sm->is_bsta = false;
+ 		sm->last_updated = time(NULL);
+ 
+-		/* wholesale-rebuild this clients affiliated STA list */
++		/* wholesale-rebuild this clients affiliated STA list.
++		 *
++		 * The rebuild frees every leg and allocates it again, which also
++		 * throws away everything we measured for it. This TLV arrives on
++		 * every Topology Response, so a per-link RCPI written by
++		 * handle_sta_link_metrics_response() survived at most one round
++		 * and affiliated_sta.rcpi read NULL forever.
++		 *
++		 * Carry the measured fields across the rebuild for legs that are
++		 * still on the same BSS. Same rule as 99993: an unmeasured value
++		 * must not erase a measured one. A leg that moved to another BSS
++		 * starts clean, because its old reading describes another link.
++		 */
++		{
++			struct wifi_affiliated_sta_element *as;
++
++			nkept = 0;
++			list_for_each_entry(as, &sm->stalist, list) {
++				if (nkept >= (int)ARRAY_SIZE(kept))
++					break;
++				if (!as->rcpi && !as->dl_rate && !as->ul_rate)
++					continue;
++
++				memcpy(kept[nkept].macaddr, as->macaddr, 6);
++				memcpy(kept[nkept].bssid, as->bssid, 6);
++				kept[nkept].rcpi = as->rcpi;
++				kept[nkept].dl_rate = as->dl_rate;
++				kept[nkept].ul_rate = as->ul_rate;
++				kept[nkept].tx_bytes = as->tx_bytes;
++				kept[nkept].rx_bytes = as->rx_bytes;
++				nkept++;
++			}
++		}
++
+ 		while (!list_empty(&sm->stalist)) {
+ 			struct wifi_affiliated_sta_element *as;
+ 
+@@ -4660,6 +4795,21 @@
+ 				break;
+ 			memcpy(as->bssid, ent, 6);
+ 			memcpy(as->macaddr, ent + 6, 6);
++
++			/* restore what we had measured for this leg on this BSS */
++			for (k = 0; k < nkept; k++) {
++				if (memcmp(kept[k].macaddr, as->macaddr, 6) ||
++				    memcmp(kept[k].bssid, as->bssid, 6))
++					continue;
++
++				as->rcpi = kept[k].rcpi;
++				as->dl_rate = kept[k].dl_rate;
++				as->ul_rate = kept[k].ul_rate;
++				as->tx_bytes = kept[k].tx_bytes;
++				as->rx_bytes = kept[k].rx_bytes;
++				break;
++			}
++
+ 			list_add_tail(&as->list, &sm->stalist);
+ 			sm->num_sta++;
+ 
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -772,11 +772,26 @@
+ 		"num_sta=excluded.num_sta, "
+ 		"ap_mld_macaddr=excluded.ap_mld_macaddr, "
+ 		"last_seen=excluded.last_seen";
++	/* The measured columns were never bound, so affiliated_sta.rcpi stayed
++	 * NULL even once the controller had the value in memory. Bind them, and
++	 * keep 99993's rule in SQL: a report carrying nothing (0, or 255 which
++	 * is the "never measured" RCPI) must not overwrite a real reading. */
+ 	static const char *ins_affsta =
+-		"INSERT INTO affiliated_sta(macaddr, mld_macaddr, bssid) "
+-		"VALUES(?,?,?) "
++		"INSERT INTO affiliated_sta(macaddr, mld_macaddr, bssid, "
++		"rcpi, dl_rate, ul_rate, bytes_tx, bytes_rx) "
++		"VALUES(?,?,?,?,?,?,?,?) "
+ 		"ON CONFLICT(macaddr, bssid) DO UPDATE SET "
+-		"mld_macaddr=excluded.mld_macaddr";
++		"mld_macaddr=excluded.mld_macaddr, "
++		"rcpi=CASE WHEN excluded.rcpi NOT IN (0,255) "
++			"THEN excluded.rcpi ELSE affiliated_sta.rcpi END, "
++		"dl_rate=CASE WHEN excluded.dl_rate>0 "
++			"THEN excluded.dl_rate ELSE affiliated_sta.dl_rate END, "
++		"ul_rate=CASE WHEN excluded.ul_rate>0 "
++			"THEN excluded.ul_rate ELSE affiliated_sta.ul_rate END, "
++		"bytes_tx=CASE WHEN excluded.bytes_tx>0 "
++			"THEN excluded.bytes_tx ELSE affiliated_sta.bytes_tx END, "
++		"bytes_rx=CASE WHEN excluded.bytes_rx>0 "
++			"THEN excluded.bytes_rx ELSE affiliated_sta.bytes_rx END";
+ 	static const char *del_affsta =
+ 		"DELETE FROM affiliated_sta WHERE mld_macaddr=?";
+ 	static const char *ins_ttlm =
+@@ -949,6 +964,11 @@
+ 					mapdb_bind_text(st, 1, amac);
+ 					mapdb_bind_text(st, 2, smac);
+ 					mapdb_bind_text(st, 3, abss);
++					mapdb_bind_int(st, 4, (long long)as->rcpi);
++					mapdb_bind_int(st, 5, (long long)as->dl_rate);
++					mapdb_bind_int(st, 6, (long long)as->ul_rate);
++					mapdb_bind_int(st, 7, (long long)as->tx_bytes);
++					mapdb_bind_int(st, 8, (long long)as->rx_bytes);
+ 					if (stmt_finish(c->db, st) != MAPDB_OK) {
+ 						mapdb_rollback(c->db);
+ 						return;

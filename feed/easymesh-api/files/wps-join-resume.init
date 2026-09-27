@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# The second half of the restart-first wireless join: if phase one left a
+# pending note, the radios just came up in the right shape - carry on.
+# START=99: everything (netifd, rpcd, ubus) must already stand.
+START=99
+
+boot() {
+	[ -f /etc/easymesh-wps-pending ] || return 0
+	local gw addr
+	read -r gw addr < /etc/easymesh-wps-pending
+	setsid /usr/libexec/easymesh-wps-join --resume "$gw" "$addr" >/dev/null 2>&1 &
+}

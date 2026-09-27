@@ -1,0 +1,191 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Keep the backhaul MLD on all the links it is configured for.
+#
+# An MLD STA fixes its set of links when it associates. If a link is not on the
+# air at that moment - 5 GHz sitting out a 60 s DFS CAC on channel 36 is the
+# ordinary case here - the association completes with fewer legs and never
+# grows one later. Half the backhaul capacity, silently, until something
+# reassociates.
+#
+# The first version of this script looked once, between 90 s and 210 s after
+# its own boot, and exited. Two ways that failed, both measured 2026-07-29:
+#
+#   - It exited on any state other than COMPLETED. In the agents-first test the
+#     agents were still SCANNING at that point, because the controller had not
+#     been switched on yet. The script wrote "not reassociating" and quit; when
+#     the controller appeared a few minutes later both agents associated on
+#     6 GHz alone and stayed one-legged for good.
+#   - The window is tied to this node's boot, not to when the question can be
+#     answered. A controller reboot in production - the common case - happens
+#     long after that window has closed.
+#
+# So: look periodically, for as long as the node runs, and act only when acting
+# can help.
+#
+# ⚠️ Reassociating is not free. Measured the same day: a bSTA picks its parent
+# by SSID and signal, nothing else, and one that had been direct on the
+# controller came back attached behind the other agent - two hops through the
+# node with the weakest 6 GHz chain, which cost 85% of throughput and stayed
+# that way. Hence MAX_TRIES, and hence the parent is logged on both sides of
+# the operation: this script may not silently make the node worse.
+
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+FIRST_CHECK=90		# CAC starts ~30 s into boot and runs 60 s on our channels
+INTERVAL=300		# then keep looking, quietly, for the life of the node
+SETTLE=25		# both links are up ~20 s after reassociate (measured)
+MAX_TRIES=3		# a leg that cannot come up must not cost a link every 5 min
+
+ifname="$(uci -q get wireless.sta_mld_1.ifname)"
+[ -n "$ifname" ] || exit 0
+
+want="$(uci -q get wireless.sta_mld_1.device | wc -w)"
+[ "$want" -gt 1 ] 2>/dev/null || exit 0
+
+# How many legs this bSTA actually holds.
+#
+# `iw dev ... link` lists every leg the MLD was set up with and prints one set
+# of numbers for all of them, so it cannot tell a leg that is carrying traffic
+# from one the driver has given up on. It is the same instrument the topology
+# picture used for its MLO marker, and it was wrong there for the same reason
+# (2026-09-21: the driver declared a 6 GHz leg lost and both readers went on
+# counting two).
+#
+# mt76_links_info is what mac80211 actually holds - the field node-heartbeat
+# already samples, and the one RESTORE.md:429 calls the authority.
+#
+# Both are consulted and the HIGHER count wins, deliberately. Acting here means
+# reassociating, and a reassociation can land this node two hops out behind the
+# weakest 6 GHz chain in the lab - measured 2026-07-29, 85% of throughput gone
+# and it stayed that way. So a leg counts as missing only when BOTH sources
+# agree it is missing. This change can therefore only make the script act LESS
+# often than before, never more.
+
+# strtonum() is gawk only and busybox awk does not have it; $(( 0x3 )) is not
+# guaranteed either. Do it by hand, it is a handful of characters.
+hex2dec() {
+	_h=${1#0[xX]}
+	_v=0
+	[ -n "$_h" ] || { echo ""; return 1; }
+	while [ -n "$_h" ]; do
+		_c=${_h%"${_h#?}"}
+		_h=${_h#?}
+		case "$_c" in
+		[0-9]) _d=$_c ;;
+		a|A) _d=10 ;; b|B) _d=11 ;; c|C) _d=12 ;;
+		d|D) _d=13 ;; e|E) _d=14 ;; f|F) _d=15 ;;
+		*) echo ""; return 1 ;;
+		esac
+		_v=$(( _v * 16 + _d ))
+	done
+	echo "$_v"
+}
+
+links_iw() {
+	iw dev "$ifname" link 2>/dev/null | grep -c '^	Link '
+}
+
+links_drv() {
+	for f in "/sys/kernel/debug/ieee80211/phy"*"/netdev:$ifname/mt76_links_info"; do
+		[ -e "$f" ] || continue
+		_m=$(sed -n 's/^valid links = //p' "$f" | head -1)
+		_m=$(hex2dec "$_m") || { echo ""; return; }
+		_n=0
+		while [ "${_m:-0}" -gt 0 ]; do
+			_n=$(( _n + _m % 2 ))
+			_m=$(( _m / 2 ))
+		done
+		echo "$_n"
+		return
+	done
+	echo ""
+}
+
+links() {
+	_i=$(links_iw)
+	_d=$(links_drv)
+	case "$_d" in ''|*[!0-9]*) echo "${_i:-0}"; return ;; esac
+	[ "$_d" -gt "${_i:-0}" ] 2>/dev/null && { echo "$_d"; return; }
+	echo "${_i:-0}"
+}
+
+parent() {
+	iw dev "$ifname" link 2>/dev/null | sed -n 's/^Connected to \([0-9a-f:]*\).*/\1/p'
+}
+
+state() {
+	wpa_cli -i "$ifname" status 2>/dev/null | sed -n 's/^wpa_state=//p'
+}
+
+sleep "$FIRST_CHECK"
+
+tries=0
+last_have=-1
+gave_up=0
+
+while :; do
+	[ -e "/sys/class/net/$ifname" ] || exit 0
+
+	have="$(links)"
+
+	# Any change in the link count is a new situation: spend the budget again.
+	if [ "$have" != "$last_have" ]; then
+		tries=0
+		gave_up=0
+		last_have="$have"
+	fi
+
+	if [ "$have" -ge "$want" ] 2>/dev/null; then
+		sleep "$INTERVAL"
+		continue
+	fi
+
+	# Not connected yet is not a reason to stop watching - it is the reason to
+	# keep watching. This is exactly where the previous version gave up.
+	if [ "$(state)" != "COMPLETED" ]; then
+		sleep "$INTERVAL"
+		continue
+	fi
+
+	if [ "$tries" -ge "$MAX_TRIES" ]; then
+		if [ "$gave_up" -eq 0 ]; then
+			logger -t mld-bsta-relink \
+				"$ifname stays at $have/$want links after $MAX_TRIES attempts - leaving it alone"
+			gave_up=1
+		fi
+		sleep "$INTERVAL"
+		continue
+	fi
+
+	was="$(parent)"
+	tries=$((tries + 1))
+	logger -t mld-bsta-relink \
+		"$ifname has $have/$want links on $was - reassociating ($tries/$MAX_TRIES)"
+
+	wpa_cli -i "$ifname" reassociate >/dev/null 2>&1
+	sleep "$SETTLE"
+
+	now="$(links)"
+	nowp="$(parent)"
+
+	if [ "$nowp" != "$was" ]; then
+		# Worth saying out loud even when the link count improved: the node may
+		# have gained a leg and lost a hop's worth of throughput at the same time.
+		logger -t mld-bsta-relink \
+			"$ifname now has $now/$want links but changed parent: $was -> $nowp"
+	elif [ "$now" -gt "$have" ] 2>/dev/null; then
+		logger -t mld-bsta-relink "$ifname now has $now/$want links on $nowp"
+	else
+		logger -t mld-bsta-relink "$ifname still has $now/$want links after reassociate"
+	fi
+
+	last_have="$now"
+	sleep "$INTERVAL"
+done

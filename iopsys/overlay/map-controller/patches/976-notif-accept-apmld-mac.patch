@@ -1,0 +1,50 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 976 - accept AP-MLD MAC BSSID in the Client
+ Association Event handler
+
+The Topology Response associated-clients handler was already taught (v6) that
+a reported BSSID may be an AP-MLD MAC that is not stored as a BSS interface,
+and to track the client anyway. The Client Association Event / Topology
+Notification handler was not: it does cntlr_find_fbss/bbss(ev->bssid), and on
+an AP-MLD MAC both miss, so it logged "Ignore unknown STA" and returned -
+dropping every dynamic MLD-client join before node_add_sta().
+
+Mirror the sibling handler: under v6, do not drop; fall through to the
+existing cntlr_add_sta/node_add_sta path (which uses ev->bssid and the node,
+not fh/bh). This lets the controller's in-memory model - which steering and
+map.controller status read - actually learn MLD fronthaul clients.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -221,6 +221,21 @@
+ 		fh = cntlr_find_fbss(c, ev->bssid);
+ 		bh = cntlr_find_bbss(c, ev->bssid);
+ 		if (!fh && !bh) {
++#if (EASYMESH_VERSION >= 6)
++			/* The reported BSSID may be the AP-MLD MAC, which is not stored
++			 * as a BSS interface. Mirror the Topology Response associated-
++			 * clients handler (already tolerant under v6): do not drop the
++			 * event; fall through and track the STA under this node with the
++			 * AP-MLD MAC as bssid (SSID stays blank until affiliated-AP
++			 * resolution is added). */
++			cntlr_dbg(LOG_STA,
++				  "%s: BSSID " MACFMT " not a BSS interface (likely AP-MLD MAC), "
++				  "accepting %sassociation event for STA " MACFMT "\n",
++				  __func__,
++				  MAC2STR(ev->bssid),
++				  associated ? "" : "dis",
++				  MAC2STR(ev->macaddr));
++#else
+ 			cntlr_warn(LOG_STA,
+ 				  "%s: Ignore unknown STA " MACFMT " %sassociation event on BSSID " MACFMT "\n",
+ 				  __func__,
+@@ -228,6 +243,7 @@
+ 				  associated ? "" : "dis",
+ 				  MAC2STR(ev->bssid));
+ 			return 0;
++#endif
+ 		}
+ 
+ 		s = cntlr_find_sta(c->sta_table, ev->macaddr);

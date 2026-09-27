@@ -1,0 +1,60 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99998: write the measurement to every copy of the leg
+
+cntlr_affiliated_sta_metrics() returned on the first affiliated element it
+matched. One client can be held under more than one AP-MLD - a leftover from an
+earlier association is ordinary in this database - and mapc_sync_apmld() walks
+all of them, deleting the client's rows by MLD address and re-inserting from
+whichever copy it reaches last.
+
+So the reading went into one copy and the sync persisted another.
+
+Measured on hardware 2026-08-04, from the controller log and a sampler reading
+the database every ten seconds:
+
+	07:15:53  cntlr_affiliated_sta_metrics: leg 06:52:f0:f8:c9:28
+	                     on 76:04:1c:81:bc:2e  rcpi 130
+	07:16:01  E2TRACE: ULOZEN sta_mld ... links=3      (rebuild + sync)
+	07:16:05  affiliated_sta.rcpi = 0
+
+rcpi 130 is -45 dBm and matches what libwifi reported on that leg. The value was
+correct, arrived, and was written - into a copy nobody read.
+
+Keep walking. The inner break still stops scanning legs of one STA-MLD once the
+address matched, but every other copy now gets the same reading.
+
+This is the third form of one habit in this series: 99994 wrote the node the
+frame named rather than the one the TLV named, 99995 let one writer overwrite
+another, and here one of several copies was updated as though it were the only
+one. Where a value has more than one home, updating one of them is not an
+optimisation - it is a coin toss.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2977,7 +2977,26 @@
+ 					    MAC2STR(as->macaddr),
+ 					    MAC2STR(as->bssid), as->rcpi,
+ 					    as->dl_rate, as->ul_rate);
+-					return;
++
++					/* Do not stop here. The same client can
++					 * be held under more than one AP-MLD -
++					 * a leftover from an earlier association
++					 * is normal in this database - and
++					 * mapc_sync_apmld() walks every one of
++					 * them, deleting the client's rows by MLD
++					 * address and re-inserting from whichever
++					 * copy it reaches last.
++					 *
++					 * Measured 2026-08-04: the writer set
++					 * rcpi 130 at 07:15:53, the rebuild and
++					 * sync ran at 07:16:01, and the database
++					 * read 0 at 07:16:05 - the reading had
++					 * gone into a copy the sync overwrote.
++					 * Updating one copy is not enough when
++					 * the reader does not care which one it
++					 * takes.
++					 */
++					break;
+ 				}
+ 			}
+ 		}

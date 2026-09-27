@@ -1,0 +1,165 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/mesh-names-sync - carry node names to the boxes that own them.
+#
+# A name lives in the box, as its hostname. This is the loop that makes that
+# true when the box was not reachable at the moment somebody typed it, and
+# when a box comes home from a reflash carrying a factory name.
+#
+# It is a convergence loop, not a synchronisation protocol. Nothing here holds
+# two copies in step; each round moves one step towards a state where there is
+# nothing left to do, and in that state this does no work at all.
+#
+#   node reports a REAL name    -> write it down as heard. That also clears any
+#                                  pending line for the node, which is rule 2:
+#                                  a user standing at the box outranks an
+#                                  instruction typed days ago for a box that
+#                                  was switched off.
+#   node reports a FACTORY name -> it has no name of its own. Give it the one
+#                                  we hold: pending first (somebody asked for
+#                                  it), else heard (it had this name before it
+#                                  was reflashed).
+#   node not on the air         -> nothing. The ledger already names it in the
+#                                  picture; there is nobody to tell.
+#
+# What this loop must NOT do is mark a name delivered because it sent it. The
+# line is cleared only when the box REPORTS the new name on the wire, one round
+# later. Writing the fuse before doing the work is how a step gets switched off
+# forever while looking done - measured 2026-09-04, a box kept its factory
+# address with the marker in place saying it had been given one.
+#
+# Only the controller runs this. An agent that pushed names would be a third
+# door with no ledger behind it: nobody would know what had not been delivered.
+
+INTERVAL="${1:-30}"
+STAMPS=/tmp/mesh-names-sync.stamps
+PIDFILE=/var/run/mesh-names-sync.pid
+
+# A box that takes the write but never reports the name back would otherwise be
+# written to every round, forever. Not harmful, but it is a loop that says
+# nothing, so a node is pushed to at most this often.
+RETRY_MIN=120
+
+. /usr/share/easymesh/names.sh 2>/dev/null || exit 0
+. /usr/share/easymesh/boot-window.sh 2>/dev/null || :
+
+command -v is_mesh_node >/dev/null 2>&1 && { is_mesh_node || exit 0; }
+[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] || exit 0
+
+log() { logger -t mesh-names-sync "$@"; }
+
+pushed_recently() {
+	local mac="$1" now last
+	now=$(date +%s)
+	last=$(awk -v m="$mac" '$1 == m { print $2; exit }' "$STAMPS" 2>/dev/null)
+	[ -n "$last" ] || return 1
+	[ $((now - last)) -lt "$RETRY_MIN" ]
+}
+
+stamp_push() {
+	local mac="$1" tmp="$STAMPS.tmp.$$"
+	grep -v "^$1 " "$STAMPS" 2>/dev/null > "$tmp"
+	printf '%s %s\n' "$mac" "$(date +%s)" >> "$tmp"
+	mv "$tmp" "$STAMPS"
+}
+
+# Write the name into the box. Same three lines as the pencil takes, because
+# it is the same act: hostname, the 1905 name that follows it, and the procd
+# event LuCI raises when it commits - that is what wakes mesh-name, which is
+# what puts the new name on the wire.
+apply_name() {
+	local mac="$1" name="$2" ip mine rc
+
+	mine=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+	if [ "$mac" = "$mine" ]; then
+		uci set system.@system[0].hostname="$name"
+		uci commit system
+		echo "$name" > /proc/sys/kernel/hostname
+		ubus -t 5 call service event \
+			'{"type":"config.change","data":{"package":"system"}}' \
+			>/dev/null 2>&1
+		log "named this box '$name'"
+		return 0
+	fi
+
+	ip=$(live_addrs_json | tr 'A-Z,' 'a-z\n' | grep "\"$mac\":" |
+		sed 's/.*:"//; s/".*//' | head -1)
+	[ -n "$ip" ] || return 1
+
+	# Two things this write has to survive, both of them ordinary in a mesh.
+	#
+	# A box that came back from a reflash answers with a NEW host key. `ssh -y`
+	# accepts a key it has never seen, but not one that changed - it refuses,
+	# and the name never reaches the one box that has lost it. Measured
+	# 2026-09-20: eight rounds of "could not reach" in a row, while the same
+	# command by hand went through the moment known_hosts was repaired.
+	#
+	# And an address is a round older than the write that uses it. A box that
+	# rebooted into somebody else's lease would be given a name that is not
+	# its own - that is how this controller ended up carrying an agent's name.
+	# So the far end says who it is, over the very connection that writes.
+	timeout 12 ssh -y -y -o BatchMode=yes "root@$ip" \
+		"[ \"\$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')\" = '$mac' ] || exit 3
+		 uci set system.@system[0].hostname='$name'
+		 uci commit system
+		 echo '$name' > /proc/sys/kernel/hostname
+		 ubus call service event '{\"type\":\"config.change\",\"data\":{\"package\":\"system\"}}'" \
+		>/dev/null 2>&1
+	rc=$?
+	[ "$rc" = 3 ] && { log "$ip does not answer as $mac; '$name' not written"; return 1; }
+	[ "$rc" = 0 ] || return 1
+	log "wrote '$name' to $mac at $ip"
+}
+
+round() {
+	local mac name have hname hstate
+
+	live_names_json | sed 's/^{//; s/}$//' | tr ',' '\n' |
+		sed 's/^[[:space:]]*"//; s/":"/ /; s/"[[:space:]]*$//' |
+	while read -r mac name; do
+		mac=$(echo "$mac" | tr 'A-Z' 'a-z')
+		[ -n "$mac" ] && [ -n "$name" ] || continue
+
+		have=$(ledger_get "$mac")
+		hname=$(echo "$have" | awk '{print $1}')
+		hstate=$(echo "$have" | awk '{print $2}')
+
+		if ! is_factory_name "$name"; then
+			# The box has a name of its own. That is the truth; the
+			# ledger is only writing it down. Re-stamping an unchanged
+			# line every round would rewrite the file for nothing.
+			if [ "$hname" != "$name" ] || [ "$hstate" != heard ]; then
+				[ -n "$hname" ] && [ "$hname" != "$name" ] &&
+					log "$mac now calls itself '$name'; '$hname' ($hstate) dropped"
+				ledger_set "$mac" "$name" heard
+			fi
+			continue
+		fi
+
+		# Factory name: the box is not telling us anything. Give it back
+		# what we hold, and the ledger already holds the right one -
+		# ledger_set keeps one line per node, so a pending instruction has
+		# replaced any older heard memory.
+		[ -n "$hname" ] || continue
+		pushed_recently "$mac" && continue
+		stamp_push "$mac"
+		apply_name "$mac" "$hname" ||
+			log "could not reach $mac to name it '$hname'"
+	done
+}
+
+echo $$ > "$PIDFILE"
+# A handler that only cleans up is not a way out: after the trap runs, the
+# shell carries on where the signal found it, so a plain `kill` tidied the
+# pidfile away and left the loop turning. The service then looked stopped and
+# could not be stopped, and every restart added one more worker to the pile
+# (2026-09-20: three of them, taking turns overwriting each other's stamps).
+trap 'rm -f "$PIDFILE"' EXIT
+trap 'rm -f "$PIDFILE"; exit 0' INT TERM
+
+while :; do
+	round
+	sleep "$INTERVAL"
+done

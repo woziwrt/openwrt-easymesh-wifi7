@@ -1,0 +1,144 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: learn the bSTAs of a bSTA MLD from 0xE1
+
+An agent operating a bSTA MLD must name it in a Backhaul STA MLD
+Configuration TLV (0xE1) and must not send any Backhaul STA Radio
+Capabilities TLV (0xCB) in its Backhaul STA Capability Report (EasyMesh
+v6.1, 6.2). handle_backhaul_sta_caps_report() only looked at 0xCB. Against
+an agent that follows the standard - ours, since map-agent 99999999f - the
+controller would no longer mark those stations as bSTAs nor record the bSTA
+of each radio, which ACS (acs.c) and the backhaul steer command
+(cntlr_commands_impl.c) read.
+
+Read the affiliated bSTAs from the 0xE1 as well: radio and MAC per link,
+the same two facts a 0xCB carries, fed through the same code as the 0xCB
+path (cntlr_note_bsta). The 0xCB path stays for agents that still send it;
+a MediaTek agent does, even with a bSTA MLD. The TLV is read with
+cmdu_peek_tlv() because the report policy in ieee1905 does not list 0xE1
+and the parser skips what it does not list.
+
+While moving the 0xCB body into the helper: when cntlr_node_add_radio()
+failed, the loop did `continue` without advancing `num` and spun on the
+same TLV for ever. The helper returns and the loop moves on.
+
+--- a/src/cntlr_map.c	2026-09-24 12:45:03.916070672 +0200
++++ b/src/cntlr_map.c	2026-09-24 12:45:50.578819470 +0200
+@@ -4551,6 +4551,38 @@
+ 	return 0;
+ }
+ 
++/* One bSTA named by an agent: remember it as a backhaul STA of this node and
++ * as the bSTA of the radio it sits on. Shared by both ways an agent can name
++ * its bSTAs in a Backhaul STA Capability Report - see below. */
++static int cntlr_note_bsta(struct controller *c, struct node *n,
++			   uint8_t *ruid, uint8_t *macaddr)
++{
++	struct netif_radio *r;
++	struct sta *s;
++
++	r = cntlr_find_radio(c, ruid);
++	if (!r) {
++		r = cntlr_node_add_radio(c, n, ruid);
++		if (!r)
++			return 0;
++	}
++
++	s = cntlr_find_sta(c->sta_table, macaddr);
++	if (!s) {
++		s = cntlr_add_sta(c, c->sta_table, macaddr);
++		if (!s) {
++			cntlr_warn(LOG_STA, "%s: failed to add bSTA " MACFMT "\n",
++				   __func__, MAC2STR(macaddr));
++			return -1;
++		}
++	}
++
++	s->is_bsta = true;
++	memcpy(s->bsta_agent_almacaddr, n->almacaddr, 6);
++	cntlr_radio_add_bsta(c, r, macaddr);
++	return 0;
++}
++
+ int handle_backhaul_sta_caps_report(void *cntlr, struct cmdu_buff *cmdu,
+ 				    struct node *n)
+ {
+@@ -4558,6 +4590,9 @@
+ 	struct controller *c = (struct controller *) cntlr;
+ 	uint8_t *tv_data;
+ 	int num = 0;
++#if (EASYMESH_VERSION >= 6)
++	struct tlv *t;
++#endif
+ 
+ 	if (!map_cmdu_validate_parse(cmdu, tv, ARRAY_SIZE(tv), n->map_profile)) {
+ 		warn("%s: map_cmdu_validate_parse( ..,EMP=%d) failed,  err = (%d) '%s'\n", __func__,
+@@ -4565,39 +4600,49 @@
+ 		return -1;
+ 	}
+ 
++	/* An agent without a bSTA MLD names each bSTA in a Backhaul STA Radio
++	 * Capabilities TLV (0xCB), one per radio. */
+ 	while (num < TLV_MAXNUM && tv[BH_STA_CAPS_REPORT_BACKHAUL_STA_RADIO_CAPABILITY_IDX][num]) {
+ 		struct tlv_bsta_radio_cap *p;
+-		struct netif_radio *r;
+ 
+ 		tv_data = (uint8_t *)tv[BH_STA_CAPS_REPORT_BACKHAUL_STA_RADIO_CAPABILITY_IDX][num]->data;
+ 		p = (struct tlv_bsta_radio_cap *)tv_data;
+ 
+-		r = cntlr_find_radio(c, p->radio);
+-		if (!r) {
+-			r = cntlr_node_add_radio(c, n, p->radio);
+-			if (!r)
+-				continue;
++		if (p->macaddr_included) {
++			if (cntlr_note_bsta(c, n, p->radio, (uint8_t *)p->macaddr))
++				return -1;
++		} else if (!cntlr_find_radio(c, p->radio)) {
++			cntlr_node_add_radio(c, n, p->radio);
+ 		}
+ 
+-		if (p->macaddr_included) {
+-			struct sta *s = cntlr_find_sta(c->sta_table, (uint8_t *)p->macaddr);
++		num++;
++	}
+ 
+-			if (!s) {
+-				s = cntlr_add_sta(c, c->sta_table, (uint8_t *)p->macaddr);
+-				if (!s) {
+-					cntlr_warn(LOG_STA, "%s: failed to add bSTA " MACFMT "\n",
+-						   __func__, MAC2STR((uint8_t *)p->macaddr));
++#if (EASYMESH_VERSION >= 6)
++	/* An agent operating a bSTA MLD must name it in one Backhaul STA MLD
++	 * Configuration TLV (0xE1) and must not send any 0xCB (EasyMesh v6.1,
++	 * 6.2). Read the affiliated bSTAs from there - radio and MAC per link,
++	 * the same two facts 0xCB carries - so the controller still knows the
++	 * bSTAs of an agent that follows the standard. The 0xCB loop above stays
++	 * for agents that do not: a MediaTek agent sends 0xCB with a bSTA MLD.
++	 *
++	 * cmdu_peek_tlv(), because the report policy in ieee1905 does not list
++	 * 0xE1 and the parser skips a TLV it does not list. */
++	t = cmdu_peek_tlv(cmdu, MAP_TLV_BACKHAUL_STA_MLD_CONFIG);
++	if (t) {
++		struct wifi_affiliated_sta_element *b;
++
++		cntlr_parse_bsta_mld_config_tlv(n, t->data, tlv_length(t));
++		if (n->bstamld) {
++			list_for_each_entry(b, &n->bstamld->affbstalist, list) {
++				if (hwaddr_is_zero(b->macaddr))
++					continue;
++				if (cntlr_note_bsta(c, n, b->ruid, b->macaddr))
+ 					return -1;
+-				}
+ 			}
+-
+-			s->is_bsta = true;
+-			memcpy(s->bsta_agent_almacaddr, n->almacaddr, 6);
+-			cntlr_radio_add_bsta(c, r, (uint8_t *)p->macaddr);
+ 		}
+-
+-		num++;
+ 	}
++#endif
+ 	return 0;
+ }
+ 

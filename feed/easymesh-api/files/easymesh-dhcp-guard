@@ -1,0 +1,240 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-dhcp-guard - one DHCP server per mesh, enforced at layer 2.
+#
+# A foreign box accepted into the mesh keeps its own dnsmasq and answers our
+# clients on our own bridge (measured 2026-09-21: 192.168.50.x handed to a
+# phone of ours, from a box with no route anywhere). EasyMesh has no way to
+# tell an agent "be a bridge" - DhcpCtl, mode and MapMode are local choices -
+# so the answer has to be ours, on our side, and it must not cost us the box.
+# This drops the answers and touches nothing else: 1905, ARP, WPS and EAPOL
+# are not matched at all, so a foreign box still joins exactly as before.
+#
+#   easymesh-dhcp-guard arm        install the rules
+#   easymesh-dhcp-guard off        remove them and write the veto file
+#   easymesh-dhcp-guard status     what is installed, and the counters
+#   easymesh-dhcp-guard selftest   one lease through the bridge, like a client
+#   easymesh-dhcp-guard watch      arm, then check every 60 s and disarm for
+#                                  good if the guard itself stops the lease
+#
+# ebtables, not br_netfilter: ebtables sits in NF_BR_FORWARD with no conntrack
+# and no IP stack, while br_netfilter would put EVERY bridged frame through
+# conntrack and the iptables FORWARD chain - on the bridge the backhaul runs
+# over. It is already on the box: map-agent depends on ebtables-legacy and
+# ieee1905d keeps a broute rule of its own. We never touch the broute table;
+# a mistake there takes 1905 down and with it the whole topology.
+#
+# RAM only. Nothing here is written to /etc/config, there is no init script
+# and no uci-default, so a reboot disarms every node - which is a kill switch
+# that needs no login, and a node that does not come up cleanly never arms at
+# all. Arm by hand, one node at a time, controller first (see the DHCP findings notes).
+
+BR=$(uci -q get network.lan.device 2>/dev/null); BR=${BR:-br-lan}
+E="ebtables --concurrent -t filter"
+CHAIN=MESHDHCP
+VETO=/etc/mapc/dhcp-guard.off
+OKST=/tmp/dhcp-guard.ok
+SRVF=/tmp/dhcp-guard.srv
+LOG=/tmp/dhcp-guard.log
+PMAC=02:e5:d4:00:00:02		# one fixed MAC for the probe = one lease, always the same
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; logger -t dhcp-guard "$*"; }
+
+role() { cat /etc/mapc/role 2>/dev/null; }
+own4() { ip -4 -o addr show "$BR" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+
+# The uplink is the one bridge port that is a station.
+#
+# Derived at run time on purpose. A written interface name survives a change
+# of parent and then matches nothing, and an ebtables -i that matches nothing
+# is fail-CLOSED: the node quietly stops passing DHCP and says nothing about
+# it until a lease lapses hours later.
+uplink() {
+	local p n
+	for p in /sys/class/net/"$BR"/brif/*; do
+		[ -e "$p" ] || continue
+		n=${p##*/}
+		iw dev "$n" info 2>/dev/null | grep -q "type managed" && { echo "$n"; return 0; }
+	done
+	return 1
+}
+
+# One lease, taken the way a client takes it: through a veth whose far end is
+# a bridge port, so the answer is FORWARDED and meets the chain.
+#
+# NOT a macvlan. A macvlan on the bridge is delivered LOCAL_IN, the chain
+# never sees it, and the self-test would pass cheerfully over a completely
+# broken guard - which is the one failure this whole file exists to avoid.
+# (easymesh-dhcp-probe keeps its macvlan for exactly the opposite reason:
+# detection has to keep working while the guard is armed.)
+probe_lease() {
+	ip link del gdv0 2>/dev/null
+	ip link add gdv0 type veth peer name gdv1 2>/dev/null || return 1
+	ip link set gdv1 address "$PMAC" 2>/dev/null
+	ip link set gdv0 master "$BR" up 2>/dev/null
+	ip link set gdv1 up 2>/dev/null
+	rm -f /tmp/dhcp-guard.out
+	cat > /tmp/dhcp-guard.probe <<'PROBE'
+#!/bin/sh
+[ "$1" = bound ] || exit 0
+printf '%s %s\n' "$ip" "$serverid" > /tmp/dhcp-guard.out
+PROBE
+	chmod +x /tmp/dhcp-guard.probe
+	udhcpc -i gdv1 -n -q -t 3 -T 2 -s /tmp/dhcp-guard.probe >/dev/null 2>&1
+	ip link del gdv0 2>/dev/null
+	cat /tmp/dhcp-guard.out 2>/dev/null
+	rm -f /tmp/dhcp-guard.out /tmp/dhcp-guard.probe
+}
+
+# Our server's MAC. On the controller it is the bridge itself.
+#
+# On an agent it is LEARNED from a live offer and never written into the
+# package. A hardcoded MAC is a mine: br-lan takes its address from the first
+# member port unless somebody pinned it, so a reflash or a swapped controller
+# moves it - and the day it moves, every agent stops passing DHCP at once, in
+# silence, and the first sign of it is a client an hour later.
+#
+# "Ours" = the offer that came from our own /24. Our nodes are static on the
+# mesh subnet; the foreign box answered from 192.168.50.1.
+learn_server() {
+	local own pfx cap=/tmp/dhcp-guard.cap mac
+	own=$(own4); [ -n "$own" ] || return 1
+	pfx="${own%.*}."
+	rm -f "$cap"
+	timeout 12 tcpdump -l -n -e -i "$BR" "udp src port 67" > "$cap" 2>/dev/null &
+	sleep 1
+	probe_lease >/dev/null 2>&1
+	sleep 2
+	killall tcpdump 2>/dev/null
+	wait 2>/dev/null
+	mac=$(awk -v p="$pfx" '/BOOTP\/DHCP, Reply/ {
+		for (i = 1; i <= NF; i++)
+			if ($i ~ /\.67$/ && index($i, p) == 1) { print tolower($2); exit }
+	}' "$cap")
+	rm -f "$cap"
+	[ -n "$mac" ] || return 1
+	echo "$mac" > "$SRVF"
+	log "learned our DHCP server at $mac"
+}
+
+server_mac() {
+	[ "$(role)" = controller ] && { cat /sys/class/net/"$BR"/address; return 0; }
+	cat "$SRVF" 2>/dev/null
+}
+
+disarm() {
+	local i=0
+	while [ $i -lt 5 ]; do $E -D FORWARD -j $CHAIN 2>/dev/null || break; i=$((i + 1)); done
+	$E -F $CHAIN 2>/dev/null
+	$E -X $CHAIN 2>/dev/null
+	return 0
+}
+
+arm() {
+	local up srv fail=0
+	[ -f "$VETO" ] && { log "veto file present, not arming: $(cat "$VETO")"; return 1; }
+	command -v ebtables >/dev/null 2>&1 || { log "no ebtables on this box, not arming"; return 1; }
+	[ -d "/sys/class/net/$BR" ] || { log "no $BR, not arming"; return 1; }
+
+	if [ "$(role)" = controller ]; then
+		# No uplink line on the controller, and none needed: our own
+		# dnsmasq answers from the bridge itself, so its replies take
+		# LOCAL_OUT and never reach a FORWARD chain at all.
+		up=""; srv=$(server_mac)
+	else
+		up=$(uplink) || { log "no station port in $BR - not arming"; return 1; }
+		srv=$(server_mac)
+		[ -n "$srv" ] || {
+			learn_server || { log "could not learn the server MAC - not arming"; return 1; }
+			srv=$(server_mac)
+		}
+	fi
+
+	disarm
+	$E -N $CHAIN -P RETURN 2>/dev/null || { log "cannot create $CHAIN - not arming"; return 1; }
+	# The one thing that gets through: our server, arriving where our server
+	# arrives. Two conditions, not one - a foreign box that becomes our
+	# parent would otherwise walk in on the port alone.
+	[ -n "$up" ] && { $E -A $CHAIN -i "$up" -s "$srv" -j RETURN || fail=1; }
+	$E -A $CHAIN -p IPv4 --ip-proto udp --ip-sport 67 -j DROP || fail=1
+	$E -A $CHAIN -p IPv6 --ip6-proto udp --ip6-sport 547 -j DROP || fail=1
+	$E -A $CHAIN -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type router-advertisement -j DROP || fail=1
+	$E -A $CHAIN -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type redirect -j DROP || fail=1
+	# All or nothing. A half-armed guard - kmod-ebtables-ipv6 missing, say -
+	# reads as "deployed" and lets router advertisements straight through,
+	# which is the worst of both states.
+	[ "$fail" = 0 ] || { log "a rule was refused - tearing the whole thing down"; disarm; return 1; }
+	$E -I FORWARD 1 -j $CHAIN || { log "cannot hook into FORWARD"; disarm; return 1; }
+	log "armed on $BR: uplink=${up:-none} server=${srv:-local}"
+	return 0
+}
+
+selftest() {
+	local own pfx got
+	own=$(own4); [ -n "$own" ] || return 1
+	pfx="${own%.*}"
+	got=$(probe_lease | awk '{print $1}')
+	case "$got" in "$pfx".*) return 0 ;; esac
+	return 1
+}
+
+status() {
+	echo "bridge:   $BR   role: $(role)   uplink: $(uplink || echo none)"
+	echo "server:   $(server_mac)"
+	echo "veto:     $([ -f "$VETO" ] && cat "$VETO" || echo none)"
+	echo "last ok:  $(cat "$OKST" 2>/dev/null || echo never)"
+	$E -L FORWARD --Lc 2>/dev/null | grep -- "-j $CHAIN" || echo "NOT hooked into FORWARD"
+	$E -L $CHAIN --Lc 2>/dev/null || echo "chain $CHAIN does not exist"
+}
+
+watch() {
+	local miss=0
+	# With an exit. A trap that only cleans up leaves the loop running, and
+	# then killing the watcher is not a way out of anything.
+	trap 'disarm; log "stopped by signal - disarmed"; exit 0' INT TERM
+	arm || exit 1
+	while :; do
+		sleep 60
+		[ -f "$VETO" ] && { disarm; log "veto appeared - disarmed, exiting"; exit 0; }
+		$E -L FORWARD 2>/dev/null | grep -q -- "-j $CHAIN" || {
+			log "our jump vanished from FORWARD (wireless reload?) - re-arming"
+			arm || exit 1
+			continue
+		}
+		if selftest; then date +%s > "$OKST"; miss=0; continue; fi
+		miss=$((miss + 1))
+		log "selftest failed ($miss/3)"
+		[ "$miss" -ge 3 ] || continue
+		# Is the guard the cause? Measure it, do not assume it. Without
+		# this step an outage on the backhaul would disarm every node in
+		# the mesh at the exact moment the guard is worth having.
+		disarm
+		if selftest; then
+			# A state, not a deadline. "age >= DEADLINE" is true forever
+			# once it passes; this file says the thing is finished, and
+			# only a person deleting it starts anything again.
+			mkdir -p /etc/mapc
+			printf 'disabled %s: no lease with the guard on, a lease came back with it off\n' \
+				"$(date '+%F %T')" > "$VETO"
+			log "THE GUARD WAS THE CAUSE - disarmed for good, veto in $VETO (delete it by hand to try again)"
+			command -v easymesh-led >/dev/null 2>&1 && easymesh-led refused
+			exit 0
+		fi
+		log "no lease either way - the fault is elsewhere, re-arming"
+		arm || exit 1
+		miss=0
+	done
+}
+
+case "$1" in
+arm)      arm ;;
+off)      disarm; mkdir -p /etc/mapc
+          printf 'disabled by hand %s\n' "$(date '+%F %T')" > "$VETO"
+          log "disarmed by hand" ;;
+status)   status ;;
+selftest) selftest && echo ok || echo FAIL ;;
+watch)    watch ;;
+*)        echo "usage: $0 arm|off|status|selftest|watch" >&2; exit 1 ;;
+esac

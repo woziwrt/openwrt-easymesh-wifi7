@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Give wifimngr the event map it needs to open hostapd's control sockets.
+#
+# Without /etc/wifi.json, wifimngr_setup_events() fails on the very first step
+# ("Failed to open '/etc/wifi.json'") and registers NO event source at all - it
+# then holds a single socket, its ubus connection. Every libwifi event producer
+# is dead code in that state, which is why nothing ever published ubus wifi.sta
+# and map-agent only ever learned of a client from its periodic refresh, minutes
+# late. The wifimngr package does not ship this file and nothing else creates it.
+#
+# ONE ENTRY PER LINK, not one per MLD. This is the part that is easy to get
+# wrong and silently does nothing:
+#
+#   hapdctrl_reopen() ends with
+#       w->req.fd_monitor = w->socks[0].ctrl->s;
+#   and socks[0] is the PARENT socket (ap-mld-1). hostapd sends nothing there -
+#   an association is reported on the affiliated link sockets (ap-mld-1_linkN),
+#   measured 2026-08-04. So the monitored descriptor never becomes readable, the
+#   drain never runs, and the link sockets that do have data are never read. The
+#   source is registered and still delivers nothing.
+#
+#   Registering each link separately fixes it with no code change: a
+#   registration whose ifname contains "_link" does not fan out further, so it
+#   holds exactly one socket and that socket becomes its own fd_monitor.
+#
+# Built from the CONFIGURATION, not from the sockets in /var/run/hostapd. The
+# sockets appear asynchronously - a 5 GHz link waits out a 60 s DFS CAC and
+# 6 GHz can be later still - so enumerating them here would be a race that
+# silently produces a short map on a slow boot. An AP-MLD's link count is
+# exactly its number of radios, which is known statically and verified against
+# the live sockets on all three nodes.
+#
+# Runs at S94: after the wireless config is final, before wifimngr at S95.
+#
+# To revert: delete /etc/wifi.json and restart wifimngr. Everything goes back to
+# polling, which is what it did before.
+
+OUT=/etc/wifi.json
+TMP=/tmp/wifi.json.$$
+
+emit() {
+	printf '\t\t{ "type": "wifi-event", "name": "%s", "ifname": "%s", "family": "hapdctrl", "group": [ "notify" ] }' \
+		"$1" "$2"
+}
+
+first=1
+{
+	printf '{\n\t"events": [\n'
+
+	for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get "wireless.$s.mode")" = 'ap' ] || continue
+
+		ifname="$(uci -q get "wireless.$s.ifname")"
+		[ -n "$ifname" ] || continue
+
+		# The parent socket. It carries the BSS-wide events (AP-ENABLED,
+		# AP-DISABLED, CSA) even on an MLD, so it is worth holding.
+		[ "$first" = 1 ] || printf ',\n'
+		first=0
+		emit "hapd-$s" "$ifname"
+
+		[ "$(uci -q get "wireless.$s.mlo")" = '1' ] || continue
+
+		# One link per radio. A plain BSS has no _linkN and falls through.
+		n=0
+		for _r in $(uci -q get "wireless.$s.device"); do
+			printf ',\n'
+			emit "hapd-${s}-l${n}" "${ifname}_link${n}"
+			n=$((n + 1))
+		done
+	done
+
+	printf '\n\t]\n}\n'
+} > "$TMP"
+
+# A map with no AP at all would disable every event source; leave the old one.
+if ! grep -q '"ifname"' "$TMP"; then
+	logger -t wifi-evmap "no AP interface in the wireless config, keeping $OUT as is"
+	rm -f "$TMP"
+	exit 0
+fi
+
+if [ -f "$OUT" ] && cmp -s "$TMP" "$OUT"; then
+	rm -f "$TMP"
+	exit 0
+fi
+
+mv "$TMP" "$OUT"
+logger -t wifi-evmap "wrote $OUT with $(grep -c '"ifname"' "$OUT") event source(s)"

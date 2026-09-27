@@ -1,0 +1,100 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: fix affiliated-link removal overflowing a 6-byte row
+
+mld_del_sta(), mld_del_bsta() and mld_del_ap() close the gap left by a removed affiliated
+link with a single memcpy. The destination is one element of
+
+    uint8_t affiliated_ap[MAX_AFFILIATED_AP_LINKS_NUM][6];
+
+but the length spans every remaining row, so the compiler sees a write of
+(num - i - 1) * 6 bytes into a 6-byte sub-object. Under _FORTIFY_SOURCE
+that is not a warning: the call is replaced by __builtin_trap(), and the
+process dies with SIGTRAP (procd exit_code 133).
+
+On a colocated controller+agent node this is fatal. agent_init_interfaces()
+tears the affiliated links down at startup, so mapagent traps before it ever
+onboards. The controller then never inserts an agent row for its own AL-MAC,
+and every apmld / affiliated_ap / ttlm row that references it fails with
+"FOREIGN KEY constraint failed" - the MLD tables stay empty and only ever
+look populated after a restore from a previous run.
+
+Two further defects in the same loops:
+
+  - the guard "if (i < mld->num_affiliated_ap)" is always true inside the
+    loop, so it never guarded anything;
+  - the loop kept iterating after the shift, skipping the row that had just
+    moved into slot i.
+
+Copy row by row so the destination stays a single 6-byte element, and
+re-test the moved row.
+
+--- a/src/mld.c	2026-07-21 08:22:57.434665122 +0200
++++ b/src/mld.c	2026-07-21 08:51:40.704869555 +0200
+@@ -52,11 +52,17 @@
+ 		return -1;
+ 
+ 	for (i = 0; i < mld->num_affiliated_sta; i++) {
++		int j;
++
+ 		if (memcmp(mld->affiliated_sta[i], s->macaddr, 6))
+ 			continue;
+ 
+-		if (i < mld->num_affiliated_sta)
+-			memcpy(mld->affiliated_sta[i], mld->affiliated_sta[i + 1], (mld->num_affiliated_sta - (i + 1)) * 6);
++		/* Close the gap one row at a time. A single memcpy spanning
++		 * several rows overflows the 6-byte destination element and
++		 * traps under _FORTIFY_SOURCE.
++		 */
++		for (j = i; j + 1 < mld->num_affiliated_sta; j++)
++			memcpy(mld->affiliated_sta[j], mld->affiliated_sta[j + 1], 6);
+ 
+ 		memset(mld->affiliated_sta[mld->num_affiliated_sta - 1], 0, 6);
+ 		mld->num_affiliated_sta--;
+@@ -81,14 +87,21 @@
+ 
+ 	mld = a->bstamld;
+ 	for (i = 0; i < mld->num_affiliated_bsta; i++) {
++		int j;
++
+ 		if (memcmp(mld->affiliated_bsta[i], bk->macaddr, 6))
+ 			continue;
+ 
+-		if (i < mld->num_affiliated_bsta)
+-			memcpy(mld->affiliated_bsta[i], mld->affiliated_bsta[i + 1], (mld->num_affiliated_bsta - (i + 1)) * 6);
++		/* Close the gap one row at a time. A single memcpy spanning
++		 * several rows overflows the 6-byte destination element and
++		 * traps under _FORTIFY_SOURCE.
++		 */
++		for (j = i; j + 1 < mld->num_affiliated_bsta; j++)
++			memcpy(mld->affiliated_bsta[j], mld->affiliated_bsta[j + 1], 6);
+ 
+ 		memset(mld->affiliated_bsta[mld->num_affiliated_bsta - 1], 0, 6);
+ 		mld->num_affiliated_bsta--;
++		i--; /* re-test the row that moved into this slot */
+ 	}
+ 
+ 	bk->is_affiliated_sta = false;
+@@ -108,14 +121,21 @@
+ 		return -1;
+ 
+ 	for (i = 0; i < mld->num_affiliated_ap; i++) {
++		int j;
++
+ 		if (memcmp(mld->affiliated_ap[i], ap->bssid, 6))
+ 			continue;
+ 
+-		if (i < mld->num_affiliated_ap)
+-			memcpy(mld->affiliated_ap[i], mld->affiliated_ap[i + 1], (mld->num_affiliated_ap - (i + 1)) * 6);
++		/* Close the gap one row at a time. A single memcpy spanning
++		 * several rows overflows the 6-byte destination element and
++		 * traps under _FORTIFY_SOURCE.
++		 */
++		for (j = i; j + 1 < mld->num_affiliated_ap; j++)
++			memcpy(mld->affiliated_ap[j], mld->affiliated_ap[j + 1], 6);
+ 
+ 		memset(mld->affiliated_ap[mld->num_affiliated_ap - 1], 0, 6);
+ 		mld->num_affiliated_ap--;
++		i--; /* re-test the row that moved into this slot */
+ 	}
+ 
+ 	ap->is_affiliated_ap = false;

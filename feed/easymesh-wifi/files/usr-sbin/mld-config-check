@@ -1,0 +1,118 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Make sure the MLD provisioning actually happened, before mapagent starts.
+#
+# map_genconfig is a hotplug handler: it runs on ieee80211 add events and
+# nothing runs it again afterwards. On a node whose configuration was wiped -
+# sysupgrade -n, or simply a new node out of the box - those events can land
+# before it is able to complete the MLD provisioning, and then the moment is
+# gone for the rest of that boot.
+#
+# The symptom is asymmetric and easy to misread. wireless.mld0 and ap_mld_1 are
+# present, because for our boards they are baked into the image, so the AP-MLD
+# comes up and looks healthy - hostapd reports every link enabled. But
+# mapagent.apmld0 is absent and no fronthaul AP carries mld_id, so the agent
+# advertises an AP-MLD with no affiliated links and the controller stores a row
+# of zeroes. Measured on the BPI-R4 Pro 8X after a -n flash, 2026-07-21: apmld=2 in the
+# database but affiliated_ap=3, all three belonging to the other agent.
+#
+# Running map_genconfig by hand fixed it immediately, which is what identified
+# this as a timing problem rather than a logic one.
+#
+# S96: before mapagent (S97), so it starts with the configuration it needs
+# instead of being restarted afterwards. On a healthy boot this script does
+# nothing at all - the guard below is false and it exits.
+
+
+# Boot only, enforced.
+#
+# Everything below writes configuration that mapagent reads at start, on the
+# assumption that mapagent has not started yet - that is what S96 buys. But
+# base-files default_postinst runs "start" on every init script a package
+# ships, on upgrade exactly as on install, so `apk upgrade easymesh-wifi`
+# calls this script on a node that is carrying traffic, with its agent running
+# and its backhaul associated. Measured on a BPI-R4 (4 GB) node on 2026-08-09: the upgrade
+# rewrote mapagent under the running agent and the node went off the air.
+#
+# The same lesson as mld-link-check, in a second place. See boot-window.sh.
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+in_boot_window || {
+	logger -t mld-config-check "started outside the boot window - skipping; mapagent is already running and this rewrites what it reads"
+	exit 0
+}
+# Only meaningful where an AP-MLD is configured in the first place.
+uci -q get wireless.mld0 >/dev/null 2>&1 || exit 0
+
+# The agent side already there? Then genconfig has done its job; leave well
+# alone. Rewriting the configuration on every boot is exactly the kind of
+# churn that produces problems rather than solving them.
+need=""
+uci -q get mapagent.apmld0 >/dev/null 2>&1 || need="apmld0"
+
+# The same race has a second half, and the fronthaul can win it while this one
+# loses - which is why checking apmld0 alone is not enough.
+#
+# map_genconfig writes the backhaul MLD placeholders (mapagent.bhmld_ap_<band>,
+# each carrying mld_id) by walking mapagent.@radio[N]. If it runs before those
+# radio sections exist the loop simply does not iterate, and the placeholders
+# are never written. No error, no warning.
+#
+# Without them apmld_parse() never runs for the backhaul MLD, so it keeps the
+# zeroed macaddr/ssid from calloc() and the controller stores a row of nulls.
+# Measured on the colocated controller 2026-07-28: wireless had mld1 and
+# ap-mld-2 correctly, mapagent had no placeholders, and the controller reported
+# its own backhaul MLD as 00:00:00:00:00:00 with num_ap=0.
+#
+# Test the placeholders, not mapagent.apmld<N>: the agent deletes and rebuilds
+# the apmld sections from the controller TLV on every autoconfig (agent_map.c,
+# uci_delete_mld_config), so their absence later in a boot is normal. The
+# placeholders are not rebuilt from the TLV - they have to be right up front.
+if uci -q get wireless.ap_mld_2 >/dev/null 2>&1; then
+	uci show mapagent 2>/dev/null | grep -q '^mapagent\.bhmld_ap_[0-9]*\.mld_id=' ||
+		need="${need:+$need and }backhaul MLD placeholders"
+fi
+
+
+# The station half of the MLD provisioning, which running map_genconfig cannot
+# recover. That block is gated on the U-Boot variable netmode being "extender",
+# and nothing in any image or package sets that variable - on the boards that
+# carry it, it was typed in by hand. So a node built from packages comes up
+# with a working MLD STA that its own agent knows nothing about: `ubus call
+# map.agent status` returns an empty bsta_mld, the node never tells the
+# controller what it hangs off, and its row in the controller topology goes
+# stale while the node looks perfectly healthy and serves clients.
+#
+# Measured on a BPI-R4 (4 GB) node on 2026-08-09, where the topology map drew that node
+# underneath a board that had been powered off for nine minutes.
+#
+# Checked and repaired here rather than left to genconfig, and deliberately
+# outside the `need` set above: this is not the boot race those checks recover,
+# it is a gap that is present on every boot of such a node.
+if uci -q get wireless.sta_mld_1 >/dev/null 2>&1 &&
+   ! uci show mapagent 2>/dev/null | grep -q "\.is_mld='1'"; then
+	logger -t mld-config-check "MLD STA configured in wireless but mapagent does not declare it - declaring"
+	if /usr/sbin/mlo-backhaul-setup --declare-sta >/dev/null 2>&1; then
+		logger -t mld-config-check "declared the backhaul STA-MLD to map-agent"
+	else
+		logger -t mld-config-check "could not declare the backhaul STA-MLD"
+	fi
+fi
+[ -n "$need" ] || exit 0
+
+logger -t mld-config-check "AP-MLD is configured in wireless but mapagent is missing $need - running map_genconfig once"
+
+/lib/wifi/multiap conf
+
+bh="$(uci show mapagent 2>/dev/null | grep -c '^mapagent\.bhmld_ap_[0-9]*\.mld_id=')"
+if uci -q get mapagent.apmld0 >/dev/null 2>&1 || [ "$bh" -gt 0 ]; then
+	logger -t mld-config-check "recovered: apmld0 $(uci -q get mapagent.apmld0 >/dev/null 2>&1 && echo present || echo absent), $bh backhaul placeholder(s), mld_id on $(uci show mapagent 2>/dev/null | grep -c '\.mld_id=') AP(s)"
+else
+	logger -t mld-config-check "still missing after map_genconfig - this is not the boot race"
+fi

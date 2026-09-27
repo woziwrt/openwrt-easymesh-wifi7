@@ -1,0 +1,167 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] mapc_sync: stamp rows on every upsert and sample the signal history
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Every sta upsert now writes last_seen (first_seen only on insert, so the
+first sighting survives), the affiliated_sta writer stamps its rows, and
+both writers feed sta_metrics_hist through mapc_hist_sample(): a sample
+is stored only when rcpi moved by >= 4 or the last sample is >= 60 s old,
+values 0/255 (not measured) never - so the table grows by a handful of
+rows per client per minute at worst, batched inside the transactions the
+writers already hold. The sampler lives next to the writers on purpose:
+history can never disagree with the row it summarizes.
+
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -487,14 +487,72 @@
+ 
+ /* ---- sta (associated client) ------------------------------------------ */
+ 
++#define MAPC_HIST_MIN_INTERVAL	60	/* seconds between forced samples */
++#define MAPC_HIST_RCPI_DELTA	4	/* immediate sample on this much change */
++
++/* DB policy pack: append a signal sample for (macaddr,bssid) when it moved
++ * enough or enough time passed. 0/255 mean "not measured" and are never
++ * sampled. Called from the same writers that persist the live value, so the
++ * history can never disagree with the row it summarizes. The hourly ageout
++ * keeps the table at its cap. */
++void mapc_hist_sample(struct controller *c, const char *macaddr,
++		      const char *bssid, int rcpi, int dl_rate, int ul_rate)
++{
++	static const char *last_sql =
++		"SELECT ts, rcpi FROM sta_metrics_hist "
++		"WHERE macaddr=? AND bssid=? ORDER BY ts DESC LIMIT 1";
++	static const char *ins_sql =
++		"INSERT INTO sta_metrics_hist"
++		"(macaddr, bssid, rcpi, dl_rate, ul_rate, ts) "
++		"VALUES(?,?,?,?,?,?)";
++	long long now = (long long)time(NULL);
++	long long last_ts = 0;
++	int last_rcpi = 0, delta;
++	mapdb_stmt *st = NULL;
++	int rc;
++
++	if (!c->db || !rcpi || rcpi == 255)
++		return;
++
++	if (mapdb_prepare(c->db, last_sql, &st) != MAPDB_OK)
++		return;
++	mapdb_bind_text(st, 1, macaddr);
++	mapdb_bind_text(st, 2, bssid);
++	rc = mapdb_step(st);
++	if (rc == MAPDB_ROW) {
++		last_ts = mapdb_column_int(st, 0);
++		last_rcpi = mapdb_column_int(st, 1);
++	}
++	mapdb_finalize(st);
++
++	delta = rcpi - last_rcpi;
++	if (delta < 0)
++		delta = -delta;
++	if (rc == MAPDB_ROW && now - last_ts < MAPC_HIST_MIN_INTERVAL &&
++	    delta < MAPC_HIST_RCPI_DELTA)
++		return;
++
++	st = NULL;
++	if (mapdb_prepare(c->db, ins_sql, &st) != MAPDB_OK)
++		return;
++	mapdb_bind_text(st, 1, macaddr);
++	mapdb_bind_text(st, 2, bssid);
++	mapdb_bind_int(st, 3, rcpi);
++	mapdb_bind_int(st, 4, dl_rate);
++	mapdb_bind_int(st, 5, ul_rate);
++	mapdb_bind_int(st, 6, now);
++	stmt_finish(c->db, st);
++}
++
+ void mapc_sync_sta(struct controller *c, struct node *n, struct sta *s)
+ {
+ 	static const char *sql =
+ 		"INSERT INTO sta(macaddr, bssid, associated, is_bsta, agent_almac, "
+ 		"last_ul_rate, last_dl_rate, est_mac_rate_ul, est_mac_rate_dl, "
+ 		"conn_time, rcpi, util_tx, util_rx, pkts_tx, pkts_rx, bytes_tx, "
+-		"bytes_rx, errors_tx, errors_rx, retrans_count, hostname) "
+-		"VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
++		"bytes_rx, errors_tx, errors_rx, retrans_count, hostname, "
++		"first_seen, last_seen) "
++		"VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?22,?22) "
+ 		"ON CONFLICT(macaddr) DO UPDATE SET "
+ 		"bssid=excluded.bssid, associated=excluded.associated, "
+ 		"is_bsta=excluded.is_bsta, agent_almac=excluded.agent_almac, "
+@@ -505,7 +563,8 @@
+ 		"pkts_tx=excluded.pkts_tx, pkts_rx=excluded.pkts_rx, "
+ 		"bytes_tx=excluded.bytes_tx, bytes_rx=excluded.bytes_rx, "
+ 		"errors_tx=excluded.errors_tx, errors_rx=excluded.errors_rx, "
+-		"retrans_count=excluded.retrans_count, hostname=excluded.hostname";
++		"retrans_count=excluded.retrans_count, hostname=excluded.hostname, "
++		"last_seen=excluded.last_seen";
+ 	struct wifi_sta_element *d = s->de_sta;
+ 	char mac[18], bssid[18], almac[18];
+ 	mapdb_stmt *st = NULL;
+@@ -548,8 +607,16 @@
+ 		for (i = 6; i <= 21; i++)
+ 			mapdb_bind_null(st, i);
+ 	}
++	mapdb_bind_int(st, 22, (long long)time(NULL));
+ 	stmt_finish(c->db, st);
+ 
++	/* DB policy pack: sample the client-level signal for the trend view.
++	 * For an MLO client the legs are sampled where their rcpi lands
++	 * (affiliated_sta writer); this covers legacy clients and the
++	 * client-level row. */
++	if (d && s->state != STA_DISCONNECTED)
++		mapc_hist_sample(c, mac, bssid, d->rcpi, d->ul_rate, d->dl_rate);
++
+ 	/* 999992: one MAC cannot be associated to two nodes at once, so the
+ 	 * moment a node reports this client, every row for it under a DIFFERENT
+ 	 * node is stale by definition.
+@@ -876,8 +943,8 @@
+ 	 * is the "never measured" RCPI) must not overwrite a real reading. */
+ 	static const char *ins_affsta =
+ 		"INSERT INTO affiliated_sta(macaddr, mld_macaddr, bssid, "
+-		"rcpi, dl_rate, ul_rate, bytes_tx, bytes_rx) "
+-		"VALUES(?,?,?,?,?,?,?,?) "
++		"rcpi, dl_rate, ul_rate, bytes_tx, bytes_rx, last_seen) "
++		"VALUES(?,?,?,?,?,?,?,?,?) "
+ 		"ON CONFLICT(macaddr, bssid) DO UPDATE SET "
+ 		"mld_macaddr=excluded.mld_macaddr, "
+ 		"rcpi=CASE WHEN excluded.rcpi NOT IN (0,255) "
+@@ -889,7 +956,7 @@
+ 		"bytes_tx=CASE WHEN excluded.bytes_tx>0 "
+ 			"THEN excluded.bytes_tx ELSE affiliated_sta.bytes_tx END, "
+ 		"bytes_rx=CASE WHEN excluded.bytes_rx>0 "
+-			"THEN excluded.bytes_rx ELSE affiliated_sta.bytes_rx END";
++			"THEN excluded.bytes_rx ELSE affiliated_sta.bytes_rx END, last_seen=excluded.last_seen";
+ 	static const char *del_affsta =
+ 		"DELETE FROM affiliated_sta WHERE mld_macaddr=?";
+ 	static const char *ins_ttlm =
+@@ -1067,10 +1134,18 @@
+ 					mapdb_bind_int(st, 6, (long long)as->ul_rate);
+ 					mapdb_bind_int(st, 7, (long long)as->tx_bytes);
+ 					mapdb_bind_int(st, 8, (long long)as->rx_bytes);
++					mapdb_bind_int(st, 9, (long long)time(NULL));
+ 					if (stmt_finish(c->db, st) != MAPDB_OK) {
+ 						mapdb_rollback(c->db);
+ 						return;
+ 					}
++
++					/* DB policy pack: per-leg signal sample
++					 * for the trend view. */
++					mapc_hist_sample(c, amac, abss,
++							 (int)as->rcpi,
++							 (int)as->dl_rate,
++							 (int)as->ul_rate);
+ 				}
+ 			}
+ 		}
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -46,6 +46,8 @@
+ void mapc_sync_sta(struct controller *c, struct node *n, struct sta *s);
+ 
+ /* Delete the 'sta' row for @s. Call ONLY on a true disconnect. */
++void mapc_hist_sample(struct controller *c, const char *macaddr,
++		      const char *bssid, int rcpi, int dl_rate, int ul_rate);
+ void mapc_del_sta(struct controller *c, struct sta *s);
+ 
+ /* Reconcile sta rows for @n against its live stalist (drop re-flash ghosts). */

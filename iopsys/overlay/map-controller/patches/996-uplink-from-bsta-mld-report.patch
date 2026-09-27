@@ -1,0 +1,82 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 996: take the uplink from what the agent reports
+
+Of two healthy agents, exactly one appeared in topology_link. Which one varied
+from boot to boot, and it never corrected itself - measured across three cold
+starts on 2026-07-29. Both agents were associated to the controller's backhaul
+AP-MLD on two links each, both reachable, both carrying traffic.
+
+topology_build_tree_from_assoc() places a node only when its upstream_bssid is
+non-zero, and the sole writer of that field is find_backhaul_upstream(), called
+while handling Link Metric messages. Captured from boot, that path shows why
+the outcome is a coin flip:
+
+  09:50:54  find_backhaul_upstream: No backhaul link found for
+              3e:fb:2f:94:72:7b <-> 86:f7:56:41:01:d4
+  09:53:04  find_backhaul_upstream: Found WiFi backhaul link via bBSS
+              (topology not valid)
+
+86:f7:56:41:01:d4 is the controller's own AP-MLD address. At 09:50 it was not
+yet registered as a bBSS, so the lookup failed; two minutes later the same
+lookup succeeded. Link Metric messages are rare - two in five minutes on this
+mesh - and nothing retries a failed resolution, so whichever agent's message
+lands in that early window keeps upstream_bssid all-zero for good.
+
+The information does not have to come from there at all. The Backhaul STA MLD
+Config TLV carries the AP-MLD the agent associated to, first-hand, and the
+controller already parses it into bstamld->bssid and persists it - the row was
+sitting in the database, correct, for both agents, while topology_link was
+empty. Use it.
+
+The tree builder already resolves a parent from an AP-MLD address
+(find_node_with_mld_macaddr, patch 995), so the address is directly usable.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -urN a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c	2026-07-29 11:55:37.014594460 +0200
++++ b/src/cntlr_map.c	2026-07-29 11:55:37.015056059 +0200
+@@ -4311,9 +4311,42 @@
+ 
+ 	if (flag & BSTA_MLD_CONF_BSTA_MLD_ADDR_VALID)
+ 		memcpy(mld->mld_macaddr, data + 1, 6);
+-	if (flag & BSTA_MLD_CONF_AP_MLD_ADDR_VALID)
++	if (flag & BSTA_MLD_CONF_AP_MLD_ADDR_VALID) {
+ 		memcpy(mld->bssid, data + 7, 6);	/* AP-MLD assoc'd to */
+ 
++		/* This is the uplink, stated first-hand: the agent is telling us
++		 * which AP-MLD it associated to. Use it, because the only other
++		 * writer of node::upstream_bssid cannot be relied on.
++		 *
++		 * That writer is find_backhaul_upstream(), called while handling
++		 * Link Metric messages. Measured on a three-node mesh 2026-07-29,
++		 * captured from boot: those messages are rare - two in five
++		 * minutes - and the first attempt failed with
++		 *
++		 *   find_backhaul_upstream: No backhaul link found for
++		 *     3e:fb:2f:94:72:7b <-> 86:f7:56:41:01:d4
++		 *
++		 * because 86:f7:56:41:01:d4 is the controller's own AP-MLD
++		 * address, which was not yet registered as a bBSS at that moment.
++		 * Two minutes later the same lookup succeeded. Nothing retries the
++		 * failed one, so whichever agent's message lands in that early
++		 * window keeps upstream_bssid all-zero forever - and
++		 * topology_build_tree_from_assoc() skips exactly the nodes whose
++		 * upstream_bssid is zero.
++		 *
++		 * The visible result was that of two healthy agents exactly one
++		 * appeared in topology_link, which one varied from boot to boot,
++		 * and it never corrected itself. Both were associated, both
++		 * carried traffic on both links.
++		 *
++		 * The tree builder already resolves a parent given an AP-MLD
++		 * address (find_node_with_mld_macaddr), so this address is
++		 * directly usable as it stands.
++		 */
++		if (!hwaddr_is_zero(mld->bssid))
++			memcpy(n->upstream_bssid, mld->bssid, 6);
++	}
++
+ 	mld->str_enabled   = !!(flag2 & BSTA_MLD_CONFIG_STR);
+ 	mld->nstr_enabled  = !!(flag2 & BSTA_MLD_CONFIG_NSTR);
+ 	mld->emlsr_enabled = !!(flag2 & BSTA_MLD_CONFIG_EMLSR);

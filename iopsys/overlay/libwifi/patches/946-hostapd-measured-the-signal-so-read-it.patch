@@ -1,0 +1,90 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: hostapd measured the signal, so read it
+
+Every backhaul link in the mesh reported its signal as "unknown" while
+hostapd had the number all along.
+
+A 4-address (WDS) backhaul station is attributed to its AP/VLAN child
+netdev, so nl80211 GET_STATION on the AP-MLD netdev yields nothing for it
+and rssi_avg stays 0. rssi_to_rcpi(0) is 255 - the spec's not-available
+value - so the controller stored 255 for every bSTA and anything choosing a
+path by signal was choosing on nothing.
+
+iface_get_sta_info_band() already consults hostapd unconditionally for
+exactly this reason ("hostapd ctrl is authoritative"), and
+hostapd_cli_iface_get_sta_info() already parses flags, listen interval and
+the whole capability set out of that same reply. It just never read the one
+line that was missing.
+
+Measured 2026-09-07 on the corridor node, both backhaul children:
+
+  wifi.apmld.ap-mld-2 stations       rssi 0        both STAs, both links
+  wifi.ap.ap-mld-2 stations          rssi 0        both STAs
+  hostapd sta <mac>                  signal=-46    signal=-56
+  iw dev ap-mld-2 station get <mac>  -46 dBm       -56 dBm
+  iw dev ap-mld-2.staN station dump  -48 dBm       -56 dBm
+
+The driver and hostapd agree; only the library came back empty.
+
+Filled only when nl80211 left it at zero, so a driver that does report the
+signal keeps what it reported. Per-chain rssi[] is untouched: hostapd gives
+one aggregate figure and inventing a per-antenna breakdown from it would be
+the same class of defect this fixes.
+
+Verify: on a mesh with a wireless backhaul, sta.rcpi for each bSTA on the
+controller must show a real value instead of 255, and it must agree with
+`iw dev <backhaul-ap> station get <bsta>`.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/libwifi/modules/wpactrl/hostapd_ctrl.c
++++ b/libwifi/modules/wpactrl/hostapd_ctrl.c
+@@ -197,6 +197,37 @@
+ 
+ #endif
+ 
++/* hostapd measured it; read it.
++ *
++ * A 4-address (WDS) backhaul station is attributed to its AP/VLAN child
++ * netdev, so GET_STATION on the AP-MLD netdev returns nothing for it and
++ * rssi_avg stays 0. rssi_to_rcpi(0) is 255, the not-available value - so
++ * every backhaul link in the mesh reported "unknown" for its signal while
++ * hostapd had the number the whole time.
++ *
++ * Measured 2026-09-07 on the corridor node, two backhaul children:
++ *
++ *   wifi.apmld.ap-mld-2 stations      rssi 0        (both, both links)
++ *   hostapd sta <mac>                 signal=-46 / -56
++ *   iw dev ap-mld-2 station get <mac> -46 dBm / -56 dBm
++ *
++ * This is only ever a fill-in: a driver that does report the signal has
++ * already written it, and is not touched.
++ */
++static int hostapd_cli_iface_get_sta_signal(const char *buf, int8_t *rssi_avg)
++{
++	char val[256] = { 0 };
++
++	if (!rssi_avg)
++		return -EINVAL;
++
++	if (wpa_ctrl_get_param(buf, "signal", val, sizeof(val)))
++		return -1;
++
++	*rssi_avg = (int8_t)strtol(val, NULL, 10);
++	return 0;
++}
++
+ static int hostapd_cli_iface_get_sta_listen_interval(const char *buf, uint16_t *listen_int)
+ {
+ 	char val[256] = { 0 };
+@@ -939,6 +970,10 @@
+ 	hostapd_cli_iface_get_sta_listen_interval(buf, &info->listen_int);
+ 	hostapd_cli_iface_get_sta_flags(buf, sta_flags, sizeof(sta_flags));
+ 
++	/* Only when nl80211 left it empty - see the helper for why it does. */
++	if (info->rssi_avg == 0)
++		hostapd_cli_iface_get_sta_signal(buf, &info->rssi_avg);
++
+ 	if (strstr(sta_flags, "[HT]")) {
+ 		size_t mcs_len = sizeof(info->caps.ht.supp_mcs);
+ 		info->caps.valid |= WIFI_CAP_HT_VALID;

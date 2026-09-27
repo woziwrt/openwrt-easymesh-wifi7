@@ -1,0 +1,173 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9992: identify the controller by its AL address
+
+Both agents reject every WSC M2 the controller sends them, and have done so for
+their whole uptime. Their own log, 2026-08-01, with LOG_APCFG at trace:
+
+  handle_ap_autoconfig_wsc: Dual controllers detected - rejecting WSC M2 from
+  86:f7:56:41:01:d3
+
+That address is the real controller. There is no second one.
+
+agent_update_controller_data() identifies the controller by cmdu->origin. For a
+unicast CMDU from a direct neighbour that is the sender's AL address, because
+ieee1905d resolves it through the link table. For a relayed multicast it is
+not - no link entry matches the source, so origin stays the raw interface MAC.
+Measured on both agents, one controller under three origins in eight minutes:
+
+  42x  86:f7:56:41:01:d3   AL address, from unicast AP-Autoconfig Responses
+  23x  86:f7:56:41:01:d4   ap-mld-2,   from relayed AP-Autoconfig Search
+  23x  7e:04:1c:81:7c:2c   br-lan,     from relayed AP-Autoconfig Search
+
+The br-lan address was latched first and persisted:
+
+  x8, 8g:  mapagent.agent.controller_macaddr = 7e:04:1c:81:7c:2c
+  4g:      mapagent.agent.controller_macaddr = 86:f7:56:41:01:d3   (colocated)
+
+so every frame from the controller's other interfaces was "a different
+controller while primary is active", multiple_cntlr latched, and the guard at
+the top of handle_ap_autoconfig_wsc() returned -1 before touching any state.
+The same guard blocks Backhaul STA MLD Config (agent_map.c:6656), which is our
+own R6 path.
+
+The consequences are all silent. The radios never reach AUTOCFG_HEARTBEAT, so
+agent_reschedule_heartbeat_autocfg() refuses to raise the interval and the mesh
+re-runs a full autoconfiguration round every probe_int (20 s) instead of
+HEARTBEAT_AUTOCFG_INTERVAL (70 s) - 60% of all 1905 traffic. And the agents keep
+serving whatever they were configured with at boot while refusing every change
+after it. Nothing else shows it: the census passed for fourteen hours, the
+database held 15 of 15 affiliated APs, the mesh forwarded traffic.
+
+The fix is to pass the identity rather than infer it from the frame. The Search
+handler already parses and validates the AL MAC Address TLV into `almac` before
+any of this, and the TLV is mandatory - verified on the wire, 339 frames of 339
+carry it with the correct value. The Response handler has no such TLV and keeps
+using origin, which is correct there and is documented as the remaining door.
+
+No manual cleanup is needed. Once the false identity stops being refreshed,
+observed_time expires after HEARTBEAT_AUTOCFG_INTERVAL + 10 s and the next
+Search re-latches the AL address and rewrites UCI; should_accept_controller()
+does not gate on the stored value unless controller_select.local is set, and it
+is not.
+
+The debug line now prints the identity and the origin side by side, because the
+difference between them is the whole defect and it was invisible.
+
+--- a/src/agent_map.c	2026-08-01 14:02:36.541347847 +0200
++++ b/src/agent_map.c	2026-08-01 14:02:36.541397843 +0200
+@@ -1311,20 +1311,52 @@
+ 	       should_accept_controller(a, origin);
+ }
+ 
+-static int agent_update_controller_data(struct agent *a, struct cmdu_buff *cmdu)
++/* Identify the controller by its AL address, which is what identifies a 1905
++ * device - cmdu->origin is whatever the frame was sourced from.
++ *
++ * For a unicast CMDU from a direct neighbour those are the same, because
++ * ieee1905d resolves the sender through its link table. For a relayed
++ * multicast they are not: the sender is several hops or one bridge away, no
++ * link entry matches, and origin stays the raw interface MAC. The agent then
++ * files the controller under an interface address, and the next frame from
++ * ANOTHER interface of that same controller looks like a second controller.
++ *
++ * Measured on hardware 2026-08-01, one controller seen under three origins by
++ * both agents in eight minutes:
++ *
++ *   42x origin 86:f7:56:41:01:d3   <- the AL address, from unicast responses
++ *   23x origin 86:f7:56:41:01:d4   <- ap-mld-2, from relayed Search
++ *   23x origin 7e:04:1c:81:7c:2c   <- br-lan,   from relayed Search
++ *
++ * The br-lan one was latched first and written to UCI, so every WSC M2 from
++ * the real controller was rejected by the multiple_cntlr guard in
++ * handle_ap_autoconfig_wsc() - for fourteen hours, on both agents, while every
++ * other indicator showed a healthy mesh. The agents kept the configuration
++ * they were given at boot and silently refused every change after it.
++ *
++ * The caller passes the best identity it has. AP-Autoconfiguration Search
++ * carries the AL MAC Address TLV and is required to (verified on the wire:
++ * 339 frames of 339), and its handler has already parsed and validated it.
++ * AP-Autoconfiguration Response carries no such TLV, so there origin is all
++ * there is - it is the AL address in practice, and if that ever stops being
++ * true this defect returns through that door.
++ */
++static int agent_update_controller_data(struct agent *a, struct cmdu_buff *cmdu,
++					uint8_t *cntlr_id)
+ {
+ 	int ret = CTRL_MAC_OLD;
+ 	char mac_str[18] = {0};
+ 	bool current;
+ 
+-	dbg("%s: cntlr_almac " MACFMT " origin " MACFMT " self " MACFMT "\n", __func__,
+-	    MAC2STR(a->cntlr_almac), MAC2STR(cmdu->origin), MAC2STR(a->almac));
++	dbg("%s: cntlr_almac " MACFMT " id " MACFMT " origin " MACFMT " self " MACFMT "\n",
++	    __func__, MAC2STR(a->cntlr_almac), MAC2STR(cntlr_id),
++	    MAC2STR(cmdu->origin), MAC2STR(a->almac));
+ 
+ 	a->active_cntlr = true;
+ 
+ 	/* Determine if this message is from the current primary controller */
+ 	current = !hwaddr_is_zero(a->cntlr_almac) &&
+-		  !memcmp(a->cntlr_almac, cmdu->origin, 6);
++		  !memcmp(a->cntlr_almac, cntlr_id, 6);
+ 
+ 	if (current)
+ 		timestamp_update(&a->observed_time);
+@@ -1338,12 +1370,12 @@
+ 		/* No active primary - clear dual controller state */
+ 		a->multiple_cntlr = false;
+ 
+-		if (should_accept_controller(a, cmdu->origin)) {
+-			if (!hwaddr_ntoa(cmdu->origin, mac_str))
++		if (should_accept_controller(a, cntlr_id)) {
++			if (!hwaddr_ntoa(cntlr_id, mac_str))
+ 				return CTRL_MAC_ERROR;
+ 
+-			if (memcmp(a->cntlr_almac, cmdu->origin, 6)) {
+-				memcpy(a->cntlr_almac, cmdu->origin, 6);
++			if (memcmp(a->cntlr_almac, cntlr_id, 6)) {
++				memcpy(a->cntlr_almac, cntlr_id, 6);
+ 				set_value_by_string("mapagent",
+ 						    "agent",
+ 						    "controller_macaddr",
+@@ -1366,13 +1398,13 @@
+ 			}
+ 		} else {
+ 			/* Message from different controller while primary is active */
+-			if (should_disable_local_controller(a, cmdu->origin)) {
++			if (should_disable_local_controller(a, cntlr_id)) {
+ 				agent_disable_local_cntlr(a);
+ 			} else {
+ 				/* Dual controller detected - block configurations */
+ 				if (!a->multiple_cntlr) {
+ 					a->multiple_cntlr = true;
+-					wifiagent_log_cntlrinfo(a, cmdu->origin);
++					wifiagent_log_cntlrinfo(a, cntlr_id);
+ 				}
+ 			}
+ 		}
+@@ -1462,7 +1494,11 @@
+ 	}
+ 
+ 	if (cntlr) {
+-		if (agent_update_controller_data(a, rx_cmdu) == CTRL_MAC_NEW) {
++		/* almac comes from the AL MAC Address TLV parsed at the top of
++		 * this function, not from the frame - see the comment on
++		 * agent_update_controller_data().
++		 */
++		if (agent_update_controller_data(a, rx_cmdu, almac) == CTRL_MAC_NEW) {
+ 			agnt_dbg(LOG_APCFG, "%s: new controller found!"\
+ 				 " Activate autoconfig configuration"\
+ 				 " for all radios\n",
+@@ -1607,7 +1643,11 @@
+ 
+ 	}
+ #endif
+-	if (agent_update_controller_data(a, rx_cmdu) == CTRL_MAC_NEW) {
++	/* No AL MAC Address TLV in an AP-Autoconfiguration Response; origin is
++	 * the AL address here because the response is a unicast from a direct
++	 * neighbour and ieee1905d resolves those.
++	 */
++	if (agent_update_controller_data(a, rx_cmdu, rx_cmdu->origin) == CTRL_MAC_NEW) {
+ 		struct wifi_radio_element *r = NULL;
+ 
+ 		agnt_dbg(LOG_APCFG, "%s: new controller found! Activate autoconfiguration"\

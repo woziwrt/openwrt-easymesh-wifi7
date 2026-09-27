@@ -1,0 +1,152 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: add missed AP MLD station links once a minute
+
+A station that associated while its event was missed stays out of the
+Associated Clients TLV for as long as it stays connected: the per-BSS
+refresh finds its links but never builds the STA MLD. Once a minute,
+compare every AP MLD with the kernel and add only the links the agent
+does not track, with the STA MLD and a Topology Notification, as the
+association event would have. Known stations are not touched, so their
+RSSI history and a pending post-steer deauth survive. Log what was added.
+
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -779,6 +779,8 @@
+ 	atimer_t enable_fhs_scheduler;
+ 	atimer_t boot_scan_scheduler;
+ 	atimer_t agent_periodic_run;
++	/* station links added by the once-a-minute reconciliation since start */
++	unsigned int sta_reconciled;
+ 	/* refresh radio stats data */
+ 	atimer_t radio_stats_scheduler;
+ 
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -5348,6 +5348,33 @@
+ 
+ 	agent_fetch_ap_stats(a);
+ 
++#if (EASYMESH_VERSION >= 6)
++	/* Once a minute, compare the stations of every AP MLD with the kernel.
++	 * A station that joined while its association event was missed (seen
++	 * 2026-09-25 after node restarts: a backhaul station and an MLO phone
++	 * associated minutes after mapagent started, the kernel and wifimngr
++	 * listed them with the right link BSSIDs, the agent reported none of
++	 * them for hours) is otherwise never reported: the per-BSS refresh
++	 * finds its links but builds no STA MLD, and without one the Associated
++	 * Clients TLV leaves it out. Offset from the minute so it does not land
++	 * on the other per-minute work. Logged at error level, the only one
++	 * the default shows, and only when something had to be added - a
++	 * total that keeps growing means events are still lost. */
++	if ((a->uptime % 60) == 30) {
++		struct netif_mld *mld = NULL;
++
++		list_for_each_entry(mld, &a->apmldlist, list) {
++			int n = apmld_reconcile_stations(a, mld);
++
++			if (n > 0) {
++				a->sta_reconciled += n;
++				err("%s: reconciled AP MLD " MACFMT ": added %d missed station link(s), %u since start\n",
++				    __func__, MAC2STR(mld->macaddr), n, a->sta_reconciled);
++			}
++		}
++	}
++#endif
++
+ 	timer_set(&a->agent_periodic_run, 1 * 1000);
+ }
+ 
+--- a/src/mld.h
++++ b/src/mld.h
+@@ -133,6 +133,7 @@
+ struct netif_mld *agent_get_apmld_by_ifname(struct agent *a, const char *ifname);
+ struct netif_mld *agent_alloc_apmld(struct agent *a, const char *ifname);
+ void apmld_refresh_stations(struct agent *a, struct netif_mld *mld);
++int apmld_reconcile_stations(struct agent *a, struct netif_mld *mld);
+ 
+ bool mld_contains_ap(struct agent *a, struct netif_mld *mld,
+                         uint8_t *macaddr);
+--- a/src/mld.c
++++ b/src/mld.c
+@@ -307,6 +307,81 @@
+ 	}
+ }
+ 
++/* Add the links of this AP MLD that the kernel has and the agent does not,
++ * and report each one as joined - what the association event would have
++ * done had it arrived. Links the agent already tracks under this AP (and,
++ * for an MLO client, under its STA MLD) are left alone: wifi_add_sta() on a
++ * known station clears its RSSI history and cancels a pending post-steer
++ * deauth, which must not happen once a minute. Returns the number of links
++ * added.
++ */
++int apmld_reconcile_stations(struct agent *a, struct netif_mld *mld)
++{
++	int added = 0;
++	int i;
++
++	for (i = 0; i < mld->num_affiliated_ap; i++) {
++		struct wifi_mlsta mlsta[128] = {0};
++		int num_mlsta = 128;
++		struct netif_ap *ap;
++		int j;
++
++		ap = agent_get_ap(a, mld->affiliated_ap[i]);
++		if (!ap || wifi_get_mld_stations(ap, mlsta, &num_mlsta))
++			continue;
++
++		for (j = 0; j < num_mlsta; j++) {
++			bool mlo = mlsta[j].mlo_capable &&
++				   !hwaddr_is_zero(mlsta[j].bssid);
++			size_t k;
++
++			for (k = 0; k < mlsta[j].num_link; k++) {
++				struct wifi_sta *link = &mlsta[j].sta[k];
++				struct sta_mld *smld;
++				struct sta *s;
++				bool known = false;
++
++				if (memcmp(link->bssid, ap->bssid, 6))
++					continue;
++
++				s = agent_get_sta(a, link->macaddr);
++				if (s && !memcmp(s->bssid, ap->bssid, 6)) {
++					known = !mlo;
++					smld = mlo ? agent_get_stamld(a, mlsta[j].macaddr) : NULL;
++					if (smld) {
++						int n;
++
++						for (n = 0; n < smld->num_affiliated_sta; n++) {
++							if (!memcmp(smld->affiliated_sta[n],
++								    link->macaddr, 6)) {
++								known = true;
++								break;
++							}
++						}
++					}
++				}
++				if (known)
++					continue;
++
++				s = wifi_add_sta(a, ap->ifname, link->macaddr);
++				if (!s)
++					continue;
++				if (mlo)
++					stamld_update(a, ap, mlsta[j].macaddr,
++						      mlsta[j].bssid,
++						      link->mlo_link_id, s);
++#ifndef UNAUTHORIZED_STA_IN_ASSOCLIST
++				wifi_topology_notification(a, s, ap, 0x01 /* joined */,
++							   0x00 /* success */);
++#endif
++				added++;
++			}
++		}
++	}
++
++	return added;
++}
++
+ int mld_parse_affiliated_ap(struct ubus_request *req, int type,
+ 		struct blob_attr *msg)
+ {

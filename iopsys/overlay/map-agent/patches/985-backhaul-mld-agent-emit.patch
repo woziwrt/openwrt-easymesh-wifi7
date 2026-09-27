@@ -1,0 +1,121 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: backhaul MLD affiliated-link path and TLV emit
+
+Mirrors the fronthaul AP-MLD path for the backhaul STA MLD: an affiliated RUID
+per link resolved at parse time (single-netdev MLO has no per-band base bSTA),
+the MLD-netdev branch in mld.c, and the emit side in agent_tlv.c so the
+bSTA-MLD Config TLV 0xE1 carries the stored RUID.
+
+Part of the chain: config wifi-mld -> libwifi wifi.bstamld -> map-agent
+bstamld parse/emit -> TLV 0xE1 -> controller parse 0x47 -> DB.
+
+Rescued from the 2026-07-16 control-plane work and re-applied 2026-07-22. The
+control plane was HW-verified then; end-to-end was blocked by RF contention
+with two AP-MLDs on shared radios, which is a separate question.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/mld.h
++++ b/src/mld.h
+@@ -74,6 +74,9 @@
+ 	int num_affiliated_bsta;
+ #define MAX_AFFILIATED_BSTA_LINKS_NUM 14
+ 	uint8_t affiliated_bsta[MAX_AFFILIATED_BSTA_LINKS_NUM][6];
++	/* RUID (radio MAC) per affiliated link - resolved at parse time from
++	 * each mlo_link's band (single-netdev MLO has no per-band base bSTA). */
++	uint8_t affiliated_ruid[MAX_AFFILIATED_BSTA_LINKS_NUM][6];
+ 
+ 	struct list_head list;
+ };
+--- a/src/mld.c
++++ b/src/mld.c
+@@ -651,6 +651,53 @@
+ 		}
+ 	}
+ 
++	/* MLD netdev: parse the MLD's own mlo_links directly (mirror
++	 * apmld_parse). The single-netdev MLO model has no per-band base bSTA
++	 * sections, so affiliation must be read here. Wholesale rebuild. */
++	if (tb[6] && bk->cfg->is_mld_netdev) {
++		static const struct blobmsg_policy lp[] = {
++			[0] = { .name = "mlo_link_id", .type = BLOBMSG_TYPE_INT32 },
++			[1] = { .name = "macaddr",     .type = BLOBMSG_TYPE_STRING },
++			[2] = { .name = "bssid",       .type = BLOBMSG_TYPE_STRING },
++			[3] = { .name = "band",        .type = BLOBMSG_TYPE_STRING },
++			[4] = { .name = "frequency",   .type = BLOBMSG_TYPE_INT32 },
++			[5] = { .name = "setup_link",  .type = BLOBMSG_TYPE_BOOL },
++		};
++		struct blob_attr *link = NULL;
++		int rem_links = 0;
++
++		a->bstamld->num_affiliated_bsta = 0;
++
++		blobmsg_for_each_attr(link, tb[6], rem_links) {
++			struct blob_attr *ld[ARRAY_SIZE(lp)];
++			struct wifi_radio_element *re;
++			enum wifi_band band;
++			uint8_t lmac[6];
++			int n = a->bstamld->num_affiliated_bsta;
++
++			if (blobmsg_type(link) != BLOBMSG_TYPE_TABLE)
++				continue;
++			blobmsg_parse(lp, ARRAY_SIZE(lp), ld,
++				      blobmsg_data(link), blobmsg_data_len(link));
++			if (!ld[1] || !ld[3])
++				continue;
++			if (!hwaddr_aton(blobmsg_data(ld[1]), lmac))
++				continue;
++			if (n >= MAX_AFFILIATED_BSTA_LINKS_NUM)
++				break;
++
++			band = wifi_bandstr_to_band(blobmsg_get_string(ld[3]));
++			re = agent_get_radio_by_band(a, band);
++
++			memcpy(a->bstamld->affiliated_bsta[n], lmac, 6);
++			if (re)
++				memcpy(a->bstamld->affiliated_ruid[n], re->macaddr, 6);
++			if (ld[5] && blobmsg_get_bool(ld[5]))
++				a->bstamld->setup_link = bk;
++			a->bstamld->num_affiliated_bsta++;
++		}
++	}
++
+ 	if (bk->cfg->is_mld_netdev || !a->cfg.physical_mld)
+ 		bk_toggle(a, bk, bssid, 0);
+ }
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -4871,27 +4871,20 @@
+ 		int i;
+ 
+ 		for (i = 0; i < *num_aff_bstas; i++) {
+-			struct wifi_radio_element *re;
+-			struct netif_bk *bsta;
+-
+-			bsta = agent_get_bsta(a, bstamld->affiliated_bsta[i]);
+-			if (!bsta || !bsta->cfg)
+-				continue;
+-
+-			re = agent_get_radio_by_band(a, bsta->cfg->band);
+-			if (!re)
+-				continue;
++			/* RUID + link MAC captured per-link at parse time
++			 * (single-netdev MLO: no per-band base bSTA to
++			 * resolve at emit; mirror apmld). */
+ 
+ 			/* Affiliated_bSTA_MAC_Addr_Valid */
+ 			t->data[offset] = valid_flag;
+ 			offset++;
+ 
+ 			/* RUID */
+-			memcpy(&t->data[offset], re->macaddr, 6);
++			memcpy(&t->data[offset], bstamld->affiliated_ruid[i], 6);
+ 			offset += 6;
+ 
+-			/* Affilated_bSTA_MAC_Addr */
+-			memcpy(&t->data[offset], bsta->macaddr, 6);
++			/* Affiliated bSTA MAC */
++			memcpy(&t->data[offset], bstamld->affiliated_bsta[i], 6);
+ 			offset += 6;
+ 
+ 			/* reserved */

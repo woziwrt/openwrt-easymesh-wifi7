@@ -1,0 +1,72 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 992 - build topology from assoc on Topology Response
+
+Patch 990 added topology_build_tree_from_assoc and called it every 60s from
+cntlr_query_nodes, which correctly writes topology_link. But handle_topology
+_response still ran the neighbor-BFS builder (the 988 block), which rebuilds
+the tree from the 1905 neighbor graph (first hop only) or leaves it invalid --
+and mapc_sync_agent runs right after and reads THAT, so agent.depth (and the
+agent_backhaul view / WebUI, which read a.depth) stayed -1 even though
+topology_link was correct.
+
+Replace the neighbor-BFS block with the assoc builder so the tree is correct
+and valid on every Topology Response, before the DB sync reads depth. Drops the
+now-moot 988 gate and the standalone root dance (the assoc builder owns the
+root).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -350,7 +350,7 @@
+ 	return 0;
+ }
+ 
+-static bool cntlr_is_standalone(struct controller *c)
++static bool __attribute__((unused)) cntlr_is_standalone(struct controller *c)
+ {
+ 	struct node *self = cntlr_find_node(c, c->almacaddr);
+ 
+@@ -800,30 +800,18 @@
+ 	}
+ 
+ 	/* When all topology responses collected, build topology tree. */
+-	if (!is_topology_valid(&c->topology)) {
+-		bool standalone = cntlr_is_standalone(c);
+-
+-		/* Gate on agents only. num_agents excludes the colocated controller
+-		 * root, but topology_num_devs() includes it, so the old
+-		 * num_agents == topology_num_devs() compared two different
+-		 * populations and stopped firing once a 2-hop agent joined (root
+-		 * present => counts differ), freezing topology_link at the first
+-		 * hop. Count agent devs on both sides so the rebuild fires once
+-		 * every agent has reported, regardless of the colocated-agent flap. */
+-		if (c->num_agents ==
+-		    topology_num_agent_devs(&c->topology, c->almacaddr)) {
+-			if (standalone) {
+-				topology_remove_device(&c->topology, c->almacaddr);
+-				build_local_controller_root(c, &c->topology, c->almacaddr);
+-			}
+-
+-			topology_build_tree(c, &c->topology, c->almacaddr);
+-
+-			/* Send BH policy only when max_node_bh_hops is configured. */
+-			if (c->cfg.max_node_bh_hops != 0) {
+-				/* Requires valid bBSS netif_iface info */
+-				cntlr_send_max_wifi_bh_hops_policy(c);
+-			}
++	/* 992: build the backhaul tree from association data (per-node
++	 * upstream_bssid) on every topology update, and do it here so the tree is
++	 * current before the DB sync (mapc_sync_agent) reads depth from it. The
++	 * 1905 neighbor graph structurally misses the wireless bSTA->bBSS hop, so
++	 * the old neighbor-BFS could only ever see the first hop. */
++	if (c->num_agents > 0) {
++		topology_build_tree_from_assoc(c, &c->topology, c->almacaddr);
++
++		/* Send BH policy only when max_node_bh_hops is configured. */
++		if (c->cfg.max_node_bh_hops != 0) {
++			/* Requires valid bBSS netif_iface info */
++			cntlr_send_max_wifi_bh_hops_policy(c);
+ 		}
+ 	}
+ 

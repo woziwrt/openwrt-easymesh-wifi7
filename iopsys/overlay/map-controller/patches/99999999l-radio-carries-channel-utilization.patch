@@ -1,0 +1,31 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a radio carries the channel utilization of its BSS
+
+The AP Metrics TLV (0x94) carries the channel utilization of each BSS, and
+the controller kept it on the BSS (bss->ch_util) only. The radio row of the
+database is written from radio_el->total_utilization, which nothing ever
+set. On 2026-09-24 the column read 0 for every radio of every node, while a
+capture of the AP Metrics Responses of the same minute showed 4-41 %
+(kitchen 2.4 GHz 37-41 %, 5 GHz 27 %, 6 GHz 4 %).
+
+Channel utilization describes the channel, so set it on the radio the BSS
+belongs to as well. It is what a parent choice needs to see before it puts
+one more backhaul on a busy radio (plan E3.7).
+
+--- a/src/cntlr_map.c	2026-09-24 18:10:45.341811402 +0200
++++ b/src/cntlr_map.c	2026-09-24 18:10:45.587530540 +0200
+@@ -2864,6 +2864,14 @@
+ 			continue;
+ 
+ 		bss->bss->ch_util = p->channel_utilization;
++		/* Channel utilization describes the channel, so it is the radio's
++		 * too. radio_el->total_utilization is what the DB row of the radio
++		 * is written from (mapc_sync.c), and nothing else ever set it:
++		 * on 2026-09-24 every radio of every node read 0 there while the
++		 * agents reported 4-41 % in this very TLV. */
++		if (bss->radio && bss->radio->radio_el)
++			bss->radio->radio_el->total_utilization =
++				p->channel_utilization;
+ 		bss->bss->num_stations = p->num_station;
+ 		bss->bss->esp_ac = p->esp_ac;
+ 

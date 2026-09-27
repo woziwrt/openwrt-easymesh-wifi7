@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Record that the clock has been set, so mesh-gwd stops asking.
+#
+# sysntpd is started with -S /usr/sbin/ntpd-hotplug, which fires this directory
+# with ACTION=stratum once a peer has been accepted (and 'step'/'periodic' as it
+# keeps up). There is no file anywhere that says "the time is now trustworthy",
+# and the wall clock cannot be asked - a node whose clock was never set still
+# reports a plausible-looking time, because sysfixtime seeds it from the newest
+# mtime in /etc at every boot. That is why the agent sat 15.7 hours behind for
+# two hours with a working network and nothing noticed.
+#
+# In /var/run on purpose: a reboot clears it, and a node that comes back up with
+# the clock unset should be asked again.
+[ "$ACTION" = "stratum" ] || [ "$ACTION" = "step" ] || exit 0
+: > /var/run/easymesh-clock-synced

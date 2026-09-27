@@ -1,0 +1,183 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: send unicast CMDUs to non-adjacent AL addresses
+
+i1905_do_cmdu_tx() can only reach a direct 1905 neighbour. It tries the
+neighbour cache, then the txpaths, and both are populated from direct links
+only, so on a chained mesh every node past the first hop is unreachable --
+even though the L2 path exists and carries data at full rate.
+
+Measured on the controller of a four-node mesh 2026-09-01:
+
+  send_cmdu: cmdu 8004 to <depth-2 node> was NOT sent (mid 0)
+             - destination is not a direct 1905 neighbour
+
+0x8004 refused 15 times in 30 s to each of the two depth-2 agents, 0x0008
+6 times, not one success. The mesh stayed up only because agents report
+upwards on their own; nothing the controller sends downwards arrives.
+
+The bridge fallback added by 0006 never ran. ieee1905d puts bridge *ports*
+into dm.self.iflist, not the bridge itself -- i1905.c:1746-1790 sends the
+bridge to dm.self.miflist and br_get_iflist() splits it into ports, and
+i1905_setup_interface() (i1905.c:1553) refuses bridges outright. So
+if_isbridge() is false for every entry and the loop always falls through.
+Runtime confirms it: 13 interfaces, br-lan not among them. Its measurement
+note cannot be reproduced against this tree either, so both go.
+
+What does know the far nodes is iface->nbriflist, filled from received
+topology responses, which carries the AL address of every device seen behind
+an interface with a direct flag rather than only the adjacent one:
+
+  ap-mld-2.sta1  nbr_ieee1905id 0e:ed:8f:c2:0f:83  direct=false
+
+ieee1905_send_cmdu() (i1905_extension.c:557-580) already sends this way and
+asks neither the neighbour cache nor the txpaths, so the two entry points
+disagreed about what is reachable. Mirror that walk here.
+
+Verified by hand on hardware before writing this, same tree:
+
+  ubus call ieee1905 cmdu ... "dst":"c2:c9:79:f6:bc:9e"
+    -> {"status":"fail"}
+  the same call plus "ifname":"ap-mld-2.sta1"
+    -> {"status":"ok","mid":57322}
+
+ap-mld-2.sta1 is the WDS netdev towards the neighbour; it is in iflist and it
+is not excluded, because exclude_ifname matches on equal length and
+ap-mld-2 != ap-mld-2.sta1.
+
+One peer can appear under several interfaces and an entry goes stale before
+its ageout timer removes it, so the walk takes the most recently refreshed
+match rather than the first one -- the same hazard 0005 hit on the receive
+side. Excluded interfaces and entries flagged invalid are skipped.
+
+No new socket and no new SA: the frame still leaves through an existing
+interface with that port's MAC, exactly as a direct-neighbour CMDU does.
+
+--- a/src/i1905_cmdresp.c
++++ b/src/i1905_cmdresp.c
+@@ -1075,59 +1075,85 @@
+ 			}
+ 		}
+ 
+-		/* Last resort: hand it to the bridge.
++		/* Not a direct neighbour: ask the interface link tables.
+ 		 *
+-		 * Neither the neighbour cache nor the txpaths know this AL MAC, and
+-		 * up to now that meant the CMDU was dropped. But 1905.1 defines no
+-		 * forwarding for unicast at all - Table 6-4 says a received unicast
+-		 * CMDU is processed and "not transmitted on any of its interfaces" -
+-		 * and the forwarding entity is explicitly out of scope, required only
+-		 * to "be interoperable with IEEE 802.1 bridging". A unicast CMDU to a
+-		 * device several hops away is therefore expected to be delivered by
+-		 * the bridge, not routed by us. Refusing to send it is our own
+-		 * addition, and it is the one that fails.
+-		 *
+-		 * The neighbour cache only ever learns direct neighbours, so on a
+-		 * chained mesh every node beyond the first is unreachable by this
+-		 * path even though the L2 route exists and carries data at full rate.
+-		 *
+-		 * Measured on hardware 2026-07-31, mesh formed as
+-		 * controller <- agentA <- agentB:
+-		 *
+-		 *   ubus call ieee1905 cmdu '{"type":2,"dst":"<agentB al-mac>"}'
+-		 *     -> {"status":"fail"}                      (this branch)
+-		 *   same call with "ifname":"br-lan"
+-		 *     -> {"status":"ok","mid":19391}
+-		 *     -> tcpdump on agentB: 3 frames with DA = its AL MAC arrived,
+-		 *        3x type 0x0002 Topology Query in, 3x 0x0003 Response out,
+-		 *        controller went from num_nodes 2 to 3.
+-		 *
+-		 * So the bridge delivers it. The destination AL MAC is not in the
+-		 * forwarding database - it belongs to no netdev of ours - and an
+-		 * unknown unicast destination is flooded, which reaches the far node
+-		 * through the intermediary. That is also why this cannot loop: the
+-		 * bridge applies its own split horizon, and a CMDU that does arrive
+-		 * is processed and never retransmitted.
+-		 *
+-		 * Other open 1905 stacks do this unconditionally - no
+-		 * neighbour lookup on the transmit path at all - and the
+-		 * Broadband Forum reference implementation assumes it.
++		 * The neighbour cache and the txpaths only ever learn direct
++		 * neighbours, so on a chained mesh every node past the first hop
++		 * is unreachable from here even though the L2 path exists and
++		 * carries data at full rate. Measured on the controller of a
++		 * four-node mesh 2026-09-01: cmdu 0x8004 to each of the two
++		 * depth-2 agents was refused 15 times in 30 s with "destination
++		 * is not a direct 1905 neighbour", and not one frame left the
++		 * box. The mesh held together only because agents report upwards
++		 * on their own.
++		 *
++		 * iface->nbriflist does know them. It is filled from received
++		 * topology responses and carries the AL address of every device
++		 * seen behind that interface, direct or not:
++		 *
++		 *   ap-mld-2.sta1  nbr_ieee1905id 0e:ed:8f:c2:0f:83  direct=false
++		 *
++		 * ieee1905_send_cmdu() in i1905_extension.c already sends this
++		 * way and consults neither the neighbour cache nor the txpaths.
++		 * This mirrors that walk so both entry points behave alike.
++		 *
++		 * Checked by hand on hardware before writing this, same tree:
++		 *
++		 *   ubus call ieee1905 cmdu with {"type":2,"dst":"c2:c9:.."}
++		 *     -> {"status":"fail"}
++		 *   the same call plus "ifname":"ap-mld-2.sta1"
++		 *     -> {"status":"ok","mid":57322}
++		 *
++		 * One peer can appear under several interfaces, and an entry
++		 * goes stale before its ageout timer removes it, so take the
++		 * most recently refreshed match rather than the first one --
++		 * the same hazard patch 0005 hit on the receive side.
+ 		 */
+ 		if (ret) {
++			struct i1905_neighbor_interface *nif = NULL;
++			struct i1905_interface *best = NULL;
++			time_t best_tsp = 0;
++
+ 			list_for_each_entry(iface, &priv->dm.self.iflist, list) {
+-				if (iface->exclude || !if_isbridge(iface->ifname))
++				if (iface->exclude)
+ 					continue;
+ 
+-				ret = i1905_cmdu_tx(iface->priv, vid, dst, src,
++				list_for_each_entry(nif, &iface->nbriflist, list) {
++					if (nif->invalid)
++						continue;
++
++					if (!hwaddr_equal(nif->aladdr, dst))
++						continue;
++
++					if (!best || nif->tsp > best_tsp) {
++						best = iface;
++						best_tsp = nif->tsp;
++					}
++				}
++			}
++
++			if (best) {
++				ret = i1905_cmdu_tx(best->priv, vid, dst, src,
+ 						    type, &mid, data, data_len,
+ 						    true);
+ 				if (!ret) {
+ 					i1905_warn(LOG_TX,
+-						   "%s: cmdu %04x to " MACFMT " handed to bridge %s\n",
+-						  __func__, type, MAC2STR(dst),
+-						  iface->ifname);
++						   "%s: cmdu %04x to " MACFMT " sent via %s (not a direct neighbour)\n",
++						   __func__, type, MAC2STR(dst),
++						   best->ifname);
+ 					goto done;
+ 				}
++
++				i1905_warn(LOG_TX, "%s: cmdu tx failed\n", __func__);
+ 			}
++
++			/* Say so when nothing matched. Without this the branch is
++			 * silent on a miss and "no message" cannot be told apart
++			 * from "never ran" - which is exactly where we stood on
++			 * 2026-09-02 after watching 58 refusals go past. */
++			if (!best)
++				i1905_warn(LOG_TX,
++					   "%s: cmdu %04x to " MACFMT ": no interface knows this AL address\n",
++					   __func__, type, MAC2STR(dst));
+ 		}
+ 	}

@@ -1,0 +1,62 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: wpactrl chmod client socket
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Make hostapd control-interface replies deliverable on OpenWrt.
+
+OpenWrt starts hostapd under procd ujail and drops it to the unprivileged user
+"network" (uid 101) while libwifi clients run as root. wpa_ctrl_open() binds the
+client socket under the root umask, so hostapd cannot write to it. Traced on the
+hostapd side the request arrives and the reply is built - only delivery fails:
+
+  recvfrom(40, "STATUS", ...) from /tmp/wpa_ctrl_928-166 = 6
+  sendto(40, "state=ENABLED\nphy=phy0.1\nfreq=5180\n"..., 1223, ...,
+         "/tmp/wpa_ctrl_928-166") = -1 EACCES (Permission denied)
+
+hostapd logs that nowhere, so from the client it is indistinguishable from an
+unresponsive daemon: select() times out and wpa_ctrl_cmd() returns -2 with an
+empty buffer. Every command is affected - STATUS, STATUS-DRIVER, GET_CONFIG,
+"get beacon".
+
+hostapd_cli_iface_ap_info() opens with a "get beacon" whose failure sets
+ap->enabled = false and returns, so every AP - plain BSS and AP-MLD alike - was
+reported disabled, with security/capabilities/bssload left empty. map-agent then
+dropped the whole AP-MLD and map-controller stored an all-zero apmld row.
+
+hostapd_cli does fchmod(fd, 0660) before bind, which is why the same commands
+work from the shell and fail from libwifi.
+
+Verified on hardware (bpi-4g, OpenWrt 25.12-SNAPSHOT, kernel 6.12.87):
+  before: apmld = 1 row of zeros | affiliated_ap = 0 | ttlm = 0
+  after:  apmld = OpenWrt-MLD enabled=1 num_ap=3 | affiliated_ap = 3 | ttlm = 24
+
+--- a/libwifi/modules/wpactrl/wpactrl.c
++++ b/libwifi/modules/wpactrl/wpactrl.c
+@@ -10,6 +10,7 @@
+ #include <stdint.h>
+ #include <errno.h>
+ #include <sys/types.h>
++#include <sys/stat.h>
+ #include <fcntl.h>
+ #include <net/if.h>
+ #include <time.h>
+@@ -116,6 +117,19 @@
+ 		return NULL;
+ 	}
+ 
++	/* OpenWrt runs hostapd unprivileged - procd ujail drops it to user
++	 * "network" - while libwifi clients run as root. bind() above created the
++	 * client socket under the root umask, so hostapd cannot write to it: it
++	 * receives the request, builds the reply, and sendto() fails with EACCES.
++	 * It reports that nowhere, so the client just times out. libwifi then
++	 * declares the AP disabled - every AP, plain BSS and AP-MLD alike - and
++	 * map-agent drops the whole AP-MLD as a result.
++	 *
++	 * Make the reply path writable for the unprivileged daemon.
++	 */
++	if (chmod(ctrl->local.sun_path, 0666) < 0)
++		libwifi_dbg("%s: chmod on ctrl socket failed\n", __func__);
++
+ 	ctrl->dest.sun_family = AF_UNIX;
+ 
+ 	if (strlen(ctrl_path) > sizeof(ctrl->dest.sun_path)) {

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# The guard learns the DHCP server's MAC from br-lan; a new lan address or
+# gateway means learning it again.
+[ "$ACTION" = ifup ] && [ "$INTERFACE" = lan ] || exit 0
+/usr/sbin/easymesh-dhcpguard

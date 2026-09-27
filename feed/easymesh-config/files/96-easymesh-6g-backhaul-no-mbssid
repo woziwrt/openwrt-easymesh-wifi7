@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# No Multiple-BSSID on a 6 GHz radio that carries the backhaul AP-MLD.
+#
+# OpenWrt's default config turns mbssid on for every 6 GHz radio, so the
+# fronthaul becomes the transmitted BSS and the backhaul a NONTRANSMITTED one
+# that never sends a beacon of its own. A backhaul station on mt76 then has to
+# take the fronthaul's beacon for its own, and the MediaTek code that does
+# that (mt76 0088 / mac80211 0136, "beacon monitor for 11v MBSS") now and then
+# hands cfg80211 a copy of the beacon rewritten to the backhaul's BSSID. From
+# that copy cfg80211 derives a swapped pair - the fronthaul's address with the
+# backhaul's profile - and wpa_supplicant later joins the fronthaul link as
+# if it were the backhaul: reason 3, then reason 7 in a loop, sometimes no
+# DHCP at all.
+#
+# Measured 2026-09-19 (A/B on the controller, 5 wifi rebuilds each):
+# mbssid=1 -> the swapped entry 5/5; mbssid=0 -> 0/5, no reason 7, backhaul
+# up every time. The same non-TX setup is the documented cause of repeated
+# beacon loss on that link.
+#
+# Only nodes with a backhaul AP (wireless.ap_mld_2) - the rest is the user's.
+# mlo-backhaul-setup --apply-ap does the same for nodes that get one later.
+
+if ! uci -q show wireless >/dev/null 2>&1; then
+	echo "96-easymesh-6g-backhaul-no-mbssid: no wireless config yet, will retry at boot" >&2
+	exit 1
+fi
+uci -q get wireless.ap_mld_2 >/dev/null 2>&1 || exit 0
+
+changed=0
+for r in $(uci -q get wireless.ap_mld_2.device); do
+	[ "$(uci -q get wireless.$r.band)" = "6g" ] || continue
+	[ "$(uci -q get wireless.$r.mbssid)" = "0" ] && continue
+	uci set "wireless.$r.mbssid=0"
+	changed=1
+done
+[ "$changed" = 1 ] && {
+	uci commit wireless
+	logger -t easymesh-config "6 GHz backhaul radio: mbssid off (backhaul must not be a nontransmitted BSS)"
+}
+exit 0

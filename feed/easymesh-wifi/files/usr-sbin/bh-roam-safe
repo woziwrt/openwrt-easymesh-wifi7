@@ -1,0 +1,108 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# bh-roam-safe - move the backhaul bSTA to a different parent, with automatic rollback.
+#
+# WHY: on 3. 9. 2026 a manual switch without a safety net twice cut off the node
+# and everything behind it. It came back on its own, but that was luck, not
+# protection.
+#
+# KEY POINT: the watchdog runs LOCALLY on the node being moved. The very link a
+# rollback would be sent over is the thing that breaks when the move fails.
+#
+# Usage:  bh-roam-safe <target-AP-MLD-address> [timeout_s]
+#
+# Picks the target AP MLD's link in the band that is currently in
+# wpa_supplicant's freq_list - a ROAM to any other band fails or breaks the
+# link (documented 3. 9.).
+
+set -u
+
+IFACE="$(ls /sys/class/net/ 2>/dev/null | grep -E '^bsta-mld' | head -1)"
+TARGET="${1:-}"
+TIMEOUT="${2:-60}"
+CHECK_IP="${CHECK_IP:-172.16.20.1}"
+LOG=/tmp/bh-roam-safe.log
+
+log() { echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
+
+[ -n "$TARGET" ] || { echo "usage: bh-roam-safe <target-AP-MLD-address> [timeout_s]"; exit 1; }
+[ -n "$IFACE" ]  || { echo "error: no bsta-mld interface"; exit 1; }
+
+# --- current state, which we return to if needed -----------------------------
+CUR="$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^bssid=//p' | head -1)"
+[ -n "$CUR" ] || { echo "error: cannot determine the current parent"; exit 1; }
+
+# --- the band roaming is allowed in -----------------------------------------
+CONF="/var/run/wpa-supplicant-$IFACE.conf"
+FREQS="$(sed -n 's/^freq_list=//p' "$CONF" 2>/dev/null | head -1)"
+
+# --- pick the target AP MLD link that lies in the allowed band ---------------
+# scan_results: <bssid> <freq> <signal> <flags> <ssid>
+wpa_cli -i "$IFACE" scan >/dev/null 2>&1
+sleep 5
+
+BSSID=""; FREQ=""
+if [ -n "$FREQS" ]; then
+	for f in $FREQS; do
+		line="$(wpa_cli -i "$IFACE" scan_results 2>/dev/null | awk -v f="$f" '$2==f {print $1" "$2; exit}')"
+		[ -n "$line" ] || continue
+		# take the first AP on an allowed frequency that belongs to the target MLD
+		# (an MLD link has a different MAC than the MLD address, which is why a
+		# prefix match is accepted too)
+		cand="$(wpa_cli -i "$IFACE" scan_results 2>/dev/null | awk -v f="$f" -v t="$TARGET" '$2==f && $1==t {print $1; exit}')"
+		if [ -n "$cand" ]; then BSSID="$cand"; FREQ="$f"; break; fi
+	done
+fi
+
+# target not found directly in the allowed band -> try the target as given,
+# but only if its frequency is in the allowed list
+if [ -z "$BSSID" ]; then
+	TF="$(wpa_cli -i "$IFACE" scan_results 2>/dev/null | awk -v t="$TARGET" '$1==t {print $2; exit}')"
+	if [ -n "$TF" ] && echo " $FREQS " | grep -q " $TF "; then
+		BSSID="$TARGET"; FREQ="$TF"
+	fi
+fi
+
+if [ -z "$BSSID" ]; then
+	echo "REFUSED: target $TARGET is not on any frequency from freq_list"
+	echo "  freq_list: $(echo "$FREQS" | cut -c1-60)..."
+	echo "  A ROAM outside this list BREAKS the link (verified 3. 9. 2026)."
+	log "refused: $TARGET outside freq_list"
+	exit 2
+fi
+
+echo "current parent : $CUR"
+echo "target         : $BSSID (freq $FREQ)"
+echo "timeout        : ${TIMEOUT}s, checked via $CHECK_IP"
+log "ROAM $CUR -> $BSSID (freq $FREQ), timeout ${TIMEOUT}s"
+
+# --- watchdog: runs detached from this session -------------------------------
+cat > /tmp/bh-roam-watchdog.sh <<EOF
+#!/bin/sh
+sleep 8
+i=0
+while [ \$i -lt $TIMEOUT ]; do
+	if ping -c1 -W2 $CHECK_IP >/dev/null 2>&1; then
+		echo "[\$(date +%H:%M:%S)] OK: controller reachable after \$i s, change confirmed" >> $LOG
+		exit 0
+	fi
+	i=\$((i+3)); sleep 3
+done
+echo "[\$(date +%H:%M:%S)] TIMEOUT after ${TIMEOUT}s -> ROLLBACK to $CUR" >> $LOG
+wpa_cli -i $IFACE ROAM $CUR >> $LOG 2>&1
+sleep 5
+wpa_cli -i $IFACE reassociate >> $LOG 2>&1
+echo "[\$(date +%H:%M:%S)] rollback finished" >> $LOG
+EOF
+chmod +x /tmp/bh-roam-watchdog.sh
+setsid /tmp/bh-roam-watchdog.sh </dev/null >/dev/null 2>&1 &
+
+# --- the switch itself -------------------------------------------------------
+R="$(wpa_cli -i "$IFACE" ROAM "$BSSID" 2>&1 | tail -1)"
+echo "ROAM reply     : $R"
+log "ROAM reply: $R"
+
+echo
+echo "watchdog running (${TIMEOUT}s). Result: $LOG"

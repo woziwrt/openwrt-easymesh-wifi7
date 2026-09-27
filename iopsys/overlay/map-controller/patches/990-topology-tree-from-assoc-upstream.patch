@@ -1,0 +1,157 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 990 - build backhaul tree from assoc/upstream
+
+The multi-hop topology was frozen at the first hop because topology_build_tree
+walks the 1905 Neighbor-Device TLV graph, which structurally does NOT carry the
+wireless bSTA->bBSS backhaul edge: an agent never advertises its downstream
+bSTA child as a 1905 neighbor (verified on HW: `ieee1905 info` lists only the
+controller as 8g's neighbor). So the 2-hop x8 was never added to the topology
+dev_list, topology stayed valid at {4g,8g}, the rebuild block was skipped, and
+every depth fell back to -1 (patch 988's gate change was therefore moot).
+
+Build the tree from per-node upstream_bssid instead (populated 1-hop-reliably
+from Link Metric Responses): add one dev per agent and chain child->parent by
+resolving upstream_bssid via cntlr_find_node_with_bssid, iterating to a stable
+N-hop tree. Driven every 60s from cntlr_query_nodes. Yields the real chain
+4g(0) <- 8g(1) <- x8(2) with correct topology_link edges and agent.depth.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -22,6 +22,7 @@
+ #include "cntlr_ubus.h"
+ #include "cntlr_events.h"
+ #include "db/mapc_sync.h"
++#include "cntlr.h"
+ 
+ static bool is_wifi(uint16_t media_type)
+ {
+@@ -50,6 +51,104 @@
+ 	return topology->num_devs;
+ }
+ 
++/* Build the backhaul tree from per-node uplink data. The 1905 Neighbor-Device
++ * TLV graph the neighbor-BFS walks does NOT carry the wireless bSTA->bBSS edge
++ * (an agent does not advertise its downstream bSTA child as a 1905 neighbor --
++ * verified on HW: `ieee1905 info` shows only the controller as 8g's neighbor),
++ * so that walk can never build the 2nd hop. n->upstream_bssid IS populated
++ * 1-hop-reliably from Link Metric Responses, so chain child->parent by it. */
++void topology_build_tree_from_assoc(struct controller *c,
++				    struct bh_topology_data *topology,
++				    const uint8_t *ctrl_al_macaddr)
++{
++	static const uint8_t zmac[6] = {0};
++	struct bh_topology_dev *root, *dev;
++	struct node *n;
++	bool progress;
++
++	topology_remove_all_devices(topology);
++
++	root = topology_add_device(topology, ctrl_al_macaddr);
++	if (!root)
++		return;
++	root->bh.depth = 0;
++	root->bh.wifi_hops_from_root = 0;
++
++	/* one dev per known agent (topology_add_device leaves depth UNKNOWN) */
++	list_for_each_entry(n, &c->agentlist, list) {
++		if (!memcmp(n->almacaddr, ctrl_al_macaddr, 6))
++			continue;
++		if (!topology_find_device(topology, n->almacaddr))
++			topology_add_device(topology, n->almacaddr);
++	}
++
++	/* place each dev under its upstream parent; repeat until stable (N-hop) */
++	do {
++		progress = false;
++		list_for_each_entry(dev, &topology->dev_list, list) {
++			struct bh_topology_dev *pdev;
++			struct local_iface *pif;
++			struct node *cn, *pn;
++
++			if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
++				continue;
++			cn = cntlr_find_node(c, dev->al_macaddr);
++			if (!cn || !memcmp(cn->upstream_bssid, zmac, 6))
++				continue;
++			pn = cntlr_find_node_with_bssid(c, cn->upstream_bssid);
++			if (!pn)
++				continue;
++			pdev = topology_find_device(topology, pn->almacaddr);
++			if (!pdev || pdev->bh.depth == UNKNOWN_TREE_LEVEL)
++				continue;	/* parent not placed yet */
++
++			dev->bh.parent = pdev;
++			dev->bh.depth = pdev->bh.depth + 1;
++			dev->bh.wifi_hops_from_root =
++				pdev->bh.wifi_hops_from_root + 1;
++
++			/* stub the parent bBSS as a local_iface so mapc_sync_topology
++			 * emits parent_iface_mac == upstream_bssid */
++			if (pdev->number_of_interfaces < IFACE_MAX_NUM) {
++				pif = &pdev->ifaces[pdev->number_of_interfaces++];
++				memcpy(pif->macaddr, cn->upstream_bssid, 6);
++				pif->media_type = 0x0100;	/* Wi-Fi */
++				dev->bh.parent_iface = pif;
++			}
++			progress = true;
++		}
++	} while (progress);
++
++	/* Only claim the tree is valid once every device actually found a
++	 * place in it. Anything else closes a loop we cannot get out of.
++	 *
++	 * find_backhaul_upstream() (cntlr.c) consults the topology first and
++	 * only falls back to a bBSS lookup when the topology is *not* valid -
++	 * and that fallback is the sole thing that ever fills
++	 * node::upstream_bssid, which is precisely this function's input. So
++	 * declaring a tree we failed to build valid shuts the fallback off
++	 * permanently: no upstream_bssid, hence no tree, hence no
++	 * upstream_bssid.
++	 *
++	 * Measured on a three-node mesh 2026-07-28: every node had
++	 * upstream_bssid all-zero and depth -1, while topology->valid was
++	 * true and topology_link held correct parents from another path.
++	 *
++	 * Leaving valid=false here is self-healing rather than a failure mode:
++	 * the next link metrics report takes the bBSS fallback, fills in
++	 * upstream_bssid, and the following rebuild places the node.
++	 */
++	topology->valid = true;
++	list_for_each_entry(dev, &topology->dev_list, list) {
++		if (dev->bh.depth == UNKNOWN_TREE_LEVEL) {
++			topology->valid = false;
++			break;
++		}
++	}
++
++	mapc_sync_topology(c);
++}
++
+ uint32_t topology_num_agent_devs(struct bh_topology_data *topology,
+ 				 const uint8_t *root_almac)
+ {
+--- a/src/topology.h
++++ b/src/topology.h
+@@ -149,6 +149,7 @@
+  * input data change (device add/remove, interface or neighbor info change.)
+  */
+ void topology_build_tree(struct controller *c, struct bh_topology_data *topology, const uint8_t *ctrl_al_macaddr);
++void topology_build_tree_from_assoc(struct controller *c, struct bh_topology_data *topology, const uint8_t *ctrl_al_macaddr);
+ 
+ /**
+  * Synthesize the controller's own root device from the local ieee1905 interface
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1448,6 +1448,10 @@
+ 		}
+ 	}
+ 
++	/* 990: the 1905 neighbor graph is missing the wireless backhaul hop, so
++	 * rebuild the tree from per-node upstream_bssid (association data). */
++	topology_build_tree_from_assoc(c, &c->topology, c->almacaddr);
++
+ 	timer_set(&c->query_nodes, 60 * 1000);
+ }
+ 

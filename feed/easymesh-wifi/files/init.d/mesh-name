@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# Late on purpose: ieee1905 is already up by then, so a name that changed while
+# the box was off is applied to a running daemon rather than written to a file
+# nobody rereads.
+#
+# The trigger is what makes this a feature rather than a boot-time one-shot.
+# Renaming a box is something an owner does months later, from the LuCI page
+# they already know, and procd calls reload_service the moment the system
+# config is committed - no reboot and nothing else to find.
+
+START=96
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/mesh-name
+}
+
+service_triggers() {
+	procd_add_reload_trigger "system"
+}
+
+reload_service() {
+	/usr/sbin/mesh-name
+}
+
+stop_service() {
+	return 0
+}

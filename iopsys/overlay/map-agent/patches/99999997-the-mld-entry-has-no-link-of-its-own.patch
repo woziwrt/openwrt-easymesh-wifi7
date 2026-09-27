@@ -1,0 +1,70 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: the MLD entry has no link of its own
+
+99999996 stopped the rssi fallback from borrowing another link's identity.
+It missed the one station for which no link carries the right address: the
+MLD-level entry itself.
+
+mlo_links lists the affiliated links, each under its own address. An
+MLD-level struct sta is keyed by the MLD address, which appears in none of
+them, so the search falls through to sta[0] and the copy takes link 0's
+address. update_sta_entry() then looks up link 0 instead of the MLD - the
+same silent miss 99999996 removed for legs, still open for the MLD.
+
+Measured 2026-09-07 on the bedroom node, six samples one minute apart:
+
+  hardware, 6 GHz leg     -52  -52  -51  -50  -50  -50 dBm
+  db sta.rcpi (MLD)       152  152  152  152  152  152      (= -34 dBm)
+  db sta.rcpi (6 GHz leg) 114                                (= -53 dBm)
+
+The row was rewritten every second throughout, so this was not staleness in
+the database. The per-leg value was right; the MLD aggregate was a number
+measured once, at association, and never touched since - kept alive because
+the controller's upsert holds the previous value when the incoming one is
+unknown (mapc_sync.c: rcpi=CASE WHEN excluded.rcpi>0 AND excluded.rcpi<>255).
+
+So the address of the station being polled is restored before the update.
+For a leg it changes nothing - m is already that leg. For the MLD it is the
+whole fix, and the borrowed measurement finally lands where it was meant to.
+
+Verify: with an MLO client parked on one link, sta.rcpi for the MLD address
+must track that link's rcpi instead of holding a constant.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1582,6 +1582,33 @@
+ 			 */
+ 			sta = *m;
+ 
++			/* The station we were asked about keeps its address.
++			 *
++			 * 99999996 stopped the fallback from borrowing another
++			 * link's identity, but left one case: an MLD-level
++			 * station has no link of its own. No entry in mlo_links
++			 * carries the MLD address, so the search above falls
++			 * through to sta[0] and the copy takes link 0's address -
++			 * and update_sta_entry() then looks THAT up instead of
++			 * the MLD, exactly the failure 99999996 was written to
++			 * remove.
++			 *
++			 * Measured 2026-09-07 on the bedroom node. The Associated
++			 * STA Link Metrics TLV is generated from the MLD-level
++			 * struct sta, and its rcpi sat at 152 (-34 dBm) through
++			 * six samples a minute apart while the only measured leg
++			 * moved between -52 and -50 dBm. The per-leg rows were
++			 * correct at the same time (rcpi 114 = -53 dBm), so the
++			 * defect is the MLD entry alone: nothing was refreshing
++			 * it, and the controller's upsert keeps the previous
++			 * value when the new one is unknown, so a number measured
++			 * once at association survived as if it were current.
++			 *
++			 * For a leg this is a no-op - m is already that leg. For
++			 * the MLD it is the whole fix.
++			 */
++			memcpy(sta.macaddr, s->macaddr, 6);
++
+ 			if (sta.rssi_avg == 0) {
+ 				struct wifi_sta *best = NULL;
+ 

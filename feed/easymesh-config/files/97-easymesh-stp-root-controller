@@ -1,0 +1,34 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# The controller is the root of the spanning tree on the mesh bridge.
+#
+# easymesh-role turns STP on for br-lan (a cable between two nodes is a loop)
+# and, since 2026-09-26, gives the controller the lowest bridge priority. A
+# box that got its role before that keeps its config over a sysupgrade and
+# never runs easymesh-role again, so the root stays wherever the lowest MAC
+# happens to be - a random agent in the middle of the mesh (seen 2026-09-25
+# and again 2026-09-26). This brings such a box in line with its role.
+
+role=$(cat /etc/mapc/role 2>/dev/null)
+[ -n "$role" ] || exit 0    # no role yet: easymesh-role will set it
+
+i=0
+while n=$(uci -q get network.@device[$i].name); do
+	[ "$n" = br-lan ] && break
+	i=$((i + 1))
+done
+[ -n "$n" ] || exit 0
+[ "$(uci -q get network.@device[$i].stp)" = 1 ] || exit 0
+
+if [ "$role" = controller ]; then
+	[ "$(uci -q get network.@device[$i].priority)" = 4096 ] && exit 0
+	uci set network.@device[$i].priority=4096
+else
+	uci -q get network.@device[$i].priority >/dev/null || exit 0
+	uci -q delete network.@device[$i].priority
+fi
+uci commit network
+logger -t easymesh-config "br-lan: spanning tree root follows the role ($role)"
+exit 0

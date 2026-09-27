@@ -1,0 +1,79 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 988 - fire topology rebuild on agent count
+
+topology_build_tree() (which writes topology_link, the source of truth for
+depth/upstream) only runs when num_agents == topology_num_devs(). But
+num_agents excludes the colocated controller root while topology_num_devs()
+includes it, so the two sides count different populations. Once a 2-hop agent
+joined, the root stayed in the dev list and the counts never matched again,
+so the tree was never rebuilt and topology_link froze at the first hop
+(x8->8g second hop missing, x8 depth=-1, controller depth=-1).
+
+Add topology_num_agent_devs() (devs excluding the root) and gate on it, so the
+rebuild fires once every agent has reported regardless of the colocated-agent
+marked/unmarked flap. depth then flows from tdev->bh.depth and the multi-hop
+edges from the BFS walk.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -50,6 +50,20 @@
+ 	return topology->num_devs;
+ }
+ 
++uint32_t topology_num_agent_devs(struct bh_topology_data *topology,
++				 const uint8_t *root_almac)
++{
++	struct bh_topology_dev *bh_topo_dev = NULL;
++	uint32_t n = 0;
++
++	list_for_each_entry(bh_topo_dev, &topology->dev_list, list) {
++		if (!hwaddr_equal(bh_topo_dev->al_macaddr, root_almac))
++			n++;
++	}
++
++	return n;
++}
++
+ struct bh_topology_dev *topology_find_device(struct bh_topology_data *topology, const uint8_t *al_macaddr)
+ {
+ 	struct bh_topology_dev *bh_topo_dev = NULL;
+--- a/src/topology.h
++++ b/src/topology.h
+@@ -82,6 +82,8 @@
+ 
+ /** Number of devices in backhaul topology tree. */
+ uint32_t topology_num_devs(struct bh_topology_data *topology);
++uint32_t topology_num_agent_devs(struct bh_topology_data *topology,
++				 const uint8_t *root_almac);
+ 
+ /** Returns backhaul topology device if exists in the model, NULL otherwise. */
+ struct bh_topology_dev *topology_find_device(struct bh_topology_data *topology, const uint8_t *al_macaddr);
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -800,12 +800,19 @@
+ 	if (!is_topology_valid(&c->topology)) {
+ 		bool standalone = cntlr_is_standalone(c);
+ 
+-		if (standalone)
+-			topology_remove_device(&c->topology, c->almacaddr);
+-
+-		if (c->num_agents == topology_num_devs(&c->topology)) {
+-			if (standalone)
++		/* Gate on agents only. num_agents excludes the colocated controller
++		 * root, but topology_num_devs() includes it, so the old
++		 * num_agents == topology_num_devs() compared two different
++		 * populations and stopped firing once a 2-hop agent joined (root
++		 * present => counts differ), freezing topology_link at the first
++		 * hop. Count agent devs on both sides so the rebuild fires once
++		 * every agent has reported, regardless of the colocated-agent flap. */
++		if (c->num_agents ==
++		    topology_num_agent_devs(&c->topology, c->almacaddr)) {
++			if (standalone) {
++				topology_remove_device(&c->topology, c->almacaddr);
+ 				build_local_controller_root(c, &c->topology, c->almacaddr);
++			}
+ 
+ 			topology_build_tree(c, &c->topology, c->almacaddr);
+ 

@@ -1,0 +1,105 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9999: steer the MLD, not the link that happens to be first
+
+A Client Steering Request for an MLO client has never produced a BTM frame.
+Measured on hardware 2026-08-03 with a three-link client on ap-mld-1:
+
+	ubus call map.controller steer '{"agent":"86:f7:56:41:01:d3",
+	    "sta":"7a:6f:6d:db:82:92","target_agent":"e6:a9:d2:c1:98:3f",
+	    "target_bssid":"00:0c:43:26:60:10","src_bssid":"7e:04:1c:81:7c:2e",
+	    "abridged":1,"disassoc_tmo":0}'
+	-> {"status":"ok","mid":2828}
+
+	dump_steer_summary: btm_attempts 1, btm_success 0, btm_fail 0
+
+Neither success nor failure - silence. The client did not move.
+
+The request is correct on the wire. Captured at the agent:
+
+	8014 ... 9b 001b 7e041c817c2e a0 0000 0000
+	     01 7a6f6ddb8292      <- num_sta=1, the client MLD address
+	     01 000c43266010      <- num_bss=1, the target BSSID
+	     53 01                <- opclass 83, channel 1
+
+and agent_process_steer_request_tlv() parses it correctly - the log prints
+"sta_mac: 7a:6f:6d:db:82:92". What fails is the lookup that follows.
+
+1. agent_set_sta_resp() compares the requested address against s->macaddr for
+every station on ap->stalist. For an MLO client that list holds the address of
+the affiliated link it associated on - 4a:d4:f5:d9:3e:1e here, the 2.4 GHz link
+- while the controller names the client by its MLD address, which is what
+EasyMesh R6 requires it to send. The two halves never meet, found stays false,
+the function returns -1, and the caller goes straight to send_ack. The 1905 Ack
+goes out, agent_try_steer_sta() is never reached, and no BTM frame is ever
+built. struct sta already carries mld_macaddr and is_affiliated_sta, so the
+comparison only has to look.
+
+2. agent_request_btm() then sends through ap->ifname. On an MLD node that is
+the per-link name and wifi.ap.<per-link> is published for no BSS - the same
+condition 9997 ran into for statistics. request_btm lives on the MLD object:
+
+	ubus -v list wifi.ap.ap-mld-1   -> request_btm present
+	ubus -v list wifi.apmld.ap-mld-1 -> absent
+
+So even with the lookup repaired the frame would have gone to an object that
+does not exist. Both had to move for one BTM frame to leave the box.
+
+Also fixed: the "not found" line printed s->macaddr, but s is the
+list_for_each_entry iterator, and after a loop that ended without break it
+points at the container of the list head. It was printing memory next to the
+head - d7:d8:d5:d6:d3:d4 on this box, an address that appears nowhere on the
+wire. That message sent this investigation down a wrong path for an hour; it
+now prints the address actually looked for.
+
+Not fixed here: the client is still held under the link address rather than
+being indexed by both. Steering works after this, but anything else that looks
+a client up by MLD address has the same trap waiting. Nor does this give the
+agent per-link metrics - affiliated_sta.rcpi, dl_rate and ul_rate are empty in
+the database, so RCPI-based steering policy still has nothing to decide on.
+
+--- a/src/agent_map.c
++++ b/src/agent_map.c
+@@ -4614,6 +4614,15 @@
+ 			agnt_dbg(LOG_STA, "%s: sta: " MACFMT "\n",
+ 			    __func__, MAC2STR(s->macaddr));
+ 			res = memcmp(s->macaddr, &sta_list[i * 6], 6);
++#if (EASYMESH_VERSION >= 6)
++			/* An MLO client is held here under the address of the
++			 * link it associated on, while the controller names it
++			 * by its MLD address - that is what the Steering
++			 * Request TLV carries, per spec. Compare both or the
++			 * two halves never meet. */
++			if (res && s->is_affiliated_sta)
++				res = memcmp(s->mld_macaddr, &sta_list[i * 6], 6);
++#endif
+ 			if (!res) {
+ 				found = true;
+ 				/**
+@@ -4630,8 +4639,12 @@
+ 			}
+ 		}
+ 		if (!found) {
++			/* s is the iterator: after the loop ran to its end it
++			 * points at the container of the list head, not at an
++			 * entry, so printing s->macaddr showed memory next to
++			 * the head. Print what was actually looked for. */
+ 			agnt_dbg(LOG_STA, "%s: sta: " MACFMT " not found\n",
+-			    __func__, MAC2STR(s->macaddr));
++			    __func__, MAC2STR(&sta_list[i * 6]));
+ 			memcpy(sta_resp[count].sta_mac, &sta_list[i * 6], 6);
+ 			sta_resp[count].response = ERR_REASON_STA_NOT_ASSOCIATED;
+ 			count++;
+@@ -4843,6 +4856,13 @@
+ 
+ 	req.validity_int = BTM_VALIDITY_TM_MSEC / WIFI_BEACON_PERIOD_MS;
+ 	req.dialog_token = agent_steer_next_dialog_token(a);
++#if (EASYMESH_VERSION >= 6)
++	/* wifi.ap.<per-link> is published for no BSS on an MLD node; the
++	 * request_btm method lives on wifi.ap.<mld_ifname>. Same reason
++	 * agent_fetch_ap_stats() addresses the MLD entity. */
++	if (ap->is_affiliated_ap && ap->mld_ifname[0])
++		return wifi_req_btm(ap->mld_ifname, client_sta, 1, pref, &req);
++#endif
+ 	return wifi_req_btm(ap->ifname, client_sta, 1, pref, &req);
+ }
+ 

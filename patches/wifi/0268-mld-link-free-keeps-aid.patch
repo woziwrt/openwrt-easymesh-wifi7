@@ -1,0 +1,149 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] AP MLD: one AID bit per sta_info, and a peer interface that belongs to the station
+
+Two Multi-AP backhaul agents associating to one AP MLD were handed the same AID.
+The 4-address peer interface name is derived from it -- hostapd_set_wds_sta()
+builds "%s.sta%d" from conf->iface and aid - 64 -- so the second station was
+pointed at an interface the first one owned:
+
+  hostapd: ap-mld-2: STA 3e:fb:2f:94:72:7b associated (aid 65)
+  hostapd: ap-mld-2: WDS-STA-INTERFACE-ADDED ifname=ap-mld-2.sta1
+  hostapd: ap-mld-2: STA 06:0c:43:26:81:10 associated (aid 65)
+  hostapd: nl80211: NL80211_ATTR_STA_VLAN (addr=06:0c:43:26:81:10
+           ifname=ap-mld-2.sta1 vlan_id=0) failed: -16 (Resource busy)
+  hostapd: ap-mld-2: AP-STA-CONNECTED 06:0c:43:26:81:10 auth_alg=sae
+
+hostapd reports the station connected regardless, so it stays associated on both
+its links, fully authorized, reporting good signal -- and moves not one byte,
+because it has no bridged interface. Measured on hardware 2026-07-30; every
+status anyone could query said the node was healthy.
+
+There are two independent reasons the AID came out duplicated, and this fixes
+both by making one thing true: the bit for an AID lives in the transmitted BSS
+of whichever BSS owns that sta_info, every sta_info sets exactly one bit and
+clears exactly that one, and the allocator ORs across the affiliated links.
+
+  - hostapd_get_aid() allocates into hostapd_mbssid_get_tx_bss(hapd)->sta_aid
+    and ap_free_sta() clears it there, but hostapd_get_aid_word() checked
+    link_bss->sta_aid directly. With mbssid=1 the backhaul AP MLD is a
+    non-transmitted BSS, so an allocation made through the transmitted BSS was
+    invisible to the check and two stations with different association links
+    could be given the same AID immediately, with nothing having been freed.
+    Read the bits where they are written.
+
+  - hostapd_get_aid() redirects hapd to the transmitted BSS before
+    hostapd_get_aid_word() ever sees it, so hapd->conf->mld_ap was that of the
+    transmitted BSS rather than of the AP MLD, and the cross-link OR was skipped
+    for a non-transmitted MLD. Keep the BSS the caller passed in for the MLD
+    question and use the transmitted one only for storage.
+
+  - ieee80211_ml_process_link() marked hapd->sta_aid on the link BSS while
+    ap_free_sta() clears tx_bss->sta_aid. Marked in one place, cleared in
+    another: the AID could be handed out again while a link still held it, and
+    the release could clear a bit belonging to a station on the transmitted BSS.
+    Mark it where it will be cleared.
+
+The peer interface is a separate matter and is fixed separately. netifd creates
+a single netdev for the whole MLD, so every link BSS shares conf->iface and
+derives the same interface name; tearing one link down therefore removes the
+interface the station is still using on its remaining links and rebinds its VLAN
+back to the BSS. Guard that teardown with hostapd_sta_is_link_sta(), the same
+distinction __ap_free_sta() makes three lines further down.
+
+Deliberately not guarded: the AID release itself. An earlier version of this
+patch did guard it, which leaks -- the bit set by ieee80211_ml_process_link() is
+cleared in exactly one place in the tree, so refusing to clear it there means it
+is never cleared at all, and every MLD association permanently consumes one AID
+out of 65..2007 until hostapd starts refusing stations. With ownership symmetric
+no predicate is needed: each sta_info clears its own bit and the AID becomes free
+when the last one goes.
+
+Companion to the AID offset fix in ieee80211_ml_process_link(): that one made the
+marking land in the right word, this one makes it land in the right BSS.
+
+Signed-off-by: WOZIWRT <petr.wozniak@gmail.com>
+---
+diff -u -r a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+--- a/src/ap/ieee802_11.c	2026-07-30 10:39:27.371537767 +0200
++++ b/src/ap/ieee802_11.c	2026-07-30 10:39:27.372489080 +0200
+@@ -3963,7 +3963,13 @@
+ 			if (!link_bss)
+ 				continue;
+ 
+-			aid_word |= link_bss->sta_aid[i];
++			/* Read the bits where they are written. Allocation
++			 * and release both go through the transmitted BSS, so
++			 * looking at link_bss->sta_aid misses every AID taken
++			 * by a non-transmitted BSS -- with mbssid=1 that is
++			 * exactly the backhaul AP MLD, and two stations then
++			 * get the same AID with nothing having been freed. */
++			aid_word |= hostapd_mbssid_get_tx_bss(link_bss)->sta_aid[i];
+ 		}
+ 
+ 		return aid_word;
+@@ -3976,11 +3982,14 @@
+ 
+ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ {
++	struct hostapd_data *mld_hapd = hapd;
+ 	int i, j = 32, aid;
+ 
+ 	/* Transmitted and non-transmitted BSSIDs share the same AID pool, so
+ 	 * use the shared storage in the transmitted BSS to find the next
+-	 * available value. */
++	 * available value. Keep the BSS we were called on as well: it is the
++	 * one that knows whether this is an AP MLD, and the transmitted BSS
++	 * need not be part of the same MLD. */
+ 	hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ 	/* get a unique AID */
+@@ -3993,7 +4002,7 @@
+ 		return -1;
+ 
+ 	for (i = 0; i < AID_WORDS; i++) {
+-		u32 aid_word = hostapd_get_aid_word(hapd, sta, i);
++		u32 aid_word = hostapd_get_aid_word(mld_hapd, sta, i);
+ 
+ 		if (aid_word == (u32) -1)
+ 			continue;
+@@ -5399,7 +5408,10 @@
+ 			status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 			goto out;
+ 		}
+-		hapd->sta_aid[(sta->aid - 1 - 64) / 32] |=
++		/* Mark it where ap_free_sta() will clear it. Every sta_info
++		 * of this MLD sets exactly one bit and clears that same one,
++		 * so the AID stays taken until the last of them is gone. */
++		hostapd_mbssid_get_tx_bss(hapd)->sta_aid[(sta->aid - 1 - 64) / 32] |=
+ 			BIT((sta->aid - 1 - 64) % 32);
+ 		sta->listen_interval = origin_sta->listen_interval;
+ 		if (update_ht_state(hapd, sta) > 0 && set_beacon)
+diff -u -r a/src/ap/sta_info.c b/src/ap/sta_info.c
+--- a/src/ap/sta_info.c	2026-07-30 10:39:27.371148637 +0200
++++ b/src/ap/sta_info.c	2026-07-30 10:39:27.372085719 +0200
+@@ -306,11 +306,20 @@
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_set_sta_flags(hapd, sta);
+ 
+-	if ((sta->flags & WLAN_STA_WDS) ||
+-	    (sta->flags & WLAN_STA_MULTI_AP &&
+-	     (hapd->conf->multi_ap & BACKHAUL_BSS) &&
+-	     hapd->conf->wds_sta &&
+-	     !(sta->flags & WLAN_STA_WPS)))
++	/* A non-AP MLD has one sta_info per affiliated link on top of the one
++	 * the association was performed on. The 4-address peer interface,
++	 * however, belongs to the station: netifd creates a single netdev for
++	 * the whole MLD, so every link BSS shares conf->iface and
++	 * hostapd_set_wds_sta() derives the very same name on each of them.
++	 * Tearing one link down therefore takes away the interface the station
++	 * is still using on its remaining links, and rebinds its VLAN back to
++	 * the BSS. __ap_free_sta() below already makes this distinction. */
++	if (!hostapd_sta_is_link_sta(hapd, sta) &&
++	    ((sta->flags & WLAN_STA_WDS) ||
++	     (sta->flags & WLAN_STA_MULTI_AP &&
++	      (hapd->conf->multi_ap & BACKHAUL_BSS) &&
++	      hapd->conf->wds_sta &&
++	      !(sta->flags & WLAN_STA_WPS))))
+ 		hostapd_set_wds_sta(hapd, NULL, sta->addr, sta->aid, 0);
+ 
+ 	if (sta->ipaddr)

@@ -1,0 +1,189 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: hal bsta status
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/libwifi/modules/wpactrl/supplicant_ctrl.c
++++ b/libwifi/modules/wpactrl/supplicant_ctrl.c
+@@ -49,6 +49,48 @@
+ 	return 0;
+ }
+ 
++/* Fill bSTA connection state (bssid/ssid) from wpa_supplicant STATUS.
++ * One cheap ctrl-iface round-trip (same call supplicant_cli_get_ssid uses).
++ * Authoritative on mainline mt76, where the NL80211 GET_STATION dump returns
++ * no station entry for a STA vif, so the driver path never learns the AP bssid.
++ * Returns 0 only when wpa_state==COMPLETED and a valid bssid was parsed. */
++int supplicant_bsta_conninfo(const char *ifname, struct wifi_sta *info)
++{
++	char buf[1024] = {};
++	char val[128] = {};
++
++	if (WARN_ON(wpa_cli_get(ifname, "status", buf, sizeof(buf))))
++		return -1;
++
++	if (wpa_ctrl_get_param(buf, "wpa_state", val, sizeof(val)))
++		return -1;
++	if (strcmp(val, "COMPLETED"))
++		return -1;
++
++	if (wpa_ctrl_get_param(buf, "bssid", val, sizeof(val)))
++		return -1;
++	if (hwaddr_aton(val, info->bssid) == NULL)
++		return -1;
++
++	if (!wpa_ctrl_get_param(buf, "ssid", val, sizeof(val))) {
++		strncpy((char *)info->ssid, val, sizeof(info->ssid) - 1);
++		info->ssidlen = strlen((char *)info->ssid);
++	}
++
++	if (!wpa_ctrl_get_param(buf, "freq", val, sizeof(val))) {
++		int freq = atoi(val);
++
++		if (freq > 0) {
++			if (!info->channel)
++				info->channel = wifi_freq_to_channel(freq);
++			if (!info->band)
++				info->band = wifi_freq_to_band(freq);
++		}
++	}
++
++	return 0;
++}
++
+ static int supplicant_cli_get_param_hex(const char *buf, const char *param, uint8_t *ie, size_t *ie_len) {
+ 	char val[256] = { 0 };
+ 	int len;
+--- a/libwifi/modules/wpactrl/supplicant_ctrl.h
++++ b/libwifi/modules/wpactrl/supplicant_ctrl.h
+@@ -46,5 +46,6 @@
+ int supplicant_cli_get_sta_supported_security(const char *ifname, uint32_t *sec);
+ int supplicant_cli_get_sta_security(const char *ifname, struct wifi_sta_security *sec);
+ int supplicant_cli_get_ssid(const char *ifname, char *ssid, size_t ssid_size);
++int supplicant_bsta_conninfo(const char *ifname, struct wifi_sta *info);
+ 
+ #endif /* SUPPLICANT_CTRL_H */
+--- a/libwifi/modules/wpactrl/wpactrl.c
++++ b/libwifi/modules/wpactrl/wpactrl.c
+@@ -180,7 +180,11 @@
+ 	free(cmd_buf);
+ 
+ 	for (;;) {
+-		tv.tv_sec = 10;
++		/* 1s (was 10s): wifimngr is single-threaded, so a slow or
++		 * unanswered wpa_ctrl reply must not stall every other ubus
++		 * caller (status/stats). wpa_supplicant answers in <100ms;
++		 * select is re-armed per message so 1s never truncates. */
++		tv.tv_sec = 1;
+ 		tv.tv_usec = 0;
+ 		FD_ZERO(&rfds);
+ 		FD_SET(ctrl->s, &rfds);
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -12,6 +12,8 @@
+ #include <stdint.h>
+ #include <errno.h>
+ #include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/time.h>
+ #include <byteswap.h>
+ #include <fcntl.h>
+ #include <net/if.h>
+@@ -441,6 +443,8 @@
+ struct nl_sock *nlwifi_socket(void)
+ {
+ 	struct nl_sock *nl;
++	struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
++	int fd;
+ 
+ 	nl = nl_socket_alloc();
+ 	if (nl == NULL)
+@@ -448,6 +452,13 @@
+ 
+ 	genl_connect(nl);
+ 
++	/* mainline mt76: a STA-mode GET_STATION NLM_F_DUMP may never deliver
++	 * NLMSG_DONE, so nl_recvmsgs() in nlwifi_send_msg() would block forever,
++	 * hanging wifi.bsta status and stalling map-agent. Bound the receive. */
++	fd = nl_socket_get_fd(nl);
++	if (fd >= 0)
++		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++
+ 	return nl;
+ }
+ 
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1902,31 +1902,49 @@
+ 
+ 	libwifi_dbg("[%s] %s called\n", ifname, __func__);
+ 	ret = nlwifi_sta_info(ifname, sta);
+-	if(ret)
+-		return -1;
++	/* mt76 STA-mode GET_STATION dump may not complete; do not bail --
++	 * GET_INTERFACE below still yields the connection state (bssid/ssid/
++	 * is4addr/macaddr) that map-agent needs. Station stats are best-effort. */
++	if (ret)
++		libwifi_dbg("[%s] nlwifi_sta_info incomplete, continuing\n", ifname);
+ 
+ 	if_gethwaddr(ifname, sta->macaddr);
+ 	ret = nlwifi_get_interface(ifname, &info);
+-	if (ret)
+-		return -1;
+-
+-	sta->band = info.band;
+-	sta->channel = info.channel;
+-	sta->bandwidth = info.bandwidth;
+-	sta->is4addr = info.is4addr;
+-	memcpy(sta->ssid, info.ssid, info.ssidlen);
+-	sta->ssidlen = info.ssidlen;
+-	sta->mlo_capable = info.mlo_capable;
++	if (!ret) {
++		sta->band = info.band;
++		sta->channel = info.channel;
++		sta->bandwidth = info.bandwidth;
++		sta->is4addr = info.is4addr;
++		memcpy(sta->ssid, info.ssid, info.ssidlen);
++		sta->ssidlen = info.ssidlen;
++		sta->mlo_capable = info.mlo_capable;
++	}
+ 
+-	radio_get_band_maxrate(ifname, sta->band, &maxrate);
+-	sta->maxrate = maxrate;
++	/* mt76 STA-mode GET_STATION dump yields no station entry, so the driver
++	 * path never learns the associated AP bssid. Without bssid, wifimngr's
++	 * print_sta_info() omits the whole connection block and map-agent treats
++	 * a fully-connected bSTA as down (endless bsta_scan). Source bssid/ssid
++	 * from wpa_supplicant STATUS (authoritative, single cheap round-trip). */
++	if (hwaddr_is_zero(sta->bssid))
++		supplicant_bsta_conninfo(ifname, sta);
++
++	/* radio_get_band_maxrate() in STA mode calls supplicant_cli_get_oper_std()
++	 * -> wpa_ctrl_request select() which hangs ~10s on mt76 bSTA (confirmed
++	 * wchan=do_select). maxrate/oper_std not needed for map-agent connected
++	 * state. Skip -- this was the real hang. */
++	/* radio_get_band_maxrate(ifname, sta->band, &maxrate); */
++	sta->maxrate = maxrate; /* 0: skipped, hangs on mt76 bSTA */
+ 
+ 	nlwifi_get_band_noise(ifname, sta->band, &noise);
+ 	if (!noise)
+ 		noise = -90;
+ 	sta->noise_avg = noise;
+ 
+-	ret = supplicant_sta_info(ifname, sta);
++	/* supplicant_sta_info() fires 5x 'timeout 5 wpa_cli' that hang on mt76
++	 * bSTA (~25s), stalling wifi.bsta status past map-agent's 2s timeout.
++	 * Connection state (macaddr/4addr/ssid/channel) is already set from
++	 * GET_INTERFACE above -- all map-agent needs. Skip the slow caps query. */
++	ret = 0; /* was: supplicant_sta_info(ifname, sta) -- hangs on mt76 bSTA */
+ 
+ 	sta->rate.m.bw = wifi_bw_enum2MHz(info.bandwidth);
+ 	wifi_nss_from_caps(&sta->caps, &sta->rate.m.nss);
+@@ -2027,7 +2045,7 @@
+ 
+ 
+ const struct wifi_driver default_wifi_driver = {
+-	.name = "wlan,phy",
++	.name = "wlan,phy,bsta",
+ 	.info = nlwifi_driver_info,
+ 
+ 	/* Radio/phy callbacks */

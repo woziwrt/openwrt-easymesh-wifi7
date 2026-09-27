@@ -1,0 +1,115 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 99991: let a client go when the HAL says it is gone
+
+The agent adds clients from the BSS refresh reply and removes them only on a
+disassociation event. A client that leaves without one - after a BTM steer, or
+simply by walking out of range - stays on ap->stalist forever, and the agent
+keeps reporting it to the controller.
+
+Reproduced deterministically on hardware 2026-08-03 by steering a client from
+one node to another, which is a much better handle on this than waiting for a
+physical roam:
+
+	steer 8g -> 4g, client obeyed and moved
+
+	8g (old node):  HAL 0   iw 0   agent 3   <- holds a client it does not have
+	4g (new node):  HAL 4   iw 1   agent 0
+
+	controller sta_mld: own = 3a:fb:2f:94:51:7b (8g), age 5 s
+
+The database is wrong and freshly written: the old node keeps sending a report
+that looks perfectly valid, and the controller has no way to tell it is
+imaginary. That is why this belongs in the agent - by the time it reaches the
+controller the information is indistinguishable from truth.
+
+bss_stations_data_cb() already fetches the current station list from the HAL
+once a minute, so the authority is right there; it was only ever used to add.
+This marks every known client before parsing the reply and releases the ones
+the reply did not mention.
+
+STA_ABSENT_MAX is 2 rather than 1 on purpose. Empty replies have been observed
+from a healthy HAL during radio bring-up, and dropping every client on one of
+those would be a worse failure than the ghost. Two consecutive misses at
+BSS_REFRESH_INTERVAL means a departed client is released after about two
+minutes - not instant, but bounded, which it was not before.
+
+Removal goes through wifi_del_sta() so refcounts and notifications follow the
+same path as an ordinary disassociation.
+
+Not fixed here: the new node is slow to pick the client up (measured 2026-08-03:
+HAL to agent at least 37 s, agent to controller up to 27 s). Releasing the old
+entry does not make the new one arrive any sooner, so a client is briefly known
+to nobody. Steering must therefore still judge freshness rather than trust
+presence.
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -264,6 +264,10 @@
+ /* enum netif_type { IFTYPE_WIRED, IFTYPE_WIFI, IFTYPE_UNKNOWN }; */
+ 
+ #define BSS_REFRESH_INTERVAL		60000       /** 1 min */
++/** Consecutive BSS refreshes a client may be missing from the HAL reply
++  * before the agent lets it go. One tolerates a lost or empty reply; the
++  * client is released after ~2 min at the refresh interval above. */
++#define STA_ABSENT_MAX			2
+ 
+ #define NBR_REFRESH_INTERVAL		600000      /** 10 mins */
+ #define NBR_AGEOUT_INTERVAL		1800000U    /** not dynamic; so 30mins is good */
+@@ -419,6 +423,8 @@
+ 	uint8_t mld_macaddr[6];
+ 	uint8_t ruid[6];
+ #endif
++	uint8_t absent;                 /** consecutive refreshes without this
++                                     *  client in the HAL reply */
+ 	uint32_t caps;                  /** capability bitmap */
+ 	int rssi[WIFI_NUM_ANTENNA];     /** rssi of last received pkt */
+ #define MAX_RSSI_MEAS 2             /** must be >= 2: current and previous measurement alway required */
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2879,8 +2879,21 @@
+ 	if (!tb[0])
+ 		return;
+ 
++	/* Mark. Everything already on the list is presumed gone until this
++	 * reply says otherwise - the HAL is the authority on who is attached,
++	 * and a client that leaves without a disassoc event (after a BTM, or
++	 * simply out of range) is otherwise never removed. */
++	{
++		struct sta *s;
++
++		list_for_each_entry(s, &ap->stalist, list)
++			if (s->absent < 255)
++				s->absent++;
++	}
++
+ 	blobmsg_for_each_attr(cur, tb[0], rem) {
+ 		uint8_t mac[6];
++		struct sta *added;
+ 
+ 		if (w->stations_mld) {
+ 			static const struct blobmsg_policy sp[] = {
+@@ -2953,7 +2966,24 @@
+ 				continue;
+ 		}
+ 
+-		wifi_add_sta(w->a, ap->ifname, mac);
++		added = wifi_add_sta(w->a, ap->ifname, mac);
++		if (added)
++			added->absent = 0;
++	}
++
++	/* Sweep. STA_ABSENT_MAX gives one refresh of tolerance so a lost or
++	 * momentarily empty reply does not drop live clients. */
++	{
++		struct sta *s, *tmp;
++
++		list_for_each_entry_safe(s, tmp, &ap->stalist, list) {
++			if (s->absent < STA_ABSENT_MAX)
++				continue;
++
++			dbg("%s: %s: releasing " MACFMT ", absent from %u replies\n",
++			    __func__, ap->ifname, MAC2STR(s->macaddr), s->absent);
++			wifi_del_sta(w->a, ap->ifname, s->macaddr);
++		}
+ 	}
+ 
+ 	w->parsed = true;

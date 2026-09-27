@@ -1,0 +1,55 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Remove disallow_bsta_profile from the ap sections an earlier generation wrote.
+#
+# What it was
+# -----------
+# mlo-backhaul-setup used to put disallow_bsta_profile=1 on every backhaul MLD
+# AP section it created. That tells every Multi-AP Profile-1 bSTA it may not
+# associate with our backhaul - the narrowest our backhaul can be made, and it
+# shuts out precisely the older third-party agents interoperability is about.
+#
+# Nobody chose it. It arrived with an unrelated commit (77297c9) and was never
+# argued for; it is deviation #4 in the project compatibility notes.
+#
+# Why a migration is needed at all
+# --------------------------------
+# The generator was fixed on 2026-09-01 (easymesh-r6-feed 3e7687c) so new nodes
+# never get it. That does NOT reach the nodes already running: their
+# /etc/config/mapagent was written once and sysupgrade keeps it. Measured the
+# same day after flashing .2 and .3 with the fixed image - the option was still
+# there, three times over, exactly as before.
+#
+# The profile a backhaul ends up using is negotiated anyway: per EasyMesh, the
+# link is "Profile-X where X is the lowest of the profiles implemented by the
+# two devices". So denying nothing costs us nothing - we still run our own
+# profile with peers that support it.
+#
+# What this deliberately does NOT do
+# ----------------------------------
+# It touches only the disallow_bsta_profile option and nothing else in the
+# section. The backhaul ap sections carry the key WPS delivered, and rewriting
+# or regenerating those would drop the node out of the mesh.
+#
+# It also does not run `uci commit` unless something actually changed, so a
+# node that never had the option is left completely untouched - and the script
+# stays idempotent across reboots.
+
+found=0
+
+# Match by option, not by section index: the backhaul sections are NAMED
+# (bhmld_ap_5, bhmld_ap_6) and do not show up as @ap[N] in `uci show`, so an
+# index loop would silently skip exactly the ones that carry this option.
+for s in $(uci show mapagent 2>/dev/null | grep "\.disallow_bsta_profile=" | cut -d. -f2 | sort -u); do
+	uci -q delete "mapagent.$s.disallow_bsta_profile" && found=$((found + 1))
+done
+
+[ "$found" -gt 0 ] || exit 0
+
+uci commit mapagent
+logger -t easymesh-config \
+	"dropped disallow_bsta_profile from $found ap section(s) - the backhaul no longer refuses Profile-1 agents"
+
+exit 0

@@ -1,0 +1,46 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: release the MLD-address entry with its STA-MLD
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+hostapd's assoclist names an MLO client by its MLD address, so the
+polled refresh adds a stalist entry under that address next to the
+per-leg entries the events create. On disconnect, stamld_clean()
+releases the affiliated legs - and nothing else. The MLD-address entry
+lives on, this node keeps listing the departed client in its Associated
+Clients TLV, and the controller keeps handing the client back to the
+node it already left.
+
+Measured 2026-08-05: bpi-8g still claimed the client at 03:15, thirteen
+minutes after its own hostapd deauthed it (03:02:40), and the
+controller obediently flipped sta ownership back to bpi-8g while the
+client was associated elsewhere.
+
+Look the MLD-address entry up before freeing the STA-MLD and release it
+through wifi_del_sta(), which also keeps num_sta and the assoc-control
+bookkeeping straight.
+
+--- a/src/agent_ubus_events.c
++++ b/src/agent_ubus_events.c
+@@ -636,6 +636,22 @@
+ 		if (data[4] && hwaddr_aton(blobmsg_data(data[4]), mlo_macaddr)) {
+ 			stamld = agent_get_stamld(a, mlo_macaddr);
+ 			if (stamld) {
++				struct sta *mld_s = agent_get_sta(a, mlo_macaddr);
++
++				/* The polled assoclist registers the client under its
++				 * MLD address too, and stamld_clean() only releases the
++				 * affiliated legs. The MLD-address entry lived on, so
++				 * this node kept reporting a departed client in its
++				 * Associated Clients TLV, and the controller kept
++				 * handing the client back to it. Release it with the
++				 * STA-MLD. */
++				if (mld_s) {
++					struct netif_ap *mld_ap = agent_get_ap(a, mld_s->bssid);
++
++					if (mld_ap)
++						wifi_del_sta(a, mld_ap->ifname, mlo_macaddr);
++				}
++
+ 				stamld_free(a, stamld);
+ 				return;
+ 			}

@@ -1,0 +1,106 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: write the neighbor routing view (schema table 17 finally gets a writer)
+
+The neighbor table was created for the mesh map and never written - the
+only statement that ever referenced it was the janitor DELETE. The
+2026-08-04 handoff carried it as item 1.7 ("0 rows while the radio
+plainly hears neighbours").
+
+Fill it from the authoritative source we already persist: right after
+mapc_sync_topology() rebuilds topology_link, a recursive walk from the
+controller derives, for every reachable node, the first-hop neighbour
+(next_hop) and the distance (num_hops). Verified against a copy of the
+live lab database: the chained mesh comes out as
+8g -> (8g, 1 hop), x8 -> (8g, 2 hops).
+
+Ownership split inside a row: pos_x/y/z belong to the user (mesh map
+placement) and are never touched here; next_hop/num_hops belong to this
+rebuild; unreachable nodes keep their row and positions but lose the
+routing fields; deleting rows is the ageout janitor\x27s job. path_loss
+stays NULL until a per-link quality source lands (follow-up: the
+affiliated/bsta rcpi chain).
+
+Verify on hardware: select * from neighbor after a topology cycle -
+one row per remote node with correct next_hop/num_hops; re-parent a
+node and watch the row follow; positions survive every rebuild.
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -830,6 +830,78 @@
+ 		warn("mapc_sync: topology commit: %s\n", mapdb_last_error(c->db));
+ 		mapdb_rollback(c->db);
+ 	}
++
++	/* Rebuild the neighbor routing view from the edges just written, in
++	 * its own transaction right after the edge commit. neighbor was created for the mesh map (17) and
++	 * never had a writer. Rows are keyed by AL-MAC and carry two kinds of
++	 * data with different owners: pos_x/y/z belong to the USER (map
++	 * placement - never touched here), next_hop/num_hops belong to this
++	 * rebuild. Unreachable nodes keep their row and positions but lose
++	 * next_hop/num_hops; deletion is the janitor's job (ageout).
++	 * path_loss stays NULL until a per-link quality source lands. */
++	{
++		static const char * const nb_fixed[] = {
++			"CREATE TEMP TABLE IF NOT EXISTS _reach "
++			"(almac TEXT PRIMARY KEY, hop1 TEXT, hops INTEGER)",
++			"DELETE FROM _reach",
++		};
++		static const char *nb_reach =
++			"WITH RECURSIVE reach(almac, hop1, hops) AS ("
++			" SELECT child_almac, child_almac, 1 FROM topology_link"
++			"  WHERE parent_almac = ?1"
++			" UNION ALL"
++			" SELECT t.child_almac, r.hop1, r.hops + 1"
++			"   FROM topology_link t JOIN reach r ON t.parent_almac = r.almac"
++			"  WHERE r.hops < 16) "
++			"INSERT INTO _reach(almac, hop1, hops) "
++			"SELECT almac, hop1, MIN(hops) FROM reach GROUP BY almac";
++		static const char * const nb_apply[] = {
++			"UPDATE neighbor SET next_hop = NULL, num_hops = NULL",
++			"INSERT OR IGNORE INTO neighbor(neighbor) SELECT almac FROM _reach",
++			"UPDATE neighbor SET "
++			"next_hop = (SELECT hop1 FROM _reach WHERE _reach.almac = neighbor.neighbor), "
++			"num_hops = (SELECT hops FROM _reach WHERE _reach.almac = neighbor.neighbor) "
++			"WHERE neighbor IN (SELECT almac FROM _reach)",
++		};
++		char self[18];
++		size_t i;
++
++		mac2str(c->almacaddr, self);
++
++		if (mapdb_begin(c->db) != MAPDB_OK)
++			return;
++
++		for (i = 0; i < sizeof(nb_fixed)/sizeof(nb_fixed[0]); i++) {
++			if (mapdb_exec(c->db, nb_fixed[i]) != MAPDB_OK) {
++				mapdb_rollback(c->db);
++				return;
++			}
++		}
++
++		st = NULL;
++		if (mapdb_prepare(c->db, nb_reach, &st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++		mapdb_bind_text(st, 1, self);
++		if (stmt_finish(c->db, st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++
++		for (i = 0; i < sizeof(nb_apply)/sizeof(nb_apply[0]); i++) {
++			if (mapdb_exec(c->db, nb_apply[i]) != MAPDB_OK) {
++				mapdb_rollback(c->db);
++				return;
++			}
++		}
++
++		if (mapdb_commit(c->db) != MAPDB_OK) {
++			warn("mapc_sync: neighbor commit: %s\n",
++			     mapdb_last_error(c->db));
++			mapdb_rollback(c->db);
++		}
++	}
+ }
+ 
+ /* ---- apmld (+ affiliated_ap) ------------------------------------------ */

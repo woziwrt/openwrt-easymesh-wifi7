@@ -1,0 +1,171 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 990: a phantom interface must not silence the node
+
+agent_init_interfaces() re-arms init_ifaces_scheduler at a flat IFACE_TIMEOUT
+every time a ubus "status" call fails -- once per failing interface, once per
+pass. A config section naming an interface the board does not have can never
+resolve, so that retry runs at 1 Hz for the lifetime of the daemon. Each pass
+goes back through agent_init_wifi_radios(), which re-reads the opclass
+preferences of every radio.
+
+Measured on hardware 2026-07-30, three-node mesh, all nodes up 11 h 36 m, no
+crash and no MCU timeout. The Pro-8X agent carried a leftover
+
+  config bsta
+	option ifname 'wlan2'
+	option enabled '1'
+
+for an interface present in neither /etc/config/wireless nor iw dev. In a 16 s
+window at log level 4 it produced 193 failed status calls, 78 "Duplicate 'ap'",
+26 "Duplicate 'bsta'" and 2178 wifi_ubus_opclass_preferences_cb -- 136 per
+second. The healthy node in the same mesh, same firmware, logged 1330 bytes in
+the same window; this one logged 375 kB.
+
+What that costs is not throughput. In that state the agent serviced exactly two
+CMDU types, AP-Autoconfig Search and Topology Discovery. Three Topology Queries
+were captured arriving on its bsta-mld-3 and handle_topology_query() was never
+reached, so not one Topology Response left the node -- confirmed from the other
+side too, where only the healthy agent's responses arrived.
+
+The controller therefore kept the node's very first report forever: parent
+86:f7:56:41:01:d4 (the controller) when the node had long since re-parented to
+ca:8e:1d:ca:bc:af, and num_bsta 1 when it was running two links. Nothing
+reported a fault. The node was associated, bridged and forwarding at 2.6 Gbit/s
+on both links, so every liveness check passed while the controller's map of the
+mesh was wrong.
+
+Re-arm once per pass instead of once per failure, and back the delay off
+1, 2, 4 ... IFACE_RETRY_MAX seconds. Boot is unaffected -- the first retries
+still land at 1 s, so an interface that appears late is picked up exactly as
+before -- and the event-driven callers in mld.c and agent_ubus_events.c keep
+arming the timer directly, so a real wifi event still forces an immediate pass.
+A pass that resolves everything resets the backoff.
+
+Once the delay reaches the ceiling the retry says so in the log every time.
+A node that never finishes interface init looks healthy from the outside; it
+should at least be loud from the inside.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -u -r a/src/agent.c b/src/agent.c
+--- a/src/agent.c	2026-07-30 08:02:42.902311497 +0200
++++ b/src/agent.c	2026-07-30 08:02:42.903450392 +0200
+@@ -4407,6 +4407,54 @@
+ 	return 0;
+ }
+ 
++/* One interface that can never resolve must not cost the node its mesh
++ * membership.
++ *
++ * Both interface loops below re-armed init_ifaces_scheduler at a flat
++ * IFACE_TIMEOUT after every failed ubus "status" call. A config section that
++ * names an interface this board does not have never resolves, so that retry ran
++ * at 1 Hz for the lifetime of the daemon, and every pass re-read the opclass
++ * preferences of every radio.
++ *
++ * Measured on hardware 2026-07-30 (bpi-x8, three-node mesh, 11 h uptime): one
++ * leftover 'bsta' section naming wlan2 -- an interface present in neither
++ * /etc/config/wireless nor iw dev -- produced 193 failed status calls and 2178
++ * wifi_ubus_opclass_preferences_cb in 16 s. In that state the agent serviced
++ * only AP-Autoconfig Search and Topology Discovery: three Topology Queries
++ * arrived on the wire (captured on bsta-mld-3) and handle_topology_query() was
++ * never reached, so not one Topology Response was sent. The controller kept the
++ * node's very first report forever -- wrong parent, wrong affiliated-bSTA count
++ * -- while every health check passed, because the node was associated and
++ * forwarding on both links.
++ *
++ * Back the retry off 1, 2, 4 ... IFACE_RETRY_MAX seconds instead. Boot is
++ * unaffected: the first retries still land at 1 s, so an interface that shows up
++ * late is picked up as before. The event-driven callers (mld.c,
++ * agent_ubus_events.c) keep arming the timer directly, so a real wifi event
++ * still forces an immediate pass and resets the backoff on the next clean one.
++ */
++static void agent_retry_init_ifaces(struct agent *a)
++{
++	unsigned int delay = IFACE_TIMEOUT;
++	unsigned int i;
++
++	for (i = 0; i < a->init_ifaces_retries && delay < IFACE_RETRY_MAX; i++)
++		delay *= 2;
++
++	if (delay > IFACE_RETRY_MAX)
++		delay = IFACE_RETRY_MAX;
++
++	a->init_ifaces_retries++;
++
++	/* Loud on purpose: a node that never completes interface init still
++	 * looks healthy from the outside. */
++	if (delay == IFACE_RETRY_MAX)
++		warn("%s: interface init still incomplete after %u attempts, retrying every %us\n",
++		     __func__, a->init_ifaces_retries, delay);
++
++	timer_set(&a->init_ifaces_scheduler, delay * 1000);
++}
++
+ static int agent_init_interfaces(struct agent *a)
+ {
+ 	trace("%s: --->\n", __func__);
+@@ -4419,6 +4467,7 @@
+ 	struct mld_credential *mldcred = NULL;
+ 	struct netif_mld *mld = NULL, *tmp;
+ #endif
++	bool iface_unresolved = false;
+ 
+ 	if (list_empty(&a->radiolist)) {
+ 		warn("%s: Failure initializing radios, retry in 10s\n", __func__);
+@@ -4523,8 +4572,7 @@
+ 		ret = ubus_call_object(a->ubus_ctx, obj_id, "status", status_cb, fn);
+ 		if (ret) {
+ 			err("Failed to get '%s' (ret = %d) name:%s\n", "status", ret, objname);
+-			timer_set(&a->init_ifaces_scheduler,
+-				IFACE_TIMEOUT * 1000);
++			iface_unresolved = true;
+ 		}
+ 
+ 		bss = &fn->bss;
+@@ -4622,8 +4670,7 @@
+ 		ret = ubus_call_object(a->ubus_ctx, bn->obj_id, "status", bk_parser, bn);
+ 		if (ret) {
+ 			dbg("Failed to get '%s' (ret = %d) ifname:%s\n", "status", ret, bn->ifname);
+-			timer_set(&a->init_ifaces_scheduler,
+-					IFACE_TIMEOUT * 1000);
++			iface_unresolved = true;
+ 		}
+ 
+ 		if (bn->connected)
+@@ -4696,6 +4743,12 @@
+ 		timer_set(&a->reload_scheduler, 5 * 1000);
+ 	}
+ 
++	/* Re-arm once per pass, not once per unresolved interface. */
++	if (iface_unresolved)
++		agent_retry_init_ifaces(a);
++	else
++		a->init_ifaces_retries = 0;
++
+ 	return 0;
+ }
+ 
+diff -u -r a/src/agent.h b/src/agent.h
+--- a/src/agent.h	2026-07-30 08:02:42.902230594 +0200
++++ b/src/agent.h	2026-07-30 08:02:42.902689603 +0200
+@@ -82,6 +82,9 @@
+ 
+ 
+ #define IFACE_TIMEOUT 1
++/* Ceiling for the interface-init retry backoff, in seconds.
++ * See agent_retry_init_ifaces(). */
++#define IFACE_RETRY_MAX 60
+ #define MAPAGENT_OBJECT		"map.agent"
+ #define MAPAGENT_DBG_OBJECT	"map.agent.dbg"
+ #define MAP_UPLINK_PATH 	"/var/run/multiap/multiap.backhaul"
+@@ -756,6 +759,9 @@
+ 	atimer_t onboarding_scheduler;
+ 	atimer_t disable_unconnected_bstas_scheduler;
+ 	atimer_t init_ifaces_scheduler;
++	/* consecutive interface-init passes that left a ubus object
++	 * unresolved; drives the retry backoff */
++	unsigned int init_ifaces_retries;
+ 	atimer_t enable_fhs_scheduler;
+ 	atimer_t boot_scan_scheduler;
+ 	atimer_t agent_periodic_run;

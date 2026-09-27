@@ -1,0 +1,78 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: the MLD must not overwrite a counted num_sta
+
+993 and 999994 both aimed at the same field and both left the count wrong on
+hardware. 999994 was verified on 2026-08-27 with the image deployed to all
+four nodes: an agent with two clients on its radio reported one, another with
+two reported none.
+
+The arithmetic in agent.c was never the problem. mld_parse_affiliated_ap()
+assigned ap->num_sta unconditionally from the MLD status object, and it runs
+after agent.c has done its work. Every AP affiliated with a fronthaul MLD -
+which is all of them - therefore had its counted value replaced by whatever
+the MLD reported, and the MLD reports zero for the same reason the per-AP
+object does:
+
+	iw dev ap-mld-1 station dump      2 stations
+	ubus wifi.ap.ap-mld-1 stations    2 entries, correct MACs
+	ubus wifi.ap.ap-mld-1 status      "num_stations": 0
+	ubus wifi.apmld.ap-mld-1 status   "num_stations": 0, three times
+	ubus map.agent status             num_sta 1 on one node, 0 on the other
+
+Apply the same rule agent.c already uses: believe a non-zero count, and when
+the MLD says none while stations are still held, count them. A real
+last-client-leaves empties the list too, so a genuine zero still lands.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/mld.c
++++ b/src/mld.c
+@@ -325,8 +325,46 @@
+ 	if (tb[9])
+ 		strncpy(ap->standard, blobmsg_data(tb[9]), sizeof(ap->standard) - 1);
+ 
+-	if (tb[10])
+-		ap->num_sta = blobmsg_get_u32(tb[10]);
++	if (tb[10]) {
++		uint32_t mld_num_sta = blobmsg_get_u32(tb[10]);
++
++		/* Do not undo a count that was worked out from the list.
++		 *
++		 * This assignment used to be unconditional, and it runs after
++		 * the guard in parse_ap_status()/agent.c, so it had the last
++		 * word on ap->num_sta for every AP affiliated with an MLD -
++		 * which, on a fronthaul MLD, is all of them. Measured
++		 * 2026-08-27 on two agents, each serving two clients, well
++		 * after boot:
++		 *
++		 *   iw dev ap-mld-1 station dump      2 stations
++		 *   ubus wifi.ap.ap-mld-1 stations    2 entries, correct MACs
++		 *   ubus wifi.ap.ap-mld-1 status      "num_stations": 0
++		 *   ubus wifi.apmld.ap-mld-1 status   "num_stations": 0 (x3)
++		 *   ubus map.agent status             num_sta 1 and 0
++		 *
++		 * The MLD object reports zero for the same reason the per-AP
++		 * object does, and this line copied that zero over a figure
++		 * agent.c had just counted correctly. That is why 993 and
++		 * 999994 both looked almost right and never matched: they fixed
++		 * the arithmetic but were not the last writer.
++		 *
++		 * Same rule as agent.c: believe a non-zero count, and when the
++		 * MLD says none while we are still holding stations, count them
++		 * instead. A genuine last-client-leaves empties stalist too, so
++		 * a real zero still lands. */
++		if (mld_num_sta > 0 || list_empty(&ap->stalist)) {
++			ap->num_sta = mld_num_sta;
++		} else {
++			struct sta *s;
++			uint32_t n = 0;
++
++			list_for_each_entry(s, &ap->stalist, list)
++				n++;
++
++			ap->num_sta = n;
++		}
++	}
+ 
+ 	ap->enabled = tb[17] ? blobmsg_get_bool(tb[17]) : false;
+ 

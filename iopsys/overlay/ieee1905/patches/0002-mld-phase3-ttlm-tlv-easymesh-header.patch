@@ -1,0 +1,45 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: mld phase3 ttlm tlv easymesh header
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/extensions/map/easymesh.h
++++ b/src/extensions/map/easymesh.h
+@@ -1720,6 +1720,38 @@
+ 	} __attribute__ ((packed)) mld[];
+ } __attribute__ ((packed));
+ 
++#if (EASYMESH_VERSION >= 6)
++/** TLV: TID-to-Link Mapping Policy TLV (0xE6)
++ *
++ * WOZIWRT R6 DB Phase 1.5 (step 3) - first open definition of this TLV. The
++ * base easymesh.h declared only the type number
++ * (MAP_TLV_TID_TO_LINK_MAPPING_POLICY); no struct existed. Variable-length: a
++ * count of MLD blocks, each carrying a variable count of {tid,dir,linkid}
++ * mappings, so walk the bytes with a running offset (a blind cast over the
++ * trailing arrays is unsafe). 'dir' carries a WIFI7_TID_TO_LINK_* value; the
++ * default map uses WIFI7_TID_TO_LINK_SUPP_NxM.
++ *
++ * Wire layout (agent serialize == controller parse, byte-for-byte):
++ *   num_mlds : u8
++ *   per MLD:
++ *     mld_macaddr  : u8[6]
++ *     num_mappings : u8
++ *     num_mappings * { tid u8 ; dir u8 ; linkid u8 }
++ */
++struct tlv_tid_to_link_mapping_policy {
++	uint8_t num_mlds;
++	struct tid_to_link_mld {
++		uint8_t mld_macaddr[6];
++		uint8_t num_mappings;
++		struct tid_to_link_map {
++			uint8_t tid;
++			uint8_t dir;
++			uint8_t linkid;
++		} __attribute__ ((packed)) map[];
++	} __attribute__ ((packed)) mld[];
++} __attribute__ ((packed));
++#endif
++
+ /** TLV: BSTA MLD Configuration TLV */
+ struct tlv_bsta_mld_config {
+ 	uint8_t flag;

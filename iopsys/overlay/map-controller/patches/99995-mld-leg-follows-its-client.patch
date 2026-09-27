@@ -1,0 +1,98 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99995: let an MLD leg follow its client when it roams
+
+An affiliated leg gets its BSSID in sta_table when it associates, and nothing
+moves it when the MLD roams to another node. parse_associated_sta_mld_config()
+rebuilds sm->stalist from the TLV, so affiliated_sta learns the new BSS, but the
+struct sta the metrics path uses keeps the old one. The two then disagree about
+the same leg.
+
+handle_sta_link_metrics_response() compares the agent's per-link report against
+that stale copy and drops the measurement.
+
+Measured on hardware 2026-08-04, one MLO client steered from 4g to x8:
+
+	affiliated_sta  96:d4:32:c3:fc:c0 -> 0a:0c:43:26:a0:10   x8, where it is
+	sta_table       96:d4:32:c3:fc:c0 -> 7e:04:1c:81:7c:2e   4g, where it was
+
+	Ignore STA 96:d4:32:c3:fc:c0 link-metrics with different bssid
+	rcpi_steer: STA 96:d4:32:c3:fc:c0 connected to 7e:04:1c:81:7c:2e
+	            on channel 1 has RCPI = 255
+
+The agent measured it correctly - libwifi reported -26 dBm on the active link -
+sent it, and the controller threw it away against its own stale copy. It then
+steered on RCPI 255, which is the value that means "never measured". Nothing
+warned, because from the controller's side both halves looked consistent.
+
+The Associated STA MLD Configuration TLV is the agent stating which BSS each
+leg is on right now. Let the leg follow it, and record the reporting node while
+we are there.
+
+This is the same shape as the two defects found earlier today: one piece of
+state with two writers that do not agree. Here the fix is to give the stale
+writer the authoritative value rather than to add a third.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -4558,12 +4558,15 @@
+  */
+ static void parse_associated_sta_mld_config(struct node *n, struct cmdu_buff *cmdu)
+ {
++	struct controller *c;
+ 	struct tlv *t;
+ 	int rem;
+ 
+ 	if (!n || !cmdu)
+ 		return;
+ 
++	c = n->cntlr;
++
+ 	rem = cmdu->datalen;
+ 	{
+ 		struct tlv *tt;
+@@ -4659,6 +4662,46 @@
+ 			memcpy(as->macaddr, ent + 6, 6);
+ 			list_add_tail(&as->list, &sm->stalist);
+ 			sm->num_sta++;
++
++			/* A leg's entry in sta_table keeps the BSSID it had when
++			 * it associated, and nothing moves it when the MLD roams.
++			 * handle_sta_link_metrics_response() compares the agent's
++			 * per-link report against that stale value and throws the
++			 * measurement away. Measured 2026-08-04, one client steered
++			 * from 4g to x8:
++			 *
++			 *   affiliated_sta  96:d4:32:c3:fc:c0 -> 0a:0c:43:26:a0:10  (x8, where it is)
++			 *   sta_table       96:d4:32:c3:fc:c0 -> 7e:04:1c:81:7c:2e  (4g, where it was)
++			 *
++			 *   Ignore STA 96:d4:32:c3:fc:c0 link-metrics with different bssid
++			 *   rcpi_steer: STA 96:d4:32:c3:fc:c0 connected to 7e:04:1c:81:7c:2e
++			 *               ... has RCPI = 255
++			 *
++			 * So the agent measures the right thing, sends it, and the
++			 * controller discards it against its own stale copy - and
++			 * then steers on RCPI 255, which means "never measured".
++			 *
++			 * This TLV is the agent saying which BSS each leg is on now.
++			 * Let the leg follow it.
++			 */
++			if (c) {
++				struct sta *ls = cntlr_find_sta(c->sta_table,
++								as->macaddr);
++
++				if (ls && memcmp(ls->bssid, as->bssid, 6)) {
++					dbg("%s: leg " MACFMT " moved " MACFMT
++					    " -> " MACFMT "\n", __func__,
++					    MAC2STR(as->macaddr),
++					    MAC2STR(ls->bssid), MAC2STR(as->bssid));
++
++					memcpy(ls->bssid, as->bssid, 6);
++					if (ls->de_sta)
++						memcpy(ls->de_sta->bssid,
++						       as->bssid, 6);
++					memcpy(ls->agent_almacaddr,
++					       n->almacaddr, 6);
++				}
++			}
+ 		}
+ 
+ 		err("E2TRACE: ULOZEN sta_mld " MACFMT " pod ap_mld " MACFMT " links=%u\n",

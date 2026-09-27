@@ -1,0 +1,43 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Watch for backhaul credentials the mesh delivers over the wire and build
+# the MLD backhaul from them. See /usr/sbin/bh-key-adopt for the whole story.
+# START=99: it only reads state others have written, and its first check is
+# a full INTERVAL after boot - nothing at boot time depends on it.
+
+START=99
+USE_PROCD=1
+
+# The gate lives in a file this package ships. If it is ever not there, say so
+# out loud: a service that silently stops starting is the failure this whole
+# layer exists to avoid. Note the [ -r ] - sourcing a missing file ends the
+# script outright in ash, so `if ! . file` would never reach its else branch.
+if [ -r /usr/share/easymesh/boot-window.sh ]; then
+	. /usr/share/easymesh/boot-window.sh
+else
+	logger -t bh-key-adopt "cannot read /usr/share/easymesh/boot-window.sh - refusing to start"
+	is_mesh_node() { return 1; }
+fi
+
+start_service() {
+	# Nobody has made this box a mesh node, so there are no backhaul credentials
+	# coming and nothing to adopt them into. The test belongs here and not in the
+	# worker: this is a respawn service, and a worker that exits immediately is
+	# not quiet, it is a crash loop - six of them in two minutes when the same
+	# guard went one layer too low in mld-bsta-bridge on 2026-08-17.
+	is_mesh_node || return 0
+	# A controller is handed its key at setup, and the worker's loop skips a
+	# controller on its very first line - but not before it has spawned
+	# `ubus listen wps_credentials`, whose spool (/tmp/bh-adopt-wps.log) is
+	# only ever truncated on the agent path. Seen running on the BPI-R4 Pro 8X controller
+	# 2026-09-22 (pid 20537 plus its listener), doing nothing but growing a
+	# file in RAM. Decline here rather than loop for nothing.
+	[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] && return 0
+	procd_open_instance
+	procd_set_param command /usr/sbin/bh-key-adopt
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_close_instance
+}

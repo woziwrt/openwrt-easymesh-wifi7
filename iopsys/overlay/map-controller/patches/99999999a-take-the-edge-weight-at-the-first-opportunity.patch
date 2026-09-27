@@ -1,0 +1,68 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: take the edge weight at the first opportunity
+
+rcpi_at_start was NULL on five edges out of six.
+
+Not a broken join: an edge is recorded the moment it appears, and at that
+moment the child bSTA has usually not been measured yet - it has just
+associated. The signal arrives seconds later, by which time the row is
+already written.
+
+So the snapshot is taken at the first opportunity instead of only at the
+first instant. While the edge is still open and the weight is still unknown,
+the next sync that has a real signal writes it; once written it is never
+revised, because the column records what the choice looked like, not how the
+link behaved afterwards - that is metric_hist.
+
+Still NULL when nothing is known. A column that is sometimes NULL is a
+nuisance; a column filled with zeros that read as measurements is the defect
+this whole series of patches has been closing.
+
+Verify: after a re-parent, the new row may be NULL for a few seconds and must
+then carry a plausible rcpi - and must never become 0.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -931,6 +931,40 @@
+ 			mapdb_bind_int(st, 1, now_ts);
+ 			stmt_finish(c->db, st);
+ 		}
++
++		/* Fill in the weight once it exists.
++		 *
++		 * An edge is recorded the moment it appears, and at that moment
++		 * the child's bSTA has usually not been measured yet - it has
++		 * just associated. Measured after the first deploy: one edge of
++		 * six carried a value, five were NULL.
++		 *
++		 * So the snapshot is taken at the first opportunity rather than
++		 * only at the first instant: while the edge is still open and
++		 * the weight is still unknown, the next sync that has a real
++		 * signal writes it. Once written it is never revised - it is
++		 * meant to record what the choice looked like, not to follow
++		 * the link afterwards. That is metric_hist's job.
++		 *
++		 * Left NULL when nothing is known. A column that is mostly NULL
++		 * is a nuisance; a column filled with zeros that read as
++		 * measurements is a defect. */
++		static const char *weigh_sql =
++			"UPDATE topology_link_history SET rcpi_at_start = ("
++			"  SELECT s.rcpi FROM sta s"
++			"    JOIN bstamld b ON b.mld_macaddr = s.macaddr"
++			"   WHERE b.agent_almac = topology_link_history.child_almac"
++			"     AND s.rcpi BETWEEN 1 AND 254 LIMIT 1) "
++			"WHERE to_ts IS NULL AND rcpi_at_start IS NULL "
++			"  AND EXISTS ("
++			"  SELECT 1 FROM sta s"
++			"    JOIN bstamld b ON b.mld_macaddr = s.macaddr"
++			"   WHERE b.agent_almac = topology_link_history.child_almac"
++			"     AND s.rcpi BETWEEN 1 AND 254)";
++
++		st = NULL;
++		if (mapdb_prepare(c->db, weigh_sql, &st) == MAPDB_OK)
++			stmt_finish(c->db, st);
+ 	}
+ 
+ 	/* Fold the backhaul signal into the hourly series.

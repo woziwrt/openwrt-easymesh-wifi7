@@ -1,0 +1,89 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] mapdb: schema v3 - row timestamps and a signal-history table
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+The DB knows only "now": sta rows carry no timestamps, so staleness is
+invisible, and a single rcpi value cannot say "below -68 for ten minutes"
+- which is the difference between a weak steering signal and a strong one
+(live-model-vs-DB design, 2026-08-04).
+
+v3 adds first_seen/last_seen to sta, last_seen to affiliated_sta, a small
+sta_metrics_hist sample table and the sta_trend view (10-minute avg/min
+per client and leg) that phase-5 policy code will read instead of raw
+tables. Migration backfills last_seen on existing rows with the migration
+time so the ageout clock starts fresh. Dry-tested against a copy of the
+live 4g database (24 rows, v2 -> v3, content intact).
+
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -16,7 +16,7 @@
+ #define MAPDB_SCHEMA_H
+ 
+ /* Bump when the DDL below changes; drives the schema_version migration gate. */
+-#define MAPDB_SCHEMA_VERSION 2
++#define MAPDB_SCHEMA_VERSION 3
+ 
+ /* schema.sql, verbatim. CREATE TABLE IF NOT EXISTS throughout -> idempotent. */
+ static const char MAPDB_SCHEMA_SQL[] =
+@@ -286,6 +286,8 @@
+ 	"    hostname             TEXT,               -- [:316]\n"
+ 	"    ipv4                 TEXT, ipv6 TEXT,    -- [:314/:315]\n"
+ 	"    assoc_frame          TEXT                -- reassoc_frame hex [:323]\n"
++	"    , first_seen         INTEGER             -- v3: epoch of first insert\n"
++	"    , last_seen          INTEGER             -- v3: epoch of last upsert\n"
+ 	");\n"
+ 	"\n"
+ 	"-- 16. scan results (iopsys wifi_scanres_element)\n"
+@@ -348,6 +350,7 @@
+ 	"    rcpi                 INTEGER,            -- [:437]\n"
+ 	"    dl_rate INTEGER, ul_rate INTEGER,        -- [:438/:439]\n"
+ 	"    bytes_tx INTEGER, bytes_rx INTEGER,      -- [:431/:432]\n"
++	"    last_seen            INTEGER,            -- v3: epoch of last upsert\n"
+ 	"    PRIMARY KEY (macaddr, bssid)\n"
+ 	");\n"
+ 
+@@ -402,6 +405,25 @@
+ 	"    mld_macaddr          TEXT REFERENCES bstamld(mld_macaddr),\n"
+ 	"    ruid                 TEXT                -- radio hosting the link [:430]\n"
+ 	");\n"
++	"\n"
++	"-- ---------- v3 : DB policy pack (signal history for trends) ----------\n"
++	"CREATE TABLE IF NOT EXISTS sta_metrics_hist (\n"
++	"    macaddr TEXT NOT NULL,                 -- client (MLD for MLO)\n"
++	"    bssid   TEXT NOT NULL,                 -- leg/BSS the sample was on\n"
++	"    rcpi    INTEGER,\n"
++	"    dl_rate INTEGER,\n"
++	"    ul_rate INTEGER,\n"
++	"    ts      INTEGER NOT NULL               -- epoch seconds\n"
++	");\n"
++	"CREATE INDEX IF NOT EXISTS idx_hist_mac_ts ON sta_metrics_hist(macaddr, ts);\n"
++	"-- policy reads views, not raw tables (phase-5 contract)\n"
++	"DROP VIEW IF EXISTS sta_trend;\n"
++	"CREATE VIEW sta_trend AS\n"
++	"    SELECT macaddr, bssid, AVG(rcpi) AS avg_rcpi, MIN(rcpi) AS min_rcpi,\n"
++	"           COUNT(*) AS samples\n"
++	"    FROM sta_metrics_hist\n"
++	"    WHERE ts > strftime('%s','now') - 600\n"
++	"    GROUP BY macaddr, bssid;\n"
+ ;
+ 
+ #endif /* MAPDB_SCHEMA_H */
+--- a/src/db/mapdb.c
++++ b/src/db/mapdb.c
+@@ -98,6 +98,16 @@
+ 	mapdb_exec(db, "ALTER TABLE sta_mld ADD COLUMN ap_mld_macaddr TEXT");
+ 	mapdb_exec(db, "ALTER TABLE sta_mld ADD COLUMN last_seen INTEGER");
+ 
++	/* v2 -> v3: DB policy pack - row timestamps. The backfill stamps
++	 * pre-v3 rows with the migration time so the ageout clock starts
++	 * now instead of instantly reaping records of unknown age. The
++	 * history table and the trend view arrive via the DDL above. */
++	mapdb_exec(db, "ALTER TABLE sta ADD COLUMN first_seen INTEGER");
++	mapdb_exec(db, "ALTER TABLE sta ADD COLUMN last_seen INTEGER");
++	mapdb_exec(db, "ALTER TABLE affiliated_sta ADD COLUMN last_seen INTEGER");
++	mapdb_exec(db, "UPDATE sta SET last_seen=strftime('%s','now') "
++		       "WHERE last_seen IS NULL");
++
+ 	if (mapdb_prepare(db, "UPDATE schema_version SET version=?, applied_at=?",
+ 			  &st) != MAPDB_OK)
+ 		return MAPDB_ERR;

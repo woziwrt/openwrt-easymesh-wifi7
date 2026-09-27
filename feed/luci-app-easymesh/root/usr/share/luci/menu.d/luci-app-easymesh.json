@@ -1,0 +1,118 @@
+{
+ "admin/network/easymesh": {
+  "title": "EasyMesh",
+  "order": 18,
+  "action": {
+   "type": "firstchild"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-easymesh"
+   ]
+  }
+ },
+ "admin/network/easymesh/overview": {
+  "title": "Overview",
+  "order": 1,
+  "action": {
+   "type": "view",
+   "path": "easymesh/overview"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/nodes": {
+  "title": "Nodes",
+  "order": 2,
+  "action": {
+   "type": "view",
+   "path": "easymesh/nodes"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/clients": {
+  "title": "Clients",
+  "order": 3,
+  "action": {
+   "type": "view",
+   "path": "easymesh/clients"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/backhaul": {
+  "title": "Backhaul & MLO",
+  "order": 4,
+  "action": {
+   "type": "view",
+   "path": "easymesh/backhaul"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/channels": {
+  "title": "Channels",
+  "order": 5,
+  "action": {
+   "type": "view",
+   "path": "easymesh/channels"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/events": {
+  "title": "Events",
+  "order": 6,
+  "action": {
+   "type": "view",
+   "path": "easymesh/events"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ },
+ "admin/network/easymesh/setup": {
+  "title": "Setup",
+  "order": 7,
+  "action": {
+   "type": "view",
+   "path": "easymesh/setup"
+  },
+  "depends": {
+   "acl": [
+    "luci-app-easymesh-setup"
+   ]
+  }
+ },
+ "admin/network/easymesh/diagnostics": {
+  "title": "Advanced (support)",
+  "order": 8,
+  "action": {
+   "type": "view",
+   "path": "easymesh/diagnostics"
+  },
+  "depends": {
+   "fs": {
+    "/etc/mapc/role": "file"
+   }
+  }
+ }
+}

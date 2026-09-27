@@ -1,0 +1,102 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: borrow the measurement, not the identity
+
+The rssi fallback for MLO clients could never write anything, so the defect
+it was added to fix was never fixed.
+
+wifi_sta_periodic_run() picks the link this BSS is entitled to report, and
+when that link is idle falls back to the strongest link that measured
+something. It did so by repointing `e` at the other link's entry - and
+update_sta_entry() looks its argument up by e->macaddr in THIS ap's stalist:
+
+	list_for_each_entry(s, &ap->stalist, list)
+		if (!memcmp(s->macaddr, e->macaddr, 6))
+
+The borrowed link's address is not in this ap's stalist; it lives on the
+affiliated AP that carries it. The loop found nothing, the function returned
+without writing, and the fallback was a no-op in exactly the case it existed
+for.
+
+It was added 2026-08-03 because an iPhone with three links reported 0 on all
+of them and the controller stored rcpi 255. Measured again 2026-09-07 on the
+bedroom node, unchanged: two of three legs read rssi 0 while the reply
+carried -43 dBm for the leg that was actually being heard. That is also
+where sta.rcpi = 128 comes from - a number matching none of the legs.
+
+So copy the entry that belongs to this BSS and take only the signal from the
+strongest link. The station keeps its own address, the lookup succeeds, and
+the borrowed value lands. `sta` is reused rather than adding another
+wifi_sta to a stack that already holds a whole wifi_mlsta.
+
+Verify: with an MLO client parked on one link, the idle legs must report the
+carrying leg's rssi instead of 0, and the controller must store an rcpi that
+corresponds to a measured link.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1553,27 +1553,56 @@
+ 		 * anything.
+ 		 */
+ 		{
+-			struct wifi_sta *e = &mlsta.sta[0];
++			struct wifi_sta *m = &mlsta.sta[0];
+ 			int li;
+ 
+ 			for (li = 0; li < mlsta.num_link; li++) {
+ 				if (!memcmp(mlsta.sta[li].macaddr, s->macaddr, 6)) {
+-					e = &mlsta.sta[li];
++					m = &mlsta.sta[li];
+ 					break;
+ 				}
+ 			}
+ 
+-			if (e->rssi_avg == 0) {
++			/* Borrow the measurement, never the identity.
++			 *
++			 * The fallback below used to repoint the entry at the
++			 * strongest link. update_sta_entry() then looked THAT
++			 * link up by ITS address in THIS ap's stalist - where it
++			 * cannot be, because it lives on the affiliated AP that
++			 * carries it. The lookup failed silently, nothing was
++			 * written, and the symptom this fallback was added for
++			 * (2026-08-03: three links all reporting 0) survived it
++			 * untouched. Measured again 2026-09-07 on the bedroom
++			 * node: two of three legs still read rssi 0, with -43 dBm
++			 * sitting unused in the reply.
++			 *
++			 * Reuse `sta`, which the non-MLO branch leaves untouched,
++			 * rather than putting another wifi_sta on a stack that
++			 * already carries a whole wifi_mlsta.
++			 */
++			sta = *m;
++
++			if (sta.rssi_avg == 0) {
++				struct wifi_sta *best = NULL;
++
+ 				for (li = 0; li < mlsta.num_link; li++) {
+ 					if (mlsta.sta[li].rssi_avg == 0)
+ 						continue;
+-					if (e->rssi_avg == 0 ||
+-					    mlsta.sta[li].rssi_avg > e->rssi_avg)
+-						e = &mlsta.sta[li];
++					if (!best || mlsta.sta[li].rssi_avg >
++						     best->rssi_avg)
++						best = &mlsta.sta[li];
++				}
++
++				/* Signal only. The address stays this link's, so
++				 * the station is found and the value lands. */
++				if (best) {
++					sta.rssi_avg = best->rssi_avg;
++					memcpy(sta.rssi, best->rssi,
++					       sizeof(sta.rssi));
+ 				}
+ 			}
+ 
+-			update_sta_entry(a, ap, e);
++			update_sta_entry(a, ap, &sta);
+ 		}
+ 	}
+ #endif

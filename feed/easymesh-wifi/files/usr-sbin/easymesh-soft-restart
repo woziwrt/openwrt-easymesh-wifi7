@@ -1,0 +1,282 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-soft-restart - the part of a boot a join needs, without
+# the reboot.
+#
+# Used by the join (easymesh-wps-join, bh-key-adopt) instead of `reboot` when
+# the join runs in its default mode. /etc/mapc/join-with-reboot puts the join
+# back on the old path, where every one of these was a reboot. Developed and measured on 2026-09-19 (A/B against a join
+# with reboots, 30+ rounds), see the pairing-without-reboot notes of 2026-09-19.
+#
+# Every reboot in the join (wps-join phase 1, bh-key-adopt adopt, the
+# fronthaul and address finishers) exists for one reason: a runtime rebuild
+# of the radios was not reliable on MT7996. Patches 0270/0271/0272 fixed the
+# three roots we found with udebug, and `wifi down; sleep 5; wifi up` passed
+# 85/85 on the reload matrix. This replays the part of the boot the reboot
+# was for, in boot order, and nothing else:
+#
+#   1. stop the mesh services, last-started first
+#   2. wifi down, settle
+#   3. the pre-network writers (S<20: genconfig, dnsmasq, firewall ...)
+#   4. network reload - the role change rewrote br-lan, ports, gateway
+#   5. wifi up, wait for the interfaces
+#   6. the mesh services again, in their START order, enabled ones only
+#   7. health check; on failure a udebug snapshot + logread are kept
+#
+# The caller is never touched (bh-key-adopt, wps-join-resume): procd would
+# kill the process that is running us.
+#
+# Where did it break? Every single operation logs BEGIN and END (with rc and
+# seconds) to /etc/mapc/soft-restart.log - synced, so it survives a watchdog
+# reset - and to syslog and /dev/kmsg, so the markers sit on the same
+# timeline as mt76/nl80211 in a udebug snapshot. A BEGIN without its END is
+# the operation the box hung in.
+
+# Which services are replayed is decided by the package that ships them, not
+# by a list of names. Until 2026-09-25 this was a fixed list, and every
+# service added after it was written (beacon-kick, easymesh-linkstat,
+# easymesh-parent-scan, easymesh-nightwatch ...) silently stayed down after a
+# join without a reboot: a repeater that sent no 6 GHz beacons to its
+# children, a controller that knew nothing about the links, a status LED
+# still blinking. Now every boot script of a mesh package is replayed, so a
+# new one cannot fall out again.
+MESH_PKGS="easymesh easymesh-api easymesh-config easymesh-core easymesh-mesh
+easymesh-wifi map-agent map-controller ieee1905 wifimngr"
+# Stock services the join changes the config of (role, br-lan, gateway):
+# dnsmasq, firewall and odhcpd. led (S96) sets the lamps as a boot would;
+# done (S95) is the boot's "status LED stops blinking" and is replayed as
+# set_state only - its mount_root and rc.local belong to a real boot.
+STOCK="dnsmasq firewall odhcpd led done"
+# Never replayed: the callers (procd would kill the process running us),
+# mld-link-check (a boot-time net that restarts wifi; this script has its
+# own health check) and the recorders, whose whole point is to see the join
+# without a gap.
+SKIP="bh-key-adopt wps-join-resume mld-link-check easymesh-trace
+easymesh-logcap easymesh-logkeep"
+
+mesh_services() {
+	for p in $MESH_PKGS; do
+		for l in /lib/apk/packages/$p.list /usr/lib/opkg/info/$p.list; do
+			[ -r "$l" ] && sed -n 's|^/*etc/init\.d/||p' "$l"
+		done
+	done
+}
+SVC=""
+for n in $(mesh_services) $STOCK; do
+	case " $(echo $SKIP) " in *" $n "*) continue ;; esac
+	SVC="$SVC $n"
+done
+
+PLOG=/etc/mapc/soft-restart.log
+FAILDIR=/etc/mapc/soft-restart-fail
+WHY="${1:-unspecified}"
+RUN=$(date +%H%M%S)
+
+say() {
+	mkdir -p /etc/mapc 2>/dev/null
+	echo "$(date +%T) up=$(cut -d' ' -f1 /proc/uptime) [$RUN] $1" >> "$PLOG"
+	sync
+	logger -t soft-restart "[$RUN] $1"
+	echo "soft-restart: [$RUN] $1" > /dev/kmsg 2>/dev/null
+}
+
+# op <label> <command...>: one operation, bracketed.
+op() {
+	_l="$1"; shift
+	say "BEGIN $_l"
+	_t0=$(cut -d. -f1 /proc/uptime)
+	"$@" >/dev/null 2>&1
+	_rc=$?
+	say "END   $_l rc=$_rc $(( $(cut -d. -f1 /proc/uptime) - _t0 ))s"
+	return $_rc
+}
+
+# [ -r ] first: in ash a `.` that cannot open its file ends the script before
+# the `||` branch runs, so the kmsg line below would never have been written.
+# Same rule as /etc/init.d/bh-key-adopt and the worker.
+if [ ! -r /usr/share/easymesh/join-health.sh ]; then
+	echo "soft-restart: join-health.sh missing" > /dev/kmsg 2>/dev/null
+	exit 1
+fi
+. /usr/share/easymesh/join-health.sh
+
+links() { iw dev "$1" info 2>/dev/null | grep -c "channel "; }
+snap() {
+	say "STATE $1: br-lan=[$(ip -4 -o addr show br-lan 2>/dev/null | awk '{print $4}' | tr '\n' ' ')]" \
+	    "ports=[$(ls /sys/class/net/br-lan/brif 2>/dev/null | tr '\n' ' ')]" \
+	    "ifs=[$(iw dev 2>/dev/null | sed -n 's/^[[:space:]]*Interface //p' | tr '\n' ' ')]" \
+	    "l1=$(links ap-mld-1) l2=$(links ap-mld-2)" \
+	    "bsta=$(iw dev bsta-mld-3 link 2>/dev/null | grep -q 'Connected to' && links bsta-mld-3 || echo 0)" \
+	    "run=[$(for p in hostapd wpa_supplicant ieee1905d mapagent mapcontroller wifimngr; do pidof $p >/dev/null && printf '%s ' $p; done)]"
+}
+
+want() { case " $(echo $SVC) " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# The boot of one service. done is only its set_state: mount_root and
+# rc.local belong to a real boot (see STOCK above).
+boot_one() {
+	if [ "$1" = done ]; then
+		( . /etc/diag.sh; set_state done )
+	else
+		/etc/init.d/$1 boot
+	fi
+}
+
+# Boot order straight from rc.d: "NN name" per line.
+order() {
+	for l in /etc/rc.d/S*; do
+		n=${l##*/S}; num=${n%%[!0-9]*}; n=${n#$num}
+		want "$n" && echo "$num $n"
+	done
+}
+
+[ -f "$PLOG" ] && [ "$(wc -l < "$PLOG")" -gt 2000 ] && { tail -n 1000 "$PLOG" > "$PLOG.tmp" && mv "$PLOG.tmp" "$PLOG"; }
+say "==== start ($WHY)"
+snap "before"
+
+for n in $(order | sort -rn | cut -d' ' -f2); do
+	[ "$n" = done ] || op "stop $n" /etc/init.d/$n stop
+done
+# A boot starts from an empty process table; stop does not get us there.
+# Several of these are plain init scripts whose stop() is empty or kills
+# only one pid, and whose start()/boot() background a loop or a delayed
+# worker. Measured 2026-09-19: three mld-bsta-relink loops at once (one per
+# soft restart) relinking one backhaul against each other, and a delayed
+# mld-link-check from the previous soft restart firing its own wifi down/up
+# in the middle of the next one. So after the stops, anything still running
+# from these scripts goes - except this script and whoever called it.
+# mld-link-check is also no longer started again: it is a boot-time net
+# that restarts wifi, and this script has its own health check.
+_keep=" $$ $PPID $(awk '/^PPid:/{print $2}' /proc/$PPID/status 2>/dev/null) "
+for d in /proc/[0-9]*; do
+	pid=${d#/proc/}
+	case "$_keep" in *" $pid "*) continue ;; esac
+	cmd=$(tr '\0' ' ' < $d/cmdline 2>/dev/null) || continue
+	for n in $(echo $SVC) mld-link-check; do
+		case "$cmd" in
+		*"/usr/sbin/$n "*|*"/usr/sbin/$n"|*"/etc/init.d/$n "*|*"/etc/rc.d/S"[0-9][0-9]"$n "*)
+			kill "$pid" 2>/dev/null && say "killed leftover [$pid] ${cmd% }"
+			break ;;
+		esac
+	done
+done
+# mapcontroller is disabled on an agent, so it has no S link to be found by;
+# stop it anyway - a role change is exactly when it must not keep running.
+[ -x /etc/init.d/mapcontroller ] && ! /etc/init.d/mapcontroller enabled &&
+	op "stop mapcontroller (disabled)" /etc/init.d/mapcontroller stop
+snap "services stopped"
+
+op "wifi down" wifi down
+sleep 5
+snap "wifi down"
+
+for n in $(order | awk '$1 < 20 {print $2}'); do
+	op "boot $n" boot_one "$n"
+done
+
+# The radios "appear" again. At boot the kernel announces every wiphy with
+# an ieee80211 add event, and hotplug.d runs its handlers - among them
+# 11-multiap-genconfig -> /lib/wifi/multiap conf, which writes the whole
+# mapagent config (agent enabled, the ap sections WPS delivers its key into)
+# and 10-wifi-detect -> wifi config. wifi down/up never removes a wiphy, so
+# none of it runs. Measured 2026-09-19 against a join with reboots: before
+# the first reboot 0 mapagent ap sections, after it 8 - and without them the
+# WPS key had nowhere to go.
+for ph in $(ls /sys/class/ieee80211 2>/dev/null); do
+	dp=$(readlink -f /sys/class/ieee80211/$ph); dp=${dp#/sys}
+	op "hotplug ieee80211 add $ph" env ACTION=add DEVPATH="$dp" DEVICENAME="$ph" \
+		SUBSYSTEM=ieee80211 /sbin/hotplug-call ieee80211
+done
+
+op "network reload" /etc/init.d/network reload
+# netifd rebuilds the bridge in the background; the address the config asks
+# for is the sign it is done. Blind sleeps hide a slow step, a wait says how
+# long it took.
+want_ip=$(uci -q get network.lan.ipaddr)
+t=0
+while [ $t -lt 20 ]; do
+	ip -4 -o addr show br-lan 2>/dev/null | grep -q " ${want_ip%/*}/" && break
+	sleep 1; t=$((t + 1))
+done
+say "br-lan has ${want_ip:-?} after ${t}s"
+sleep 2
+snap "network reloaded"
+
+op "wifi up" wifi up
+# The daemons below attach to hostapd, so they must not start while it is
+# still building links: wait until netifd calls every radio up and every
+# AP-MLD's hostapd object answers.
+radios_up() {
+	ubus -t 5 call network.wireless status 2>/dev/null |
+		grep -q '"up": false' && return 1
+	ubus -t 5 call network.wireless status 2>/dev/null | grep -q '"up": true'
+}
+mlds_answer() {
+	for m in $(ls /sys/class/net 2>/dev/null | grep '^ap-mld-'); do
+		ubus -t 3 call hostapd.$m get_status >/dev/null 2>&1 || return 1
+	done
+	return 0
+}
+t=0
+while [ $t -lt 60 ]; do
+	radios_up && mlds_answer && break
+	sleep 2; t=$((t + 2))
+done
+say "radios up + hostapd answering after ${t}s$([ $t -ge 60 ] && echo ' (TIMEOUT)')"
+# What is on the air now, as far as config goes (see multiap wireless_reload).
+uci -q export wireless 2>/dev/null | md5sum | cut -d' ' -f1 > /tmp/wireless.applied.md5
+sleep 5
+snap "wifi up"
+
+for n in $(order | awk '$1 >= 20 {print $2}'); do
+	op "boot $n" boot_one "$n"
+done
+snap "services started"
+
+# Health: give the backhaul and the daemons up to 90 s to find each other.
+# What is expected depends on where in the join we are, so each piece is
+# reported on its own rather than as one verdict - the MLD APs exist only
+# after adopt, the controller is only reachable once the backhaul stands.
+t=0
+uci -q get wireless.sta_mld_1 >/dev/null || t=90
+while [ $t -lt 90 ]; do
+	iw dev bsta-mld-3 link 2>/dev/null | grep -q 'Connected to' &&
+		pidof mapagent >/dev/null && pidof ieee1905d >/dev/null && break
+	sleep 3; t=$((t + 3))
+done
+# The rules themselves live in /usr/share/easymesh/join-health.sh, because
+# bh-key-adopt asks the same question at the end of the join and decides
+# whether to spend the fallback reboot on what this script just did. Two
+# private copies would drift, and the day they disagreed we would be
+# debugging the difference instead of the node.
+# Which questions are fair depends on where in the join we are, and the caller
+# already told us in $WHY. Phase one is the box preparing its radios before it
+# has any credentials, so the MLDs are legitimately short of links; everything
+# later is a normal mid-join restart.
+case "$WHY" in
+	*"phase 1"*) _level=phase1 ;;
+	*)           _level=mid ;;
+esac
+say "health level: $_level"
+join_health_verdict "$_level"
+bad="$JOIN_HEALTH_BAD"
+[ -n "$(echo $JOIN_HEALTH_LOOKS | tr -d ' |')" ] && [ -z "$bad" ] &&
+	say "health: transient only ($JOIN_HEALTH_LOOKS)"
+ctrl=$(ubus -t 5 call ieee1905 info 2>/dev/null | grep -c '"ieee1905id"')
+snap "health after ${t}s (1905 neighbours: $ctrl)"
+
+if [ -n "$bad" ]; then
+	say "==== FAIL:$bad"
+	mkdir -p "$FAILDIR"
+	udebug -d 300 -o "$FAILDIR/$RUN.pcapng" snapshot >/dev/null 2>&1
+	logread > "$FAILDIR/$RUN.logread" 2>/dev/null
+	iw dev > "$FAILDIR/$RUN.iwdev" 2>&1
+	ubus -t 5 call network.wireless status > "$FAILDIR/$RUN.wireless-status" 2>&1
+	sync
+	say "     kept $FAILDIR/$RUN.*"
+	exit 1
+fi
+say "==== done, healthy"
+exit 0

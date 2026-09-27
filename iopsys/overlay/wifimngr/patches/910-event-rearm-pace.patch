@@ -1,0 +1,82 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] wifimngr: event rearm pace
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Pace the ENETDOWN event-fd re-arm to stop a boot-time fd-exhaustion spin.
+
+Root cause (HW-confirmed 2026-07-15): wifimngr_event_uloop_cb() re-armed the
+uloop fd synchronously (uloop_fd_delete + uloop_fd_add ULOOP_EDGE_TRIGGER) from
+inside the read callback whenever wifi_recv_event() returned -ENETDOWN. On a
+down/flapping event socket the fd is instantly "readable" (EOF/error), so the
+edge re-fires as fast as uloop can cycle, and every firing re-runs the libwifi
+event-source reopen (parent socket + assoclist/status seed opens added by the
+apconn/staconn event caches). During the boot BSS bring-up storm this bursts the
+system-wide file table to ENFILE ("Too many open files in system"), which makes
+hostapd add_iface fail for the 6 GHz radio and prevents the EasyMesh backhaul
+from forming. The per-source WPACTRL_MAX_FAILS/dead bound does not help because
+the tight re-arm is above it and a flapping socket never accumulates 5
+consecutive failures.
+
+Fix: re-arm on a short uloop_timeout (500 ms) instead of synchronously, bounding
+the whole-process reopen rate regardless of how many sources flap. Source-
+agnostic: every event source (netlink and the wpactrl/hapdctrl caches) routes
+through this callback. The pending timer is cancelled in wifimngr_event_exit()
+so a reload cannot fire it on freed memory.
+
+--- a/wifimngr_event.c
++++ b/wifimngr_event.c
+@@ -32,6 +32,7 @@
+ 
+ struct wifimngr_event {
+ 	struct uloop_fd uloop_fd;
++	struct uloop_timeout rearm;	/* 910: paced ENETDOWN re-arm (anti fd-exhaustion) */
+ 	struct list_head list;
+ 	struct event_struct event;
+ 	void *handle;
+@@ -136,6 +137,25 @@
+ 	return 0;
+ }
+ 
++/* 910 fix: pace the ENETDOWN re-arm so a down/flapping event socket cannot
++ * spin the reopen path into fd exhaustion. The old code re-armed the uloop fd
++ * synchronously (delete + add EDGE_TRIGGER) from inside the read callback; on a
++ * socket that is down the fd is instantly "readable" (EOF/error), so the edge
++ * re-fires as fast as uloop can cycle and each firing re-runs the libwifi
++ * event-source reopen (parent + seed opens). During the boot BSS bring-up storm
++ * that bursts the system file table to ENFILE ("Too many open files"), which
++ * kills 6 GHz iface creation and stops the mesh backhaul from forming. Re-arming
++ * on a short timer bounds the whole-process reopen rate regardless of how many
++ * sources flap. */
++#define WIFIMNGR_EVENT_REARM_MS		500
++
++static void wifimngr_event_rearm_cb(struct uloop_timeout *t)
++{
++	struct wifimngr_event *ev = container_of(t, struct wifimngr_event, rearm);
++
++	uloop_fd_add(&ev->uloop_fd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
++}
++
+ static void wifimngr_event_uloop_cb(struct uloop_fd *fd, unsigned int events)
+ {
+ 	struct wifimngr_event *ev = (void *) fd;
+@@ -148,9 +168,10 @@
+ 	}
+ 
+ 	if (rv == -ENETDOWN) {
+-		wifimngr_dbg("%s read error ENETDOWN - rearm uloop fd monitor\n", ev->event.ifname);
++		wifimngr_dbg("%s read error ENETDOWN - rearm uloop fd monitor (paced)\n", ev->event.ifname);
+ 		uloop_fd_delete(&ev->uloop_fd);
+-		uloop_fd_add(&ev->uloop_fd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
++		ev->rearm.cb = wifimngr_event_rearm_cb;
++		uloop_timeout_set(&ev->rearm, WIFIMNGR_EVENT_REARM_MS);
+ 	}
+ }
+ 
+@@ -161,6 +182,7 @@
+ 	list_for_each_entry_safe(ev, tmp, &w->event_list, list) {
+ 		wifimngr_dbg("remove %s %s %s\n", ev->event.ifname, ev->event.family, ev->event.group);
+ 		uloop_fd_delete(&ev->uloop_fd);
++		uloop_timeout_cancel(&ev->rearm);
+ 		wifi_unregister_event(ev->event.ifname, ev->handle);
+ 		list_del(&ev->list);
+ 		free(ev->event.resp.data);

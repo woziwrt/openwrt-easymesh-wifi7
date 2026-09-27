@@ -1,0 +1,160 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# The button is the decision.
+#
+# Onboarding used to need two LuCI sessions at once - one on a box that is not
+# on the network yet, to tell it a gateway and an address, and one on the mesh
+# to open the window. Everything in that sentence is something the user has to
+# know. None of it is something they should have to.
+#
+# So the button says it instead. On a box with no role, pressing it IS "I want
+# this box in a mesh"; on the mesh, pressing it IS "and I am expecting it".
+# That is the whole interface, and it is the one every consumer mesh already
+# taught people. The wire stays exactly as it was - it still works, it is still
+# the fallback when a radio will not come up - it just stops being the path a
+# user is asked to walk.
+#
+# Runs from /etc/rc.button/wps, which executes /etc/rc.wps/* in order and stops
+# at the first one that succeeds. This sorts before 40-wps_ap on purpose: on a
+# mesh box the stock "start WPS on every hostapd" is not what the press meant,
+# and on an unconfigured box the stock long-press would enrol it as an ordinary
+# client of somebody's wifi rather than as an agent of a mesh. Where this script
+# declines, both of those still happen exactly as they did.
+#
+# The press length is not decoration here - it is the difference between serving
+# our user and robbing somebody else's.
+#
+# EasyMesh ships in the image, but wanting it is the owner's decision. A box with
+# no role is therefore not "a box waiting to join a mesh" - it is equally the box
+# of somebody who has never heard of one and is pressing WPS because they want to
+# pair a printer. Taking their short press would hand their router to a mesh they
+# did not ask for, and that is not a bug they could even describe.
+#
+# So on a box with no role, joining takes a HELD press, which is a deliberate act
+# and cannot happen by accident, while the short press keeps the stock meaning
+# for the people who never wanted any of this. On the controller there is no such
+# conflict: wps_open arms the fronthaul with wps_pbc, so one short press serves
+# the mesh and an ordinary client equally, and nothing needs to be taken away.
+#
+# Held is what OpenWrt already means by it - 50-wps_sta reads a long press as
+# "enrol me into somebody else's network", which is the same sentence one level
+# up. The convention is borrowed rather than invented.
+[ -r /usr/share/easymesh/boot-window.sh ] || exit 1
+. /usr/share/easymesh/boot-window.sh
+
+# While the finger is down.
+#
+# procd calls this once at press and once at release and says nothing in
+# between, so anything to be shown DURING a hold has to be left running. The
+# lamp then reports one thing only: what letting go right now would do.
+#
+# The bounds are not the same on every box, which is the whole reason this is
+# worth doing. "Hold three seconds" is wrong half the time - on a box already
+# in the mesh the useful press is the SHORT one - and nobody counts seconds
+# anyway. A lamp that changes rhythm needs no counting and no instructions.
+if [ "$ACTION" = "pressed" ]; then
+	if is_mesh_node; then
+		case "$(cat /etc/mapc/role 2>/dev/null)" in
+		controller) easymesh-led hold 0 2 10 ;;   # short press opens the window
+		*)          easymesh-led hold 99 99 10 ;; # an agent has nothing to offer
+		esac
+	else
+		easymesh-led hold 3 9 10                  # held press joins a mesh
+	fi
+	# Not ours to conclude. Returning success here would tell the spliced
+	# rc.button/reset that the press was handled and stop it looking at its
+	# own handlers, which on press is not something to take away.
+	exit 1
+fi
+
+if [ "$ACTION" = "released" ]; then
+	# Stop the watcher without handing the lamp back: whatever is decided
+	# below answers immediately, and a dark gap in between lands exactly when
+	# the user is looking for the answer.
+	easymesh-led hold-stop
+fi
+
+[ "$ACTION" = "released" ] || exit 1
+
+if is_mesh_node; then
+	# Short press only on a box that is already ours; a held press keeps its
+	# stock meaning here too - including the five-second wipe, which on a
+	# configured box is the one thing a user cannot reach any other way once
+	# they have broken it.
+	[ "${SEEN:-0}" -lt 3 ] || exit 1
+	# Only the controller can hand out credentials. An agent relaying the WSC
+	# exchange was measured not to work (2026-08-11), so a press here would
+	# arm a radio that nobody is listening behind and the join would time out
+	# looking like our fault. Say where to press instead of pretending.
+	case "$(cat /etc/mapc/role 2>/dev/null)" in
+	controller)
+		# 30 s, not 15: wps_open now puts an address aside before it
+		# answers, and working out which one is free costs about seven
+		# seconds of ARP probing - more on a subnet where the first few
+		# candidates are taken. A timeout here does not just lose the
+		# reservation; the window is opened first, so the user would be
+		# shown the refused light for a press that had actually worked.
+		ubus -t 30 call easymesh wps_open >/dev/null 2>&1 || {
+			logger -t easymesh "button: could not open the window - is the fronthaul up?"
+			easymesh-led refused
+			exit 1
+		}
+		easymesh-led armed
+		logger -t easymesh "button: window open for 120 s - now press the button on the box you are adding"
+		;;
+	*)
+		# A box with a join in flight is not an agent yet, and sending its
+		# owner to press somewhere else is the one answer that cannot help
+		# - is_mesh_node() is true for it only because of the pending note.
+		# A second press cancels the join instead, which is also the only
+		# way out of a worker that died, short of the wipe.
+		if [ -f /etc/easymesh-wps-pending ]; then
+			rm -f /etc/easymesh-wps-pending /etc/mapc/wps-join-band
+			echo "error: cancelled at the box" > /tmp/wps-join.state
+			logger -t easymesh "button: the join in progress was cancelled"
+			easymesh-led refused
+			exit 0
+		fi
+		logger -t easymesh "button: this box is an agent - press the button on the controller instead"
+		easymesh-led refused
+		exit 1
+		;;
+	esac
+else
+	# No role. A held press is the consent - the only consent this box can
+	# give, since it has no UI anyone can reach - and a short press is not
+	# ours to read: it belongs to whoever is pairing a client.
+	#
+	# The upper bound is new and it is not ours either. BPI-R4 has one gpio
+	# button and its DTS gives it KEY_RESTART (measured 2026-08-22: label
+	# "WPS", linux,code = KEY_RESTART, so the press arrives at
+	# rc.button/reset and this script is called from there). That handler
+	# reads a long hold as "wipe this box", which is the only way back from a
+	# configuration broken past logging in - worth more than a join, and a
+	# join is retryable while a wipe is not. So we take the deliberate middle
+	# and hand the long hold back.
+	#
+	# Nine, not four. Stock OpenWrt wipes at five, which would leave ONE
+	# SECOND between "add this box to the mesh" and "erase this box" - and
+	# people hold buttons longer than they are told to, precisely because
+	# they are not sure it registered. The companion uci-defaults script
+	# moves the wipe to ten seconds for the same reason; consumer gear does
+	# the same thing (UniFi holds ten), so a long hold meaning "wipe" is
+	# already what people expect.
+	[ "${SEEN:-0}" -ge 3 ] || exit 1
+	[ "${SEEN:-0}" -lt 10 ] || exit 1
+	#
+	# No arguments. Neither the gateway nor the address is ours to know here:
+	# the worker learns both from the mesh once it is on it.
+	ubus -t 15 call easymesh wps_join '{}' >/dev/null 2>&1 || {
+		logger -t easymesh "button: could not start the join"
+		easymesh-led refused
+		exit 1
+	}
+	easymesh-led joining
+	logger -t easymesh "button: held - joining a mesh. This box restarts on its own a few times and needs no further help"
+fi
+
+exit 0

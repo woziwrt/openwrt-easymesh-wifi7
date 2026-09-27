@@ -1,0 +1,221 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: apconn cache fix spin
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Layer 1 fix: stop the hapdctrl event source from spinning wpa_ctrl_open()
+on permanently-missing hostapd ctrl sockets (fd burst at boot -> 6 GHz radio
+fails to come up -> mesh does not form). HW-confirmed 2026-07-15.
+
+Applies on top of 920-ap-mld-event-cache.patch. Touches only the hapdctrl
+source in libwifi/modules/wpactrl/wpactrl.c. See 921-README.md for the pinned
+root cause (file:line) and the bounded live checks.
+
+Root of the unbounded spin:
+  The anti-spin guard (fails/dead) lived in the per-registration handle
+  struct hapdctrl_event. wifimngr_reconfig() destroys and recreates every
+  event handle on each wireless reload (wifimngr.c: wifimngr_event_exit() +
+  wifimngr_setup_events()), so the guard is reset to fails=0/dead=false every
+  reload and bounds nothing across reloads. Each fresh hapdctrl_register_event()
+  unconditionally calls hapdctrl_reopen(), which unconditionally tries the
+  parent socket plus <ifname>_link0.._link3 -- structurally guaranteed to fail
+  for a plain wlanX (no per-link sockets) and for wlan2/6G (parent absent too).
+  A 6 GHz BSS that fails to come up drives repeated reloads, so this is a
+  self-reinforcing fd burst.
+
+Fix:
+  1. Durable per-socket open throttle (file-static, keyed by ctrl socket NAME,
+     survives handle recreation): a missing socket costs at most one
+     wpa_ctrl_open() per exponential-backoff window (2 s -> 30 s cap), globally.
+  2. Only fan out to _linkN sockets for real MLD parents: gate on the parent
+     attaching AND _link0 being present; a plain wlanX / down 6 GHz BSS is
+     never probed for link1..N.
+
+diff --git a/libwifi/modules/wpactrl/wpactrl.c b/libwifi/modules/wpactrl/wpactrl.c
+--- a/libwifi/modules/wpactrl/wpactrl.c
++++ b/libwifi/modules/wpactrl/wpactrl.c
+@@ -18,6 +18,7 @@
+ #include <stdlib.h>
+ #include <endian.h>
+ #include <dirent.h>
++#include <pthread.h>
+ 
+ #include <easy/easy.h>
+ #include "wifiutils.h"
+@@ -824,6 +825,112 @@
+ 	}
+ }
+ 
++/* ---- 921 fix: durable per-socket open throttle -------------------------
++ * The anti-spin state MUST live OUTSIDE struct hapdctrl_event. wifimngr's
++ * wifimngr_reconfig() calls wifimngr_event_exit() (frees every event handle)
++ * then wifimngr_setup_events() (re-registers -> fresh calloc'd handle), so the
++ * per-handle fails/dead guard is reset to zero on every reload. A 6 GHz BSS
++ * that fails to come up drives repeated reloads, so the per-handle guard bounds
++ * nothing across them. This file-static table is keyed by the ctrl SOCKET NAME
++ * (it survives handle recreation): a permanently-missing socket costs at most
++ * one wpa_ctrl_open() per backoff window (exponential, capped), globally. */
++#define HAPD_THROTTLE_MAX	48
++#define HAPD_THROTTLE_BASE_MS	2000
++#define HAPD_THROTTLE_CEIL_MS	30000
++
++struct hapd_throttle {
++	char sock[32];			/* ctrl socket ifname (key) */
++	struct timespec next;		/* earliest next open (CLOCK_MONOTONIC) */
++	int backoff_ms;			/* current backoff, grows to the ceiling */
++	bool used;
++};
++
++static pthread_mutex_t hapd_throttle_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct hapd_throttle hapd_throttle_tbl[HAPD_THROTTLE_MAX];
++
++/* Caller holds hapd_throttle_lock. Slot for @sock, or NULL. */
++static struct hapd_throttle *hapd_throttle_find(const char *sock)
++{
++	int i;
++
++	for (i = 0; i < HAPD_THROTTLE_MAX; i++) {
++		if (hapd_throttle_tbl[i].used &&
++		    !strncmp(hapd_throttle_tbl[i].sock, sock,
++			     sizeof(hapd_throttle_tbl[i].sock)))
++			return &hapd_throttle_tbl[i];
++	}
++	return NULL;
++}
++
++/* True if an open of @sock is allowed now (no record, or the backoff expired).
++ * Fail-open when the table is full so behaviour degrades to the old path. */
++static bool hapd_throttle_ok(const char *sock)
++{
++	struct hapd_throttle *t;
++	struct timespec now;
++	bool ok = true;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	pthread_mutex_lock(&hapd_throttle_lock);
++	t = hapd_throttle_find(sock);
++	if (t)
++		ok = (now.tv_sec > t->next.tv_sec) ||
++		     (now.tv_sec == t->next.tv_sec &&
++		      now.tv_nsec >= t->next.tv_nsec);
++	pthread_mutex_unlock(&hapd_throttle_lock);
++	return ok;
++}
++
++/* Record a failed open: arm/extend the backoff (exponential, capped). */
++static void hapd_throttle_fail(const char *sock)
++{
++	struct hapd_throttle *t;
++	struct timespec now;
++	int i, bo;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	pthread_mutex_lock(&hapd_throttle_lock);
++	t = hapd_throttle_find(sock);
++	if (!t) {
++		for (i = 0; i < HAPD_THROTTLE_MAX; i++) {
++			if (!hapd_throttle_tbl[i].used) {
++				t = &hapd_throttle_tbl[i];
++				t->used = true;
++				t->backoff_ms = 0;
++				strncpy(t->sock, sock, sizeof(t->sock) - 1);
++				t->sock[sizeof(t->sock) - 1] = '\0';
++				break;
++			}
++		}
++	}
++	if (t) {
++		bo = t->backoff_ms ? t->backoff_ms * 2 : HAPD_THROTTLE_BASE_MS;
++		if (bo > HAPD_THROTTLE_CEIL_MS)
++			bo = HAPD_THROTTLE_CEIL_MS;
++		t->backoff_ms = bo;
++		t->next = now;
++		t->next.tv_sec += bo / 1000;
++		t->next.tv_nsec += (long)(bo % 1000) * 1000000L;
++		if (t->next.tv_nsec >= 1000000000L) {
++			t->next.tv_sec++;
++			t->next.tv_nsec -= 1000000000L;
++		}
++	}
++	pthread_mutex_unlock(&hapd_throttle_lock);
++}
++
++/* Record a successful open: drop the record so a recovered socket is hot. */
++static void hapd_throttle_ok_reset(const char *sock)
++{
++	struct hapd_throttle *t;
++
++	pthread_mutex_lock(&hapd_throttle_lock);
++	t = hapd_throttle_find(sock);
++	if (t)
++		t->used = false;
++	pthread_mutex_unlock(&hapd_throttle_lock);
++}
++
+ /* Try to ATTACH one hostapd ctrl socket; on success record it in @w. */
+ static int hapdctrl_open_one(struct hapdctrl_event *w, const char *sock_ifname)
+ {
+@@ -834,17 +941,28 @@
+ 	if (w->nsocks >= HAPDCTRL_MAX_SOCK)
+ 		return -1;
+ 
++	/* 921: skip sockets we recently failed to open (durable backoff), so a
++	 * permanently-missing socket -- 6 GHz down, or _linkN on a non-MLD BSS --
++	 * can never cost a wpa_ctrl_open() every reload/wakeup. */
++	if (!hapd_throttle_ok(sock_ifname))
++		return -1;
++
+ 	snprintf(cfile, sizeof(cfile), "%s/%s",
+ 		 CONFIG_HOSTAPD_CTRL_IFACE_DIR, sock_ifname);
+ 	ctrl = wpa_ctrl_open(cfile);
+-	if (!ctrl)
++	if (!ctrl) {
++		hapd_throttle_fail(sock_ifname);
+ 		return -1;
++	}
+ 
+ 	if (wpa_ctrl_attach(ctrl)) {
+ 		wpa_ctrl_close(ctrl);
++		hapd_throttle_fail(sock_ifname);
+ 		return -1;
+ 	}
+ 
++	hapd_throttle_ok_reset(sock_ifname);	/* attached: clear backoff */
++
+ 	s = &w->socks[w->nsocks++];
+ 	s->ctrl = ctrl;
+ 	strncpy(s->ifname, sock_ifname, sizeof(s->ifname) - 1);
+@@ -863,6 +981,7 @@
+ {
+ 	struct hapdctrl_ev ev = {};
+ 	char link[16];
++	bool parent_ok;
+ 	int i;
+ 
+ 	for (i = 0; i < w->nsocks; i++) {
+@@ -875,12 +994,21 @@
+ 	w->nsocks = 0;
+ 
+ 	/* the bare (parent / regular-BSS) socket */
+-	hapdctrl_open_one(w, w->ifname);
++	parent_ok = (hapdctrl_open_one(w, w->ifname) == 0);
+ 
+-	/* affiliated-MLD link sockets: <ifname>_link0 .. _link(N-1) */
+-	for (i = 0; i < WIFI_NUM_LINK_PER_MLD; i++) {
+-		snprintf(link, sizeof(link), "%s_link%d", w->ifname, i);
+-		hapdctrl_open_one(w, link);
++	/* 921: only fan out to affiliated-MLD link sockets when this really is an
++	 * MLD parent. A plain wlanX -- and a down 6 GHz BSS -- has no _linkN, so
++	 * probing all four every reopen is pure churn that, multiplied by the
++	 * reconfig-driven handle recreation, bursts the fd table at boot. Gate on
++	 * the parent being attached AND _link0 present; if _link0 is absent treat
++	 * the iface as non-MLD and do NOT probe _link1.._linkN. A registration
++	 * whose own ifname already carries "_link" never fans out further. */
++	if (parent_ok && !strstr(w->ifname, "_link")) {
++		for (i = 0; i < WIFI_NUM_LINK_PER_MLD; i++) {
++			snprintf(link, sizeof(link), "%s_link%d", w->ifname, i);
++			if (hapdctrl_open_one(w, link) != 0 && i == 0)
++				break;	/* no _link0 => not an MLD parent */
++		}
+ 	}
+ 
+ 	if (!w->nsocks)

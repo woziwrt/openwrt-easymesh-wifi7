@@ -1,0 +1,92 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9997: fetch AP stats from the object the name says, not a stale id
+
+agent_fetch_ap_stats() works out which ubus object serves the statistics for a
+BSS - wifi.ap.<ifname> for a plain BSS, wifi.apmld.<mld_ifname> for a link
+affiliated to an MLD - writes it into objname, and then calls ap->obj_id
+instead. The computed name is never used. Same defect class as 9994.
+
+ap->obj_id is resolved once, in netif_alloc_ap(), from wifi.ap.<ifname>. On an
+MLD node that id does not survive: the per-link BSSes are published at startup
+and are gone once the links fold into the MLD entity, so the id goes stale
+while the entry stays on re->aplist. Measured on 4g, 2026-08-03:
+
+	ubus list | grep ^wifi\.ap
+	    wifi.ap.ap-mld-1        wifi.apmld.ap-mld-1
+	    wifi.ap.ap-mld-2        wifi.apmld.ap-mld-2
+
+	iw dev | grep Interface
+	    ap-mld-1   ap-mld-2   ap-mld-2.sta1
+
+There is no wifi.ap.wlan0 / wlan1 / wlan2 object and no such netdev, yet the
+agent carries wlan0, wlan1 and wlan2 on its aplist and asks their stale ids
+every second:
+
+	/tmp/mapc-log/mapagent.log
+	    1230 x  Failed to get 'stats' (ret = 4)        [UBUS_STATUS_NOT_FOUND]
+	       0 x  netif_alloc_ap: object:... missing over UBUS
+
+Zero warnings from netif_alloc_ap is the evidence that the object existed when
+the id was taken - this is staleness, not a lookup that never succeeded. The
+apmld refresh path already carries the same reasoning in a comment (agent.c,
+apmld_refresh(): "obj_id may be stale if wifimngr published the object after
+the MLD entity was created during onboarding") and resolves by name; this makes
+the stats path do the same.
+
+The object answers once it is addressed by the right name:
+
+	ubus call wifi.apmld.ap-mld-1 stats '{"band":5}'   -> stats object returned
+
+Resolved lazily and cached in its own field rather than re-looked-up per tick:
+the function runs once a second over every BSS, and ap->obj_id cannot be reused
+as the cache because for an affiliated link the name resolves to the MLD
+object, which the neighbour and status callers must not be handed. A failed
+call drops the cache so a republished object is picked up on the next tick.
+
+This repairs BSS statistics reporting (tx/rx bytes, packets per BSS). It does
+not touch the station list - that path is bss_issue_stations(), which already
+resolves apmld by name.
+
+Not fixed here, and still open: num_stations from the HAL reads 0 while the
+station list under the same BSS is correct.
+
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -291,6 +291,11 @@
+ 	int bandwidth;
+ 	uint8_t bssid[6];
+ 	uint32_t obj_id;
++	/** object serving "stats" for this BSS - the MLD object when the BSS is
++	 *  an affiliated link, so it cannot share obj_id. WIFI_OBJECT_INVALID
++	 *  (0, as calloc leaves it) means "resolve on next use".
++	 */
++	uint32_t stats_obj_id;
+ 	char ssid[33];
+ 	char standard[32];
+ 	char radio_name[16];
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -4841,7 +4841,22 @@ static void agent_fetch_ap_stats(struct agent *a)
+ 			if (band)
+ 				blobmsg_add_u32(&bb, "band", band);
+ #endif
+-			ubus_call_object_args(a->ubus_ctx, ap->obj_id, &bb, "stats", parse_ap_stats, bss);
++			/* Resolve objname, not ap->obj_id: the id taken in
++			 * netif_alloc_ap() is stale once the per-link BSS is
++			 * folded into the MLD entity, and for an affiliated
++			 * link objname names the MLD object anyway.
++			 */
++			if (ap->stats_obj_id == WIFI_OBJECT_INVALID)
++				ap->stats_obj_id = ubus_get_object(a->ubus_ctx,
++								   objname);
++
++			if (ap->stats_obj_id != WIFI_OBJECT_INVALID &&
++			    ubus_call_object_args(a->ubus_ctx,
++						  ap->stats_obj_id, &bb,
++						  "stats", parse_ap_stats, bss))
++				/* republished under a new id - resolve again */
++				ap->stats_obj_id = WIFI_OBJECT_INVALID;
++
+ 			blob_buf_free(&bb);
+ 		}
+ 	}

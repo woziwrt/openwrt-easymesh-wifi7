@@ -1,0 +1,286 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 9997: ingest the Associated STA MLD Configuration TLV
+
+The agent has emitted this TLV since the R6 work started
+(agent_gen_associated_sta_mld_config, one per associated STA-MLD, riding the
+Topology Response next to 0xE0 and 0xE6). The controller has the schema for it -
+sta_mld and affiliated_sta, both commented as R6 telemetry - and no parser.
+MAP_TLV_STA_MLD_CONFIG does not appear anywhere in the controller sources. So
+the two tables have been empty since the day they were created: nothing was
+broken, the receiving half was simply never written.
+
+Measured on hardware 2026-08-02 with one MLO client, after 939 and 9995 had
+repaired everything upstream:
+
+	agent: MLDTRACE stamld_update mld=7a:6f:6d:db:82:92 link_id=0
+	agent: MLDTRACE stamld_update mld=7a:6f:6d:db:82:92 link_id=2
+	controller: sta_mld 0, affiliated_sta 0
+
+Two pieces, both modelled on the siblings beside them:
+
+cntlr_map.c gets parse_associated_sta_mld_config(), a byte-walk in the shape of
+parse_tid_to_link_policy(). One difference matters: 0xE0 and 0xE6 are single
+TLVs carrying an internal count, while this one is emitted once per client, so
+cmdu_peek_tlv() would only ever see the first. It iterates with
+cmdu_for_each_tlv() instead. Each block is attached to the wifi_apmld_element
+matching its ap_mld_macaddr, and that clients affiliated list is rebuilt
+wholesale, exactly as the TTLM parser rebuilds ttlmlist. It runs after
+cntlr_parse_ap_mld_config_tlv() for the same reason: apmld_list has to exist.
+
+mapc_sync.c gets the persistence, inside the existing mapc_sync_apmld()
+transaction so the whole MLD picture lands atomically. affiliated_sta rows are
+deleted per client MLD address and re-inserted; sta_mld is an upsert.
+
+Known gap, stated rather than hidden: a client that disappears entirely leaves
+its sta_mld row behind. The per-agent wholesale delete used for apmld and
+bstamld is not available here because sta_mld has no owner column - it is keyed
+by the client MLD address alone. Reconciling that needs a schema change, and
+guessing an owner from the affiliated BSSIDs would break the moment a client
+roams between agents.
+
+Wire layout (agent_tlv.c, struct tlv_associated_sta_mld_config):
+	sta_mld_macaddr[6], ap_mld_macaddr[6], flag u8, reserved[18],
+	num_affiliated_sta u8, then per STA: bssid[6], macaddr[6], reserved[19]
+	header 32 bytes, entry 31 bytes; flag bits per easymesh.h:1811.
+
+Note for whoever touches the generator: it does not zero its reserved bytes,
+and cmdu_reserve_tlv() does not either - the same defect 9996 fixed in the AP
+MLD Config TLV. This parser never reads them, so it is not affected, but a
+future field added there would inherit garbage.
+
+diff -urN a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c	2026-08-02 16:23:48.910567874 +0200
++++ b/src/cntlr_map.c	2026-08-02 16:23:48.922091630 +0200
+@@ -4468,6 +4468,117 @@
+ 	    __func__, MAC2STR(mld->mld_macaddr), num_bsta, MAC2STR(n->almacaddr));
+ }
+ 
++
++/* DB Phase 1.5 (MLD, step 4): byte-walk every Associated STA MLD Configuration
++ * TLV (MAP_TLV_STA_MLD_CONFIG) out of @cmdu into the stamldlist of the matching
++ * AP-MLD. The agent emits one such TLV per associated STA-MLD
++ * (agent_gen_associated_sta_mld_config), so unlike 0xE0 this is a repeated TLV
++ * and cmdu_peek_tlv would only ever see the first one - walk them all.
++ *
++ * MUST run AFTER cntlr_parse_ap_mld_config_tlv(), which (re)builds
++ * n->apmld_list; we attach each client to an existing wifi_apmld_element found
++ * by ap_mld_macaddr and rebuild that clients affiliated list wholesale.
++ *
++ * Wire layout (agent_tlv.c, struct tlv_associated_sta_mld_config):
++ *   sta_mld_macaddr[6], ap_mld_macaddr[6], flag u8, reserved[18],
++ *   num_affiliated_sta u8,
++ *   per affiliated STA: bssid[6], macaddr[6], reserved[19]
++ * Header is 32 bytes, each entry 31.
++ */
++static void parse_associated_sta_mld_config(struct node *n, struct cmdu_buff *cmdu)
++{
++	struct tlv *t;
++	int rem;
++
++	if (!n || !cmdu)
++		return;
++
++	rem = cmdu->datalen;
++	cmdu_for_each_tlv(t, cmdu->data, rem) {
++		struct wifi_apmld_element *mld, *match = NULL;
++		struct wifi_stamld_element *sm = NULL, *e;
++		const uint8_t *data, *sta_mac, *ap_mac;
++		uint8_t flag, num_aff, j;
++		uint16_t len;
++
++		if (t->type != MAP_TLV_STA_MLD_CONFIG)
++			continue;
++
++		data = t->data;
++		len = tlv_length(t);
++		if (!data || len < 32)
++			continue;
++
++		sta_mac = data;
++		ap_mac = data + 6;
++		flag = data[12];
++		num_aff = data[31];
++
++		if ((size_t)32 + (size_t)num_aff * 31 > len)
++			continue;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			if (!memcmp(mld->mld_macaddr, ap_mac, 6)) {
++				match = mld;
++				break;
++			}
++		}
++		if (!match)
++			continue;
++
++		list_for_each_entry(e, &match->stamldlist, list) {
++			if (!memcmp(e->mld_macaddr, sta_mac, 6)) {
++				sm = e;
++				break;
++			}
++		}
++		if (!sm) {
++			sm = calloc(1, sizeof(*sm));
++			if (!sm)
++				continue;
++			memcpy(sm->mld_macaddr, sta_mac, 6);
++			INIT_LIST_HEAD(&sm->stalist);
++			INIT_LIST_HEAD(&sm->ttlmlist);
++			list_add_tail(&sm->list, &match->stamldlist);
++		}
++
++		sm->str_enabled = !!(flag & STA_MLD_CONFIG_STR);
++		sm->nstr_enabled = !!(flag & STA_MLD_CONFIG_NSTR);
++		sm->emlsr_enabled = !!(flag & STA_MLD_CONFIG_EMLSR);
++		sm->emlmr_enabled = !!(flag & STA_MLD_CONFIG_EMLMR);
++		sm->is_bsta = false;
++		sm->last_updated = time(NULL);
++
++		/* wholesale-rebuild this clients affiliated STA list */
++		while (!list_empty(&sm->stalist)) {
++			struct wifi_affiliated_sta_element *as;
++
++			as = list_first_entry(&sm->stalist,
++					struct wifi_affiliated_sta_element, list);
++			list_del(&as->list);
++			free(as);
++		}
++		sm->num_sta = 0;
++
++		for (j = 0; j < num_aff; j++) {
++			const uint8_t *ent = data + 32 + (size_t)j * 31;
++			struct wifi_affiliated_sta_element *as;
++
++			as = calloc(1, sizeof(*as));
++			if (!as)
++				break;
++			memcpy(as->bssid, ent, 6);
++			memcpy(as->macaddr, ent + 6, 6);
++			list_add_tail(&as->list, &sm->stalist);
++			sm->num_sta++;
++		}
++
++		dbg("%s: STA-MLD " MACFMT " on AP-MLD " MACFMT " with %u link(s)\n",
++		    __func__, MAC2STR(sm->mld_macaddr), MAC2STR(match->mld_macaddr),
++		    sm->num_sta);
++	}
++}
++
+ /* DB Phase 1.5 (MLD, step 3): byte-walk the TID-to-Link Mapping Policy TLV
+  * (0xE6, WOZIWRT-defined) out of @cmdu into the ttlmlist of each matching
+  * AP-MLD. MUST run AFTER cntlr_parse_ap_mld_config_tlv(), which (re)builds
+@@ -4994,6 +5105,10 @@
+ 					/* TID-to-Link (0xE6) rides here too; parse
+ 					 * after 0xE0 so apmld_list exists (step 3). */
+ 					parse_tid_to_link_policy(n, cmdu);
++					/* Associated STA MLD Config (0xE2) rides
++					 * here too; parse after 0xE0 so the
++					 * apmld_list exists (step 4). */
++					parse_associated_sta_mld_config(n, cmdu);
+ 					mapc_sync_apmld(c, n);
+ 				}
+ 				/* bSTA-MLD Config TLV (0xE1) rides Topology
+diff -urN a/src/db/mapc_sync.c b/src/db/mapc_sync.c
+--- a/src/db/mapc_sync.c	2026-08-02 16:23:48.912776182 +0200
++++ b/src/db/mapc_sync.c	2026-08-02 16:25:05.854987412 +0200
+@@ -752,6 +752,23 @@
+ 		"ON CONFLICT(bssid) DO UPDATE SET mld_macaddr=excluded.mld_macaddr, "
+ 		"ruid=excluded.ruid, link_id=excluded.link_id, "
+ 		"punct_bitmap=excluded.punct_bitmap";
++	static const char *ins_stamld =
++		"INSERT INTO sta_mld(mld_macaddr, is_bsta, emlmr_enabled, "
++		"emlsr_enabled, str_enabled, nstr_enabled, num_sta) "
++		"VALUES(?,0,?,?,?,?,?) "
++		"ON CONFLICT(mld_macaddr) DO UPDATE SET is_bsta=0, "
++		"emlmr_enabled=excluded.emlmr_enabled, "
++		"emlsr_enabled=excluded.emlsr_enabled, "
++		"str_enabled=excluded.str_enabled, "
++		"nstr_enabled=excluded.nstr_enabled, "
++		"num_sta=excluded.num_sta";
++	static const char *ins_affsta =
++		"INSERT INTO affiliated_sta(macaddr, mld_macaddr, bssid) "
++		"VALUES(?,?,?) "
++		"ON CONFLICT(macaddr, bssid) DO UPDATE SET "
++		"mld_macaddr=excluded.mld_macaddr";
++	static const char *del_affsta =
++		"DELETE FROM affiliated_sta WHERE mld_macaddr=?";
+ 	static const char *ins_ttlm =
+ 		"INSERT INTO ttlm(mld_macaddr, tid, direction, link_id) "
+ 		"VALUES(?,?,?,?) "
+@@ -857,6 +874,76 @@
+ 				}
+ 			}
+ 		}
++
++		/* step 4: the associated STA-MLDs of this AP-MLD and their
++		 * affiliated links, from mld->stamldlist (filled by
++		 * parse_associated_sta_mld_config). Scoped per client: the
++		 * affiliated rows are dropped by client MLD address and rebuilt,
++		 * which is safe because affiliated_sta references
++		 * sta_mld(mld_macaddr) and nothing else. A client that vanishes
++		 * entirely still leaves its sta_mld row behind - reconciling that
++		 * needs an owner column the schema does not have yet. */
++		{
++			struct wifi_stamld_element *sm;
++
++			list_for_each_entry(sm, &mld->stamldlist, list) {
++				struct wifi_affiliated_sta_element *as;
++				char smac[18], amac[18], abss[18];
++
++				mac2str(sm->mld_macaddr, smac);
++
++				st = NULL;
++				if (mapdb_prepare(c->db, del_affsta, &st) != MAPDB_OK) {
++					warn("mapc_sync: affsta del prepare: %s\n",
++					     mapdb_last_error(c->db));
++					mapdb_rollback(c->db);
++					return;
++				}
++				mapdb_bind_text(st, 1, smac);
++				if (stmt_finish(c->db, st) != MAPDB_OK) {
++					mapdb_rollback(c->db);
++					return;
++				}
++
++				st = NULL;
++				if (mapdb_prepare(c->db, ins_stamld, &st) != MAPDB_OK) {
++					warn("mapc_sync: sta_mld ins prepare: %s\n",
++					     mapdb_last_error(c->db));
++					mapdb_rollback(c->db);
++					return;
++				}
++				mapdb_bind_text(st, 1, smac);
++				mapdb_bind_int(st, 2, sm->emlmr_enabled ? 1 : 0);
++				mapdb_bind_int(st, 3, sm->emlsr_enabled ? 1 : 0);
++				mapdb_bind_int(st, 4, sm->str_enabled ? 1 : 0);
++				mapdb_bind_int(st, 5, sm->nstr_enabled ? 1 : 0);
++				mapdb_bind_int(st, 6, sm->num_sta);
++				if (stmt_finish(c->db, st) != MAPDB_OK) {
++					mapdb_rollback(c->db);
++					return;
++				}
++
++				list_for_each_entry(as, &sm->stalist, list) {
++					mac2str(as->macaddr, amac);
++					mac2str(as->bssid, abss);
++
++					st = NULL;
++					if (mapdb_prepare(c->db, ins_affsta, &st) != MAPDB_OK) {
++						warn("mapc_sync: affsta ins prepare: %s\n",
++						     mapdb_last_error(c->db));
++						mapdb_rollback(c->db);
++						return;
++					}
++					mapdb_bind_text(st, 1, amac);
++					mapdb_bind_text(st, 2, smac);
++					mapdb_bind_text(st, 3, abss);
++					if (stmt_finish(c->db, st) != MAPDB_OK) {
++						mapdb_rollback(c->db);
++						return;
++					}
++				}
++			}
++		}
+ 	}
+ 
+ 	if (mapdb_commit(c->db) != MAPDB_OK) {

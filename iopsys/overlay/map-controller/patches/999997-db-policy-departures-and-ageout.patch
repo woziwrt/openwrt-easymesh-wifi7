@@ -1,0 +1,124 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] mapc: uniform departures and an hourly DB janitor
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+A clean disconnect used to DELETE the sta row while the sweep flags
+associated=0, so the departed-client history existed only for departures
+the sweep happened to catch (measured 2026-08-05: an airplane-mode leave
+erased the row, a roam-away kept it). True disconnects now flag + stamp
+the row like everything else.
+
+The eraser moves to one place: an hourly janitor on the heartbeat drops
+departed rows older than 20 days - finally capping the "departed records"
+growth - and trims sta_metrics_hist to its 10k cap.
+
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -564,7 +564,8 @@
+ 		"bytes_tx=excluded.bytes_tx, bytes_rx=excluded.bytes_rx, "
+ 		"errors_tx=excluded.errors_tx, errors_rx=excluded.errors_rx, "
+ 		"retrans_count=excluded.retrans_count, hostname=excluded.hostname, "
+-		"last_seen=excluded.last_seen";
++		"last_seen=excluded.last_seen, "
++		"first_seen=COALESCE(sta.first_seen, excluded.first_seen)";
+ 	struct wifi_sta_element *d = s->de_sta;
+ 	char mac[18], bssid[18], almac[18];
+ 	mapdb_stmt *st = NULL;
+@@ -1769,6 +1770,61 @@
+ 	}
+ 
+ }
++
++/* DB policy pack: a clean disconnect used to DELETE the row (977) while the
++ * sweep flags associated=0 - history existed only for departures the sweep
++ * happened to catch (measured 2026-08-05: an airplane-mode leave erased the
++ * row, a roam-away kept it). Departures are uniform now: flag + timestamp,
++ * never delete. The hourly ageout is the only eraser left. */
++void mapc_mark_sta_gone(struct controller *c, struct sta *s)
++{
++	static const char *sql =
++		"UPDATE sta SET associated=0, last_seen=? WHERE macaddr=?";
++	char mac[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	mac2str(s->macaddr, mac);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	mapdb_bind_int(st, 1, (long long)time(NULL));
++	mapdb_bind_text(st, 2, mac);
++	stmt_finish(c->db, st);
++}
++
++#define MAPC_DB_HISTORY_DAYS	20
++#define MAPC_HIST_MAX_ROWS	10000
++
++/* DB policy pack: hourly janitor, called from the heartbeat. Departed rows
++ * older than MAPC_DB_HISTORY_DAYS go away (this finally caps the
++ * "departed records" growth), and the sample table is trimmed to its cap.
++ * Cheap by construction: two indexed DELETEs. */
++void mapc_db_ageout(struct controller *c)
++{
++	long long cutoff = (long long)time(NULL) -
++			   (long long)MAPC_DB_HISTORY_DAYS * 86400;
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	if (mapdb_prepare(c->db,
++			  "DELETE FROM sta WHERE COALESCE(associated,0)=0 "
++			  "AND COALESCE(last_seen,0) < ?", &st) == MAPDB_OK) {
++		mapdb_bind_int(st, 1, cutoff);
++		stmt_finish(c->db, st);
++	}
++
++	st = NULL;
++	if (mapdb_prepare(c->db,
++			  "DELETE FROM sta_metrics_hist WHERE rowid NOT IN "
++			  "(SELECT rowid FROM sta_metrics_hist "
++			  "ORDER BY ts DESC LIMIT 10000)", &st) == MAPDB_OK)
++		stmt_finish(c->db, st);
++}
+ #endif /* EASYMESH_VERSION >= 6 */
+ 
+ void db_restore(struct controller *c)
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -48,6 +48,8 @@
+ /* Delete the 'sta' row for @s. Call ONLY on a true disconnect. */
+ void mapc_hist_sample(struct controller *c, const char *macaddr,
+ 		      const char *bssid, int rcpi, int dl_rate, int ul_rate);
++void mapc_mark_sta_gone(struct controller *c, struct sta *s);
++void mapc_db_ageout(struct controller *c);
+ void mapc_del_sta(struct controller *c, struct sta *s);
+ 
+ /* Reconcile sta rows for @n against its live stalist (drop re-flash ghosts). */
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -287,7 +287,7 @@
+ 						memset(s->bssid, 0, sizeof(s->bssid));
+ 						memset(s->agent_almacaddr, 0, sizeof(s->agent_almacaddr));
+ 						s->state = STA_DISCONNECTED;
+-						mapc_del_sta(c, s); /* 977: true disconnect */
++						mapc_mark_sta_gone(c, s); /* 999997: keep the history row */
+ 					}
+ 				}
+ 			}
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -2353,6 +2353,11 @@
+ 	}
+ #endif
+ 	cntlr_ageout_nodes(c);
++
++	/* DB policy pack: hourly DB janitor (departed rows + history cap). */
++	if (c->uptime && (c->uptime % 3600) == 0)
++		mapc_db_ageout(c);
++
+ 	timer_set(&c->heartbeat, 1 * 1000);
+ }
+ 

@@ -1,0 +1,102 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 994 - island prevention must check the uplink reaches the controller
+
+Island prevention exists to stop a node without an uplink from serving anyone:
+on backhaul loss it takes the BSSes down, ignores connect attempts and
+disassociates STAs. It bails out early whenever the backhaul looks regained --
+and that test is agent_has_active_backhaul(), which only asks whether some bSTA
+is associated:
+
+  bool agent_has_active_backhaul(struct agent *a)
+  {
+  	return (agent_is_bsta_connected(a) || agent_is_backhaul_type_eth());
+  }
+
+Nothing there asks whether the association leads anywhere. Two agents that pick
+each other's backhaul BSS -- trivial once both advertise the same backhaul SSID,
+because a bSTA selects on SSID and nothing else -- each see a connected bSTA,
+each conclude the backhaul is fine, and neither takes its backhaul BSS down.
+The pair then holds each other up with no path to the controller. Observed on
+hardware 2026-07-26: 8g associated to x8, x8 to 8g, both with a default route
+they could not use, topology_link=0, and the state was stable rather than
+oscillating. A cold power cycle reproduced it, because both agents boot at once
+and have their backhaul BSSes up before either reaches the controller.
+
+Add agent_backhaul_reaches_cntlr() and use it at the three island-prevention
+sites that mean "the backhaul came back". active_cntlr is the missing half of
+the question: it is set on every CMDU received from the controller and cleared
+only after max_misstime without one, so a brief controller outage does not trip
+this, while a mutual lock -- where neither side ever hears from the controller --
+does. Wired backhaul keeps returning true unconditionally.
+
+agent_has_active_backhaul() itself is left alone: it has ten callers with other
+meanings, and the fault is specific to the "regained" test.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/backhaul.c
++++ b/src/backhaul.c
+@@ -800,6 +800,24 @@
+ 	return (agent_is_bsta_connected(a) || agent_is_backhaul_type_eth());
+ }
+ 
++/* 994: an uplink only counts as regained if it actually leads to the
++ * controller. Two agents that associate to each other's backhaul BSS both see
++ * a connected bSTA, so both bail out of island prevention, neither takes its
++ * backhaul BSS down, and the pair deadlocks with no path to the controller --
++ * observed on hardware. active_cntlr is the missing half of the question: it
++ * is set on every CMDU received from the controller (agent_map.c) and only
++ * cleared after max_misstime without one, so a brief controller outage does
++ * not trip this while a mutual lock, where neither side ever hears from the
++ * controller, does.
++ */
++bool agent_backhaul_reaches_cntlr(struct agent *a)
++{
++	if (agent_is_backhaul_type_eth())
++		return true;
++
++	return agent_is_bsta_connected(a) && a->active_cntlr;
++}
++
+ char *agent_get_backhaul_ifname(struct agent *a, char *ifname)
+ {
+ 	struct blob_buf bk = { 0 };
+--- a/src/backhaul.h
++++ b/src/backhaul.h
+@@ -36,6 +36,7 @@
+ bool agent_is_bsta_onboarded(struct agent *a);
+ bool agent_is_backhaul_type_eth(void);
+ bool agent_has_active_backhaul(struct agent *a);
++bool agent_backhaul_reaches_cntlr(struct agent *a);
+ char *agent_get_backhaul_ifname(struct agent *a, char *ifname);
+ void agent_trigger_bsta_sync(atimer_t *t);
+ void agent_update_active_uplink(struct agent *a, struct netif_bk *bk);
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2125,7 +2125,7 @@
+ 	trace("%s: --->\n", __func__);
+ 	struct wifi_radio_element *re = NULL;
+ 
+-	if (agent_has_active_backhaul(a))
++	if (agent_backhaul_reaches_cntlr(a))
+ 		/* backhaul regained, don't send BTM */
+ 		return;
+ 
+@@ -2171,7 +2171,7 @@
+ 	struct agent *a = container_of(t, struct agent, fh_disable_timer);
+ 	struct wifi_radio_element *re = NULL;
+ 
+-	if (agent_has_active_backhaul(a))
++	if (agent_backhaul_reaches_cntlr(a))
+ 		/* backhaul regained, don't disable FHs */
+ 		return;
+ 
+@@ -2198,7 +2198,7 @@
+ 	struct agent *a = container_of(t, struct agent, sta_disconnect_timer);
+ 	struct wifi_radio_element *re = NULL;
+ 
+-	if (agent_has_active_backhaul(a))
++	if (agent_backhaul_reaches_cntlr(a))
+ 		/* backhaul regained, don't disconnect STAs */
+ 		return;
+ 

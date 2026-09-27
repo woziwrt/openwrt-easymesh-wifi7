@@ -1,0 +1,70 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Give the mesh the name the user typed into the hostname field.
+#
+# The name a node shows in the topology picture is ieee1905.device_name, which
+# travels to the controller inside the 1905 Device Identification TLV. Nothing
+# ever kept it in step with the system hostname, so a box renamed by its owner
+# stayed 'easymesh-31aec7' in the picture forever. Measured 2026-08-25 on the
+# e.g. a BPI-R4 (8 GB) with hostname 'BPI-R4-agent', name in the picture
+# 'easymesh-f1b50c'.
+#
+# Why the hostname and not a field of our own: it is the box's own name, it is
+# where an OpenWrt user goes to rename a box, it lives on the box rather than in
+# a table on the controller, and so it survives both a controller reflash and -
+# the case that decided this - the box being carried from the bedroom to the
+# living room, where the owner renames it standing next to it instead of on a
+# web interface they would have to go find.
+#
+# Measured 2026-08-25 on the running four-node mesh, agent behind a wireless
+# backhaul: setting device_name and reloading ieee1905 put the new name on the
+# controller within 8 s. No reboot, no re-pairing, mesh untouched - all four
+# nodes present, the two-hop node still at depth 2, easymesh-check 12 rules and
+# 0 broken.
+#
+# ⚠️ `ubus call ieee1905 refresh` does NOT do it - the daemon holds the name
+# from startup. It takes an init reload, and that reload is a full restart of
+# ieee1905d (measured: process 27 s old against 3377 s of uptime). Cheap, but
+# not free, which is why this only acts when the name actually differs.
+#
+# Duplicates are expected and are NOT this script's problem. Every box ships
+# with the same hostname, because 99-set-hostname names it after the medium it
+# booted from - three lab agents all answered 'BPI-R4-SD' on 2026-08-25. That
+# is the documented starting state: the README tells the owner to rename each
+# node. The picture tells identical names apart by appending a piece of the
+# AL-MAC, which is done once, on the controller, in names_json.
+
+CFG=ieee1905
+
+. /usr/share/easymesh/boot-window.sh 2>/dev/null || exit 0
+
+is_mesh_node || exit 0
+[ -f /etc/config/$CFG ] || exit 0
+
+# One word. Anything else would become a second column in /etc/mesh-node-names
+# or a second line in a TLV, and both are read by things that split on spaces.
+want=$(uci -q get system.@system[0].hostname)
+[ -n "$want" ] || want=$(uname -n)
+want=$(echo "$want" | tr -d " \t\r\n" | tr -cd "A-Za-z0-9._-")
+
+# The stock name is every box at once. A node carrying it is skipped by the
+# controller on purpose, and a skipped node draws as a MAC address - worse than
+# the generated name it would be replacing. Leave those alone.
+case "$want" in
+""|OpenWrt|openwrt) exit 0 ;;
+esac
+
+have=$(uci -q get $CFG.$CFG.device_name)
+[ "$want" = "$have" ] && exit 0
+
+uci set $CFG.$CFG.device_name="$want"
+uci commit $CFG
+logger -t mesh-name "mesh name follows the hostname: '$have' -> '$want'"
+
+# Only poke the daemon if it is up. During boot this script can land before
+# ieee1905 has started, and there the config on disk is enough - it reads it
+# when it starts, and a reload here would start it too early instead.
+pgrep ieee1905d >/dev/null 2>&1 || exit 0
+/etc/init.d/ieee1905 reload >/dev/null 2>&1

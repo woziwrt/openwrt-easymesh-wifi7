@@ -1,0 +1,97 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# A box nobody has made into a mesh node yet behaves like an ordinary router.
+#
+# Measured 2026-08-17 on the first production image, on a freshly flashed card
+# that had been through nothing but firstboot:
+#
+#     radio0/1/2   disabled='0'        all three on
+#     wifi-iface   2, and that is all there is
+#       ap_mld_1   'OpenWrt-'          on the air
+#       ap_mld_2   'MAP--BH'           on the air   <- the mesh backhaul
+#
+# The default networks the board is supposed to come up with are not
+# overwritten - they are simply not there, replaced by two sections nobody
+# asked for. Petr put it plainly: without doing anything, and perhaps never
+# wanting a mesh at all, the user loses the networks that belong there and
+# gains a backhaul they did not order.
+#
+# It happens because the image ships mapcontroller.enabled=1 AND
+# mapagent.enabled=1, so both daemons start on a box with no role, and
+# map-agent builds its BSSes from its own factory sections. Broadcasting the
+# backhaul before onboarding is also what project_easymesh_wired_onboarding
+# warns against: existing nodes can hang themselves on the newcomer and form a
+# loop, and the only thing preventing it today is that the factory key differs.
+#
+# The mark is /etc/mapc/role, written by easymesh-role before it touches anything
+# else, or /etc/easymesh-wps-pending while a join is in flight. Nodes configured
+# before the marker existed get it from 88-easymesh-role-marker, which runs just
+# before this file. The same two tests gate 11-multiap-genconfig and
+# 991-multiap-genconfig; if one changes, all three change.
+#
+# ⚠️ Two earlier versions of this test were wrong, both for the same reason - they
+# asked about a value the factory also writes.
+#
+# The first tested mapagent.@controller_select[0]. The factory ships that section,
+# so this script exited at its first line on every boot and was dead from the day
+# it shipped.
+#
+# The second added a non-empty dhcp.lan.ignore, on the belief that only
+# easymesh-role writes it. easymesh-dhcp-safe writes it too, on every box that is
+# not a controller - factory ones included. That put the mark on an untouched
+# router and reopened all three gates one boot later. Traced on hardware
+# 2026-08-17; the board came up broadcasting a backhaul three builds running.
+#
+# 🔑 A mark only means "someone decided" if nothing but a decision can produce it.
+#
+# Neither way in is affected. The over-the-air join builds its own STA section
+# (wireless.wps_join on radio1) and only reads map-agent's config, so it does
+# not need the daemon; the cable join runs easymesh-role, which switches both
+# daemons on and reboots into a configured node.
+#
+# A box that has already taken a role keeps the section through sysupgrade with
+# keep-config, so this never disturbs a working mesh. After firstboot the
+# section is gone with the rest of the overlay - and then it should apply,
+# because that box is factory-fresh again by definition.
+
+# The same test as everywhere else, from the same code. This file used to keep
+# its own inline copy, which meant a failure in 88 turned "we could not decide"
+# into "factory" here - and this script's answer to factory is to switch both
+# daemons off, on a node that may be carrying traffic. Three gates on three
+# private copies of the mark is how the last four rounds of this bug happened.
+[ -r /usr/share/easymesh/boot-window.sh ] || {
+	echo "89-easymesh-quiet-until-role: cannot read boot-window.sh - leaving daemons alone" >&2
+	exit 1
+}
+. /usr/share/easymesh/boot-window.sh
+
+if is_mesh_node; then
+	exit 0
+fi
+
+# Nothing to quiet down before map-agent has written its config at all. Exit
+# non-zero so the file survives and runs again at the next boot, by which time
+# it exists - the same reason 90-easymesh-mld-backhaul does it.
+uci -q get mapagent >/dev/null 2>&1 || {
+	echo "89-easymesh-quiet-until-role: no mapagent config yet, will retry at boot" >&2
+	exit 1
+}
+
+changed=0
+[ "$(uci -q get mapagent.agent.enabled)" = "0" ] || {
+	uci set mapagent.agent.enabled='0'
+	uci commit mapagent
+	changed=1
+}
+[ "$(uci -q get mapcontroller.controller.enabled)" = "0" ] || {
+	uci set mapcontroller.controller.enabled='0'
+	uci commit mapcontroller
+	changed=1
+}
+
+[ "$changed" = 1 ] && logger -t easymesh-config \
+	"no mesh role yet - map-agent and map-controller left off, so the box does not put a backhaul on the air before anyone asks for one"
+
+exit 0

@@ -1,0 +1,222 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: steer an MLO bSTA without pinning a link BSSID
+
+A Backhaul Steering Request names its target by the BSSID of one link. The
+agent pinned that BSSID in the bSTA network block. For an MLO bSTA that
+cannot work: wpa_supplicant matches the pin against the link BSSID when it
+selects a BSS, but against the AP MLD address (what the driver reports as
+the BSSID of an MLO association) when it looks the network up for the
+4-way handshake. Measured 2026-09-17 on BPI-8g-corridor: steered by our
+controller to the controller 6 GHz link 0a:0c:43:26:a0:11 (AP MLD
+52:55:e2:da:55:fa), the bSTA associated on both links and then dropped
+every EAPOL-Key 1/4 with "WPA: No SSID info found (msg 1 of 4)" until the
+pin was removed by hand.
+
+For a bSTA whose mapagent section has is_mld=1 the script clears the pin and
+uses bssid_accept, which wpa_supplicant checks only at selection, and
+releases that list by itself once the bSTA has completed an association or
+the steer timed out - the first hardware test showed the list still set
+minutes after a successful steer. The success handler accepts a connection
+to the AP MLD that owns the target link. The bSTA MLD netif now gets the
+steer timer callback the radio bSTAs get in agent_alloc_radio(); without it
+an MLO steer timeout did nothing. A successful MLO steer no longer disables
+the radio bSTA sections, which are its links. Single-link bSTAs are
+unchanged.
+
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2539,11 +2539,35 @@
+ 	return agent_exec_platform_scripts(fmt);
+ }
+ 
++/* An MLO bSTA reports the AP MLD address as the BSSID it connected to, while
++ * the controller names the target by the BSSID of one link. The steer reached
++ * its target when that link belongs to the AP MLD we are now associated to;
++ * wpa_supplicant knows the AP MLD address of every link it has scanned.
++ */
++static bool bsta_steer_reached_mld(struct netif_bk *bk, uint8_t *bssid,
++				   uint8_t *target_bssid)
++{
++	char out[32] = {0};
++	uint8_t mld[6] = {0};
++
++	if (!bk->cfg || !bk->cfg->is_mld_netdev)
++		return false;
++
++	chrCmd(out, sizeof(out),
++	       "wpa_cli -i %s bss " MACFMT " | sed -n 's/^ap_mld_addr=//p'",
++	       bk->ifname, MAC2STR(target_bssid));
++	if (!hwaddr_aton(out, mld) || hwaddr_is_zero(mld))
++		return false;
++
++	return !memcmp(bssid, mld, 6);
++}
++
+ int agent_bsta_steer_handler(struct agent *a, struct netif_bk *bk, uint8_t *bssid)
+ {
+ 	uint8_t *target_bssid = bk->bsta_steer.target_bssid;
+ 
+ 	if (!memcmp(bssid, target_bssid, 6) ||
++	    bsta_steer_reached_mld(bk, bssid, target_bssid) ||
+ 	    /* if target was any BSSID, treat connection over correct
+ 	     * bsta as success */
+ 	    hwaddr_is_zero(target_bssid) || hwaddr_is_bcast(target_bssid)) {
+@@ -4225,6 +4249,10 @@
+ 	snprintf(bsta->ifname, sizeof(bsta->ifname), "%s", cfg->name);
+ 	bsta->cfg = cfg;
+ 	bsta->agent = a;
++	/* Radio bSTAs get this in agent_alloc_radio(); the bSTA MLD netif is
++	 * set up only here, and without it a steer timeout on an MLO bSTA was
++	 * a timer with no callback: no restore, no failure response. */
++	timer_init(&bsta->steer_timeout, bsta_steer_cb);
+ #if (EASYMESH_VERSION >= 6)
+ 	if (cfg->mld_id) {
+ 		struct mld_credential *mldcred;
+--- a/src/agent_ubus_events.c
++++ b/src/agent_ubus_events.c
+@@ -2024,6 +2024,11 @@
+ 				if (!re->has_bsta)
+ 					continue;
+ 
++				/* The radio bSTAs are the links of an MLO bSTA,
++				 * not alternatives to it: keep them enabled. */
++				if (bk->cfg->is_mld_netdev)
++					continue;
++
+ 				if (strncmp(re->bk.ifname, bk->ifname, IFNAMSIZ) /* && !agent_bsta_steer_is_active(b) */)
+ 					config_disable_bsta(re->bk.cfg);
+ 			}
+--- a/src/script/multiap
++++ b/src/script/multiap
+@@ -560,6 +560,77 @@
+ 	uci commit wireless
+ }
+ 
++# An MLO bSTA (bsta section with is_mld=1) cannot be steered by pinning a
++# BSSID in its network block. wpa_supplicant checks the pin twice and against
++# two different addresses: scan selection compares it with the BSSID of the
++# link it found (events.c, "skip - BSSID mismatch"), while the 4-way handshake
++# compares it with what the driver reports as the BSSID, which for an MLO
++# association is the AP MLD address (wpa_supplicant_get_ssid()). A link BSSID
++# pin therefore associates and then drops every EAPOL-Key 1/4 with
++# "WPA: No SSID info found (msg 1 of 4)" - measured 2026-09-17 on
++# BPI-8g-corridor after a controller backhaul steer to a 6 GHz link whose
++# BSSID differs from the AP MLD address - and an AP MLD address pin never
++# selects a link whose BSSID differs from it.
++#
++# bssid_accept is checked only at scan selection, so it does the steering and
++# leaves the handshake alone.
++bsta_is_mld() {
++	local ifname=$1
++	local found=0
++
++	bsta_is_mld_section() {
++		local sec_ifname sec_is_mld
++
++		config_get sec_ifname "$1" ifname
++		config_get sec_is_mld "$1" is_mld "0"
++		[ "$sec_ifname" = "$ifname" ] && [ "$sec_is_mld" = "1" ] && found=1
++	}
++
++	[ -n "$ifname" ] || return 1
++	config_load mapagent
++	config_foreach bsta_is_mld_section bsta
++	[ "$found" = "1" ]
++}
++
++# Point an MLO bSTA at one link BSSID ("any" or empty: at any link) without
++# pinning. An empty bssid_accept list lets every BSS through again.
++bsta_mld_accept() {
++	local ifname=$1
++	local bssid=$2
++	local network_id=$(get_network_id $ifname)
++	local accept="$bssid"
++
++	[ -n "$ifname" ] || return 1
++	[ "$bssid" = "any" -o "$bssid" = "00:00:00:00:00:00" ] && accept=""
++
++	[ "$(wpa_cli -i $ifname set_n $network_id bssid any)" = "FAIL" ] && return 1
++	[ "$(wpa_cli -i $ifname set_n $network_id bssid_accept "$accept")" = "FAIL" ] && return 1
++	return 0
++}
++
++# The accept list is only needed while the steer selects its BSS. Releasing it
++# must not depend on the agent reporting the steer's outcome: on 2026-09-17 the
++# list was still set minutes after a successful steer. Once the bSTA has
++# completed an association (or after the agent's 20 s steer timeout plus a
++# margin) it goes, so a later reconnect may use any link of the SSID again.
++# Detached, because the agent reads this script's output until EOF.
++bsta_mld_release_later() {
++	local ifname=$1
++
++	(
++		local i=0 state
++
++		sleep 3
++		while [ $i -lt 30 ]; do
++			state=$(wpa_cli -i "$ifname" status 2>/dev/null | sed -n 's/^wpa_state=//p')
++			[ "$state" = "COMPLETED" ] && break
++			sleep 1
++			i=$((i + 1))
++		done
++		bsta_mld_accept "$ifname" any
++	) </dev/null >/dev/null 2>&1 &
++}
++
+ set_network_bssid() {
+ 	local ifname=$1
+ 	local bssid=$2
+@@ -567,6 +638,13 @@
+ 
+ 	[ -n "$ifname" ] || return
+ 
++	# The address an MLO steer restores is the AP MLD address, which is no
++	# use as a link filter: release the bSTA to any link of its SSID.
++	if bsta_is_mld "$ifname"; then
++		bsta_mld_accept "$ifname" any
++		return
++	fi
++
+ 	wpa_cli -i $ifname set_n $network_id bssid $bssid
+ }
+ 
+@@ -577,11 +655,19 @@
+ 
+ 	[ -n "$ifname" ] || return
+ 
+-	rc=$(wpa_cli -i $ifname set_n $network_id bssid $bssid)
+-	[ "$rc" == "FAIL" ] && {
+-		echo "1"
+-		return;
+-	}
++	if bsta_is_mld "$ifname"; then
++		bsta_mld_accept "$ifname" "$bssid" || {
++			echo "1"
++			return;
++		}
++		bsta_mld_release_later "$ifname"
++	else
++		rc=$(wpa_cli -i $ifname set_n $network_id bssid $bssid)
++		[ "$rc" == "FAIL" ] && {
++			echo "1"
++			return;
++		}
++	fi
+ 
+ 	rc=$(wpa_cli -i $ifname enable_n $network_id)
+ 	[ "$rc" == "FAIL" ] && {
+@@ -626,6 +712,14 @@
+ 
+ 	#echo diff = $diff > /dev/console
+ 
++	# A successful MLO steer leaves nothing behind: a BSSID written into
++	# wireless would come back as a pin on the next reload and break the
++	# handshake (see bsta_is_mld), and the accept list is released so the
++	# bSTA follows its SSID like after any other association (map-agent 984).
++	if bsta_is_mld "$ifname"; then
++		bsta_mld_accept "$ifname" any
++		return
++	fi
+ 
+ 	config_load mapagent
+ 

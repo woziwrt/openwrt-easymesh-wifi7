@@ -1,0 +1,63 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: clean node respect shared identity
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Do not let an aged-out duplicate delete the identity of its live twin.
+
+cntlr_clean_node() removes the mac_table ALID entry, the UCI node and radio
+sections and the topology device purely by AL-MAC. All of those are shared
+with any duplicate node object carrying the same AL-MAC, and mac_table holds
+exactly one entry per AL-MAC - pointing at whichever object got there first.
+
+So aging out a duplicate deletes the surviving twin identity: the twin can no
+longer be found by cntlr_find_node(), stops being refreshed by incoming CMDUs
+and expires 65 s later. Observed in the lab as "node ages out and never comes
+back" across three consecutive induced-flap cycles.
+
+Perform the AL-MAC-keyed deletions only from the object the mac_table actually
+points at. Per-object cleanup (stalist, radiolist, apmld) is unconditional.
+
+The warn() marks a state that should not exist at all once node identity is
+single-sourced; it is a diagnostic, not an expected path.
+
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1655,14 +1655,33 @@
+ 	if (!timestamp_expired(&n->last_tsp_seen, NODE_EXPIRE_TIME * 1000))
+ 		return false;
+ 
+-	list_for_each_entry_safe(r, temp, &n->radiolist, list)
+-		cntlr_config_del_radio(n->almacaddr);
++	/* Everything keyed purely by AL-MAC (mac_table entry, UCI node/radio
++	 * sections, topology device) is SHARED with any duplicate node object
++	 * carrying the same AL-MAC. mac_table holds exactly one entry per
++	 * AL-MAC, so aging out a duplicate would otherwise delete the identity
++	 * of its still-live twin: the twin stops being findable, stops being
++	 * refreshed, and expires 65 s later. Only the object the mac_table
++	 * actually points at may perform those deletions. */
++	{
++		struct macaddr_entry *_e =
++			mactable_lookup(c->mac_table, n->almacaddr, MAC_ENTRY_ALID);
++		bool owns_identity = (_e && _e->data == (void *)n);
++
++		if (owns_identity) {
++			list_for_each_entry_safe(r, temp, &n->radiolist, list)
++				cntlr_config_del_radio(n->almacaddr);
++
++			cntlr_config_del_node(n->almacaddr);
++			topology_remove_device(&c->topology, n->almacaddr);
++			mactable_del_entry(c->mac_table, n->almacaddr, MAC_ENTRY_ALID);
++		} else {
++			warn("%s: aging out duplicate node " MACFMT " - keeping shared identity for live twin\n",
++			     __func__, MAC2STR(n->almacaddr));
++		}
++	}
+ 
+-	cntlr_config_del_node(n->almacaddr);
+-	topology_remove_device(&c->topology, n->almacaddr);
+ 	node_clean_stalist(c, n);
+ 	cntlr_clean_radiolist(c, n);
+-	mactable_del_entry(c->mac_table, n->almacaddr, MAC_ENTRY_ALID);
+ #if (EASYMESH_VERSION >= 6)
+ 	cntlr_free_apmld_list(n);
+ #endif

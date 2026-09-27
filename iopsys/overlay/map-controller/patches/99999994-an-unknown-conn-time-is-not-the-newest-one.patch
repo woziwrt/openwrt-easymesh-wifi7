@@ -1,0 +1,143 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: an unknown conn_time is not the newest one
+
+One number nobody measured pinned a client to the wrong node permanently.
+
+99999993 lets the periodic report move a roamed client, breaking the tie
+with conn_time: the later instant of association wins. That is right, and it
+has one hole. conn_time 0 means the reporter does not know how long it has
+had the client. Read as an instant it becomes time(NULL) - 0 - the newest
+association that can exist - so an unmeasured report outbids every measured
+one. Worse, once stored as s->assoc_time, every later honest report is
+compared against a moment that never happened, and loses.
+
+Measured 2026-09-07, decoded off the wire on the corridor node. Its
+Associated Clients TLV:
+
+  BSS 1a:20:7c:74:c7:74  clients=1
+    b8:09:8a:50:f2:2a  conn_time = 1185 s
+
+and the controller kept that client filed under itself, because at 07:58:52
+its own stale hostapd entry had reported the same client with conn_time 0,
+stored as "associated here, just now":
+
+  rep_assoc  = 08:14:45 - 1185 = 07:55:00
+  assoc_time =                   07:58:52
+  07:55:00 <= 07:58:52  ->  dropped, on every report, for 17 minutes
+
+Nothing would have ended it: the true owner's claim only gets older.
+
+So an unknown conn_time is stored as unknown. A report that cannot say when
+the association began does not acquire the strongest possible claim; it takes
+ownership only when nothing better is on record, and it leaves assoc_time
+unset so a substantiated report can still correct it. This is the same rule
+as est_thput and rcpi: a value that was never measured must not read as one.
+
+The drop is also no longer silent. It was the only branch here that said
+nothing, and that is why a client sitting on the wrong node for a quarter of
+an hour looked like the report never arrived.
+
+Verify: with a client that roamed while its old node still listed it, the
+controller's sta row must follow the node that reports a real conn_time, and
+`grep "stays on"` must show the comparison when it does not.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -794,7 +794,11 @@
+ 						s->ssidlen = 0;
+ 					}
+ 					s->de_sta->conn_time = conntime;
+-					s->assoc_time = time(NULL) - conntime;
++					/* conn_time 0 is "unknown", not "just now" - see
++					 * the move branch below for what recording it as
++					 * an instant costs. */
++					s->assoc_time = conntime ?
++						time(NULL) - conntime : 0;
+ 
+ 					memcpy(s->de_sta->bssid, bssid, 6);
+ 					node_add_sta(n, s);
+@@ -858,10 +862,51 @@
+ 					 * before.
+ 					 */
+ 					struct node *old_n;
+-					time_t rep_assoc = time(NULL) - conntime;
++					time_t rep_assoc;
+ 
+-					if (s->assoc_time && rep_assoc <= s->assoc_time)
+-						continue;
++					/* conn_time 0 means the reporter does not know how
++					 * long the client has been there. Read as an
++					 * instant it becomes time(NULL) - 0, the newest
++					 * association possible, so an unmeasured report
++					 * outbids every measured one - and, once stored,
++					 * makes every later honest report look older than
++					 * the truth for good.
++					 *
++					 * Measured 2026-09-07, decoded off the wire. The
++					 * Mac b8:09:8a:50:f2:2a had been on the corridor
++					 * node for 1185 s and was reported so. The
++					 * controller had it filed under itself because at
++					 * 07:58:52 its own stale hostapd entry reported it
++					 * with conn_time 0, which was stored as "associated
++					 * here, now". From then on:
++					 *
++					 *   rep_assoc  = 08:14:45 - 1185 = 07:55:00
++					 *   assoc_time =                   07:58:52
++					 *   07:55:00 <= 07:58:52  ->  dropped, every time
++					 *
++					 * The client was pinned to the wrong node
++					 * permanently by one number nobody had measured.
++					 */
++					if (!conntime) {
++						if (s->assoc_time)
++							continue;
++						rep_assoc = 0;
++					} else {
++						rep_assoc = time(NULL) - conntime;
++
++						if (s->assoc_time &&
++						    rep_assoc <= s->assoc_time) {
++							cntlr_dbg(LOG_STA, "%s: STA " MACFMT
++								  " stays on " MACFMT ": reported"
++								  " assoc %lld is not later than"
++								  " %lld\n", __func__,
++								  MAC2STR(s->macaddr),
++								  MAC2STR(s->agent_almacaddr),
++								  (long long)rep_assoc,
++								  (long long)s->assoc_time);
++							continue;
++						}
++					}
+ 
+ 					cntlr_info(LOG_STA, "%s: STA " MACFMT " is on node "
+ 						   MACFMT " now (was " MACFMT "), conn_time %u < %u\n",
+@@ -879,7 +924,7 @@
+ 					memcpy(s->de_sta->bssid, bssid, 6);
+ 					s->state = STA_CONNECTED;
+ 					s->de_sta->conn_time = conntime;
+-					s->assoc_time = time(NULL) - conntime;
++					s->assoc_time = rep_assoc;
+ 					node_add_sta(n, s);
+ 				} else {
+ 					/* Same node. A changed BSSID here is a steer between
+@@ -906,8 +951,16 @@
+ 					 * the branch above compares against it. It is
+ 					 * time-invariant, so on a settled client this writes
+ 					 * the same value every time; it moves only when the
+-					 * client really re-associated. */
+-					s->assoc_time = time(NULL) - conntime;
++					 * client really re-associated.
++					 *
++					 * An unknown conn_time leaves it unknown rather than
++					 * stamping "now": a node that cannot say how long it
++					 * has had the client must not thereby acquire the
++					 * strongest possible claim to it. */
++					if (conntime)
++						s->assoc_time = time(NULL) - conntime;
++					else
++						s->assoc_time = 0;
+ 				}
+ 
+ 				if (bss_iface && bss_iface->bss && bss_iface->bss->is_bbss)

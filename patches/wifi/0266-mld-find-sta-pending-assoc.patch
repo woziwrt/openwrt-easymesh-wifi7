@@ -1,0 +1,120 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] AP MLD: find a station that has been answered but not yet acked
+
+An MLD station could associate, report every link up, and never move a byte.
+The AP had no 4-address peer interface for it, the station had no idea, and
+nothing ever retried. Measured twice on hardware 2026-07-29: once on a cold
+boot where two agents associated at the same moment, and once - reproducibly -
+by removing and re-adding a link with SETUP_LINK_RECONFIG.
+
+The 4-address peer is created either from handle_assoc_cb(), or lazily from
+ieee802_11_rx_from_unknown() when the first 4-address frame arrives. That
+second path exists precisely because the frame can arrive before the
+association is complete, and it is careful about it: a station that is only
+WLAN_STA_ASSOC_REQ_OK gets pending_wds_enable set instead of an immediate
+enable, and handle_assoc_cb() acts on that flag once the association lands.
+
+None of that care is reached for an MLD station, because ap_get_sta() does not
+return one in that window - its MLD fallback requires WLAN_STA_ASSOC, which is
+set later, after the Association Response TX status. So the frame looks like it
+came from an unknown station and is answered with a deauth, which the station
+discards because it is unprotected and PMF is on.
+
+The station therefore stays associated while the AP never enables WDS for it,
+and it never gets a second chance: mac80211 reports an unexpected 4-address
+frame exactly once per station (WLAN_STA_4ADDR_EVENT is set and never cleared),
+so every later frame is dropped in silence.
+
+Only the lookup is missing, so add only the lookup, and keep it local to this
+caller: a station that is WLAN_STA_ASSOC_REQ_OK and not yet WLAN_STA_ASSOC,
+which is exactly what ap_get_sta() cannot see.
+
+Widening ap_get_sta() itself is emphatically not the same change, and was tried
+first: its MLD fallback also matches on setup_link_addr, so it can return a
+different sta_info than a caller expects. Every agent then failed its 4-way
+handshake with reason 15 and the mesh stayed down until the build was reverted.
+
+Deterministic reproducer on an agent:
+  wpa_cli -i bsta-mld-3 setup_link_reconfig delete=1
+  wpa_cli -i bsta-mld-3 setup_link_reconfig add=1
+  -> peer netdev ap-mld-2.staN disappears, node unreachable, links still shown
+
+Signed-off-by: WOZIWRT <petr.wozniak@gmail.com>
+---
+diff -urN a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+--- a/src/ap/ieee802_11.c	2026-07-29 17:56:13.544998748 +0200
++++ b/src/ap/ieee802_11.c	2026-07-29 17:56:13.545683632 +0200
+@@ -8171,6 +8171,64 @@
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++/* Find an MLD station that has been answered but not yet acked.
++ *
++ * ap_get_sta() will not: its MLD fallback requires WLAN_STA_ASSOC, which is set
++ * only in handle_assoc_cb(), after the TX status for the Association Response.
++ * A 4-address frame that arrives inside that window therefore looks like it
++ * came from an unknown station and is answered with a deauth - which the
++ * station discards, because it is unprotected and PMF is on.
++ *
++ * The station stays associated while the AP never enables WDS for it, and there
++ * is no second chance: mac80211 reports an unexpected 4-address frame exactly
++ * once per station and never clears that flag. Measured twice on hardware
++ * 2026-07-29, once on a cold boot with two agents associating at the same
++ * moment and once reproducibly via SETUP_LINK_RECONFIG.
++ *
++ * The caller already knows how to handle this state - it sets
++ * pending_wds_enable rather than enabling WDS immediately, and handle_assoc_cb()
++ * acts on it once the association completes. All that is missing is finding the
++ * station. Keep that search here, narrow: only a station that is
++ * WLAN_STA_ASSOC_REQ_OK and not yet WLAN_STA_ASSOC, which is exactly the window
++ * ap_get_sta() cannot see. Widening ap_get_sta() itself is not the same change -
++ * its MLD fallback also matches on setup_link_addr, so it can return a
++ * different sta_info than the caller expects, and doing that broke the 4-way
++ * handshake for every agent when tried.
++ */
++static struct sta_info * hostapd_ml_get_sta_pending_assoc(
++	struct hostapd_data *hapd, const u8 *src)
++{
++	u8 link_id;
++
++	if (!hapd->conf->mld_ap)
++		return NULL;
++
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++		struct hostapd_data *h = hostapd_mld_get_link_bss(hapd, link_id);
++		struct sta_info *s;
++
++		if (!h)
++			continue;
++
++		for (s = h->sta_list; s; s = s->next) {
++			if (!s->mld_info.mld_sta)
++				continue;
++			if (s->flags & WLAN_STA_ASSOC)
++				continue;
++			if (!(s->flags & WLAN_STA_ASSOC_REQ_OK))
++				continue;
++			if (!os_memcmp(s->setup_link_addr, src, ETH_ALEN) ||
++			    !os_memcmp(s->addr, src, ETH_ALEN))
++				return s;
++		}
++	}
++
++	return NULL;
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
+ 				int wds)
+ {
+@@ -8179,6 +8237,8 @@
+ 	sta = ap_get_sta(hapd, src);
+ 
+ #ifdef CONFIG_IEEE80211BE
++	if (!sta)
++		sta = hostapd_ml_get_sta_pending_assoc(hapd, src);
+ 	if (sta && sta->mld_info.mld_sta)
+ 		sta = sta->mld_assoc_sta;
+ #endif

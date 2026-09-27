@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# S94: after the wireless configuration is final, before wifimngr (S95) reads
+# /etc/wifi.json. Without that file wifimngr registers no event source at all
+# and every libwifi event producer is dead code. See /usr/sbin/wifi-evmap.
+#
+# Synchronous on purpose - wifimngr must not start before the map exists. It
+# rewrites the file only when the content actually changes, so on a normal boot
+# it costs one comparison.
+
+START=94
+
+start() {
+	/usr/sbin/wifi-evmap >/dev/null 2>&1
+}
+
+stop() {
+	return 0
+}

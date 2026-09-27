@@ -1,0 +1,180 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: give a TTLM pin a fuse, and a way to be undone
+
+Two holes in the actuator, both of the same shape: it can pin a backhaul
+station onto one link and there is no way back.
+
+1. NO FUSE. Pinning every TID of a backhaul station onto one link is as
+   consequential as moving the node to another parent. The decision is
+   applied by the PARENT on its own AP-MLD, so the parent can watch the
+   result and undo it without depending on the link. ttlm_guard now does
+   that for as long as the pin stands: every 30 s it reads the MLD-level
+   rx bytes from the station, and the first tick with none tears the map
+   down. A backhaul peer is never quiet (1905 topology queries arrive
+   every 2 s), so a silent tick means the pinned link carries nothing.
+   Watching once is not enough: on 2026-09-23 the 6 GHz leg of two nodes
+   went deaf for 25-40 s every 92-116 min. When the map is gone - torn
+   down by the station, a newer policy or by hand - the fuse ends itself.
+
+   A backhaul station is a 4-address peer and lives on ap-mld-N.staM, not
+   on ap-mld-N: `iw dev ap-mld-2 station dump` lists none of them. The
+   lookup walks the MLD and every such sub-interface.
+
+2. NO TEARDOWN. The wire format could not say "stop steering this
+   station", and a map of 0 went to hostapd as "this TID may use no link
+   at all". A policy mapping every TID to 0 is now a teardown.
+
+Values that come off the network and are not numbers are refused instead
+of being handed to hostapd.
+
+Tested on the controller from /tmp: the lookup finds a backhaul peer under
+ap-mld-2.sta1 and fails for an unknown one; the fuse runs on a healthy
+peer without touching it; an all-zero policy logs a teardown and starts no
+fuse; a non-numeric map is refused. In production (2026-09-23) the
+controller delivered a fresh policy and the parent started the fuse; after
+the station tore the map down, hostapd reported "Neg-TTLM is inactive" -
+which is what the fuse now checks every tick.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+--- a/src/script/multiap	2026-09-23 13:35:30.759047661 +0200
++++ b/src/script/multiap	2026-09-23 13:35:30.767259000 +0200
+@@ -1023,20 +1023,128 @@
+ #
+ # hostapd wants the pairs as "<tid> <link_map>" after num_tids, which is exactly
+ # how the TLV carries them, so they are passed through untouched.
++# MLD-level rx bytes the AP-MLD has received from one peer.
++#
++# A backhaul station is a 4-address peer and the kernel moves it onto its own
++# ap-mld-N.staM interface: `iw dev ap-mld-N station dump` lists no backhaul
++# peer at all (measured 2026-09-23 on the controller: 0 stations on ap-mld-2,
++# one on each of ap-mld-2.sta1..3). So look at the MLD and every sub-interface.
++#
++# One tab heads the MLD summary and two head the per-link blocks, which is the
++# only thing that separates them - hence awk and not grep.
++ttlm_peer_rxbytes() {
++	local i
++
++	for i in "$1" $(ls /sys/class/net 2>/dev/null | grep "^$1\.sta"); do
++		iw dev "$i" station dump 2>/dev/null | awk -v s="$2" '
++			/^Station / { cur = ($2 == s) }
++			cur && /^\trx bytes:/ { print $3; found = 1; exit }
++			END { exit !found }' && return 0
++	done
++	return 1
++}
++
++# ttlm_guard <mld-ifname> <sta-mac> <tick-seconds>
++#
++# The local fuse for a TTLM pin. Pinning every TID of a backhaul station onto
++# one link is as consequential as moving the node to another parent, and
++# bh-roam-safe taught us that such a move needs a rollback that does not travel
++# over the thing it might break. Here it does not have to: the decision is
++# applied by the PARENT on its own AP-MLD, so the parent can watch the result
++# and undo it without depending on the link at all.
++#
++# It watches what the station SENDS, not what we send it. A backhaul peer is
++# never quiet - 1905 topology queries alone arrive every 2 s - so a tick with
++# no rx bytes means the pinned link carries nothing. tx bytes would be the
++# wrong half: whether mt76 counts frames that were never acknowledged is not
++# something we have measured.
++#
++# And it watches for as long as the pin stands, not once. The failure we fear
++# is periodic: on 2026-09-23 the 6 GHz leg of two nodes went deaf for 25-40 s
++# every 92-116 min. A single check after 60 s would pass and the pin would take
++# the node off the air an hour later. The first silent tick tears the map down;
++# the station falls back to every link, which is the safe state.
++#
++# Writes the OUTCOME to the log, not the attempt.
++ttlm_guard() {
++	local mld="$1" sta="$2" tick="$3" before after
++
++	before=$(ttlm_peer_rxbytes "$mld" "$sta") || {
++		logger -t ttlm-guard "no peer $sta under $mld - nothing to guard"
++		return 0
++	}
++	logger -t ttlm-guard "guarding the pin on $mld for $sta every ${tick}s"
++
++	while sleep "$tick"; do
++		# Torn down elsewhere - by the station, by a newer policy, by hand:
++		# there is nothing left to guard. Measured 2026-09-23: without this
++		# the fuse outlived the map and watched a station with no pin at all.
++		if hostapd_cli -i "$mld" get_neg_ttlm "$sta" 2>/dev/null | grep -q "inactive"; then
++			logger -t ttlm-guard "map for $sta on $mld is gone - nothing left to guard"
++			rm -f "/tmp/.ttlm-guard.$sta"
++			return 0
++		fi
++		after=$(ttlm_peer_rxbytes "$mld" "$sta") || {
++			logger -t ttlm-guard "$sta left $mld - its map went with the association"
++			return 0
++		}
++		if [ "$after" -le "$before" ]; then
++			hostapd_cli -i "$mld" neg_ttlm_teardown "$sta" >/dev/null 2>&1
++			logger -t ttlm-guard "pin TORN DOWN on $mld for $sta: no rx bytes in ${tick}s, station still associated"
++			rm -f "/tmp/.ttlm-guard.$sta"
++			return 0
++		fi
++		before=$after
++	done
++}
++
+ ttlm_set() {
+ 	local mld="$1" sta="$2" dir="$3" ntids="$4"
++	local sum=0 pos=0 arg guard
++
+ 	shift 4
+ 
+ 	[ -n "$mld" ] && [ -n "$sta" ] && [ -n "$ntids" ] || return 1
+ 
++	# The values come off the network: refuse anything that is not a number
++	# instead of handing it to hostapd. And a policy that maps every TID to
++	# the empty link set is a teardown - the wire format has no other way to
++	# say "stop steering this station" (direction is 0..2, an all-links map
++	# restricts nothing, and a removed policy file is explicitly not a
++	# teardown on the controller). Until now a map of 0 went to hostapd as
++	# "this TID may use no link at all", the one thing nobody wants.
++	for arg in "$@"; do
++		case "$arg" in
++		''|*[!0-9]*) return 1 ;;
++		esac
++		pos=$((pos + 1))
++		[ $((pos % 2)) -eq 0 ] && sum=$((sum + arg))
++	done
++
+ 	# Negotiated and advertised TTLM are mutually exclusive per client: a
+ 	# stale negotiated mapping has to go before a new one is requested, or
+ 	# the request is refused. Measured 2026-07-29 while building mlo-steerd.
+ 	hostapd_cli -i "$mld" neg_ttlm_teardown "$sta" >/dev/null 2>&1
+ 
++	# A fuse still watching the mapping we just removed watches nothing.
++	guard="/tmp/.ttlm-guard.$sta"
++	[ -s "$guard" ] && kill "$(cat "$guard")" 2>/dev/null
++	rm -f "$guard"
++
++	if [ "$sum" -eq 0 ]; then
++		logger -t ttlm-guard "teardown for $sta on $mld (policy mapped every TID to no link)"
++		return 0
++	fi
++
+ 	hostapd_cli -i "$mld" negotiated_ttlm request "$sta" \
+-		dir=$dir def_link_map=0 link_map_size=0 num_tids=$ntids $@ \
+-		>/dev/null 2>&1
++		dir=$dir def_link_map=0 link_map_size=0 num_tids=$ntids "$@" \
++		>/dev/null 2>&1 || return 1
++
++	# Detached on purpose: this runs from agent_exec_platform_scripts and
++	# must not hold the daemon for as long as the pin stands.
++	setsid "$0" ttlm_guard "$mld" "$sta" "${TTLM_GUARD_TICK:-30}" \
++		</dev/null >/dev/null 2>&1 &
++	echo $! > "$guard"
+ }
+ 
+ clean_stale_ifaces() {
+@@ -1964,6 +2072,7 @@
+ 	teardown_iface) teardown_iface $@;;
+ 	clean_stale_ifaces) clean_stale_ifaces $@;;
+ 	ttlm_set) ttlm_set $@;;
++	ttlm_guard) ttlm_guard $@;;
+ 	bsta_to_wireless) bsta_to_wireless $@;;
+ 	sync_mapcontroller_from_wireless) sync_mapcontroller_from_wireless $@;;
+ 	ts) ts_sub $@;;

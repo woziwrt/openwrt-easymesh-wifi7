@@ -1,0 +1,31 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 993 - sta sweep only removes bSTA ghosts
+
+mapc_sync_sta_sweep (989) deleted any sta row for a node not in the current
+TOPOLOGY_RESPONSE stalist, including fronthaul clients (is_bsta=0). The agent's
+MLD client enumeration is racy (a single empty wifi.apmld reply evicts an MLO
+client for up to a full async-refresh interval), so a transient under-report
+was written straight through as a DELETE -- oscillating real clients out of the
+DB (observed 3 -> 1). Restrict the sweep to is_bsta=1, its documented job
+(re-flash backhaul ghosts); fronthaul accuracy comes from assoc/disassoc.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -589,8 +589,14 @@
+ 		return;
+ 
+ 	mac2str(n->almacaddr, almac);
++	/* 993: only sweep backhaul bSTA ghosts (is_bsta=1). Fronthaul clients
++	 * (is_bsta=0) must never be deleted on a single stalist snapshot -- the
++	 * agent's MLD enumeration is racy, so a transient under-report would
++	 * otherwise hard-delete real clients. Their accuracy comes from real
++	 * assoc/disassoc + notifications, not this prune. */
+ 	snprintf(sql, sizeof(sql),
+-		 "DELETE FROM sta WHERE agent_almac=? AND macaddr NOT IN (");
++		 "DELETE FROM sta WHERE COALESCE(is_bsta,0)=1 AND agent_almac=? "
++		 "AND macaddr NOT IN (");
+ 	for (i = 0; i < cnt; i++)
+ 		strcat(sql, i ? ",?" : "?");
+ 	strcat(sql, ")");

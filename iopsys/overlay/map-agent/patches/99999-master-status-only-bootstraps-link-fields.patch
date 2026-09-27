@@ -1,0 +1,57 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 99999: the MLD master status only bootstraps per-link fields
+
+99995 protected ap->bssid from the MLD master status reply and stated the
+ownership rule: when stage 1 of the BSS refresh asks wifi.ap.<mld> on an
+affiliated link\x27s behalf, the reply describes the MLD, mld_parse_ap()
+owns the per-link values, and the master reply may only bootstrap a field
+that has no value yet. It then applied the rule to one field out of five.
+The blind review of 2026-08-04 (finding 1.8) counted the rest: channel,
+ssid, bssload and max_sta are still overwritten from the master reply on
+every refresh round.
+
+The channel is the sharpest of the four: affiliated links of an AP-MLD
+sit on different bands by definition, so the master\x27s channel is wrong
+for every link but the master\x27s own - and every consumer keyed by
+channel/band (steering policy, opclass reporting, the DB per-link rows)
+reads the flap.
+
+Apply the stated rule to all four: write-through for a plain BSS,
+bootstrap-only when the reply came from the MLD master (bssload takes no
+bootstrap - zero is its honest default and the master\x27s utilization is
+another link\x27s airtime).
+
+Verify on hardware: agent with an active AP-MLD, watch the refresh debug
+line - per-link channel must stay put across rounds instead of snapping
+to the master\x27s; sta/affiliated rows in mapc.db keep per-band values.
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3153,16 +3153,24 @@
+ 			assoc_ctrl_sync_from_file(w->a, ap);
+ 		}
+ 	}
+-	if (tb[0])
++	/* The same ownership rule as the BSSID above, extended to the rest of
++	 * the reply (review 2026-08-04, finding 1.8): when stage 1 asked the
++	 * MLD master on this affiliated link's behalf, every field below
++	 * describes the MLD, not the link. mld_parse_ap() owns the per-link
++	 * values. The master reply may only bootstrap a field that has no
++	 * value yet - it must never overwrite one. The channel is the sharpest
++	 * case: affiliated links sit on different bands by definition, so the
++	 * master's channel is wrong for two links out of three. */
++	if (tb[0] && (!w->status_mld || !ap->channel))
+ 		ap->channel = blobmsg_get_u32(tb[0]);
+-	if (tb[2])
++	if (tb[2] && (!w->status_mld || ap->ssid[0] == '\0'))
+ 		strncpy(ap->ssid, blobmsg_get_string(tb[2]), sizeof(ap->ssid) - 1);
+-	if (tb[3]) {
++	if (tb[3] && !w->status_mld) {
+ 		util = blobmsg_get_u32(tb[3]);
+ 		if (util != 0xff)
+ 			ap->bssload = util;
+ 	}
+-	if (tb[4])
++	if (tb[4] && (!w->status_mld || !ap->max_sta))
+ 		ap->max_sta = blobmsg_get_u32(tb[4]);
+ 
+ 	/* Need a usable BSSID (from this reply or a previous round) to proceed. */

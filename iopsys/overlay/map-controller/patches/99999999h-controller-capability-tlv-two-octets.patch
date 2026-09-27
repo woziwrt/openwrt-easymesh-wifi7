@@ -1,0 +1,52 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: send the Controller Capability TLV at two octets
+
+MediaTek's EasyMesh R3 mapd accepts the Controller Capability TLV (0xDD)
+only at a length of exactly 2. At length 1, which is what we sent, or
+with the TLV absent, it discards the whole AP-Autoconfiguration Response,
+does not record the sender as the controller and never sends WSC M1:
+
+  parse_controller_cap_tlv: error CONTROLLER_CAPABILITY_LEN length is 1 incorrect
+  topo_srv_get_controller_device: controller not found in MAP dev list
+
+Over a wired link it got configured anyway; over Wi-Fi it searched for
+112 s, gave up, dropped its backhaul and started again, so a MediaTek
+agent never took our SSIDs and kept its factory ones (found on hardware
+2026-09-18; the length check was read from its mapd disassembly: len == 2,
+flags in the first octet, bit 6 used).
+
+The TLV now carries the flags octet and one reserved zero octet. Our own
+readers are unaffected: the ieee1905 validator refuses only fewer than
+one octet, and map-agent reads the first one.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff --git a/src/cntlr_tlv.c b/src/cntlr_tlv.c
+index 645b8ca..d2b7f4e 100644
+--- a/src/cntlr_tlv.c
++++ b/src/cntlr_tlv.c
+@@ -2453,7 +2453,23 @@ int cntlr_gen_cntlr_capability(struct controller *c, struct cmdu_buff *frm, uint
+ 
+ 	data->flag = caps;
+ 
+-	t->len = sizeof(*data);
++	/* Two octets, the second one zero.
++	 *
++	 * The TLV carries one octet of flags, and one octet is what we sent.
++	 * MediaTek's mapd (EasyMesh R3, reference box 2026-09-18) accepts this
++	 * TLV only at a length of exactly 2 and reads the flags from the first
++	 * octet; at any other length, or with the TLV missing, it drops the
++	 * whole AP-Autoconfiguration Response ("CONTROLLER_CAPABILITY_LEN
++	 * length is 1 incorrect"), never records us as the controller and never
++	 * sends M1. Over Wi-Fi that left it retrying for 112 s and then
++	 * dropping its backhaul, in a loop.
++	 *
++	 * A trailing reserved octet costs a reader of the flags nothing: our
++	 * own validator only refuses fewer than one octet and map-agent reads
++	 * the first one.
++	 */
++	data->rsvd[0] = 0;
++	t->len = sizeof(*data) + 1;
+ 	if (cmdu_put_tlv(frm, t))
+ 		return -1;
+ 

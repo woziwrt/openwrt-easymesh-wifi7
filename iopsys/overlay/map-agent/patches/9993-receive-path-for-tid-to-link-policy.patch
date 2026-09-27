@@ -1,0 +1,248 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9993: receive path for a TID-to-Link Mapping policy
+
+TID-to-Link Mapping existed in this stack in one direction only. The agent puts
+an 0xE6 into every Topology Response describing its own default map
+(agent_gen_tid_to_link_mapping, our own addition), and the controller parses it
+into its database. Verified on the wire 2026-08-01: the TLV is there, in every
+Topology Response, and the controller holds 112 ttlm rows.
+
+What was missing is the half that steering is made of. No agent could be told
+what map to use: there is no consumer for 0xE6 anywhere in map-agent, and
+cntlr_gen_ap_mld_configuration_request() never put one in. Our Neg-TTLM actuator
+has been driven locally by mlo-steerd since 2026-07-29 - proven on hardware, but
+deciding from one node's view of one link, which is exactly what a mesh
+controller exists to improve on.
+
+This adds the receive path:
+
+  - a parser for the policy layout, bounds-checked at every step because the
+    TLV arrives from the network and its trailing arrays are variable;
+  - the actuator, `multiap ttlm_set`, which reaches hostapd's negotiated_ttlm
+    through the platform script like every other wifi operation here. It tears
+    an existing negotiated mapping down first, because negotiated and advertised
+    TTLM are mutually exclusive per client and the request is otherwise refused
+    (measured 2026-07-29 while building mlo-steerd);
+  - the TLV index, and the call, placed after the MLD configuration is applied,
+    because a policy names links of an AP-MLD and the MLD has to exist in its
+    final shape first.
+
+The policy layout carries a link BITMAP per TID, not a link id. A TID may map to
+several links, and the bitmap is what hostapd takes; the reporting direction
+carries link ids because it describes which link an affiliated AP is. The two
+directions therefore share the TLV number and differ in layout - see ieee1905
+patch 0008 for why nothing has to distinguish them at parse time.
+
+A policy naming no station (all-zero STA MLD address) would be a default map for
+the whole MLD. That is a different hostapd command with different semantics, so
+it is refused loudly rather than quietly applied to nobody.
+
+Not yet exercised: no controller sends this TLV. That is the next patch. This
+one is the door.
+
+diff -urN a/src/agent_map.c b/src/agent_map.c
+--- a/src/agent_map.c	2026-08-01 18:08:03.520579809 +0200
++++ b/src/agent_map.c	2026-08-01 18:08:03.520618855 +0200
+@@ -6673,6 +6673,131 @@
+ #endif
+ 
+ #if (EASYMESH_VERSION >= 6)
++#if (EASYMESH_VERSION > 5)
++/* Apply a TID-to-Link Mapping policy sent by the controller.
++ *
++ * This is the receive half of TID-to-Link Mapping. The stack had only the send
++ * half, and only in the reporting direction: agent_gen_tid_to_link_mapping()
++ * puts an 0xE6 into every Topology Response describing this node's default map,
++ * and the controller parses it into its database. Nothing could ever tell an
++ * agent what map to use - which is the half steering needs.
++ *
++ * Wire layout of the policy direction (see the comment on the ieee1905 side,
++ * patch 0008, for why the two directions share a TLV number and differ):
++ *
++ *	u8      num_policies
++ *	per policy:
++ *	  u8[6] ap_mld_macaddr      which AP-MLD the policy applies to
++ *	  u8[6] sta_mld_macaddr     the station; all-zero = the MLD's own default
++ *	  u8    direction           0 downlink, 1 uplink, 2 both (hostapd dir=)
++ *	  u8    num_tids
++ *	    u8 tid, u8 link_map     link BITMAP, not a link id - a TID may map to
++ *	                            several links, and the bitmap is what the
++ *	                            actuator takes
++ *
++ * The actuator is hostapd's negotiated_ttlm, reached through the platform
++ * script like every other wifi operation this daemon performs. It is the same
++ * command mlo-steerd v0.4 has been driving locally since 2026-07-29, so the
++ * mechanism is hardware-proven; what is new here is that the decision can come
++ * from the controller, which is the only place that can see the whole mesh.
++ *
++ * Bounds are checked at every step: the TLV arrives from the network and its
++ * trailing arrays are variable.
++ */
++static void agent_process_tid_to_link_policy(struct agent *a, uint8_t *data,
++					     uint16_t len)
++{
++	uint16_t off = 0;
++	uint8_t num_policies;
++	int p;
++
++	if (!data || len < 1)
++		return;
++
++	num_policies = data[off++];
++	agnt_dbg(LOG_MLO, "%s: %u policy block(s)\n", __func__, num_policies);
++
++	for (p = 0; p < num_policies; p++) {
++		char args[512] = {0};
++		uint8_t *ap_mld, *sta_mld;
++		struct netif_mld *mld;
++		uint8_t direction, num_tids;
++		char stastr[18] = {0};
++		int used, t;
++
++		/* 6 + 6 + 1 + 1 fixed part */
++		if (off + 14 > len) {
++			agnt_warn(LOG_MLO, "%s: truncated policy %d\n", __func__, p);
++			return;
++		}
++
++		ap_mld = &data[off];
++		off += 6;
++		sta_mld = &data[off];
++		off += 6;
++		direction = data[off++];
++		num_tids = data[off++];
++
++		if (off + (num_tids * 2) > len) {
++			agnt_warn(LOG_MLO, "%s: policy %d claims %u tids, frame too short\n",
++				  __func__, p, num_tids);
++			return;
++		}
++
++		mld = agent_get_apmld(a, ap_mld);
++		if (!mld) {
++			agnt_dbg(LOG_MLO, "%s: no AP-MLD " MACFMT " here, skip\n",
++				 __func__, MAC2STR(ap_mld));
++			off += num_tids * 2;
++			continue;
++		}
++
++		if (hwaddr_is_zero(sta_mld)) {
++			/* A default map for the whole MLD is a different hostapd
++			 * command (advertised_ttlm) with different semantics.
++			 * Refusing it is better than quietly applying a per-STA
++			 * command to nobody. */
++			agnt_warn(LOG_MLO, "%s: default-map policy for %s not supported yet\n",
++				  __func__, mld->ifname);
++			off += num_tids * 2;
++			continue;
++		}
++
++		hwaddr_ntoa(sta_mld, stastr);
++
++		/* ttlm_set <mld-ifname> <sta-mac> <dir> <num_tids> <tid> <map> ... */
++		used = snprintf(args, sizeof(args), "ttlm_set %s %s %u %u",
++				mld->ifname, stastr, direction, num_tids);
++
++		for (t = 0; t < num_tids; t++) {
++			uint8_t tid = data[off++];
++			uint8_t map = data[off++];
++			int n;
++
++			if (used < 0 || used >= (int)sizeof(args))
++				break;
++
++			n = snprintf(args + used, sizeof(args) - used, " %u %u",
++				     tid, map);
++			if (n < 0)
++				break;
++			used += n;
++		}
++
++		if (used < 0 || used >= (int)sizeof(args)) {
++			agnt_warn(LOG_MLO, "%s: policy for %s does not fit, skipped\n",
++				  __func__, stastr);
++			continue;
++		}
++
++		agnt_info(LOG_MLO, "%s: TTLM %s -> %s, dir %u, %u tid(s)\n",
++			  __func__, mld->ifname, stastr, direction, num_tids);
++
++		agent_exec_platform_scripts(args);
++	}
++}
++#endif
++
+ int handle_ap_mld_config_request(void *agent, struct cmdu_buff *cmdu, struct node *n)
+ {
+ 	trace("%s:--->\n", __func__);
+@@ -6734,6 +6859,16 @@
+ 				tv[AP_MLD_CONFIG_REQUEST_BSS_ADVANCED_CONFIG_IDX][0]->data,
+ 				tlv_length(tv[AP_MLD_CONFIG_REQUEST_BSS_ADVANCED_CONFIG_IDX][0]));
+ 
++#if (EASYMESH_VERSION > 5)
++	/* Applied after the MLD configuration above on purpose: a policy names
++	 * links of an AP-MLD, so the MLD has to exist in its final shape first.
++	 */
++	if (tv[AP_MLD_CONFIG_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0])
++		agent_process_tid_to_link_policy(a,
++				tv[AP_MLD_CONFIG_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0]->data,
++				tlv_length(tv[AP_MLD_CONFIG_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0]));
++#endif
++
+ 	/* Generate AP MLD Configuration Response */
+ 	resp = agent_gen_ap_mld_configuration_response(a,
+ 			cmdu->origin, cmdu_get_mid(cmdu));
+diff -urN a/src/agent_map.h b/src/agent_map.h
+--- a/src/agent_map.h	2026-08-01 18:08:03.520138813 +0200
++++ b/src/agent_map.h	2026-08-01 18:08:03.520158448 +0200
+@@ -496,6 +496,7 @@
+ 	AP_MLD_CONFIG_REQUEST_EHT_OPERATIONS_IDX,
+ 	AP_MLD_CONFIG_REQUEST_RSN_PARAMETERS_CONFIG_IDX,
+ 	AP_MLD_CONFIG_REQUEST_BSS_ADVANCED_CONFIG_IDX,
++	AP_MLD_CONFIG_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX,
+ 
+ 	AP_MLD_CONFIG_REQUEST_NUM_OF_TLV_TYPES
+ };
+diff -urN a/src/script/multiap b/src/script/multiap
+--- a/src/script/multiap	2026-08-01 18:08:03.521256864 +0200
++++ b/src/script/multiap	2026-08-01 18:08:03.521294457 +0200
+@@ -887,6 +887,31 @@
+ 	uci commit mapagent
+ }
+ 
++# ttlm_set <mld-ifname> <sta-mac> <dir> <num_tids> <tid> <link_map> ...
++#
++# The actuator for a TID-to-Link Mapping policy pushed by the controller
++# (map-agent patch 9993). Same hostapd command mlo-steerd v0.4 has been driving
++# locally since 2026-07-29, so the mechanism is hardware-proven - what is new is
++# where the decision comes from.
++#
++# hostapd wants the pairs as "<tid> <link_map>" after num_tids, which is exactly
++# how the TLV carries them, so they are passed through untouched.
++ttlm_set() {
++	local mld="$1" sta="$2" dir="$3" ntids="$4"
++	shift 4
++
++	[ -n "$mld" ] && [ -n "$sta" ] && [ -n "$ntids" ] || return 1
++
++	# Negotiated and advertised TTLM are mutually exclusive per client: a
++	# stale negotiated mapping has to go before a new one is requested, or
++	# the request is refused. Measured 2026-07-29 while building mlo-steerd.
++	hostapd_cli -i "$mld" neg_ttlm_teardown "$sta" >/dev/null 2>&1
++
++	hostapd_cli -i "$mld" negotiated_ttlm request "$sta" \
++		dir=$dir def_link_map=0 link_map_size=0 num_tids=$ntids $@ \
++		>/dev/null 2>&1
++}
++
+ clean_stale_ifaces() {
+ 	local iface=$1
+ 
+@@ -1811,6 +1836,7 @@
+ 	teardown_bsta_mld) teardown_bsta_mld $@;;
+ 	teardown_iface) teardown_iface $@;;
+ 	clean_stale_ifaces) clean_stale_ifaces $@;;
++	ttlm_set) ttlm_set $@;;
+ 	bsta_to_wireless) bsta_to_wireless $@;;
+ 	sync_mapcontroller_from_wireless) sync_mapcontroller_from_wireless $@;;
+ 	ts) ts_sub $@;;

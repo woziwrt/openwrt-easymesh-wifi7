@@ -1,0 +1,55 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: take agent depth from the topology tree
+
+The agent table reports depth -1 for every node while topology_link, written
+in the same sync pass, reports the correct depth of 1 for the same devices.
+
+node.depth is never computed. The only assignment anywhere in the controller
+is its initialiser:
+
+    cntlr.c:1024:   n->depth = -1;
+
+Nothing else writes it and nothing reads it, so mapc_sync_agent() faithfully
+persists -1 forever. The structure that does track how far a device sits from
+the root is the 1905 topology (bh_topology_dev.bh.depth), which the
+topology_link sync already reads.
+
+Read the depth from that same source when writing the agent row. This does not
+add a second producer - it removes one of the two answers.
+
+--- a/src/db/mapc_sync.c	2026-07-21 11:58:30.974754525 +0200
++++ b/src/db/mapc_sync.c	2026-07-21 11:58:32.978337531 +0200
+@@ -119,13 +119,24 @@
+ 		"max_bstalink_num=excluded.max_bstalink_num, "
+ 		"tid_link_caps=excluded.tid_link_caps, last_seen=excluded.last_seen";
+ 	char almac[18], upbssid[18], caps[3];
++	struct bh_topology_dev *tdev;
+ 	mapdb_stmt *st = NULL;
++	int depth;
+ 
+ 	if (!c->db)
+ 		return;
+ 
+ 	mac2str(n->almacaddr, almac);
+ 	mac2str(n->upstream_bssid, upbssid);
++
++	/* node.depth is never computed - the only assignment in the controller is
++	 * its initialiser, so it stays -1 for the lifetime of the node. The tree
++	 * that does know how far a device sits from the root is the 1905 topology,
++	 * and topology_link is already written from it. Read the depth from the
++	 * same place so the two tables stop disagreeing. */
++	tdev = c->topology.valid ? topology_find_device(&c->topology, n->almacaddr)
++				 : NULL;
++	depth = tdev ? tdev->bh.depth : n->depth;
+ 	bytes2hex(&n->ap_cap, 1, caps, sizeof(caps));	/* multiap AP-capability byte */
+ 
+ 	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
+@@ -137,7 +148,7 @@
+ 	mapdb_bind_int(st, 3, n->type);
+ 	mapdb_bind_int(st, 4, n->map_profile);
+ 	mapdb_bind_text(st, 5, caps);
+-	mapdb_bind_int(st, 6, n->depth);
++	mapdb_bind_int(st, 6, depth);
+ 	mapdb_bind_int(st, 7, n->ul_type);
+ 	mapdb_bind_text(st, 8, upbssid);
+ 	mapdb_bind_int(st, 9, n->est_thput_ul);

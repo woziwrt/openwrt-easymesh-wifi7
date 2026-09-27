@@ -1,0 +1,90 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9994: ask the MLD netdev in stage 1 of the BSS refresh
+
+Stage 2 of the BSS refresh already knows that an affiliated AP has to be read
+from the MLD master (patch 987):
+
+	if (ap->is_affiliated_ap) {
+		snprintf(objname, ..., "wifi.ap.%s", ap->mld_ifname);
+		method = "stations";
+	}
+
+Stage 1 - the status query that chains to stage 2 - was left on the per-link
+name. Under mt76 MLD the affiliated link has no netdev of its own; only the MLD
+master does. So stage 1 asks for an object that cannot exist, fails, reschedules,
+and stage 2 is never reached. The refresh has been running for interfaces that
+do not exist and never for the ones that do.
+
+Measured on hardware 2026-08-02 with a client associated, agent verbosity 4,
+via a temporary trace patch (since removed):
+
+	STATRACE: tick ap=wlan2-2 inflight=0
+	STATRACE: stage1 SELHAL ap=wlan2-2 obj=wifi.ap.wlan2-2
+	STATRACE: tick ap=bhmld6  inflight=0
+	STATRACE: stage1 SELHAL ap=bhmld6  obj=wifi.ap.bhmld6
+	...
+	9 ticks, 9 stage-1 failures, none of them for ap-mld-1 or ap-mld-2
+
+Those names are not stale ghosts - they are the affiliated links, and their
+netif_ap carries the correct mld_ifname. Only the object name stage 1 builds
+from them is wrong. Both reads work when issued by hand against the MLD netdev:
+
+	ubus call wifi.ap.ap-mld-1 stations   -> the client
+	ubus call wifi.ap.ap-mld-1 assoclist  -> the client
+
+What this unblocks, all from the same root: the agent never issued a station
+query, so it held no struct sta, so map.agent reported num_sta 0 on every BSS,
+so the Associated STA Link Metrics response carried no STA ("No STA found in
+Assoc-Link-Metrics-Resp") and rcpi stayed 0 with steering thresholds correctly
+configured, and mld->stamldlist stayed empty so the Associated STA MLD
+Configuration Report TLV was never generated at all - which is why sta_mld and
+affiliated_sta are empty on the controller.
+
+obj_id has to follow the name: the cached ap->obj_id was resolved for the
+per-link object that does not exist, so the MLD path resolves by name with
+WIFI_OBJECT_INVALID, again mirroring stage 2.
+
+diff -urN a/src/agent.c b/src/agent.c
+--- a/src/agent.c	2026-08-02 11:11:11.925640533 +0200
++++ b/src/agent.c	2026-08-02 11:11:11.937337628 +0200
+@@ -3272,6 +3272,7 @@
+ 	struct netif_ap *ap = container_of(t, struct netif_ap, bss_timer);
+ 	struct bss_refresh_req *w;
+ 	char objname[64] = {};
++	uint32_t stage1_obj;
+ 
+ 	trace("%s: ap = %s\n", __func__, ap->ifname);
+ 
+@@ -3290,18 +3291,30 @@
+ 		return;
+ 	}
+ 	w->a = ap->agent;
++	stage1_obj = ap->obj_id;
+ 	w->stage = 1;
+ 	w->status = -1;
+ 	w->bssid_unset = !!hwaddr_is_zero(ap->bssid);
+ 	snprintf(w->ifname, sizeof(w->ifname), "%s", ap->ifname);
+ 
+-	snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);
++#if (EASYMESH_VERSION >= 6)
++	/* Same conditional stage 2 already uses (987). Under MLD the affiliated
++	 * link has no netdev of its own - only the MLD master does - so asking
++	 * for wifi.ap.<link ifname> can never succeed and stage 1 dies before it
++	 * can chain to the station read. Resolve the MLD object by name, exactly
++	 * as bss_issue_stations() does. */
++	if (ap->is_affiliated_ap && ap->mld_ifname[0]) {
++		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->mld_ifname);
++		stage1_obj = WIFI_OBJECT_INVALID;
++	} else
++#endif
++		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->ifname);
+ 	ap->bss_refresh_inflight = true;
+ 
+ 	/* Stage 1: async AP status. On success bss_status_data_cb() applies the
+ 	 * fields and chains stage 2 (stations/assoclist). Terminal reschedule +
+ 	 * in-flight clear happen in bss_refresh_complete/bss_refresh_timeout. */
+-	if (agent_wifi_async(w->a, &w->areq, objname, ap->obj_id, "status",
++	if (agent_wifi_async(w->a, &w->areq, objname, stage1_obj, "status",
+ 			     bss_status_data_cb, bss_refresh_complete,
+ 			     bss_refresh_timeout, w, 2 * 1000)) {
+ 		ap->bss_refresh_inflight = false;

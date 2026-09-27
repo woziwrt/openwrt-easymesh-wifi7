@@ -1,0 +1,248 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: let the periodic report move a client
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+A roamed client could not be corrected by the one message that says where
+clients ARE.
+
+The Associated Clients TLV of a Topology Response is every node's periodic
+statement of the clients it is serving. When a client appeared there under a
+node other than the one the controller had it filed under, the report was
+discarded as a "conflicting STA-association from multiple Agents". Roaming was
+left entirely to the association EVENT, which does handle it - it removes the
+client from the old node and adds it to the new one.
+
+Events get lost. This mesh has measured CMDUs going nowhere at startup, and a
+controller restart misses every event that fires while it is down. Once an
+event is missed the client is filed under the wrong node forever, because the
+periodic report - the only thing that could notice - is forbidden from saying
+so.
+
+Measured 2026-09-06 on the lab mesh, and the chain is complete:
+
+  the kitchen node HAS aa:9f:01:68:1b:d9   wlan1 5 GHz, -46 dBm, in its
+                                           own map.agent model
+  the kitchen node REPORTS it              node heard 0 s ago
+  the controller DISCARDS the report       filed under the corridor node
+  -> 51 minutes and counting, with nothing in the system able to end it
+
+The discard was protecting against something real: during a roam both the old
+and the new node list the client, and letting either one win would flap. So
+the tie is broken instead of ignored, using a number the TLV already carries -
+conn_time, seconds since the client associated to the reporting node.
+
+The comparison has to be between absolute instants. A stored conn_time ages
+with the wall clock while the number itself sits still, so comparing it
+against a freshly reported one asks which was smaller when it was written,
+which is not the question. The first cut of this patch did exactly that and
+was measured failing: 16:79:d1:37:ae:0b had been on the bedroom node for 60 s,
+the stored value said 5 s and had been sitting there for 87 s - really 92 -
+and 60 >= 5 refused the move that 60 < 92 demanded. So the instant of
+association, time(NULL) - conntime, is what is compared, against s->assoc_time
+which already holds it. Later wins; equal or earlier is dropped as before.
+
+The same-node branch now also writes the BSSID and the state. A steer between
+bands inside one box changes the BSSID, and steering, assoc_control and the
+metrics queries are all addressed by BSSID - a stale one aims them at a BSS
+the client has left. And a node listing a client among its associated clients
+is saying that client is associated: not writing the state is why
+b8:09:8a:50:f2:2a, associated to the controller's own radio and carrying
+traffic, sat in the database with associated=0.
+
+@@ -811,13 +811,80 @@
+ 						send_cmdu(c, txcmdu);
+ 						cmdu_free(txcmdu);
+ 					}
+-				} else {
+-					/* ignore conflicting STA-association from multiple Agents */
+-					if (memcmp(s->agent_almacaddr, n->almacaddr, 6) ||
+-						memcmp(s->bssid, bssid, 6)) {
++				} else if (memcmp(s->agent_almacaddr, n->almacaddr, 6)) {
++					/* The node reporting this client is not the one we
++					 * have it filed under.
++					 *
++					 * This used to be discarded as a "conflicting
++					 * association", which leaves the periodic report -
++					 * the only statement of what IS - unable to correct a
++					 * roam. A roam is normally carried by an association
++					 * EVENT, and when that event is lost the
++					 * misattribution becomes permanent, because the one
++					 * mechanism able to repair it is forbidden from
++					 * doing so.
++					 *
++					 * Measured 2026-09-06 on the lab mesh:
++					 * aa:9f:01:68:1b:d9 sat on the kitchen node at
++					 * -46 dBm, present in that node's own model and
++					 * reported by it every few seconds - and the
++					 * controller kept it filed under the corridor node
++					 * for 51 minutes and counting. Nothing was going to
++					 * end that.
++					 *
++					 * Two nodes CAN report the same client at once: a
++					 * roam leaves the old AP listing it for a while, and
++					 * that is the case the discard was protecting
++					 * against. So the tie is broken rather than ignored,
++					 * with a number the TLV already carries. conn_time
++					 * counts up from association, so the SMALLER value is
++					 * the younger attachment and therefore the current
++					 * one. Equal or older loses and is dropped exactly as
++					 * before.
++					 */
++					struct node *old_n;
++
++					if (conntime >= s->de_sta->conn_time)
+ 						continue;
+-					}
+ 
++					cntlr_info(LOG_STA, "%s: STA " MACFMT " is on node "
++						   MACFMT " now (was " MACFMT "), conn_time %u < %u\n",
++						   __func__, MAC2STR(s->macaddr),
++						   MAC2STR(n->almacaddr),
++						   MAC2STR(s->agent_almacaddr),
++						   (unsigned int)conntime,
++						   (unsigned int)s->de_sta->conn_time);
++
++					old_n = cntlr_find_node(c, s->agent_almacaddr);
++					if (old_n)
++						node_del_sta(old_n, s);
++
++					memcpy(s->bssid, bssid, 6);
++					memcpy(s->de_sta->bssid, bssid, 6);
++					s->state = STA_CONNECTED;
++					s->de_sta->conn_time = conntime;
++					s->assoc_time = time(NULL) - conntime;
++					node_add_sta(n, s);
++				} else {
++					/* Same node. A changed BSSID here is a steer between
++					 * bands inside one box and has to land too: steering,
++					 * assoc_control and the metrics queries are addressed
++					 * by BSSID, so a stale one aims them at a BSS the
++					 * client has left.
++					 *
++					 * The state is set because the report IS the evidence:
++					 * a node listing a client among its associated clients
++					 * is saying that client is associated. Leaving it
++					 * alone is why b8:09:8a:50:f2:2a - measured the same
++					 * day, associated to the controller's own radio -
++					 * carried associated=0 in the database while it was
++					 * carrying traffic.
++					 */
++					if (memcmp(s->bssid, bssid, 6)) {
++						memcpy(s->bssid, bssid, 6);
++						memcpy(s->de_sta->bssid, bssid, 6);
++					}
++					s->state = STA_CONNECTED;
+ 					s->de_sta->conn_time = conntime;
+ 				}
+ 
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -811,14 +811,103 @@
+ 						send_cmdu(c, txcmdu);
+ 						cmdu_free(txcmdu);
+ 					}
+-				} else {
+-					/* ignore conflicting STA-association from multiple Agents */
+-					if (memcmp(s->agent_almacaddr, n->almacaddr, 6) ||
+-						memcmp(s->bssid, bssid, 6)) {
++				} else if (memcmp(s->agent_almacaddr, n->almacaddr, 6)) {
++					/* The node reporting this client is not the one we
++					 * have it filed under.
++					 *
++					 * This used to be discarded as a "conflicting
++					 * association", which leaves the periodic report -
++					 * the only statement of what IS - unable to correct a
++					 * roam. A roam is normally carried by an association
++					 * EVENT, and when that event is lost the
++					 * misattribution becomes permanent, because the one
++					 * mechanism able to repair it is forbidden from
++					 * doing so.
++					 *
++					 * Measured 2026-09-06 on the lab mesh:
++					 * aa:9f:01:68:1b:d9 sat on the kitchen node at
++					 * -46 dBm, present in that node's own model and
++					 * reported by it every few seconds - and the
++					 * controller kept it filed under the corridor node
++					 * for 51 minutes and counting. Nothing was going to
++					 * end that.
++					 *
++					 * Two nodes CAN report the same client at once: a
++					 * roam leaves the old AP listing it for a while, and
++					 * that is the case the discard was protecting
++					 * against. So the tie is broken rather than ignored,
++					 * with a number the TLV already carries: conn_time,
++					 * seconds since this client associated HERE.
++					 *
++					 * The comparison is between absolute instants, not
++					 * between two conn_times. A stored conn_time ages
++					 * with the wall clock while the number itself sits
++					 * still, so comparing it against a freshly reported
++					 * one asks "which was smaller when it was written",
++					 * which is not the question. Measured 2026-09-06,
++					 * first cut of this patch: 16:79:d1:37:ae:0b had
++					 * moved to the bedroom node 60 s earlier, the stored
++					 * value said 5 s and had been sitting there for 87 s
++					 * - really 92 s - and 60 >= 5 refused the move that
++					 * 60 < 92 demanded.
++					 *
++					 * time(NULL) - conntime is the instant of
++					 * association, which does not age, and s->assoc_time
++					 * already holds it for the attachment on record.
++					 * Later wins; equal or earlier is dropped exactly as
++					 * before.
++					 */
++					struct node *old_n;
++					time_t rep_assoc = time(NULL) - conntime;
++
++					if (s->assoc_time && rep_assoc <= s->assoc_time)
+ 						continue;
+-					}
+ 
++					cntlr_info(LOG_STA, "%s: STA " MACFMT " is on node "
++						   MACFMT " now (was " MACFMT "), conn_time %u < %u\n",
++						   __func__, MAC2STR(s->macaddr),
++						   MAC2STR(n->almacaddr),
++						   MAC2STR(s->agent_almacaddr),
++						   (unsigned int)conntime,
++						   (unsigned int)s->de_sta->conn_time);
++
++					old_n = cntlr_find_node(c, s->agent_almacaddr);
++					if (old_n)
++						node_del_sta(old_n, s);
++
++					memcpy(s->bssid, bssid, 6);
++					memcpy(s->de_sta->bssid, bssid, 6);
++					s->state = STA_CONNECTED;
++					s->de_sta->conn_time = conntime;
++					s->assoc_time = time(NULL) - conntime;
++					node_add_sta(n, s);
++				} else {
++					/* Same node. A changed BSSID here is a steer between
++					 * bands inside one box and has to land too: steering,
++					 * assoc_control and the metrics queries are addressed
++					 * by BSSID, so a stale one aims them at a BSS the
++					 * client has left.
++					 *
++					 * The state is set because the report IS the evidence:
++					 * a node listing a client among its associated clients
++					 * is saying that client is associated. Leaving it
++					 * alone is why b8:09:8a:50:f2:2a - measured the same
++					 * day, associated to the controller's own radio -
++					 * carried associated=0 in the database while it was
++					 * carrying traffic.
++					 */
++					if (memcmp(s->bssid, bssid, 6)) {
++						memcpy(s->bssid, bssid, 6);
++						memcpy(s->de_sta->bssid, bssid, 6);
++					}
++					s->state = STA_CONNECTED;
+ 					s->de_sta->conn_time = conntime;
++					/* Keep the instant of association current, because
++					 * the branch above compares against it. It is
++					 * time-invariant, so on a settled client this writes
++					 * the same value every time; it moves only when the
++					 * client really re-associated. */
++					s->assoc_time = time(NULL) - conntime;
+ 				}
+ 
+ 				if (bss_iface && bss_iface->bss && bss_iface->bss->is_bbss)

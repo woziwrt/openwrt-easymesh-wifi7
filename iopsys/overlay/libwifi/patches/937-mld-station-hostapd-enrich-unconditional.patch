@@ -1,0 +1,57 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: 937 - enumerate MLD stations via hostapd unconditionally
+
+iface_get_sta_info_band() only consulted hostapd when the nl80211 GET_STATION
+read succeeded. On open mt76 an MLO fronthaul client is attributed to the
+affiliated-link netdev, so a dump on the MLD netdev returns nothing and the
+nl80211 read fails -- which then skipped the (working) hostapd ctrl query.
+Result: wifi.apmld.<mld> stations returned empty even though the clients were
+associated (assoclist, built from the hostapd cache, saw them fine).
+
+Consult hostapd unconditionally (nl80211 best-effort, hostapd authoritative)
+and treat the station as found if either source yields it. This lets
+iface_get_mlsta_4addr_info populate every link so the apmld stations reply
+carries per-link data, which map-agent (patch 986) then enumerates.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1464,12 +1464,25 @@
+ 	info->band = band;
+ 
+ 	ret = nlwifi_get_sta_info_band(iface, band, addr, info);
++	{
++		int hret;
++
++		/* nl80211 GET_STATION is best-effort here: on mt76 a dump on the
++		 * MLD netdev returns nothing for an MLO client (it is attributed
++		 * to the affiliated-link netdev), so gating hostapd on nl80211
++		 * success discarded the good data and MLD clients never enumerated.
++		 * hostapd ctrl is authoritative -- consult it unconditionally and
++		 * treat the station as found if either source yields it. */
++		hret = hostapd_cli_iface_get_sta_info(ctrl_iface, addr, info);
++		if (ret && !hret)
++			ret = 0;
++	}
++
+ 	if (!ret) {
+ 		uint16_t ap_width, sta_width;
+ 		enum wifi_bw ap_bw;
+ 
+-		ret = hostapd_cli_iface_get_sta_info(ctrl_iface, addr, info);
+-		if (!ret && info->rate.m.bw == 0) {
++		if (info->rate.m.bw == 0) {
+ 			WARN_ON(nlwifi_get_band_channel(iface, band, &ch, &ap_bw));
+ 
+ 			ap_width = wifi_bw_enum2MHz(ap_bw);
+@@ -1481,9 +1494,7 @@
+ 		}
+ 
+ 		info->oper_std = wifi_standard_from_caps(ifname, band, &info->caps);
+-	}
+ 
+-	if (!ret) {
+ 		bw = wifi_bw_to_enum_bw(info->rate.m.bw);
+ 		info->maxrate = wifi_get_estimated_throughput(80, bw, &info->caps, info->rate.m.nss, 0);
+ 	}

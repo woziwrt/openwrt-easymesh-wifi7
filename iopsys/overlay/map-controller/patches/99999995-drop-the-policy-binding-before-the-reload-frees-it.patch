@@ -1,0 +1,70 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: drop the policy binding before the reload frees it
+
+Every config reload leaves some nodes pointing at freed memory, and the
+tripwire built to catch exactly that cannot see it.
+
+cntlr_config_reload() moves the current lists aside, parses fresh ones out of
+UCI, and ends with clean_agent_policies(&old) - which frees every
+struct node_policy that the nodes in agentlist are holding in n->np.
+cntlr_resync_config() then re-binds them, but it walks the NEW config
+nodelist:
+
+	list_for_each_entry(np, &c->cfg.nodelist, list)
+		n = cntlr_find_node(c, np->agent_id);
+		if (n) n->np = np;
+
+so it only reaches nodes that still have a section. A node whose UCI section
+was removed, and a node that never had one - the case the invariant check
+itself names - is never visited, and keeps a pointer into freed memory for as
+long as it lives.
+
+The check at the agent-policy send site tests !n->np. A dangling pointer is
+not NULL, so it passes, is dereferenced, and nodes_without_policy - the
+counter that exists to make this visible - stays 0 while it happens. The
+tripwire is silent precisely in the case it was built for.
+
+Clearing the bindings before the reload costs one pass over agentlist and
+converts a use-after-free into the condition the code already reports. It
+also makes nodes_without_policy mean what its comment says.
+
+This needs no SIGHUP: cntlr_resync_config() runs on the ordinary config-check
+path, so an unbound node is reached by ordinary operation.
+
+Verify: remove a `node` section for a live agent from mapcontroller and
+reload. `ubus call map.controller status` must show nodes_without_policy
+counting up instead of the controller reading freed memory.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1740,6 +1740,28 @@
+ {
+ 	uint32_t diff;
+ 	struct node_policy *np = NULL;
++	struct node *node = NULL;
++
++	/* Let go before the ground moves.
++	 *
++	 * cntlr_config_reload() moves the current lists aside, parses fresh
++	 * ones from UCI and then frees the old with clean_agent_policies().
++	 * Every node in agentlist is holding a pointer into what it just
++	 * freed. The loop below re-binds them - but it walks the NEW config
++	 * nodelist, so it only reaches nodes that still have a section. A
++	 * node whose section was removed, or one that never had one, is
++	 * never visited and keeps pointing at freed memory.
++	 *
++	 * The invariant check at the agent-policy send site tests !n->np. A
++	 * freed pointer is not NULL, so it walks straight past the tripwire
++	 * and is dereferenced - and nodes_without_policy, the counter that
++	 * exists to make exactly this visible, stays at 0 while it happens.
++	 *
++	 * Clearing first costs one pass and turns a use-after-free into the
++	 * condition the code already knows how to report.
++	 */
++	list_for_each_entry(node, &c->agentlist, list)
++		node->np = NULL;
+ 
+ 	diff = cntlr_config_reload(&c->cfg);
+ 

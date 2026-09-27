@@ -1,0 +1,34 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Put the hooks back before anything else in the boot chain runs.
+#
+# The hook is one line inside somebody else's file, so it is lost whenever the
+# package that owns that file is replaced - an `apk upgrade` of map-agent takes
+# the hook out of /lib/multiap/map_genconfig without anyone noticing, and the
+# next trace is quietly incomplete. A trace with a hole in it is worse than no
+# trace, because it reads like an answer.
+#
+# START=04: ahead of S10boot, which is what runs the uci-defaults, so a first
+# boot after a flash is recorded from its own beginning.
+#
+# This is not a service. It runs, it re-hooks what is missing, it exits.
+
+START=04
+STOP=99
+
+start() {
+	[ -x /usr/sbin/easymesh-trace-install ] || return 0
+	# Cheap check first: with nothing missing this costs a few greps.
+	missing=$(/usr/sbin/easymesh-trace-install list 2>/dev/null | while read -r f; do
+		grep -q EASYMESH-TRACE "$f" 2>/dev/null || echo "$f"
+	done | wc -l)
+	[ "${missing:-0}" -gt 0 ] 2>/dev/null || return 0
+	logger -t easymesh-trace "$missing scripts lost their hook - re-hooking the boot chain"
+	/usr/sbin/easymesh-trace-install on >/dev/null 2>&1
+}
+
+stop() {
+	return 0
+}

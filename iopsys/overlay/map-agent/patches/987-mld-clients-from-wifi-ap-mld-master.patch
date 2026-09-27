@@ -1,0 +1,47 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 987 - enumerate MLD clients via wifi.ap.<mld> master bssid
+
+libwifi 937 makes wifi.ap.<mld_ifname> "stations" return all MLD fronthaul
+clients, but wifi.apmld.<mld> "stations" (what the async refresh queried) stays
+empty because its apmld assoclist is empty on mt76. Point the affiliated-AP
+station refresh at wifi.ap.<mld_ifname> instead. That reply reports each
+client's bssid as the AP-MLD master address (no mlo_links), so also accept a
+station whose bssid equals ap->mld_macaddr, gated to the primary affiliated
+link (mlo_link_id==0) so the client is added exactly once per MLD. The 986
+per-link mlo_links match is kept for sources that do carry mlo_links.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2917,7 +2917,13 @@
+ 				if (!stb[1] ||
+ 				    !hwaddr_aton(blobmsg_get_string(stb[1]), bssid))
+ 					continue;
+-				if (memcmp(bssid, ap->bssid, 6))
++				/* wifi.ap.<mld> reports the client bssid as the
++				 * AP-MLD master address (no mlo_links). Accept the
++				 * master on the primary affiliated link only, so the
++				 * client is added exactly once per MLD. */
++				if (memcmp(bssid, ap->bssid, 6) &&
++				    !(ap->mlo_link_id == 0 &&
++				      !memcmp(bssid, ap->mld_macaddr, 6)))
+ 					continue;
+ 				if (!hwaddr_aton(blobmsg_get_string(stb[0]), mac))
+ 					continue;
+@@ -2960,9 +2966,13 @@
+ 	 * conditional so non-MLD stations are not lost. */
+ #if (EASYMESH_VERSION >= 6)
+ 	if (ap->is_affiliated_ap) {
+-		snprintf(objname, sizeof(objname), "wifi.apmld.%s", ap->mld_ifname);
++		/* 987: query the MLD netdev's wifi.ap object. wifi.apmld.<mld>
++		 * "stations" is empty on mt76 (its apmld assoclist is empty);
++		 * wifi.ap.<mld> "stations" returns the MLD clients (libwifi 937),
++		 * reporting each client's bssid as the AP-MLD master address. */
++		snprintf(objname, sizeof(objname), "wifi.ap.%s", ap->mld_ifname);
+ 		method = "stations";
+-		obj_id = WIFI_OBJECT_INVALID;	/* resolve apmld by name */
++		obj_id = WIFI_OBJECT_INVALID;	/* resolve MLD netdev by name */
+ 		w2->stations_mld = true;
+ 	} else
+ #endif

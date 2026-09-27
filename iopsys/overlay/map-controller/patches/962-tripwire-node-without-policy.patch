@@ -1,0 +1,73 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: tripwire node without policy
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Tripwire: never dereference node policy that was never bound.
+
+cntlr_check_config_diff() walks c->agentlist and reads n->np->is_policy_diff.
+np is NULL for any node that reached agentlist without a policy binding:
+duplicate AL-MAC mirrors (unreachable via mac_table, so never backfilled by
+cntlr_resync_config) and agents with no matching UCI node section. Both crash
+the controller with SIGSEGV; procd respawns it, so it presents as a restart
+loop rather than a crash.
+
+Confirmed on hardware from a core dump: si_addr=0x2d = offsetof(struct
+node_policy, is_policy_diff), faulting at ldrb w0,[x0,#45] with x0=0, right
+after ldr x0,[x21,#296] = offsetof(struct node, np).
+
+The guard must sit at the top of the loop body, not inline in the existing
+condition: with only CONFIG_DIFF_AGENT_POLICY_CNT set that test is skipped and
+np still reaches cntlr_gen_policy_config_req() further down.
+
+This is deliberately NOT a fix. The counter is exported as
+map.controller status -> nodes_without_policy and MUST read 0. A non-zero
+value means node identity is still created from more than one source and the
+real defect is upstream in node creation, not here.
+
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -305,6 +305,10 @@
+ 	 * prebuilt plugin .so's that dereference struct controller* opaquely. */
+ 	atimer_t db_checkpoint;	/* periodic WAL checkpoint of mapc.db */
+ 	mapdb *db;		/* persistence handle (mapc.db); NULL = degraded */
++
++	/* Tripwire: nodes that reached agentlist without a policy binding.
++	 * MUST stay 0 once node identity is single-sourced; appended = ABI-safe. */
++	uint32_t nodes_without_policy;
+ };
+ 
+ #define STA_CHANNEL_REPORT_MAX_NUM 32
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1433,6 +1433,21 @@
+ 			struct netif_radio *r = NULL;
+ 			int num_radio = 0;
+ 
++			/* A node must never reach agentlist without a policy binding.
++			 * It happens today for duplicate AL-MAC mirrors (unreachable via
++			 * mac_table, so never backfilled) and for agents with no matching
++			 * UCI node section. Both dereference np below and crash.
++			 *
++			 * This is a tripwire, NOT a fix: the counter is exported in
++			 * map.controller status and MUST read 0. If it does not, node
++			 * identity is still multi-sourced and the real defect is upstream. */
++			if (!n->np) {
++				c->nodes_without_policy++;
++				warn("%s: node " MACFMT " in agentlist without policy - INVARIANT VIOLATED (count=%u)\n",
++				     __func__, MAC2STR(n->almacaddr), c->nodes_without_policy);
++				continue;
++			}
++
+ 			if ((diff & CONFIG_DIFF_AGENT_POLICY) && !n->np->is_policy_diff)
+ 				continue;
+ 
+--- a/src/cntlr_commands_impl.c
++++ b/src/cntlr_commands_impl.c
+@@ -3332,6 +3332,7 @@
+ 
+ 
+ 	blobmsg_add_u32(bb, "num_nodes", c->num_agents);
++	blobmsg_add_u32(bb, "nodes_without_policy", c->nodes_without_policy);
+ 	a = blobmsg_open_array(bb, "node");
+ 	list_for_each_entry(n, &c->agentlist, list) {
+ 		void *t, *tt;

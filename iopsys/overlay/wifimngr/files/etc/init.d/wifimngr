@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+
+USE_PROCD=1
+PROG=/usr/sbin/wifimngr
+
+start_service() {
+	procd_open_instance
+	procd_set_param command ${PROG}
+	procd_set_param env LIBWIFI_DEBUG_LEVEL=3    #for debugging only
+	procd_set_param env LIBWIFI_DEBUG_LEVEL=3 LIBWIFI_STA_RATINGS_SOFILE="/usr/lib/libwifi-sta-ratings.so"
+	procd_set_param stderr 1                    #for debugging only
+	procd_set_param respawn
+	procd_close_instance
+}
+
+reload_service() {
+        stop
+        start
+}
+

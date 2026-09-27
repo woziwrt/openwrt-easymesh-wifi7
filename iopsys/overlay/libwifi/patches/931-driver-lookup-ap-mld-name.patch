@@ -1,0 +1,42 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: driver lookup ap mld name
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Recognise OpenWrt MLD netdev names (ap-mld-N) in the driver lookup.
+
+get_wifi_driver() picks a driver by matching the interface name against the
+comma-separated prefixes in wifi_driver.name. The default driver declares
+"wlan,phy,bsta" and nlwifi declares "wlan". OpenWrt names the AP-MLD netdev
+ap-mld-N, which matches none of them, so get_wifi_driver() returns NULL and
+every libwifi call on that interface comes back -ENOTSUP.
+
+That single miss disables the whole AP-MLD data path, silently and completely:
+
+  wifi_get_mlo_links(ap-mld-1)         -> -ENOTSUP
+  wl_apmld_status()                    -> UBUS_STATUS_UNKNOWN_ERROR
+  ubus call wifi.apmld.ap-mld-1 status -> "Unknown error"
+  map-agent                            -> num_ap_mld = 0
+  map-agent                            -> never emits AP-MLD Config TLV (0xE0)
+  map-controller                       -> apmld / affiliated_ap / ttlm stay empty
+
+The MLD itself is up the whole time - three links, clients associated, traffic
+flowing. Only the reporting path is dead, which is why it went unnoticed: the
+dashboard reads the configured link list instead and shows three links either
+way.
+
+Adding the prefix is enough. The matcher takes strspn(ifname, token) and then
+requires the next character to be a digit or NUL: for "ap-mld-1" and token
+"ap-mld" that is s=7, ifname[7]='1', so it matches, and "ap-mld" cannot collide
+with wlan/phy/bsta interfaces.
+
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -2187,7 +2187,7 @@
+ 
+ 
+ const struct wifi_driver default_wifi_driver = {
+-	.name = "wlan,phy,bsta",
++	.name = "wlan,phy,bsta,ap-mld",
+ 	.info = nlwifi_driver_info,
+ 
+ 	/* Radio/phy callbacks */

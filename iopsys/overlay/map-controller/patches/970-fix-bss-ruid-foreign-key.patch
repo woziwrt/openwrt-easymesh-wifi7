@@ -1,0 +1,47 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: give a BSS the RUID of its radio
+
+The bss table is permanently empty on hardware. Every agent reports its BSSes correctly -
+a capture of the AP Operational BSS TLV (0x83) shows fourteen of them across
+three nodes, with BSSIDs and SSIDs - and the controller parses them into
+r->iflist, so mapc_sync_bss() does run once per BSS.
+
+It just cannot write them:
+
+    bss.ruid TEXT REFERENCES radio(ruid)
+
+mapc_sync_bss() binds b->ruid, but nothing on the Topology Response path ever
+fills that field in. cntlr_radio_add_iface() has the radio in hand and sets
+is_fbss, is_bbss and enabled, yet leaves bss->ruid zeroed; the only two writers
+of a BSS ruid in the controller sit in an unrelated TLV handler. So every insert
+carries ruid "00:00:00:00:00:00", matches no radio row, and is rejected.
+
+Measured on 2026-07-21: an agent reporting two BSSes produced exactly two
+"FOREIGN KEY constraint failed" entries, one reporting six produced exactly six.
+
+Copy the RUID from the radio the interface is being attached to, on both the
+newly allocated and the already existing path. radio.ruid and
+operating_class.ruid are both written from r->radio_el->macaddr, so this uses
+the same identity and the key matches.
+
+--- a/src/cntlr.c	2026-07-21 11:57:02.472981611 +0200
++++ b/src/cntlr.c	2026-07-21 11:57:04.022196131 +0200
+@@ -879,6 +879,10 @@
+ 	if (n) {
+ 		n->bss->enabled = true;
+ 		n->radio = r;
++		/* The BSS carries the RUID of the radio it belongs to; without it
++		 * mapc_sync_bss() writes an all-zero ruid and the bss row is
++		 * rejected by the foreign key into radio(ruid). */
++		memcpy(n->bss->ruid, r->radio_el->macaddr, 6);
+ 		return n;
+ 	}
+ 
+@@ -910,6 +914,7 @@
+ 	n->bss->is_fbss = true;
+ 	n->bss->is_bbss = false;
+ 	n->bss->enabled = true;
++	memcpy(n->bss->ruid, r->radio_el->macaddr, 6);
+ 	list_add(&n->list, &r->iflist);
+ 	n->agent = r->agent;
+ 	n->radio = r;

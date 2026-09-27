@@ -1,0 +1,172 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi 940: read the per-link station metrics nl80211 already returns
+
+nlwifi_get_mlsta_info_cb() walks NL80211_ATTR_MLO_LINKS for identity - link id,
+affiliated addresses, BSSID, band - and never looks at the STA_INFO nested
+inside each link. Every metric it assigns afterwards is read from the MLD-level
+STA_INFO and written to mlsta->sta[0] alone. On mt76 that MLD-level signal is
+zero, and rssi_to_rcpi() turns zero into 255, so the mesh has been carrying a
+number that reads like a measurement and is not one. The remaining links keep
+whatever they were initialised with.
+
+The data is there. Verified on hardware 2026-08-03, `iw station dump` on an
+AP-MLD, one client, two links:
+
+    signal:  -11 [-18, -11, -20] dBm
+    signal:  -18 [-24, -31, -19] dBm
+
+That is the same GET_STATION reply this callback parses, so nothing new has to
+be asked of the driver.
+
+Three changes:
+
+1. A second pass over NL80211_ATTR_MLO_LINKS fills rssi, rssi_avg and the tx/rx
+   rates per link. It runs after the MLD-level assignments deliberately, so the
+   per-link value wins for link 0 too instead of being overwritten by it. Links
+   are matched by link id, not by position, because the first loop skips any
+   link that has none.
+
+2. iface_get_mlsta_info() now keeps rssi across the hostapd band enrichment, the
+   same way patch 939 already keeps the identity, and for the same reason: that
+   helper is handed the MLD netdev and answers with MLD-level numbers.
+
+3. A plain bug on the way past. The MLD address copy tests the per-link
+   attribute and then reads the top-level one:
+
+       if (tblink[NL80211_ATTR_MLD_ADDR])
+               memcpy(sta->mld_macaddr, nla_data(tb[NL80211_ATTR_MLD_ADDR]), 6);
+
+   If the top-level attribute is absent that is nla_data(NULL). It has not
+   crashed because AP mode overwrites the field a few lines later, which is also
+   why it went unnoticed.
+
+This is below EasyMesh, so it also reaches LuCI and anything else reading a
+station on an MLD.
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -3496,7 +3496,7 @@
+ 			sta->mlo_capable = true;
+ 
+ 			if (tblink[NL80211_ATTR_MLD_ADDR])
+-				memcpy(sta->mld_macaddr, nla_data(tb[NL80211_ATTR_MLD_ADDR]), 6);
++				memcpy(sta->mld_macaddr, nla_data(tblink[NL80211_ATTR_MLD_ADDR]), 6);
+ 
+ 			if (tblink[NL80211_ATTR_BSSID])
+ 				memcpy(sta->bssid, nla_data(tblink[NL80211_ATTR_BSSID]), 6);
+@@ -3592,6 +3592,83 @@
+ 	if (s[NL80211_STA_INFO_SIGNAL_AVG])
+ 		mlsta->sta[0].rssi_avg = (int)nla_get_u8(s[NL80211_STA_INFO_SIGNAL_AVG]);
+ 
++	/* Per-link metrics.
++	 *
++	 * The loop above takes identity out of NL80211_ATTR_MLO_LINKS but never
++	 * reads the STA_INFO nested inside each link, so every metric assigned
++	 * since then came from the MLD-level STA_INFO and landed on sta[0] alone.
++	 * On mt76 that MLD-level signal is zero, and rssi_to_rcpi() faithfully
++	 * turns zero into 255 - a number that reads like a measurement and is not
++	 * one. The other links kept whatever they were initialised with.
++	 *
++	 * The kernel does carry the real thing. Verified on hardware 2026-08-03,
++	 * `iw station dump` on an AP-MLD printed for a single client:
++	 *
++	 *     signal:  -11 [-18, -11, -20] dBm
++	 *     signal:  -18 [-24, -31, -19] dBm
++	 *
++	 * which is the same GET_STATION reply this callback is parsing.
++	 *
++	 * Done as a second pass, after the MLD-level assignments above, so that
++	 * the per-link value also wins for link 0 instead of being overwritten.
++	 * Links are matched by link id rather than by position, because the first
++	 * loop skips any link without one.
++	 */
++	if (tb[NL80211_ATTR_MLO_LINKS]) {
++		struct nlattr *linkattrs;
++		int rem;
++
++		nla_for_each_nested(linkattrs, tb[NL80211_ATTR_MLO_LINKS], rem) {
++			struct nlattr *tblink[NL80211_ATTR_MAX + 1];
++			struct nlattr *ls[NL80211_STA_INFO_MAX + 1];
++			struct wifi_sta *sta = NULL;
++			uint8_t lid;
++			int i;
++
++			nla_parse_nested(tblink, NL80211_ATTR_MAX, linkattrs, NULL);
++			if (!tblink[NL80211_ATTR_MLO_LINK_ID] ||
++			    !tblink[NL80211_ATTR_STA_INFO])
++				continue;
++
++			lid = nla_get_u8(tblink[NL80211_ATTR_MLO_LINK_ID]);
++			for (i = 0; i < mlsta->num_link; i++) {
++				if (mlsta->sta[i].mlo_link_id == lid) {
++					sta = &mlsta->sta[i];
++					break;
++				}
++			}
++			if (!sta)
++				continue;
++
++			if (nla_parse_nested(ls, NL80211_STA_INFO_MAX,
++					     tblink[NL80211_ATTR_STA_INFO], sta_policy))
++				continue;
++
++			if (ls[NL80211_STA_INFO_CHAIN_SIGNAL]) {
++				struct nlattr *itr;
++				int idx = 0;
++				int crem;
++
++				nla_for_each_nested(itr, ls[NL80211_STA_INFO_CHAIN_SIGNAL], crem) {
++					sta->rssi[idx++] = nla_get_u8(itr);
++					if (idx == WIFI_NUM_ANTENNA)
++						break;
++				}
++			} else if (ls[NL80211_STA_INFO_SIGNAL]) {
++				sta->rssi[0] = nla_get_u8(ls[NL80211_STA_INFO_SIGNAL]);
++			}
++
++			if (ls[NL80211_STA_INFO_SIGNAL_AVG])
++				sta->rssi_avg = (int8_t)nla_get_u8(ls[NL80211_STA_INFO_SIGNAL_AVG]);
++
++			if (ls[NL80211_STA_INFO_TX_BITRATE])
++				nlwifi_bitrate_attrs(ls[NL80211_STA_INFO_TX_BITRATE], &sta->tx_rate);
++
++			if (ls[NL80211_STA_INFO_RX_BITRATE])
++				nlwifi_bitrate_attrs(ls[NL80211_STA_INFO_RX_BITRATE], &sta->rx_rate);
++		}
++	}
++
+ 	if (s[NL80211_STA_INFO_STA_FLAGS]) {
+ 		sta_flags = (struct nl80211_sta_flag_update *)
+ 					nla_data(s[NL80211_STA_INFO_STA_FLAGS]);
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1948,6 +1948,8 @@
+ 				uint8_t link_macaddr[6];
+ 				uint8_t link_bssid[6];
+ 				uint8_t link_id;
++				int8_t link_rssi[WIFI_NUM_ANTENNA];
++				int8_t link_rssi_avg;
+ 
+ 				sta = &mlsta->sta[i];
+ 				memcpy(sta->bssid, aplinks[j].macaddr, 6);
+@@ -1966,6 +1968,8 @@
+ 				link_id = sta->mlo_link_id;
+ 				memcpy(link_macaddr, sta->macaddr, 6);
+ 				memcpy(link_bssid, sta->bssid, 6);
++				memcpy(link_rssi, sta->rssi, sizeof(link_rssi));
++				link_rssi_avg = sta->rssi_avg;
+ 
+ 				ret = iface_get_sta_info_band(ifname, aplinks[j].band, macaddr, sta);
+ 				if (ret) {
+@@ -1981,6 +1985,12 @@
+ 				sta->mlo_link_id = link_id;
+ 				memcpy(sta->macaddr, link_macaddr, 6);
+ 				memcpy(sta->bssid, link_bssid, 6);
++				/* Same reason as the identity above: the band enrichment
++				 * is handed the MLD netdev and answers with MLD-level
++				 * numbers, which on mt76 are zero. Keep what nl80211
++				 * measured per link. */
++				memcpy(sta->rssi, link_rssi, sizeof(link_rssi));
++				sta->rssi_avg = link_rssi_avg;
+ 				sta->mlo_capable = true;
+ 
+ 				if (!(sta->caps.valid & WIFI_CAP_EHT_VALID))

@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Diagnostic heartbeat. START=99 so it does not delay anything that matters, and
+# it must survive reboot because the failure it chases may follow one.
+START=99
+start() {
+	/usr/sbin/node-heartbeat 60 >/dev/null 2>&1 &
+}
+stop() {
+	# Unquoted on purpose. Quoting glued several pids into one word and kill
+	# died on "illegal pid", so a restart left the old worker alive and every
+	# heartbeat line appeared twice from then on.
+	# shellcheck disable=SC2046
+	kill $(pgrep -f '/usr/sbin/node-heartbeat') 2>/dev/null
+	return 0
+}

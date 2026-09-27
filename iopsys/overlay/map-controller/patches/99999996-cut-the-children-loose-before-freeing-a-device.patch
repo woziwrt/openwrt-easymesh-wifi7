@@ -1,0 +1,80 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: cut the children loose before freeing a device
+
+A node ageing out leaves every node behind it holding two pointers into
+freed memory.
+
+struct backhaul_info keeps bh.parent as a pointer to another
+bh_topology_dev, and bh.parent_iface as a pointer into that device's
+ifaces[] array. topology_remove_device() frees the device and leaves both
+pointers standing in every child. This is not an exotic path: it is called
+from cntlr_clean_node(), i.e. whenever a node ages out.
+
+topology->valid is set false here for exactly this hazard, and topology.h
+says reading backhaul info while it is false is undefined. But only one
+place in the controller asks - cntlr.c, is_topology_valid(). The parent
+chain walk, the neighbour match, and the ubus topology dump all guard with
+
+	if (dev->bh.parent)
+		... dev->bh.parent->al_macaddr ...
+
+and a freed pointer passes that test. The safety flag protects one reader
+out of four.
+
+So the pointers are cleared instead of being left to a flag nobody reads.
+The NULL checks that already exist then mean what they say, and a child of a
+departed node reads as having no parent - which is the truth - rather than
+reading freed memory. Same shape as the policy binding: make the guard the
+code already has become effective, instead of adding a second one.
+
+own_iface is not touched: it points into the device's own ifaces[], so it
+dies with the device and no one else holds it.
+
+Verify: with a three-level mesh, power off the middle node and let it age
+out. `ubus call map.controller topology` must show the orphan without a
+parent instead of a random address, and must not fault.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -209,6 +209,39 @@
+ 
+ 	list_for_each_entry_safe(bh_topo_dev, bh_topo_dev_tmp, &topology->dev_list, list) {
+ 		if (hwaddr_equal(bh_topo_dev->al_macaddr, al_macaddr)) {
++			struct bh_topology_dev *other = NULL;
++
++			/* Cut the children loose before freeing what they point at.
++			 *
++			 * bh.parent points at another device and bh.parent_iface
++			 * into that device's ifaces[] array, so freeing a device
++			 * leaves every child of it holding two pointers into freed
++			 * memory - and this runs on ordinary node ageout, not on
++			 * anything exotic.
++			 *
++			 * topology->valid is set false here for exactly this
++			 * reason, and the header says reading backhaul info is
++			 * undefined while it is false. But only one reader in the
++			 * controller asks (cntlr.c: is_topology_valid). The others -
++			 * the parent-chain walk, the neighbour match, the ubus
++			 * topology dump - guard with `if (dev->bh.parent)` and
++			 * dereference. A freed pointer passes that test.
++			 *
++			 * So the pointers are cleared rather than left for a flag
++			 * nobody reads: the NULL checks that already exist then
++			 * mean what they say, and a child of a departed node reads
++			 * as having no parent instead of reading freed memory.
++			 */
++			list_for_each_entry(other, &topology->dev_list, list) {
++				if (other == bh_topo_dev)
++					continue;
++				if (other->bh.parent != bh_topo_dev)
++					continue;
++
++				other->bh.parent = NULL;
++				other->bh.parent_iface = NULL;
++			}
++
+ 			list_del(&bh_topo_dev->list);
+ 			free(bh_topo_dev);
+ 

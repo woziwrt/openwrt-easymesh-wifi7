@@ -1,0 +1,95 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: split advertised AKM suites by haul, not by iftype
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+The AKM Suite Capabilities TLV (17.2.78, Table 101) carries Num_BackAKM for
+the backhaul BSSes and Num_FrontAKM for the fronthaul ones. A fronthaul BSS is
+an AP as well, so keying the split off the AP/STA interface type puts the same
+list in both fields. 999999-akm-suites-from-ap-sections merged every AP on the
+radio into one bitmap and used it for both, which did exactly that.
+
+Our fronthaul runs sae-mixed and our backhaul runs sae, so the merged bitmap
+told every peer that our backhaul speaks PSK. It does not.
+
+Measured on the wire 2026-09-03 (tcpdump -i any 'ether proto 0x893a' on the
+controller, triggered with query_ap_caps), CMDU 0x8002 from a live agent:
+
+  Num_BackAKM  = 2   00:0f:ac:02 (PSK)   00:0f:ac:08 (SAE)
+  Num_FrontAKM = 2   00:0f:ac:02 (PSK)   00:0f:ac:08 (SAE)
+
+with uci apmld_bh.encryption='sae' - no PSK on that BSS at all. A peer that
+believes this and offers PSK on the backhaul gets nothing back, and will look
+for the fault on its own side. Advertising nothing would have been more honest
+than advertising what we do not offer.
+
+netif_apcfg already carries the haul: multi_ap is 0x01 backhaul, 0x02
+fronthaul, 0x03 combined, and the rest of the agent keys off it the same way
+(agent_map.c:2371). Fill the two bitmaps separately from it.
+
+The upstream field names read backwards here and are left alone:
+agent_gen_akm_suite_cap() emits ap_akms as Num_BackAKM and sta_akms as
+Num_FrontAKM. Filling them by haul keeps that mapping intact and corrects only
+what goes in - nothing else in the tree reads either array.
+
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3944,7 +3944,7 @@
+ 					       struct wifi_radio_element *re)
+ {
+ 	struct netif_apcfg *apcfg;
+-	uint16_t enc = 0;
++	uint16_t bh_enc = 0, fh_enc = 0;
+ 
+ 	/* Encryption is a property of the BSS, not of the radio. The radio
+ 	 * sections carry no encryption option at all - every one of them
+@@ -3952,18 +3952,45 @@
+ 	 * the AKM Suite Capabilities TLV went out empty, leaving no peer able
+ 	 * to learn what security this device speaks.
+ 	 *
+-	 * Merge every AP on this radio: one radio can host BSSes with
+-	 * different security, and the TLV advertises what the device can do.
++	 * Split by haul, not by interface type. The TLV (17.2.78, Table 101)
++	 * carries Num_BackAKM for the backhaul BSSes and Num_FrontAKM for the
++	 * fronthaul ones; a fronthaul BSS is an AP too, so keying off AP/STA
++	 * puts the same list in both fields. Merging every AP on the radio did
++	 * exactly that, and since our fronthaul runs sae-mixed while the
++	 * backhaul runs sae, we ended up telling every peer that our backhaul
++	 * speaks PSK. It does not.
++	 *
++	 * Measured on the wire 2026-09-03, CMDU 0x8002 from a live agent:
++	 *   Num_BackAKM  = 2   00:0f:ac:02 (PSK)   00:0f:ac:08 (SAE)
++	 *   Num_FrontAKM = 2   00:0f:ac:02 (PSK)   00:0f:ac:08 (SAE)
++	 * with uci apmld_bh.encryption='sae' - no PSK anywhere on that BSS.
++	 * A peer that believes it and offers PSK on the backhaul gets nothing,
++	 * and will look for the fault on its own side. Advertising nothing is
++	 * more honest than advertising what we do not offer.
++	 *
++	 * Note the field names below are the upstream ones and read backwards
++	 * here: agent_gen_akm_suite_cap() emits ap_akms as Num_BackAKM and
++	 * sta_akms as Num_FrontAKM. Filling them by haul keeps that mapping
++	 * intact and only corrects what goes in.
+ 	 */
+ 	list_for_each_entry(apcfg, &a->cfg.aplist, list) {
++		uint16_t apenc;
++
+ 		if (strncmp(apcfg->device, re->name, sizeof(apcfg->device)))
+ 			continue;
+-		enc |= get_encryption(apcfg->encryption);
++
++		apenc = get_encryption(apcfg->encryption);
++
++		/* multi_ap: 0x01 backhaul, 0x02 fronthaul, 0x03 combined */
++		if (apcfg->multi_ap & 0x01)
++			bh_enc |= apenc;
++		if (apcfg->multi_ap & 0x02)
++			fh_enc |= apenc;
+ 	}
+ 
+-	re->num_ap_akms = default_akm_suites_from_encryption(enc,
++	re->num_ap_akms = default_akm_suites_from_encryption(bh_enc,
+ 			(uint8_t *)re->ap_akms, MAX_AKM_SUITES);
+-	re->num_sta_akms = default_akm_suites_from_encryption(enc,
++	re->num_sta_akms = default_akm_suites_from_encryption(fh_enc,
+ 			(uint8_t *)re->sta_akms, MAX_AKM_SUITES);
+ }
+ 

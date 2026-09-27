@@ -1,0 +1,60 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: a 4-address STA-MLD with two links is MLO capable
+
+941 gave the 4-address WDS child its identity back, but the per-link
+breakdown it was written for still never reaches ubus: every such child
+is published with mlo_capable false, and wifimngr gates the whole
+mlo_links array on that flag, so the array is simply absent.
+
+Measured 2026-08-07 on the running mesh. Both backhaul children of the
+controller hold two links:
+
+  Link 0  BSSID 86:f7:56:41:01:d4  freq 5180.0
+  Link 1  BSSID 76:04:1c:81:bc:2f  freq 6135.0
+
+while ubus call wifi.apmld.ap-mld-2 stations reports, for both:
+
+  "mlo_capable": false,
+  "link_id": 0,
+
+and no mlo_links at all.
+
+The cause is inside iface_get_mlsta_4addr_info(). It counts the links
+correctly, but the only place it can set mlo_capable is a test that the
+MLD address differs from the station address - and a few lines earlier
+the same function fills both from the address the caller asked about, so
+on mt76 they always compare equal. That test is kept, because a driver
+which does report a distinct MLD address still benefits from it; what
+was missing is the plain criterion the non-4addr path a few lines below
+already applies: more than one link is what makes a station MLO.
+
+Why 941 was reported as verified on hardware: its check was "real MAC
+and BSSID, real stats, link ids present", and every part of that was
+true then and is true now. The per-link breakdown - the thing the patch
+existed for - was not the thing looked at.
+
+Verify on hardware, on the goal rather than on what is easy to see:
+ubus call wifi.apmld.<backhaul-mld> stations on a node with a 4-address
+child must report mlo_capable true and an mlo_links array holding one
+entry per link the child actually has; iw dev <bsta> link on the child
+says how many that should be.
+
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1951,6 +1951,16 @@
+ 		mlsta->num_link++;
+ 	}
+ 
++	/* Mirror iface_get_mlsta_info() below: more than one link is what makes
++	 * a station MLO. The per-link test above cannot fire on mt76, because
++	 * this path fills macaddr and mld_macaddr from the same address the
++	 * caller asked about, so they always compare equal - which left every
++	 * 4-address child published with mlo_capable false, and wifimngr gates
++	 * the whole per-link breakdown on that flag, so no mlo_links came out
++	 * at all (measured 2026-08-07: two links on the air, none reported). */
++	if (mlsta->num_link > 1)
++		mlsta->mlo_capable = 1;
++
+ 	return 0;
+ }
+ 

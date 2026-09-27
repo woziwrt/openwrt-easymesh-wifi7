@@ -1,0 +1,25 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 994 - keep last-good agent.depth
+
+topology_build_tree_from_assoc rebuilds the tree on every Topology Response;
+if a node's upstream_bssid is transiently unresolvable that pass it stays
+unplaced (bh.depth = -1). mapc_sync_agent wrote that -1 straight into
+agent.depth, so the agent_backhaul view / WebUI flickered a node to depth -1
+even though it was correctly placed moments earlier. Only overwrite depth when
+the incoming value is valid (>= 0), so a transient miss keeps the last good
+value instead of regressing.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -112,7 +112,8 @@
+ 		"ON CONFLICT(almac) DO UPDATE SET "
+ 		"is_agent=excluded.is_agent, node_type=excluded.node_type, "
+ 		"profile=excluded.profile, multiap_caps=excluded.multiap_caps, "
+-		"depth=excluded.depth, uplink_type=excluded.uplink_type, "
++		"depth=CASE WHEN excluded.depth>=0 THEN excluded.depth ELSE depth END, "
++		"uplink_type=excluded.uplink_type, "
+ 		"upstream_bssid=excluded.upstream_bssid, est_thput_ul=excluded.est_thput_ul, "
+ 		"est_thput_dl=excluded.est_thput_dl, scan_supported=excluded.scan_supported, "
+ 		"sta_count=excluded.sta_count, max_mld_num=excluded.max_mld_num, "

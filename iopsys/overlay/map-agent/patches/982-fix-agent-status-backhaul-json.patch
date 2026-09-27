@@ -1,0 +1,60 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: emit valid JSON for the backhaul in agent status
+
+`ubus call map.agent status` opens "backhaul" as a table and then places an
+unkeyed table inside it:
+
+	d = blobmsg_open_table(&bb, "backhaul");
+	if (re->has_bsta && re->bk.cfg) {
+		ttt = blobmsg_open_table(&bb, "");
+
+An unkeyed member is array syntax, so the rendered document is
+
+	"backhaul": {
+		{
+			"name": "wlan2",
+
+which is not JSON. Parsers do not skip the malformed member - they reject
+the whole document:
+
+	jsonfilter: Failed to parse JSON data: quoted object property name expected
+	python:     Expecting property name enclosed in double quotes: line 57 column 5
+
+So nothing on the node can parse the agent's own status output, on every
+node that has a backhaul STA. The failure is silent in the worst way: a
+caller reading a count out of it gets 0 rather than an error, which reads
+as "healthy node with nothing configured".
+
+The surrounding code already treats this as a list - the line above closes
+the previous member with blobmsg_close_array(), and the sibling radio
+status uses blobmsg_open_array(&bb, "backhauls") for the same shape. Open
+it as an array so the unkeyed table becomes a legitimate element.
+
+Keys and their indentation are unchanged, so line-based readers - which is
+everything that works today, by necessity - are unaffected.
+
+Found while writing mld-report-check, which needs to count the affiliated
+APs the agent reports. Measured on bpi-8g and bpi-x8, 2026-07-22.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c	2026-07-22 06:36:36.765439704 +0200
++++ b/src/agent.c	2026-07-22 06:36:36.781001108 +0200
+@@ -5955,7 +5955,7 @@
+ 			blobmsg_close_table(&bb, tt);
+ 		}
+ 		blobmsg_close_array(&bb, d);
+-		d = blobmsg_open_table(&bb, "backhaul");
++		d = blobmsg_open_array(&bb, "backhaul");
+ 		if (re->has_bsta && re->bk.cfg) {
+ 			struct netif_bk *bk = &re->bk;
+ 			void *ttt;
+@@ -5990,7 +5990,7 @@
+ 			blobmsg_close_table(&bb, b);
+ 			blobmsg_close_table(&bb, ttt);
+ 		}
+-		blobmsg_close_table(&bb, d);
++		blobmsg_close_array(&bb, d);
+ 		blobmsg_close_table(&bb, t);
+ 	}
+ 	blobmsg_close_array(&bb, a);

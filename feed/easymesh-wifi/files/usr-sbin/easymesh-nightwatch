@@ -1,0 +1,219 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-nightwatch - what the box was doing while nobody was looking.
+#
+# Written 2026-08-20, the day a controller retuned its channel 80 times in an
+# hour for no reason anyone could name, wedged hostapd, and dropped both agents.
+# Every account of that hour had to be reconstructed afterwards from a kernel
+# buffer that a reboot would have taken with it - and the one witness built for
+# exactly this, hostapd-watch, writes through logger into /var/log/messages,
+# which starts empty after every boot. So on the morning after, its verdict is
+# not "no" - it is nothing at all, which is worse, because nothing reads as no.
+#
+# This writes to /etc/mapc/ instead, for the same reason node-heartbeat does:
+# that survives the reboot that ends the incident. One short line a minute is
+# some 60 kB a night. That matters here - the card in this controller is
+# throwing I/O errors - so the line is short, written once, and never rewritten.
+#
+# Deliberately NOT a follower. Two readers of /proc/kmsg have wedged a node
+# before, and a tail on a pipe blocks; this samples logread and keeps the
+# deltas. A burst that wraps the buffer inside one interval is undercounted,
+# which is a fair price for not being the thing that breaks the box.
+#
+# It never fixes anything. Reading a wedge is a different job from clearing it,
+# and the clearing is not trusted enough to happen unattended.
+
+LOG=/etc/mapc/nightwatch.log
+INTERVAL=${1:-60}
+
+mkdir -p /etc/mapc 2>/dev/null
+
+count() { logread 2>/dev/null | grep -c "$1"; }
+
+# The kernel ring, not logd. Measured 2026-08-28 on the node that had been
+# losing beacons on one backhaul leg for 26 minutes without a break: dmesg held
+# 15 of those lines and logread held 1. logd does carry kernel messages - 709 of
+# them in the same sample - so this is a level filter, not a missing path, and
+# no amount of grepping logread would ever have found the fault.
+#
+# Read as a snapshot, never followed, for the reason in the header: two readers
+# of /proc/kmsg have wedged a node before. The ring wraps rather than rotates,
+# so a burst larger than the buffer is undercounted the way logread's is, and
+# a wrap shows up as a negative delta, which is reported as "?" like the rest.
+# How long ago the last matching kernel message was, in seconds, or "" if the
+# ring holds none. Deliberately NOT a count.
+#
+# Counting occurrences in the kernel ring was the first attempt and it does not
+# survive contact: the ring wraps, old lines fall out faster than new ones
+# arrive, the delta goes negative and the field degrades to "?". Measured
+# 2026-08-28 on a freshly booted agent - two consecutive samples unusable, and
+# on a busy boot it is worse. A timestamp cannot be spoiled that way: either the
+# line is in the ring or it is not.
+#
+# It also matches what the fault actually looks like. When a backhaul leg goes
+# deaf the driver re-reports every 2 s for as long as it lasts, so the rate is
+# the monitor's own period and measures nothing. What distinguishes a real fault
+# is that it does not stop - which is exactly what "seconds since the last one"
+# shows and a per-minute count hides.
+klast() {
+	t=$(echo "$1" | grep "$2" | tail -1 | sed 's/\[ *\([0-9]*\).*/\1/')
+	[ -n "$t" ] && echo $(( $(cut -d. -f1 /proc/uptime) - t ))
+}
+
+probe() {
+	# Same question hostapd-watch asks, and the same 5 s bound: an object that
+	# answers late is the wedge starting, not a slow box.
+	ubus -t 5 call "hostapd.$1" get_status >/dev/null 2>&1 && { echo ok; return; }
+
+	# Before hostapd has had a chance to register, absence is not a wedge, and
+	# calling it one poisons the only signal we have for the real thing.
+	#
+	# Measured 2026-09-01 after upgrading all four nodes: on every agent the
+	# last "ap1=SILENT ap2=SILENT" in the log sat at up=96-99 s - boot, every
+	# time. On the controller 246 of them had accumulated the same way, so a
+	# grep for the wedge returned almost entirely noise and the one line that
+	# mattered (up=3309, nodes=3, beaconfail=5) was buried in it.
+	#
+	# Report it, but not under the name that means "hostapd stopped answering
+	# on a node carrying traffic".
+	[ "$(cut -d. -f1 /proc/uptime)" -lt 120 ] 2>/dev/null && { echo boot; return; }
+
+	echo SILENT
+}
+
+csa_prev=$(count "STARTED-CHANNEL-SWITCH")
+mmc_prev=$(count "mmc0: Card stuck")
+# Note these two are unrelated despite the names. "Failed to set beacon
+# parameters" is hostapd failing on the AP side; beacon loss below is the
+# driver's monitor on the backhaul STA side noticing the parent went quiet.
+# Watching only the first is what let 26 minutes of the second go unrecorded.
+err_prev=$(count "Failed to set beacon parameters")
+
+printf '=== NIGHTWATCH START %s up=%ss interval=%ss ===\n' \
+	"$(date '+%Y-%m-%d %H:%M:%S')" "$(cut -d. -f1 /proc/uptime)" "$INTERVAL" >> "$LOG"
+
+while :; do
+	sleep "$INTERVAL"
+
+	csa_now=$(count "STARTED-CHANNEL-SWITCH")
+	mmc_now=$(count "mmc0: Card stuck")
+	err_now=$(count "Failed to set beacon parameters")
+
+	# One read of the ring, everything below comes out of it.
+	dm=$(dmesg 2>/dev/null)
+
+	# A negative delta means logread's buffer wrapped or logd restarted. Say so
+	# rather than print a negative count that a reader would take for a number.
+	csa=$((csa_now - csa_prev)); [ "$csa" -lt 0 ] && csa="?"
+	mmc=$((mmc_now - mmc_prev)); [ "$mmc" -lt 0 ] && mmc="?"
+	err=$((err_now - err_prev)); [ "$err" -lt 0 ] && err="?"
+	csa_prev=$csa_now; mmc_prev=$mmc_now; err_prev=$err_now
+
+	# Per leg, because that is the whole point of the field. On 2026-08-28 a
+	# node lost beacons 696 times in 26 minutes and every single one was link 1,
+	# the 6 GHz leg, while link 0 carried 864 Mbit/s throughout. A single number
+	# would have read as "the backhaul is bad" and sent the next person after
+	# the wrong thing.
+	# An empty klast() result has TWO different meanings, and until now both
+	# were written as "none": either nothing really happened, or we can no
+	# longer see it because the ring buffer wrapped. Both were read as healthy.
+	#
+	# Measured 4. 9. 2026 on node .2: dmesg held 711 "detect 20 beacon loss"
+	# messages on the 6GHz link, repeated every two seconds. Two minutes later
+	# it held ZERO - the messages had pushed each other out of the buffer and
+	# ordinary traffic finished them off. Since its last start nightwatch had
+	# written "none" 43x, and punct reported CLEAN. The evidence vanished
+	# before anybody looked at it.
+	#
+	# A wrap is recognised from the first line of the ring: as long as a boot
+	# record sits there (timestamp close to zero), the buffer holds the whole
+	# run and "nothing there" really means nothing happened. As soon as the
+	# first line starts somewhere in the middle, part of the history is gone
+	# and the right answer is "?", not "none".
+	dm_first=$(echo "$dm" | head -1 | sed 's/^\[ *\([0-9]*\).*/\1/')
+	case "$dm_first" in
+	''|*[!0-9]*) dm_lost=1 ;;
+	*) if [ "$dm_first" -gt 10 ]; then dm_lost=1; else dm_lost=0; fi ;;
+	esac
+
+	# And because "don't know" is a weak answer too, a running total that
+	# survives a wrap is kept alongside: the difference against the previous
+	# sample, and when the count drops (the buffer wrapped), at least what is
+	# left in it gets added.
+	bcn=
+	bsum=
+	for lk in 0 1; do
+		age=$(klast "$dm" "beacon_mon_work: link $lk: detect")
+		if [ -n "$age" ]; then
+			bcn="$bcn${bcn:+,}link$lk=$age"
+		elif [ "$dm_lost" = 1 ]; then
+			bcn="$bcn${bcn:+,}link$lk=?"
+		else
+			bcn="$bcn${bcn:+,}link$lk=none"
+		fi
+
+		now=$(echo "$dm" | grep -c "beacon_mon_work: link $lk: detect")
+		eval "prev=\${bcn_prev_$lk:-0}"
+		eval "tot=\${bcn_tot_$lk:-0}"
+		if [ "$now" -ge "$prev" ]; then
+			tot=$(( tot + now - prev ))
+		else
+			tot=$(( tot + now ))
+		fi
+		eval "bcn_prev_$lk=$now"
+		eval "bcn_tot_$lk=$tot"
+		bsum="$bsum${bsum:+,}link$lk=$tot"
+	done
+	[ -n "$bcn" ] || bcn=none
+	[ -n "$bsum" ] || bsum=none
+
+	# The last puncturing transition the driver reported, which is the thing
+	# that was flipping every five seconds. Empty until one happens.
+	punct=$(logread 2>/dev/null | grep "mt76_switch_vif_chanctx" | tail -1 |
+		grep -o "punct_bitmap=0x[0-9a-f]*->0x[0-9a-f]*" | cut -d= -f2)
+
+	# iw, not iwinfo. assoclist undercounts MLO stations - the same deflink
+	# fault that makes the driver report 1 Mbit/s for a phone doing 483 - and
+	# this log had a line reading sta=0 csa=10 while mlo-steerd, which counts
+	# with iw, was busy steering the client that was supposedly not there.
+	# A witness that disagrees with the thing it is watching is worth nothing,
+	# so it now counts the way the watched thing counts.
+	sta=$(iw dev ap-mld-1 station dump 2>/dev/null | grep -c "^Station")
+
+	# The radio runs some 25 C above everything else on the board and has no
+	# cooling of its own - the heatsink and fan serve the SoC. Measured
+	# 2026-08-21 while chasing a fault that turned out not to be thermal at
+	# all: 48 C on the bench, 73 C assembled, and the fault appeared at both.
+	# Recorded anyway, because ruling heat out took a whole morning and the
+	# next person should be able to rule it out from the log.
+	# The sensor is looked up by NAME, not by position - the same as in punct.
+	#
+	# This used to be `sed -n 3p`, the third line of all hwmon sensors. On the
+	# classic R4 that happens to land on the mt7996 by accident; on the
+	# BPI-R4 Pro 8X the order differs and the third one is `mxl862xx_dsa_0:00`,
+	# the MaxLinear SWITCH. Measured 2026-09-01 on the controller: the log
+	# reported wifi=89C while mt7996_phy0.0 was at 68 C. For eight days the
+	# whole wifi= column on the BPI-R4 Pro 8X was the switch temperature.
+	#
+	# punct had already received the same fix once (7532cc0); nightwatch was
+	# forgotten. A number that cannot be trusted is worse than none - so rather
+	# nothing than a guessed line.
+	temp=""
+	for _h in /sys/class/hwmon/*; do
+		case "$(cat "$_h/name" 2>/dev/null)" in
+		mt7996*|mt76*) temp=$(cat "$_h/temp1_input" 2>/dev/null); [ -n "$temp" ] && break ;;
+		esac
+	done
+	nodes=$(ubus -t 5 call map.controller status 2>/dev/null | grep -c ieee1905id)
+
+	printf '%s up=%s csa=%s punct=%s ap1=%s ap2=%s sta=%s nodes=%s beaconfail=%s beaconloss=%s bcnsum=%s mmc=%s load=%s wifi=%sC\n' \
+		"$(date '+%H:%M:%S')" \
+		"$(cut -d. -f1 /proc/uptime)" \
+		"$csa" "${punct:-none}" \
+		"$(probe ap-mld-1)" "$(probe ap-mld-2)" \
+		"${sta:-0}" "${nodes:-0}" "$err" "$bcn" "$bsum" "$mmc" \
+		"$(cut -d' ' -f1 /proc/loadavg)" \
+		"$(( ${temp:-0} / 1000 ))" >> "$LOG"
+done

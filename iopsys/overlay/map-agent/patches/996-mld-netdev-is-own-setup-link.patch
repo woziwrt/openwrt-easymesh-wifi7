@@ -1,0 +1,66 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 996: the MLD netdev is its own setup link
+
+bk_toggle() refuses to mark a bSTA connected unless it is the bSTA MLD setup
+link:
+
+	if (a->bstamld && bk != a->bstamld->setup_link)
+		return;
+
+setup_link is an affiliated-STA concept. With a non-physical MLD the first
+affiliated bSTA to connect becomes the setup link and the others must not touch
+connection state. A physical MLD netdev has no affiliated bk of its own -- it
+IS the connection -- and nothing ever assigns it: setup_link is set in
+bstamld_parse() from the "setup_link" field of wifi.bstamld status, which
+wifimngr feeds from sta->is_setup_link, and that member is only ever populated
+by libwifi/modules/mediatek/mtk.c. The default nl80211 module, which is what
+drives bsta-mld-N on open mt76 (and the only one that matches the interface
+name at all, see patch 935 and commit 0288f7cde), leaves it false permanently.
+
+So the guard returned unconditionally, wifi_bsta_connect() was never reached
+and bk->connected stayed 0 for an uplink that was fully associated:
+
+  agent_manage_bsta: bsta-mld-3 has got 4addr mode enabled (1) connected:0 cfg->enabled:1
+
+agent_manage_bsta() then refused to bridge it, so the MLD STA never became a
+br-lan port and no traffic passed -- while iw, the driver and
+ubus call wifi.bstamld.bsta-mld-3 status all reported a healthy two-link
+association.
+
+Exempt the MLD netdev itself from the guard. Affiliated STAs keep the old
+behaviour unchanged.
+
+Companion to 995 (which asks the MLD for status in the first place) and to
+0288f7cde (which lets libwifi find a driver for it at all).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -4074,7 +4074,25 @@
+ 
+ 		if (!bk->connected) {
+ #if (EASYMESH_VERSION >= 6)
+-			if (a->bstamld && bk != a->bstamld->setup_link)
++			/* setup_link is an affiliated-STA concept: with a
++			 * non-physical MLD the first affiliated bSTA to connect
++			 * becomes the setup link, and the others must not touch
++			 * connection state. A physical MLD netdev has no
++			 * affiliated bk of its own -- it IS the connection --
++			 * and nothing ever assigns it as setup_link: the flag
++			 * comes from wifi.bstamld status "setup_link", which is
++			 * fed by sta->is_setup_link, and that is only ever
++			 * populated by libwifi/modules/mediatek/mtk.c. The
++			 * default nl80211 module, which drives bsta-mld-N on
++			 * open mt76, leaves it false for good.
++			 *
++			 * So this guard returned unconditionally and
++			 * bk->connected stayed 0 for a fully associated MLD
++			 * uplink, which agent_manage_bsta() then refused to
++			 * bridge. Exempt the MLD netdev itself.
++			 */
++			if (a->bstamld && !bk->cfg->is_mld_netdev &&
++			    bk != a->bstamld->setup_link)
+ 				return;
+ #endif
+ 			wifi_bsta_connect(a, bk, bssid, freq);

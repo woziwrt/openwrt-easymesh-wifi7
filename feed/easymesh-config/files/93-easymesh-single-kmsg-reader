@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# One reader of the kernel log, not two.
+#
+# /proc/kmsg hands a message to whoever reads it first and to nobody else.
+# OpenWrt's logd keeps it open for logread; rsyslog's imklog module opens it
+# too, and the production image ships both. They then race for every kernel
+# message, and logd is single-threaded: uloop tells it the fd is readable,
+# imklog takes the message first, and logd's read blocks with nothing left to
+# read. It never returns to its loop again.
+#
+# What that costs is out of all proportion to the cause. A blocked logd stops
+# draining /dev/log, so every daemon still holding a connection to it hangs on
+# its next log line - and the ones that do are the ones started before rsyslog
+# took the socket over: dropbear, netifd, wpad. Measured on hardware
+# 2026-08-17, on the first image ever built with both the production package
+# set and the mesh layer:
+#
+#     logd            wchan=syslog_print         ubus log read: timeout
+#     netifd          wchan=unix_wait_for_peer   LuCI: "XHR request timed out"
+#     hostapd         wchan=unix_wait_for_peer   no AP on the air at all
+#     wpa_supplicant  wchan=unix_wait_for_peer
+#     dropbear child  wchan=unix_wait_for_peer   no SSH, banner never sent
+#
+# The node answered ping and served static pages, so from outside it looked
+# alive. Dropping imklog and waking logd with one kernel message brought every
+# one of them back within seconds, with nothing restarted.
+#
+# It is a race, which is the worst part: rsyslog and logd have coexisted in
+# production images all along and mostly logd won. A fault that appears on one
+# boot in some and never on the next is the kind that reaches a customer.
+#
+# rsyslog keeps everything else - /dev/log through imuxsock, the remote input,
+# the files under /var/log. Only the second pair of eyes on the kernel log
+# goes, and logread works again because of it.
+
+[ -f /etc/config/rsyslog ] || exit 0
+uci -q get rsyslog.syslog.modules | grep -q imklog || exit 0
+
+uci del_list rsyslog.syslog.modules='imklog'
+uci commit rsyslog
+
+# Only if it is already running - at first boot the init system has not
+# started it yet and this would race with that.
+[ -n "$(pidof rsyslogd)" ] && /etc/init.d/rsyslog restart >/dev/null 2>&1
+
+exit 0

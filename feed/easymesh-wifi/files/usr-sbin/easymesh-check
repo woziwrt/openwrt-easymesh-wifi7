@@ -1,0 +1,744 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-check - the invariants a mesh node must satisfy, checked out loud.
+#
+# On 2026-08-19 eight defects were found in one day, and six of them were in
+# code we wrote ourselves. Three were created by an earlier point fix: the
+# repair held for the case in front of us and broke the same rule seen from
+# the other side. What they had in common is not subtlety - it is silence.
+# Every one of them left a node that answered ping, served DHCP, showed a
+# healthy config and did not work:
+#
+#   a controller whose own registrar was disabled by a hotplug handler
+#   a node with the radios enabled in uci and no wireless interfaces at all
+#   clients handed a gateway address that nobody held
+#   an AP-MLD broadcasting the factory name while the real one sat in config
+#
+# So this states the rules as rules. It does not fix anything and it does not
+# guess at causes - when it complains, /usr/share/easymesh/trace.sh is what
+# tells you why. It is cheap enough to run on every boot and by hand at any
+# time: no snapshots, no daemons, a second at most.
+#
+#   easymesh-check          check, print, log the failures
+#   easymesh-check -v       print every rule, passed or not
+
+VERBOSE=0
+[ "$1" = "-v" ] && VERBOSE=1
+
+STATE=/etc/mapc/check.log
+
+# Fingerprint of the running image: the installed-package database. Every
+# package version in the image is in it, so a sysupgrade to anything we built
+# changes it and a reboot of the same image does not. It is what lets the
+# restart rule below tell a crash from a flash.
+#
+# Until 2026-09-23 this was `uname -v | cksum`, and it never worked: there is
+# no cksum on our images, the error went to /dev/null and every line of
+# check.log carried img=0. Even with cksum it would have failed - the kernel
+# stamp is still Sep 15 because full builds since then did not rebuild the
+# kernel, and the fast loop never does. On 2026-09-23 four freshly flashed
+# nodes reported "restarted 3 times on the same image".
+_IMG=$(md5sum /lib/apk/db/installed 2>/dev/null | cut -c1-8)
+[ -n "$_IMG" ] || _IMG=0
+ROLE=$(cat /etc/mapc/role 2>/dev/null)
+
+# The PID of the controller daemon, by the kernel's own name for it.
+#
+# NOT pgrep. `pgrep -f /usr/sbin/mapcontroller` matches its OWN command line -
+# the pattern is in it - so it answers "found" whether or not the daemon is
+# running, and rule 1 below reported "mapcontroller running" unconditionally
+# for as long as it has existed. Measured 2026-09-06: three PIDs returned, one
+# of them the asking shell. `pgrep -x mapcontroller` finds nothing at all on
+# this busybox. /proc/<pid>/comm is what the kernel calls the process and is
+# neither.
+controller_pid() {
+	local p
+	for p in /proc/[0-9]*; do
+		[ "$(cat "$p/comm" 2>/dev/null)" = mapcontroller ] || continue
+		echo "${p#/proc/}"
+		return 0
+	done
+	return 1
+}
+FAILED=0
+CHECKED=0
+
+say() { logger -t easymesh-check "$1"; echo "$1"; }
+
+# ok <rule> <explanation-if-it-fails>
+ok() {
+	CHECKED=$((CHECKED + 1))
+	[ "$VERBOSE" = "1" ] && printf '  ok    %s\n' "$1"
+	return 0
+}
+
+bad() {
+	CHECKED=$((CHECKED + 1))
+	FAILED=$((FAILED + 1))
+	say "BROKEN: $1"
+	[ -n "$2" ] && say "        $2"
+}
+
+radios_disabled() {
+	for r in radio0 radio1 radio2; do
+		[ "$(uci -q get wireless.$r.disabled)" = "1" ] && return 0
+	done
+	return 1
+}
+
+have_backhaul_key() {
+	i=0
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		[ "$(uci -q get mapagent.@ap[$i].type)" = "backhaul" ] &&
+			[ -n "$(uci -q get mapagent.@ap[$i].key)" ] && return 0
+		i=$((i + 1))
+	done
+	[ -n "$(uci -q get mapcontroller.ap_bh_2g.key)" ]
+}
+
+fronthaul_ssid() {
+	if [ "$(uci -q get mapcontroller.controller.enabled)" = "1" ]; then
+		uci -q get mapcontroller.ap_fh_2g.ssid
+		return
+	fi
+	i=0
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		[ "$(uci -q get mapagent.@ap[$i].type)" = "fronthaul" ] &&
+			{ uci -q get mapagent.@ap[$i].ssid; return; }
+		i=$((i + 1))
+	done
+}
+
+# A node with no role is not a node with nothing to check - it is a node this
+# tool cannot speak about. Until 2026-09-05 it said so only under -v and then
+# exited 0, so a box that had lost its role reported success. That is the exact
+# silence this script was written against: every caller, and every person
+# reading the last line, was told the node was sound.
+if [ -z "$ROLE" ]; then
+	echo "easymesh-check: role=none"
+	say "BROKEN: no role on this node - nothing could be checked"
+	say "        /etc/mapc/role is missing or empty, so every rule was skipped"
+	echo "easymesh-check: 0 rules, 1 broken"
+	{
+		echo "$(date '+%Y-%m-%d %H:%M:%S') up=$(cut -d. -f1 /proc/uptime)s role=none checked=0 broken=1"
+	} >> "$STATE" 2>/dev/null
+	exit 1
+fi
+
+echo "easymesh-check: role=$ROLE"
+
+# 1. The role on disk and the daemons that implement it must agree. A
+#    controller with its registrar switched off is a mesh with no registrar,
+#    and nothing else complains about it.
+if [ "$ROLE" = "controller" ]; then
+	[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] \
+		&& ok "controller.enabled=1" \
+		|| bad "role is controller but mapcontroller.controller.enabled=0" \
+		       "the mesh has no registrar; agents will never receive credentials"
+	controller_pid >/dev/null \
+		&& ok "mapcontroller running" \
+		|| bad "role is controller but mapcontroller is not running" \
+		       "check 'logread | grep mapcontroller' and the config above"
+else
+	[ "$(uci -q get mapcontroller.controller.enabled)" != "1" ] \
+		&& ok "controller disabled on an agent" \
+		|| bad "role is agent but mapcontroller.controller.enabled=1" \
+		       "two registrars on one L2 hand out conflicting credentials"
+fi
+
+# 2. Credentials in hand and the radios still off means somebody switched them
+#    off and nobody switched them back. The node joins the topology and is
+#    deaf from then on.
+if have_backhaul_key && radios_disabled; then
+	bad "a backhaul key is configured but radios are disabled" \
+	    "nothing on this node will reach the air; see bh-key-adopt"
+else
+	ok "radios not held down while credentials exist"
+fi
+
+# 3. "Enabled" in uci is not the same as being on the air, and only the second
+#    one carries traffic.
+if ! radios_disabled; then
+	if [ "$(iw dev 2>/dev/null | grep -c Interface)" -gt 0 ]; then
+		ok "wireless interfaces exist"
+	else
+		bad "radios are enabled in config but there are no wireless interfaces" \
+		    "netifd did not build them - look for retry_setup_failed and for ucode errors"
+	fi
+fi
+
+# 4. The AP-MLD must broadcast the name the mesh actually uses. The factory
+#    name in the air while the real one sits in the config is the signature of
+#    a genconfig fallback that fired at the wrong moment.
+FH=$(fronthaul_ssid)
+AIR=$(uci -q get wireless.ap_mld_1.ssid)
+if [ -n "$FH" ] && [ -n "$AIR" ] && [ "$FH" != "$AIR" ]; then
+	bad "the mesh fronthaul is '$FH' but this box broadcasts '$AIR'" \
+	    "clients will not find the network they were told about"
+else
+	ok "fronthaul name matches the mesh"
+fi
+
+# 5. A passphrase of exactly 64 characters takes a radio down: ap.uc reads an
+#    undeclared variable in that one branch and the whole configuration of
+#    that radio fails. Cheap to check, expensive to diagnose.
+LONG=0
+for s in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)\.key=.*/\1/p'); do
+	k=$(uci -q get wireless.$s.key)
+	[ "${#k}" = "64" ] && { LONG=1; break; }
+done
+[ "$LONG" = "0" ] && ok "no 64-character passphrase" \
+	|| bad "wireless.$s.key is exactly 64 characters long" \
+	       "ap.uc fails on that length and the radios carrying it never come up - use 62"
+
+# 6. Clients are handed a gateway and a resolver by DHCP. Whatever address
+#    that is, somebody has to hold it.
+GW=$(uci -q get dhcp.lan.dhcp_option 2>/dev/null | tr ' ' '\n' | sed -n "s/^'*3,//p" | tr -d "'")
+if [ -n "$GW" ]; then
+	if ip -4 addr show 2>/dev/null | grep -q "inet $GW/" ||
+	   ping -c 1 -W 2 "$GW" >/dev/null 2>&1; then
+		ok "the advertised gateway $GW is held by somebody"
+	else
+		bad "DHCP advertises gateway $GW and nobody answers for it" \
+		    "clients will associate, take a lease, ping this box and load nothing"
+	fi
+else
+	ok "no explicit gateway option"
+fi
+
+# 7. Being internally consistent is not the same as being in the mesh, and a
+#    node can be perfectly consistent about credentials it invented for
+#    itself. Measured 2026-08-19: an agent that never received a single M2
+#    built its own backhaul key from the wireless config, bh-key-adopt
+#    accepted it, adopt-state read "settled", and this checker passed it with
+#    six rules and no complaint. The evidence of membership is the file the
+#    controller's credentials are written into.
+#
+#    But "no M2 yet" is not the same fault as "keys it made up", and this rule
+#    could not tell them apart. A node joined by WPS is handed its BACKHAUL key
+#    in the M8 of that exchange; the fronthaul M2 arrives afterwards, over an
+#    ordinary AP-Autoconfig that has no window and repeats forever. In between
+#    - and that window is a reboot long - a perfectly healthy node was called
+#    a liar. Measured 2026-08-19 on the first WPS join onto a baked image.
+#
+#    The two cases are told apart by the backhaul itself. An invented key
+#    associates with nobody: the node of 2026-08-19 that built its own read
+#    "settled" and was a mesh of one. A key that came from the controller is
+#    proven every second the bSTA stays associated - that is not a file that
+#    can be wrong, it is a radio link that either exists or does not.
+if [ "$ROLE" = "agent" ]; then
+	if [ -f /etc/multiap/wsc_m2.json ]; then
+		ok "credentials were delivered (wsc_m2.json exists)"
+	else
+		# By name, not by "the first managed interface". During a join the
+		# pairing station is managed too, and it is the one `iw dev` lists
+		# first - so this rule would judge the backhaul by a station that is
+		# not the backhaul. A glob, so a box with no bSTA is simply no match.
+		_bs=""
+		for _i in /sys/class/net/bsta-mld-*; do
+			[ -e "$_i" ] && { _bs=${_i##*/}; break; }
+		done
+		if [ -n "$_bs" ] && iw dev "$_bs" link 2>/dev/null | grep -q "^Connected"; then
+			ok "no M2 yet, but the backhaul is associated - the key is the controllers, not invented"
+		else
+			bad "no credentials have ever been delivered to this node" \
+			    "whatever keys it holds, it made up: no M2, and the backhaul is associated with nobody"
+		fi
+	fi
+fi
+
+# 8. A fronthaul still on a factory name after a role was decided means the
+#    credentials never arrived, or arrived and were overwritten.
+case "$AIR" in
+	OpenWrt-*|MT76_*)
+		bad "role is $ROLE but the fronthaul is still '$AIR'" \
+		    "this is the name the image ships, not one the mesh handed out" ;;
+	*) ok "fronthaul is not a factory name" ;;
+esac
+
+# 9. An agent reaches the mesh through its backhaul: over the wire while it is
+#    plugged in, over the bSTA otherwise. Neither means an island.
+if [ "$ROLE" = "agent" ]; then
+	# The ports this box actually has, not the ports a BPI-R4 has.
+	#
+	# A Pro 8X carries mxl_lan1..5 (seen on the controller, 2026-09-22), so a Pro 8X
+	# used as an AGENT on a live cable answers to none of the four names that
+	# used to be listed here, and was reported an island. The bridge knows its
+	# own members; ask it. Wireless members are skipped, because the bSTA is
+	# the other half of this test.
+	wired=0
+	for p in /sys/class/net/br-lan/brif/*; do
+		[ -e "$p" ] || continue
+		p=${p##*/}
+		case "$p" in *-mld-*|phy*|wlan*) continue ;; esac
+		[ "$(cat /sys/class/net/$p/carrier 2>/dev/null)" = "1" ] && wired=1
+	done
+	bsta=""
+	for _i in /sys/class/net/bsta-mld-*; do
+		[ -e "$_i" ] && { bsta=${_i##*/}; break; }
+	done
+	linked=0
+	[ -n "$bsta" ] && iw dev "$bsta" link 2>/dev/null | grep -q "^Connected" && linked=1
+	if [ "$wired" = "1" ] || [ "$linked" = "1" ]; then
+		ok "the node has a way to the mesh (wire=$wired bsta=$linked)"
+	else
+		bad "no path to the mesh: no cable and the bSTA is not connected" \
+		    "the node is an island; nothing it reports about itself can be acted on"
+	fi
+fi
+
+
+# An AP-MLD is only multi-link while every radio it was built from carries a
+# link. Measured 2026-08-25 on an agent whose bSTA lost its parent: the search
+# took 5 GHz and 6 GHz with it and the fronthaul kept broadcasting on 2.4 GHz
+# alone for as long as it lasted - 210 s under observation, and it would have
+# been the whole outage. Nothing said so. The radios were up, the SSID was
+# right, the config was right, and clients simply got the slowest band.
+#
+# The same shape appeared on the Pro 8X when a scanning STA was added beside a
+# running MLD: the link on that radio went and never came back until the STA
+# was gone - 9 times in 30. Both are one rule of the hardware, which the card
+# publishes itself: "#channels <= 1". A radio that is busy searching cannot
+# also hold an AP link, and mac80211 does not warn - there is nothing to warn
+# about, the request was simply impossible.
+#
+# The expected count is not guessed. wifi-iface.device is the list of radios
+# the MLD was built from, so it states how many links there should be; a radio
+# held down in config is not expected to carry one.
+#
+# Zero links is not reported: an interface with none is still coming up, and
+# this runs on every boot. The failure we are after showed 1 of 3, not 0.
+for s in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+	[ "$(uci -q get wireless.$s.mlo)" = "1" ] || continue
+	ifn=$(uci -q get wireless.$s.ifname)
+	[ -n "$ifn" ] || continue
+	iw dev "$ifn" info >/dev/null 2>&1 || continue
+
+	want=0
+	for r in $(uci -q get wireless.$s.device); do
+		[ "$(uci -q get wireless.$r.disabled)" = "1" ] || want=$((want + 1))
+	done
+	have=$(iw dev "$ifn" info 2>/dev/null | grep -c '^[[:space:]]*channel')
+	[ "$want" -gt 1 ] || continue
+	[ "$have" -gt 0 ] || continue
+
+	if [ "$have" -ge "$want" ]; then
+		ok "$ifn carries all $want links"
+	else
+		chans=$(iw dev "$ifn" info 2>/dev/null | sed -n 's/^[[:space:]]*channel \([0-9]*\).*/\1/p' | tr '\n' ' ')
+		bad "$ifn has $have of $want links (channels: $chans)" \
+		    "clients keep only the bands that are left; a searching STA on one of these radios is the usual cause"
+	fi
+done
+
+# No two 'ap' sections may name the same interface.
+#
+# Found 2026-09-04 on three nodes of four, after a month spent chasing sections
+# that "disappeared". They did not always disappear. Sometimes two of them ended
+# up with the same ifname and map-agent merged them: config.c logs
+#
+#   Duplicate 'ap wlan2' config!! ignore
+#
+# and then fills the *same* object from the second section, so one link silently
+# leaves the model. And "clean_stale_ifaces <ifname>" deletes by name, so
+# tearing down either one removes both at once.
+#
+# The cause is that check_wireless_ifname() asks whether a candidate name is
+# taken by looking at wifi-iface sections in /etc/config/wireless - and on an
+# all-MLD node there are none, because every BSS is a link inside ap-mld-*. It
+# therefore answers "free" for every candidate and hands out the same name twice.
+#
+# What it costs: re->aplist, the whole runtime AP model, is built exclusively
+# from these sections. A lost one takes its AP-MLD link with it - out of the
+# TTLM map, assoc_control returning -1 on !ap->cfg, invisible to steering and to
+# the client count.
+#
+# This rule exists because none of the rules above saw any of it. The nodes
+# reported "10 rules, 0 broken" all morning while three of four carried it.
+ap_ifnames=""
+for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\([^.=]*\)=ap$/\1/p'); do
+	n=$(uci -q get "mapagent.$s.ifname")
+	[ -n "$n" ] && ap_ifnames="$ap_ifnames$n
+"
+done
+dup=$(printf '%s' "$ap_ifnames" | sort | uniq -d | tr '\n' ' ')
+if [ -z "$dup" ]; then
+	ok "every mapagent ap section has an interface name of its own"
+else
+	bad "mapagent ap sections share an interface name: $dup" \
+	    "map-agent merges them and a link leaves the model; tearing down either one deletes both"
+fi
+
+# A bookkeeping placeholder must not carry credentials.
+#
+# bhmld_ap_<band> is not a BSS. It exists so that apmld_parse() runs for the
+# backhaul AP-MLD, and it names an interface that is deliberately not a netdev.
+# The controller has never heard of it.
+#
+# Measured on the controller 2026-09-04: a WSC M2 wrote ssid='MAP--BH', key,
+# encryption='sae', bss_index and hidden into bhmld_ap_5, because
+# wifi_get_first_available_ifname() returned the placeholder as a free BSS slot.
+# With an ssid on it the placeholder answers agent_config_get_ap_by_ssid_on_band()
+# for that band, so it is used as *the* affiliated AP of the backhaul MLD and the
+# real link never is - on that node the wlan1-1 section was gone entirely.
+#
+# Checked separately from the rule above because the two failures look nothing
+# alike from outside: this one leaves the section count correct.
+claimed=""
+for s in $(uci show mapagent 2>/dev/null | sed -n 's/^mapagent\.\(bhmld_ap_[0-9]*\)=ap$/\1/p'); do
+	[ -n "$(uci -q get "mapagent.$s.ssid")" ] && claimed="$claimed $s"
+done
+if [ -z "$claimed" ]; then
+	ok "no backhaul MLD placeholder carries credentials"
+else
+	bad "backhaul MLD placeholder was handed credentials:$claimed" \
+	    "a WSC M2 took it for a free BSS slot; the real link on that band is not affiliated"
+fi
+
+# A name that was typed and never arrived.
+#
+# The naming model has exactly one way to go wrong, and this is it. A name
+# lives in the box as its hostname; the controller keeps a ledger line only
+# for a name that has NOT been confirmed by its box yet, and mesh-names-sync
+# clears that line when the box reports the name on the wire. So a line that
+# is still there long after the box has been reachable means the write is not
+# landing - and nobody would otherwise notice, because the picture draws the
+# typed name and looks entirely correct.
+#
+# Only counted for a node that is ON THE AIR and still answering to a factory
+# name: a box that is switched off is not a fault, it is a box that is
+# switched off, and the ledger naming it is the feature.
+#
+# The stamp file is mesh-names-sync's own record of when it last wrote to a
+# node. No stamp means it has not tried yet, which is not a failure either.
+if [ "$ROLE" = "controller" ] && [ -r /usr/share/easymesh/names.sh ]; then
+	. /usr/share/easymesh/names.sh
+	stuck=""
+	now=$(date +%s)
+	live_names_json | sed 's/^{//; s/}$//' | tr ',' '\n' |
+		sed 's/^[[:space:]]*"//; s/":"/ /; s/"[[:space:]]*$//' > /tmp/.emc-names.$$
+	while read -r mac name; do
+		[ -n "$mac" ] && [ -n "$name" ] || continue
+		is_factory_name "$name" || continue
+		want=$(ledger_get "$mac" | awk '{print $1}')
+		[ -n "$want" ] || continue
+		last=$(awk -v m="$(echo "$mac" | tr 'A-Z' 'a-z')" \
+			'$1 == m { print $2; exit }' /tmp/mesh-names-sync.stamps 2>/dev/null)
+		[ -n "$last" ] || continue
+		[ $((now - last)) -gt 300 ] && stuck="$stuck $want($mac)"
+	done < /tmp/.emc-names.$$
+	rm -f /tmp/.emc-names.$$
+	if [ -z "$stuck" ]; then
+		ok "every typed node name has reached the box it names"
+	else
+		bad "a name was written down and never reached its box:$stuck" \
+		    "the box is on the air and still answers to a factory name; the picture shows the typed name anyway"
+	fi
+fi
+
+# The controller daemon is not quietly eating the machine.
+#
+# VSZ has been the health marker for mapcontroller since 2026-08-19 - flat
+# around 20-27 MB is healthy, hundreds of megabytes means it is spinning - and
+# it has been read by hand every time. It was never a rule, so on 2026-09-06
+# the daemon went to 850 MB, stopped answering ubus, processed no agent for
+# nine minutes and every node aged out of the picture. easymesh-check said
+# "0 broken" throughout, because nothing here looked.
+#
+# A threshold is enough. This is not a memory-leak detector; it is the
+# difference between finding out from a rule and finding out because the
+# topology vanished from somebody's screen.
+if [ "$ROLE" = "controller" ]; then
+	cpid=$(controller_pid)
+	vsz=$(awk '/^VmSize:/ {print $2}' "/proc/$cpid/status" 2>/dev/null)
+	if [ -z "$vsz" ]; then
+		bad "mapcontroller is not running" \
+		    "the mesh has no controller; agents keep their config but nothing steers or configures them"
+	elif [ "$vsz" -gt 204800 ] 2>/dev/null; then
+		bad "mapcontroller has grown to $((vsz / 1024)) MB" \
+		    "healthy is a flat 20-30 MB; this size means it is looping and has stopped processing agents"
+	else
+		ok "mapcontroller memory is normal ($((vsz / 1024)) MB)"
+	fi
+fi
+
+# A backhaul link that carries traffic and has never heard a beacon.
+#
+# Found 2026-09-21, and only because a night was quiet enough to look at. Every
+# node hanging off a repeater had `beacon rx: 0` on its 6 GHz link while 50 MB
+# crossed it, and sent a nullfunc every two seconds for ten hours. Nothing said
+# so: the link is up, the mesh is settled, `iw` shows all the links present,
+# and `beacon loss:` in that very same station dump reads 0 - it counts losses
+# of a beacon that was being received, so it says 0 both for a healthy link and
+# for one where no beacon ever arrived. The only honest number is beacon rx.
+#
+# The cause is on the PARENT: an AP-MLD link whose beacon was never switched on
+# (see /usr/sbin/beacon-kick). A node cannot repair it from here, but it is the
+# only place from which it is visible at all, so this is where it gets said.
+if iw dev bsta-mld-3 link 2>/dev/null | grep -q '^Connected'; then
+	# Link order is the same in both outputs. In `station dump` the first
+	# "beacon rx" is the MLD total and the ones after it are the links.
+	freqs=$(iw dev bsta-mld-3 link 2>/dev/null |
+		sed -n 's/^[[:space:]]*freq:[[:space:]]*\([0-9]*\).*/\1/p')
+	bcns=$(iw dev bsta-mld-3 station dump 2>/dev/null |
+		sed -n 's/^[[:space:]]*beacon rx:[[:space:]]*\([0-9]*\).*/\1/p' | tail -n +2)
+
+	# Zero is not the only way to be broken, and it is the way we happened
+	# to see first.
+	#
+	# Measured 2026-09-22 on a five-node mesh six minutes after it had
+	# re-formed: the two children of the ROOT had heard 97 % of the beacons
+	# due to them on their 6 GHz link, the two children of a REPEATER 73 %
+	# and 80 % - on a stronger signal, -57 and -65 dBm against -75 and -76.
+	# Both of the deaf ones read a large non-zero total and nothing here
+	# said a word. The total is cumulative since association, so a quarter
+	# of a life spent deaf averages away into a number that looks fine.
+	#
+	# Only a delta over a known window sees it. Three seconds at a 100 ms
+	# beacon interval is thirty beacons; under half of that is a parent
+	# that is not beaconing now, whatever its total says.
+	sleep 3
+	bcns2=$(iw dev bsta-mld-3 station dump 2>/dev/null |
+		sed -n 's/^[[:space:]]*beacon rx:[[:space:]]*\([0-9]*\).*/\1/p' | tail -n +2)
+
+	if [ -n "$bcns" ] && [ -n "$freqs" ]; then
+		silent=""
+		starved=""
+		n=0
+		for b in $bcns; do
+			n=$((n + 1))
+			f=$(echo "$freqs" | sed -n "${n}p")
+			b2=$(echo "$bcns2" | sed -n "${n}p")
+			[ -n "$f" ] || continue
+			if [ "$b" = "0" ]; then
+				silent="$silent ${f}MHz"
+			elif [ -n "$b2" ] && [ "$((b2 - b))" -lt 15 ] 2>/dev/null; then
+				starved="$starved ${f}MHz"
+			fi
+		done
+
+		if [ -n "$silent" ]; then
+			bad "backhaul link(s) associated but no beacon ever received:$silent" \
+			    "the parent's AP-MLD link never had its beacon switched on - beacon-kick on the PARENT is what fixes it"
+		elif [ -n "$starved" ]; then
+			bad "backhaul link(s) hearing only a fraction of their parent's beacons:$starved" \
+			    "fewer than 15 beacons in 3 s where 30 are due - the parent's AP-MLD link had its beacon switched on and lost it again; beacon-kick on the PARENT is what puts it back"
+		else
+			ok "every backhaul link hears its parent's beacons"
+		fi
+	fi
+fi
+
+
+# A node that restarts is invisible to every rule above.
+#
+# Each boot it is briefly healthy, so each single run passes. The only record
+# that spans boots is this script's own log: a line whose up= is SMALLER than
+# the line before it means the box went down between two checks. Three of
+# those over the last twenty checks is a loop, not a maintenance reboot.
+# This is exactly what "0 broken" could not see while a node cycled.
+#
+# A reflash is a restart too, and until 22. 9. 2026 this rule called every
+# planned sysupgrade a loop: three boxes reflashed in one day reported BROKEN
+# while nothing was wrong with them. A flash is told apart by the image
+# fingerprint changing across the drop - a crash reboots the same image.
+_rows=$(awk '{u = ""; g = "?"
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /^up=/)  { u = $i; sub(/^up=/, "", u); sub(/s$/, "", u) }
+			if ($i ~ /^img=/) { g = $i; sub(/^img=/, "", g) }
+		}
+		if (u != "") print u ":" g }' "$STATE" 2>/dev/null | tail -20)
+_drops=0
+_flashes=0
+_stare=0
+_prev=0
+_previmg=""
+for _r in $_rows; do
+	_u=${_r%%:*}
+	_g=${_r##*:}
+	if [ "$_u" -lt "$_prev" ] 2>/dev/null; then
+		# Lines written before img= existed cannot be told apart from a
+		# flash, so they are counted separately and not as restarts.
+		#
+		# Counting them as restarts was the first attempt and it was
+		# worse: this log gets ONE line per boot, so those lines leave
+		# the twenty-line window only after twenty more boots. Every
+		# reflashed node would have shown BROKEN for weeks, and a rule
+		# that is always on is a rule nobody reads.
+		# img=0 is the same: the fingerprint could not be taken (see _IMG).
+		if [ "$_g" = "?" ] || [ "$_previmg" = "?" ] ||
+		   [ "$_g" = "0" ] || [ "$_previmg" = "0" ]; then
+			_stare=$((_stare + 1))
+		elif [ "$_g" != "$_previmg" ]; then
+			_flashes=$((_flashes + 1))
+		else
+			_drops=$((_drops + 1))
+		fi
+	fi
+	_prev=$_u
+	_previmg=$_g
+done
+_pozn=""
+[ "$_flashes" -gt 0 ] && _pozn="$_pozn, $_flashes reflashes"
+[ "$_stare" -gt 0 ]   && _pozn="$_pozn, $_stare without an image fingerprint and not counted"
+if [ "$_drops" -ge 3 ]; then
+	bad "this node restarted $_drops times on the same image over the last 20 checks" \
+	    "see /etc/mapc/join-fallback-reboot, /etc/mapc/soft-restart.log and /etc/init.d/autoreboot"
+else
+	ok "no restart loop ($_drops restarts on the same image${_pozn})"
+fi
+
+# The join said how it ended, and until now nothing read it.
+if [ "$(cat /etc/mapc/adopt-state 2>/dev/null)" = failed ]; then
+	bad "the join on this node ended in 'failed'" \
+	    "/etc/mapc/adopt-state says failed; see join-fallback-reboot and bh-adopt.loud"
+else
+	ok "adopt-state is not 'failed'"
+fi
+
+# The one join the fallback reboot could not repair. It is written into the
+# fuse and nowhere else, and the node otherwise looks like any other.
+if grep -q "after reboot: still broken" /etc/mapc/join-fallback-reboot 2>/dev/null; then
+	bad "the fallback reboot could not finish this join" \
+	    "$(grep 'after reboot: still broken' /etc/mapc/join-fallback-reboot | tail -1)"
+else
+	ok "no unrepaired join on record"
+fi
+
+# A join note nobody is behind. While it is there easymesh-genconfig - the one
+# writer of /etc/config/wireless - exits at its first line, and the button
+# refuses to start a join. Phase 1 has already deleted every wifi-iface, so a
+# box in this state has no config writer, no radios and no button.
+if [ -f /etc/easymesh-wps-pending ]; then
+	bad "a WPS join note is still in place" \
+	    "easymesh-genconfig is silenced and the button will not start a join while it is there"
+else
+	ok "no stale WPS join note"
+fi
+
+# A stamp that outlived its join. Both writers use `[ -s ] ||`, so the next
+# join on this box inherits it and starts already past its ten-minute
+# deadline, with one fallback reboot to spend (778fbe4).
+if [ -s /etc/mapc/join-started ] && [ "$(cat /etc/mapc/adopt-state 2>/dev/null)" = settled ]; then
+	bad "a join stamp survived a settled join" \
+	    "the next join on this box starts past its deadline with a fallback reboot to spend"
+else
+	ok "no inherited join stamp"
+fi
+
+# Adoption gave up. It says so once and then stays quiet for ever, by design.
+if [ -f /etc/mapc/bh-adopt.loud ]; then
+	bad "backhaul adoption gave up on this node" \
+	    "clear /etc/mapc/bh-adopt.count to let it try again; see logread for the reason"
+else
+	ok "backhaul adoption has not given up"
+fi
+
+# Something on this box is wired to reboot it, and it is not ours.
+#
+# /etc/init.d/autoreboot ships on all five nodes. `enabled` in rc.d while its
+# uci switch is 0 means one click in LuCI - or one uci-defaults run that does
+# not know better - turns a scheduled reboot on. On a mesh that is not one
+# node restarting, it is every node restarting at the same minute, and the
+# picture that comes back is "the mesh fell apart", not "a timer fired".
+#
+# Not a fault by itself: the rule is that it must not be ARMED behind our
+# back. Enabled in rc.d AND switched on in uci is the state worth one line.
+if [ -x /etc/init.d/autoreboot ] && /etc/init.d/autoreboot enabled 2>/dev/null; then
+	_arb=$(uci -q get autoreboot.@autoreboot[0].enable 2>/dev/null)
+	[ -n "$_arb" ] || _arb=$(uci -q get autoreboot.autoreboot.enable 2>/dev/null)
+	if [ "$_arb" = "1" ]; then
+		bad "autoreboot is armed on this node" \
+		    "it will reboot on its own schedule; on a mesh every node does it at the same minute"
+	else
+		ok "autoreboot is present but not armed (enable=${_arb:-unset})"
+	fi
+else
+	ok "no autoreboot service enabled"
+fi
+
+# A TID-to-Link Mapping policy addressed to yesterday's parent.
+#
+# A policy line names the parent that owns the AP-MLD and the station it
+# applies to. When the child changes parent, a line written before the change
+# goes to an agent that has no such station and drops it without a word - the
+# request is one unicast with no ack tracking - and the mesh runs unsteered
+# while the file says it is steered. On 2026-09-23 the mesh re-parented three
+# times in one day after reflashes; this is not a rare state.
+#
+# All-zero lines are teardowns (map-agent 99999999e) and are meant for the
+# parent the station just left, so they are not checked. Only checked when the
+# live file exists: no policy is the normal state and must not read as a fault.
+if [ "$ROLE" = "controller" ] && [ -f /etc/mapc/ttlm-policy ]; then
+	stale=""
+	while read -r par ap sta dir maps; do
+		case "$par" in ''|'#'*) continue ;; esac
+		[ -n "$maps" ] || continue
+		case " $maps " in *[0-7]:[1-9]*) ;; *) continue ;; esac
+		live=$(sqlite3 -cmd ".timeout 3000" /etc/mapc/mapc.db \
+			"select count(*) from bstamld b join apmld p
+			   on p.mld_macaddr = b.ap_mld_macaddr
+			 where b.mld_macaddr='$sta' and b.ap_mld_macaddr='$ap'
+			   and p.agent_almac='$par';" 2>/dev/null)
+		[ "${live:-0}" -ge 1 ] 2>/dev/null || stale="$stale $sta"
+	done < /etc/mapc/ttlm-policy
+
+	if [ -n "$stale" ]; then
+		bad "TTLM policy names a parent that is no longer the parent:$stale" \
+		    "the agent drops such a line silently - easymesh-ttlm-policy rewrites it on its next pass; if it does not, it is not running"
+	else
+		ok "every TTLM policy line matches the live topology"
+	fi
+fi
+
+# A policy producer that is enabled and has stopped ticking.
+#
+# The policy file is no proof of life - it is rewritten only when its content
+# changes. The producer writes a heartbeat every pass (30 s); only checked where
+# the producer is installed and enabled, so a mesh without it stays silent.
+if [ "$ROLE" = "controller" ] && [ -x /etc/init.d/easymesh-ttlm-policy ] &&
+   /etc/init.d/easymesh-ttlm-policy enabled 2>/dev/null; then
+	hb=$(cat /tmp/easymesh/ttlm-policy/alive 2>/dev/null)
+	up=$(cut -d. -f1 /proc/uptime)
+	if [ -z "$hb" ]; then
+		if [ "$up" -gt 300 ] 2>/dev/null; then
+			bad "easymesh-ttlm-policy is enabled but has never completed a pass" \
+			    "logread -e ttlm-policy / /var/log/messages; it needs mapc.db and sqlite3"
+		fi
+	else
+		age=$(( $(date +%s) - hb ))
+		if [ "$age" -gt 300 ] 2>/dev/null; then
+			bad "easymesh-ttlm-policy has not ticked for ${age}s" \
+			    "it passes every 30 s - a heartbeat this old means it is wedged or dead"
+		else
+			ok "TTLM policy producer ticking (${age}s ago)"
+		fi
+	fi
+fi
+
+
+# Radio cards that hear themselves (easymesh-card-check, 2026-09-25). A card
+# that is noisier than the rest is hardware, not a fault of this mesh's
+# configuration, so it is said as a NOTE and does not count as broken - but it
+# is said, because a slow link on such a box is otherwise blamed on the mesh.
+if [ "$ROLE" = "controller" ] && [ -r /etc/mapc/card-suspect ]; then
+	[ -r /usr/share/easymesh/names.sh ] && . /usr/share/easymesh/names.sh
+	grep -v '^#' /etc/mapc/card-suspect | while read -r al band ex n; do
+		[ -n "$al" ] || continue
+		nm=$(nameof "$al" 2>/dev/null); [ -n "$nm" ] || nm=$al
+		echo "NOTE: radio card suspect on $nm - $( [ "$band" = 8 ] && echo 6 || echo 5 ) GHz noise ${ex} dB above the other boxes; keep it at the end of the chain"
+	done
+fi
+
+echo "easymesh-check: $CHECKED rules, $FAILED broken"
+{
+	echo "$(date '+%Y-%m-%d %H:%M:%S') up=$(cut -d. -f1 /proc/uptime)s img=$_IMG role=$ROLE checked=$CHECKED broken=$FAILED"
+} >> "$STATE" 2>/dev/null
+
+# The exit code has to carry the verdict. It always said 0, so anything that
+# tried to act on the result - a script, a boot hook, a person typing $? - was
+# told the node was fine while BROKEN lines scrolled past above.
+[ "$FAILED" -eq 0 ] || exit 1
+exit 0

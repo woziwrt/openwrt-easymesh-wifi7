@@ -1,0 +1,209 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=20
+
+USE_PROCD=1
+
+IS_CFG_VALID=1
+
+validate_agent_section() {
+	uci_validate_section mapagent agent "agent" \
+		'enabled:bool:true' \
+		'debug:range(0,16)' \
+		'profile:range(1,4):2' \
+		'brcm_setup:bool:false' \
+		'controller_macaddr:macaddr' \
+		'al_bridge:string' \
+		'netdev:string' \
+		'vlan_segregation:bool:false' \
+		'resend_num:uinteger:0' \
+		'dyn_cntlr_sync:bool:true' \
+		'island_prevention:bool:false' \
+		'eth_onboards_wifi_bhs:bool:false' \
+		'scan_on_boot_only:bool:false' \
+		'limit_scanresults:uinteger:128'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of agent section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_cs_section() {
+	local section="$1"
+
+	uci_validate_section mapagent $section "${section}" \
+		'local:bool:false' \
+		'mode:string' \
+		'probe_int:range(0,1000):20' \
+		'retry_int:range(0,255):3' \
+		'autostart:bool:false'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of controller_select section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_ap_section() {
+	local section="$1"
+
+	uci_validate_section mapagent $section "${1}" \
+			'ifname:string' \
+			'device:string' \
+			'band:or("2", "5", "6")' \
+			'enabled:bool:true' \
+			'onboarded:bool:false' \
+			'ssid:string' \
+			'key:string' \
+			'encryption:string' \
+			'disallow_bsta_p1:bool:false' \
+			'disallow_bsta_p2:bool:false'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of ap section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_radio_section() {
+	local section="$1"
+
+	uci_validate_section mapagent $section "${1}" \
+			'device:string' \
+			'band:or("2", "5", "6")' \
+			'configured:bool:false' \
+			'onboarded:bool:false' \
+			'dedicated_backhaul:bool:false' \
+			'steer_policy:range(0,255)' \
+			'util_threshold:range(0,255)' \
+			'rcpi_threshold:range(0,255)' \
+			'report_rcpi_threshold:range(0,255)' \
+			'include_sta_stats:bool:false' \
+			'include_sta_metric:bool:false' \
+			'rcpi_hysteresis_margin:range(0,255)' \
+			'report_util_threshold:range(0,255)' \
+			'encryption:or("sae", "sae+aes", "psk2",
+				"psk2+aes", "sae-mixed", "sae-mixed+aes",
+				"none", "psk-mixed", "psk-mixed+aes",
+				"wpa", "wpa+aes", "wpa2", "wpa2+aes",
+				"psk", "psk+aes", "owe")' \
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of radio section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_policy_section() {
+	local section="$1"
+
+	uci_validate_section mapagent $section "${1}" \
+			'report_interval:range(0,255)' \
+			'pvid:uinteger' \
+			'report_interval:range(0,255)' \
+			'pcp_default:range(0,255)' \
+			'report_scan:bool' \
+			'report_sta_assocfails:bool' \
+			'report_sta_assocfails_rate:uinteger' \
+			'steer_exclude:list(macaddr)' \
+			'steer_exclude_btm:list(macaddr)' \
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of policy section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_dyn_bh_section() {
+	local section="$1"
+
+	uci_validate_section mapagent $section "${1}" \
+			'missing_bh_timer:range(1,255)'
+	uci_validate_section mapagent $section "${1}" \
+			'missing_bh_reconfig_timer:range(0,65535)'
+
+	[ "$?" -ne 0 ] && {
+		logger -s -t "mapagent" "Validation of dynamic backhaul section failed"
+		IS_CFG_VALID=0
+		return 1
+	}
+	return 0
+}
+
+validate_agent_config() {
+	IS_CFG_VALID=1
+
+	validate_agent_section &&
+		config_foreach validate_cs_section controller_select &&
+		config_foreach validate_ap_section ap &&
+		config_foreach validate_radio_section radio &&
+		config_foreach validate_policy_section policy &&
+		config_foreach validate_dyn_bh_section dynamic_backhaul
+
+	[ "$IS_CFG_VALID" -ne 1 ] && {
+		logger -s -t "mapagent" "Validation of mapagent UCI file failed"
+		return 1
+	}
+	return 0
+}
+
+create_dir() {
+        mkdir -p /var/run/multiap
+        mkdir -p /etc/multiap
+}
+
+start_service() {
+	config_load "mapagent"
+	validate_agent_config || return 1;
+
+	ubus -t 5 wait_for wifi
+
+	sleep 2
+
+	local enabled
+	config_get_bool enabled agent enabled 1
+	[ "$enabled" -eq 0 ] && return 1
+
+	procd_open_instance
+	create_dir
+	# Log to a plain file, never a fifo.
+	#
+	# "-o /tmp/mapagent.log -f" wrote to a named pipe that nothing ever read,
+	# so everything this daemon said was lost. Attaching a reader afterwards
+	# does not recover it: the daemon opens the fifo at startup, finds no
+	# reader, and stays silent for good - measured 2026-09-02, "cat | logger"
+	# on the live pipe produced nothing at all. procd stdout/stderr capture
+	# does not deliver this text to logread either.
+	#
+	# Truncated on start, because -d is chatty and /tmp is RAM. If it ever
+	# grows fast enough to matter between restarts, it needs real rotation.
+	rm -f /tmp/mapagent.log
+	procd_set_param command "/usr/sbin/mapagent" "-d" "-o" "/tmp/mapagent.log"
+	procd_set_param respawn
+#	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "mapagent"
+}
+
+reload_service() {
+	stop
+	start
+}
+

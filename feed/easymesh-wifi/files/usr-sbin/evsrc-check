@@ -1,0 +1,108 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Make sure wifimngr is attached to the hostapd control sockets that EXIST NOW.
+#
+# wifimngr starts at S95 and reads /etc/wifi.json there, but hostapd is still
+# bringing BSSes up - 5 GHz alone waits out a 60 s DFS CAC. Measured on the BPI-R4 Pro 8X
+# after a cold boot, 2026-08-04: wifimngr at ~42 s, ap-mld-1_linkN sockets at
+# ~86-93 s.
+#
+# Three ways that goes wrong, and each one was found by a different failure:
+#
+#   1. No socket at all when the source registers. libwifi registers it DORMANT
+#      (hapdctrl_register_event leaves fd_monitor at 0), wifimngr adds no uloop
+#      fd, nothing polls it and it never re-attaches. wifimngr sits at one
+#      socket, its ubus connection.
+#
+#   2. A socket existed and hostapd REPLACED it when the BSS came up. wifimngr
+#      keeps the fd to the old, unlinked socket. It still counts as open - so a
+#      socket census alone says "healthy" - but no event arrives on it again.
+#
+#   3. The restart itself lands too early. Measured on a BPI-R4 (4 GB), 2026-08-04:
+#      restarted at 16:56:03 while link sockets were still being created at
+#      16:56:xx, so the fresh wifimngr attached to one source out of seven and
+#      published events for ap-mld-1_link0 only. The script had logged
+#      "after restart: 2 socket(s) for 7 event source(s)" - it knew, and did
+#      nothing with it.
+#
+# So: test BOTH conditions, and then verify the repair instead of assuming it.
+# A socket younger than wifimngr means it cannot be attached to it; fewer
+# sockets held than sources registered means dormant registrations.
+#
+# Runs detached from S99 so it can wait out the CAC without holding up the boot.
+#
+# To disable: remove /etc/rc.d/S99evsrc-check. Everything reverts to polling.
+
+WAIT_MAX=300		# > DFS CAC (60 s), with margin for 6 GHz
+STEP=5
+SETTLE=20		# let hostapd finish churning before judging a restart
+TRIES=3
+TAG=evsrc-check
+DIR=/var/run/hostapd
+
+want=$(jsonfilter -i /etc/wifi.json -e '@.events[*].ifname' 2>/dev/null | wc -l)
+if [ "${want:-0}" -eq 0 ]; then
+	logger -t "$TAG" "no event map, nothing to verify"
+	exit 0
+fi
+
+# Wait until hostapd has published as many sockets as the map asks for.
+waited=0
+while [ "$waited" -lt "$WAIT_MAX" ]; do
+	have=$(ls "$DIR" 2>/dev/null | grep -vc '^global$')
+	[ "${have:-0}" -ge "$want" ] && break
+	sleep "$STEP"
+	waited=$((waited + STEP))
+done
+
+# Even once they all exist hostapd may still be recreating them, and attaching
+# during that window is exactly failure 3. Let it settle before judging.
+sleep "$SETTLE"
+
+try=0
+while [ "$try" -lt "$TRIES" ]; do
+	pid=$(ps w | grep '[/]usr/sbin/wifimngr' | awk '{print $1}' | head -1)
+	if [ -z "$pid" ]; then
+		logger -t "$TAG" "wifimngr is not running"
+		exit 0
+	fi
+
+	now=$(date +%s)
+	up=$(cut -d. -f1 /proc/uptime)
+
+	# /proc/<pid>/stat field 22 is start time in clock ticks since boot
+	# (USER_HZ is 100 here), so this is the wall-clock second it started.
+	started=$(( now - up + $(awk '{print $22}' "/proc/$pid/stat") / 100 ))
+
+	newest=0
+	for s in "$DIR"/*; do
+		case "$s" in */global) continue ;; esac
+		[ -e "$s" ] || continue
+		m=$(date -r "$s" +%s 2>/dev/null) || continue
+		[ "${m:-0}" -gt "$newest" ] && newest=$m
+	done
+
+	socks=$(ls -l "/proc/$pid/fd" 2>/dev/null | grep -c socket)
+
+	if [ "$newest" -le "$started" ] && [ "${socks:-0}" -gt "$want" ]; then
+		[ "$try" -eq 0 ] || logger -t "$TAG" "attached after $try restart(s): $socks socket(s) for $want source(s)"
+		exit 0
+	fi
+
+	try=$((try + 1))
+
+	if [ "$newest" -gt "$started" ]; then
+		logger -t "$TAG" "try $try/$TRIES: newest hostapd socket is $((newest - started))s younger than wifimngr - it cannot be attached to it; restarting"
+	else
+		logger -t "$TAG" "try $try/$TRIES: wifimngr holds $socks socket(s) for $want event source(s) - registrations are dormant; restarting"
+	fi
+
+	/etc/init.d/wifimngr restart >/dev/null 2>&1
+	sleep "$SETTLE"
+done
+
+pid=$(ps w | grep '[/]usr/sbin/wifimngr' | awk '{print $1}' | head -1)
+socks=$(ls -l "/proc/$pid/fd" 2>/dev/null | grep -c socket)
+logger -t "$TAG" "STILL NOT ATTACHED after $TRIES restarts: $socks socket(s) for $want source(s) - events will be missing on this node"

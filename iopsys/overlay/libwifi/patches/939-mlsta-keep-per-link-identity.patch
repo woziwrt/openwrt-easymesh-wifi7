@@ -1,0 +1,104 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi 939: keep the per-link identity across the mlsta band enrichment
+
+nl80211 already returns correct per-link data for an MLO client.
+nlwifi_get_mlsta_info_cb() (modules/nl80211/nlwifi.c:3482-3531) walks
+NL80211_ATTR_MLO_LINKS and fills, per link, the real mlo_link_id, the affiliated
+client address and the link BSSID. iface_get_mlsta_info() then improves it once
+more, joining on link id to write the affiliated AP BSSID
+(modules/default/wifi.c:1950).
+
+The very next line throws all of it away:
+
+	ret = iface_get_sta_info_band(ifname, aplinks[j].band, macaddr, sta);
+
+That helper is handed the MLD netdev and the MLD address of the client and has
+no per-link concept. get_ctrl_interface_band() (wifi.c:1206) ignores its band
+argument and returns the MLD ifname, so all three links talk to the same
+hostapd socket; nlwifi_get_station_cb() then writes mlo_link_id =
+WIFI_MLO_INVALID_LINK_ID (nlwifi.c:3204), macaddr = the MLD address and bssid =
+if_gethwaddr(MLD netdev) (nlwifi.c:3224-3225); and hostapd_cli_get_sta_mlo()
+(wpactrl/hostapd_ctrl.c:880-898) cannot repair any of it because it looks for
+mlo_link_id=, mlo_bssid= and mlo_sta_link_addr=, none of which this hostapd
+emits - it emits peer_addr[N]= instead. Storing -1 into a uint8_t is where the
+255 comes from.
+
+Patch 937 is what made this bite. Before it the hostapd enrichment ran only
+where nl80211 had failed; 937 made it unconditional - correctly, because on
+mt76 a GET_STATION dump on the MLD netdev returns nothing for an MLO client and
+gating on it discarded good data. The cost is that the enrichment now lands on
+every link of the mlsta path too, where nl80211 had in fact succeeded.
+
+Measured on hardware 2026-08-02, one MLO client on ap-mld-1:
+
+	ubus call wifi.apmld.ap-mld-1 stations
+	  mlo_links[0]: link_id 255, link_bssid 7e:04:1c:81:7c:2e, band 2.4GHz
+	  mlo_links[1]: link_id 255, link_bssid 7e:04:1c:81:7c:2e, band 6GHz
+
+	real affiliated BSSIDs: link0 7e:04:1c:81:7c:2e
+	                        link1 7a:04:1c:81:9c:2e
+	                        link2 76:04:1c:81:bc:2e
+
+band is the one field that survives, because iface_get_sta_info_band() sets it
+from its own loop variable (wifi.c:1464).
+
+Save the three fields before the enrichment and re-assert them after, rather
+than reverting 937 or making get_ctrl_interface_band() band-aware. The MediaTek
+producer solves the identical problem the identical way, re-asserting
+mlo_link_id after its own enrichment call (modules/mediatek/mtk.c:1570); that
+module is not compiled for this target, but it is the in-tree precedent for
+this hardware. Making get_ctrl_interface_band() resolve a per-link hostapd
+socket the way qualcomm does (modules/qualcomm/qca.c:146, "%s_link%u") would be
+the deeper fix - the sockets do exist here, ap-mld-1_link0..2 - but that helper
+is shared by many callers and the blast radius is not worth it for this.
+
+What this unblocks: map-agent reads mlo_links[].link_bssid to match a client to
+an affiliated AP (bss_stations_data_cb). With every entry carrying link 0, the
+match lands on one link twice, mld->stamldlist stays empty and the Associated
+STA MLD Configuration Report TLV is never generated - so sta_mld and
+affiliated_sta stay empty on the controller.
+
+diff -urN a/libwifi/modules/default/wifi.c b/libwifi/modules/default/wifi.c
+--- a/libwifi/modules/default/wifi.c	2026-08-02 12:18:46.045133343 +0200
++++ b/libwifi/modules/default/wifi.c	2026-08-02 12:18:46.054096625 +0200
+@@ -1945,10 +1945,28 @@
+ 		for (int j = 0; j < num_aplinks; j++) {
+ 			if (mlsta->sta[i].mlo_link_id == aplinks[j].id) {
+ 				struct wifi_sta *sta;
++				uint8_t link_macaddr[6];
++				uint8_t link_bssid[6];
++				uint8_t link_id;
+ 
+ 				sta = &mlsta->sta[i];
+ 				memcpy(sta->bssid, aplinks[j].macaddr, 6);
+ 
++				/* Keep the per-link identity across the enrichment
++				 * below. iface_get_sta_info_band() is handed the MLD
++				 * netdev and the MLD address of the client, and has no
++				 * per-link concept - get_ctrl_interface_band() drops
++				 * the band and returns the MLD ifname - so every link
++				 * queries the same hostapd socket and comes back with
++				 * mlo_link_id = 255 and the MLD addresses. Since 937
++				 * that enrichment is unconditional, so it now lands on
++				 * every link, not only where nl80211 had failed.
++				 * Re-asserting afterwards is what the MediaTek producer
++				 * does for the same reason (mtk.c:1570). */
++				link_id = sta->mlo_link_id;
++				memcpy(link_macaddr, sta->macaddr, 6);
++				memcpy(link_bssid, sta->bssid, 6);
++
+ 				ret = iface_get_sta_info_band(ifname, aplinks[j].band, macaddr, sta);
+ 				if (ret) {
+ 					/* Hostapd band enrichment can fail for a link the
+@@ -1960,6 +1978,11 @@
+ 					break;
+ 				}
+ 
++				sta->mlo_link_id = link_id;
++				memcpy(sta->macaddr, link_macaddr, 6);
++				memcpy(sta->bssid, link_bssid, 6);
++				sta->mlo_capable = true;
++
+ 				if (!(sta->caps.valid & WIFI_CAP_EHT_VALID))
+ 					mlsta->mlo_capable = false;
+ 

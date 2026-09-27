@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Declare the backhaul AP-MLD before the agent generates its config.
+#
+# The agent only builds a backhaul MLD when its own config says so; without
+# this the whole MLD backhaul path is a no-op and the mesh falls back to a
+# single-link WDS association. Idempotent: it never overwrites an existing
+# value, so a node reconfigured by the user keeps that choice.
+
+# Any existing value counts as the user's choice, including '0'. Testing for
+# '1' would silently switch MLD backhaul back on at the next sysupgrade for
+# anyone who deliberately turned it off, since keep-config re-runs this from
+# the new image.
+[ -n "$(uci -q get mapagent.agent.mld_backhaul)" ] && exit 0
+
+# Without /etc/config/mapagent there is nothing to declare into - and at
+# install time there is not, because apk installs easymesh-config as 13/31 and
+# map-agent as 26/31, so default_postinst runs this script thirteen steps
+# before the config it writes into exists.
+#
+# Exiting 0 here used to end the story: a uci-default that succeeds is deleted,
+# so the one shot was fired into an empty room and the file was gone. The
+# switch then stayed unset forever, which quietly disables the backhaul half of
+# map-agent patch 989 - and the per-radio backhaul BSSes it exists to prevent
+# came back on every founding (measured 2026-08-13: four MAP--BH on the air
+# instead of one).
+#
+# A non-zero exit keeps the file, so it runs again at the next boot - which the
+# wizard asks for anyway - and by then map-agent has written its config.
+if ! uci -q get mapagent >/dev/null 2>&1; then
+	echo "90-easymesh-mld-backhaul: no mapagent config yet, will retry at boot" >&2
+	exit 1
+fi
+
+uci -q get mapagent.agent >/dev/null 2>&1 || uci set mapagent.agent=agent
+uci set mapagent.agent.mld_backhaul='1'
+uci commit mapagent
+exit 0

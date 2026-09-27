@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Keep mlo-steerd installed, but do not let it start on its own.
+#
+# It is a second, independent steering brain sitting next to the EasyMesh
+# controller, and on 2026-08-04 it was measured overwriting the controller's
+# decisions in a way that takes a client off the air entirely:
+#
+#   attlm_set() { hostapd_cli -i ap-mld-1 set_attlm disabled_links=$mask ... }
+#
+# The mask lists DISABLED links, the decision comes from the minimum RSSI over
+# ALL stations, and A-TTLM is advertised - so it applies to the whole AP-MLD.
+# One client walking into the next room therefore disables a band for every
+# client on that node, including the one sitting by the antenna. Measured
+# masks: 4 on a BPI-R4 (4 GB) (6 GHz off) and 6 on a BPI-R4 (8 GB) (5 and 6 GHz off, only 2.4
+# left). The client stays associated with its TIDs mapped to links it may not
+# use, which is "connected, no internet" from the sofa. Stopping the daemon
+# brought the connection back with nobody touching the phone.
+#
+# The daemon is NOT removed. Neg-TTLM and the R-TWT groups inside it are real
+# work we want back; what has to change is doing per-STA policy through a
+# per-BSS mechanism. Until that is rewritten it must not run unattended.
+#
+# Why this lives in the package rather than in a builder: it used to be shipped
+# by easymesh_install_mld_scripts(), the function that baked the whole mesh
+# layer into the image. That baking was deliberately switched off on 2026-08-09
+# because it made no two boards alike - and this guard silently went out with
+# it. Measured 2026-08-17: a node from the first production image came up with
+# mlo-steerd enabled at boot, while both configured lab nodes had it off.
+# easymesh-role does stop and disable it when a node takes a mesh role, so the
+# exposure is the window between first boot and the wizard - which is exactly
+# the window where a user is walking around the flat looking at signal bars.
+#
+# An init script cannot be disabled by leaving its rc.d symlink out of the
+# image: OpenWrt enables every /etc/init.d/* carrying a START= line when it
+# builds the rootfs, so the symlink comes back. It has to be disabled here, on
+# the device.
+#
+# To run it again:  /etc/init.d/mlo-steerd enable && /etc/init.d/mlo-steerd start
+# and stop it before measuring anything about EasyMesh behaviour, or the
+# measurement is against somebody else's decisions.
+
+[ -x /etc/init.d/mlo-steerd ] || exit 0
+
+/etc/init.d/mlo-steerd disable 2>/dev/null
+/etc/init.d/mlo-steerd stop 2>/dev/null
+
+logger -t mlo-steerd-off "mlo-steerd left installed but disabled - A-TTLM disables a band for every client on the node"
+
+exit 0

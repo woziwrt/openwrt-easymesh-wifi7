@@ -1,0 +1,54 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: free the STA-MLD children with the AP-MLD model
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+cntlr_free_apmld_list() is the teardown half of the model rebuild that
+runs on every Topology Response, and it frees the affiliated-AP and
+TID-to-Link child lists - but it never knew about stamldlist. Every
+STA-MLD element, with its affiliated-STA and TTLM children, leaked once
+per rebuild, roughly once a minute per agent, for as long as the
+controller lives. Found 2026-08-04 while chasing per-link RCPI through
+the same teardown, fixed today.
+
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1685,12 +1685,15 @@
+ }
+ 
+ #if (EASYMESH_VERSION >= 6)
+-/* Free the AP-MLD model attached to a node: each apmld plus its affiliated-AP
+- * and TID-to-Link child lists (DB Phase 1.5). Safe to call on an empty list. */
++/* Free the AP-MLD model attached to a node: each apmld plus its affiliated-AP,
++ * STA-MLD and TID-to-Link child lists (DB Phase 1.5). Safe to call on an
++ * empty list. */
+ void cntlr_free_apmld_list(struct node *n)
+ {
+ 	struct wifi_apmld_element *mld = NULL, *mtmp;
+ 	struct wifi_affiliated_ap_element *ap = NULL, *atmp;
++	struct wifi_stamld_element *sm = NULL, *smtmp;
++	struct wifi_affiliated_sta_element *as = NULL, *astmp;
+ 	struct wifi_ttlm_element *tt = NULL, *ttmp;
+ 
+ 	list_for_each_entry_safe(mld, mtmp, &n->apmld_list, list) {
+@@ -1702,6 +1705,21 @@
+ 			list_del(&tt->list);
+ 			free(tt);
+ 		}
++		/* 999994: the STA-MLD children leaked here on every Topology
++		 * Response since Phase 1.5 - this function is the teardown half
++		 * of the rebuild cycle and never knew about stamldlist. */
++		list_for_each_entry_safe(sm, smtmp, &mld->stamldlist, list) {
++			list_for_each_entry_safe(as, astmp, &sm->stalist, list) {
++				list_del(&as->list);
++				free(as);
++			}
++			list_for_each_entry_safe(tt, ttmp, &sm->ttlmlist, list) {
++				list_del(&tt->list);
++				free(tt);
++			}
++			list_del(&sm->list);
++			free(sm);
++		}
+ 		list_del(&mld->list);
+ 		free(mld);
+ 	}

@@ -1,0 +1,70 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: AKM suite copy takes a count, not a byte length
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+num_akms counts selectors, not bytes - it is the attribute length divided by
+sizeof(uint32_t) a few lines above. ap_akms and sta_akms are
+uint32_t[WIFI_NUM_AKM_SUITES] (wifidefs.h), so copying num_akms bytes moved a
+quarter of the data and left the rest of the destination as it was: three
+advertised AKM suites became 3 bytes instead of 12.
+
+Silent on MT7996 today. The driver does not report
+NL80211_ATTR_IFTYPE_AKM_SUITES at all, so this branch never runs and the arrays
+stay empty - measured 2026-09-03, ubus call wifi.radio.radio0 status returns
+"ap_akms": [] and "sta_akms": []. The agent therefore falls back to the UCI
+encryption options and the corruption never shows.
+
+That is exactly why it is worth fixing now: the moment any driver does report
+them, the AKM Suite Capabilities TLV goes out with a quarter of one selector
+and whatever was in the array before, and the fault would be looked for in the
+TLV writer rather than here.
+
+Also clamp to the destination. The count comes from the kernel while the arrays
+are fixed size, and nothing between the two checks it. ARRAY_SIZE keeps this
+independent of the constant's name; both arrays have the same length.
+
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -2631,12 +2631,40 @@
+ 			akms = nla_data(tbk[NL80211_IFTYPE_AKM_ATTR_SUITES]);
+ 			num_akms = nla_len(tbk[NL80211_IFTYPE_AKM_ATTR_SUITES]) / sizeof(uint32_t);
+ 
++			/* num_akms counts selectors, not bytes: it is the
++			 * attribute length divided by sizeof(uint32_t) just
++			 * above. ap_akms and sta_akms are uint32_t arrays, so
++			 * copying num_akms bytes moved a quarter of the data
++			 * and left the rest of the destination as it was -
++			 * three advertised AKM suites became 3 bytes instead
++			 * of 12.
++			 *
++			 * Silent on MT7996 today: the driver does not report
++			 * NL80211_ATTR_IFTYPE_AKM_SUITES at all, so this whole
++			 * branch never runs and ap_akms stays empty (measured
++			 * 2026-09-03: ubus call wifi.radio.radio0 status gives
++			 * "ap_akms": []). The agent therefore falls back to the
++			 * UCI encryption options. The moment a driver does
++			 * report them, the AKM Suite Capabilities TLV would go
++			 * out corrupted and the fault would be looked for in
++			 * the TLV writer, not here.
++			 *
++			 * Clamp to the destination as well: the count comes
++			 * from the kernel, but ap_akms and sta_akms are
++			 * uint32_t[WIFI_NUM_AKM_SUITES] (wifidefs.h) and both
++			 * have the same length.
++			 */
++			if (num_akms > (int)ARRAY_SIZE(radio->ap_akms))
++				num_akms = (int)ARRAY_SIZE(radio->ap_akms);
++
+ 			nla_for_each_nested(nliftype, tbk[NL80211_IFTYPE_AKM_ATTR_IFTYPES], i) {
+ 				if (nla_type(nliftype) == NL80211_IFTYPE_AP) {
+-					memcpy(radio->ap_akms, akms, num_akms);
++					memcpy(radio->ap_akms, akms,
++					       num_akms * sizeof(*radio->ap_akms));
+ 					radio->num_ap_akms = num_akms;
+ 				} else if (nla_type(nliftype) == NL80211_IFTYPE_STATION) {
+-					memcpy(radio->sta_akms, akms, num_akms);
++					memcpy(radio->sta_akms, akms,
++					       num_akms * sizeof(*radio->sta_akms));
+ 					radio->num_sta_akms = num_akms;
+ 				}
+ 			}

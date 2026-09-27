@@ -1,0 +1,128 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-logkeep - keep the log across the reboot that fixes the problem.
+#
+# On 2026-08-17 the controller ran all night and by morning no client could
+# associate. Petr got back on by rebooting it. That is the shape of the problem:
+# the failure is cured by a reboot, the log lives in RAM, so curing it destroys
+# the evidence. Measured the next morning: logread held 929 lines - 26 minutes -
+# and 41 % of that was one ubus call failing fifteen times a minute.
+#
+# ⚠️ logread is NOT the source. On the production image rsyslogd owns /dev/log
+# via imuxsock, so everything from logger(1) - this whole script layer, mesh-gwd,
+# hostapd and wpad through syslog(3) - lands in /var/log/messages and is invisible
+# to logread, which then carries kernel messages only. The first draft of this file
+# followed logread and would have preserved a night of nothing but kernel chatter.
+# Measured the same morning on the box in hand:
+#
+#     logger -t probe hello
+#     logread   | grep -c probe     ->  0
+#     /var/log/messages             ->  1
+#
+# On older builds without that rsyslog config the file does not exist and logread
+# is the whole truth, so the source is chosen at run time rather than assumed.
+#
+# See also node-heartbeat, which has been writing a minute-by-minute summary to
+# /etc/mapc/ the whole time and is what actually reconstructed that night. This
+# file is the full record next to that summary, not a replacement for it.
+DIR=${DIR:-/root/easymesh-log}
+FILE="$DIR/messages"
+PREV="$DIR/messages.1"
+# The size-cap spill. Deliberately not messages.1 - see the cap branch.
+BIG="$DIR/messages.big.1"
+MAX=${MAX:-8388608}
+CHECK=${CHECK:-60}
+# tmpfs, so it is gone at every boot and present across every respawn - which is
+# exactly the difference this needs to tell apart.
+STAMP=${STAMP:-/tmp/.easymesh-logkeep-rotated}
+# Refuse rather than fill the rootfs. The NAND variants have a 128 MiB rootfs, and
+# an overlay with no room left breaks uci and hostapd config writes - a far worse
+# failure than a missing log.
+NEED_KB=${NEED_KB:-$(( (MAX / 1024) * 4 ))}
+
+free_kb() { df -kP "$DIR" 2>/dev/null | awk 'NR==2 {print $4}'; }
+
+room() {
+	local free
+	free=$(free_kb)
+	[ -n "$free" ] || return 1
+	[ "$free" -ge "$NEED_KB" ]
+}
+
+rotate_once_per_boot() {
+	# Returns 0 when it rotated - i.e. this is the first start after a boot -
+	# and 1 on every respawn after that. The follower uses the answer to
+	# decide where in the source file to begin.
+	[ -f "$STAMP" ] && return 1
+	[ -f "$FILE" ] && mv -f "$FILE" "$PREV"
+	: > "$FILE"
+	: > "$STAMP"
+	return 0
+}
+
+case "$1" in
+follow)
+	mkdir -p "$DIR" 2>/dev/null || exit 1
+	room || {
+		logger -t easymesh-logkeep "only $(free_kb) kB free under $DIR, need ${NEED_KB} - not keeping a log"
+		exit 1
+	}
+	if rotate_once_per_boot; then
+		# First start of this boot: take the source from the top, so the
+		# boot itself is in the file.
+		from="-n +1"
+	else
+		# A respawn. /var/log is tmpfs and survived it, so starting from
+		# the top again would append everything since boot a second time -
+		# and a few restarts on a chatty node would drive the size cap on
+		# nothing but copies.
+		from="-n 0"
+	fi
+	# exec, so the follower IS the process procd supervises. The first draft ran
+	# it as a background child under a shell sitting in sleep(1), where ash defers
+	# the trap until the sleep returns: procd killed the shell, the child survived
+	# holding its fd, and the next start renamed that inode to messages.1 - so the
+	# orphan appended live log into the file labelled "previous boot", one more
+	# orphan per restart.
+	if [ -f /var/log/messages ]; then
+		exec tail $from -F /var/log/messages >> "$FILE"
+	fi
+	# No offset control here - logread replays logd's whole buffer on every
+	# start, so a respawn duplicates it. Bounded by log_size (128 kB) and only
+	# reached on builds without the rsyslog file at all.
+	exec logread -f >> "$FILE"
+	;;
+cap)
+	while :; do
+		sleep "$CHECK"
+		sz=$(wc -c < "$FILE" 2>/dev/null) || continue
+		[ "${sz:-0}" -gt "$MAX" ] || continue
+		# ⚠️ NOT $PREV. That file is the previous boot - the night this whole
+		# tool exists to preserve - and an earlier draft copied over it as soon
+		# as the current boot grew past MAX. The node reboots, runs a few hours,
+		# crosses the threshold, and the evidence is gone exactly when someone
+		# comes to look for it.
+		#
+		# Copy rather than move: the follower holds $FILE open, and an O_APPEND
+		# writer carries on at offset 0 after a truncate. A move would leave it
+		# writing into a file nobody looks at.
+		if cp "$FILE" "$BIG" 2>/dev/null; then
+			: > "$FILE"
+			logger -t easymesh-logkeep "current log passed $sz bytes - previous part kept in $BIG"
+		else
+			# The realistic trigger is a full overlay. Keeping $PREV intact
+			# matters more than keeping the current boot, and an unbounded
+			# file would take uci and hostapd config writes down with it - a
+			# far worse failure than a lost log. So: say so, and truncate.
+			logger -t easymesh-logkeep "cannot copy aside ($(free_kb) kB free) - dropping the current log to protect the overlay"
+			: > "$FILE"
+		fi
+	done
+	;;
+*)
+	echo "usage: $0 follow|cap" >&2
+	exit 1
+	;;
+esac

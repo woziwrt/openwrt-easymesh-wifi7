@@ -1,0 +1,55 @@
+#!/bin/sh
+
+[ "${ACTION}" = "add" ] || return 0
+
+# Nothing to generate on a box that is not part of a mesh.
+#
+# This handler fires on every radio that appears, at every boot, whether or not
+# map-agent is enabled and whether or not it is even running - which is what
+# makes it easy to miss. Measured 2026-08-17 on a factory-fresh production
+# image: with mapagent and mapcontroller both disabled and every mesh worker
+# switched off, the box still came up with the per-radio defaults rewritten
+# into one MLD and a backhaul on the air. The OpenWrt-2g/5g/6g networks the
+# board is meant to offer were gone, and a backhaul nobody had asked for was
+# broadcasting - on a router whose owner may never want a mesh at all.
+#
+# It is also why those networks looked unpredictable: the rewrite lands in UCI
+# after hostapd has already started, so config and air disagree until something
+# reloads wifi, and then the backhaul appears out of nowhere.
+#
+# The test is what someone DECIDED, never what they named things. /etc/mapc/role
+# is written by easymesh-role before it touches anything else, and every way
+# into the mesh goes through it. A box configured before that marker existed
+# carries dhcp.lan.ignore instead - '0' on a controller, '1' on an agent, unset
+# from the factory - which easymesh-role is the only thing that writes.
+#
+# Measured on three boxes at once, and every other candidate failed: a fresh
+# box already had /etc/mapc/adopt-state, already had mapc.db, and already had
+# controller_select.local='0' because map-agent elects a controller by itself
+# when it sees one. An earlier version of this file tested the fronthaul SSID
+# against a list of factory names - which would have silenced the mesh of
+# anyone who called their network "OpenWrt-home".
+
+# A join in progress counts too, and this is the half the first version got
+# wrong. easymesh-role writes /etc/mapc/role only in phase 2, but the join
+# needs its config built before that: WPS delivers the backhaul key into
+# mapagent's ap sections, and if those do not exist the key is written nowhere.
+# Measured 2026-08-17: WPS-SUCCESS on the controller, and on the joining box no
+# ap sections at all, no credentials, and bh-key-adopt waiting for a key that
+# had been delivered an hour earlier. /etc/easymesh-wps-pending is written by
+# phase 1 and removed when the join finishes or fails, which is exactly the
+# window in which genconfig must be allowed to work.
+#
+# 2026-08-17, later the same day: dhcp.lan.ignore was removed from this test.
+# It had been included as the mark carried by nodes configured before
+# /etc/mapc/role existed. It cannot serve that purpose - easymesh-dhcp-safe
+# writes dhcp.lan.ignore='1' on every box that is not a controller, factory ones
+# included, so the mark appeared on untouched routers and reopened this gate one
+# boot later. Three builds in a row came up with a backhaul on the air because of
+# it. Older nodes now get the real marker from 88-easymesh-role-marker instead.
+#
+# A mark only means "someone decided" if nothing but a decision can produce it.
+[ -f /etc/mapc/role ] ||
+	[ -f /etc/easymesh-wps-pending ] || return 0
+
+/lib/wifi/multiap conf

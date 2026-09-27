@@ -1,0 +1,77 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: one column, one unit
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+sta_metrics_hist.dl_rate carried two units at once. Measured 2026-09-06 on a
+live mesh: 940, 109 and 88 sitting next to 65000 and 450567 - a thousandfold
+apart, and every one of them readable as a rate.
+
+The two writers take their value from two different TLVs:
+
+  Extended Link Metrics TLV   struct sta_ext_link_metric_bss.dl_rate
+                              Last Data Downlink Rate, Kbps
+                              -> the client-level row (cntlr_map.c:2712, :3331)
+
+  Link Metrics TLV            struct assoc_sta_link_metrics_bss.dl_thput
+                              Estimated MAC Data Rate, Mb/s
+                              -> the per-leg row (this call site)
+
+Both land in wifi_stamld_element.dl_rate, whose declaration says "latest data
+rate in Kbps" (wifi_dataelements.h:438). One of them is telling the truth.
+
+Within one series nothing was visibly wrong, which is why this survived:
+sta_trend groups by (macaddr, bssid), so a leg curve is all estimates and a
+client curve is all measurements, each internally consistent. What was wrong
+is everything that compares two series, or prints the number with a unit
+after it - and a graph drawn from this column would have looked entirely
+plausible while doing exactly that.
+
+Converted where the value enters, so the field means what its declaration
+says. Nothing downstream changes; the readers already treat it as Kbps.
+
+NOT fixed here, and worth saying: the two writers still put two different
+QUANTITIES in one column - an estimate of what the link could do, and a
+measurement of what it did. Per series that is harmless, since each series
+has one writer. Before this column is ever plotted across series it needs
+either a source marker or a second column.
+
+Verify: on a live mesh, per-leg rows in sta_metrics_hist must be of the same
+magnitude as the client-level rows for a link of comparable speed - hundreds
+of thousands, not hundreds.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -3245,11 +3245,31 @@
+ 			}
+ 
+ #if (EASYMESH_VERSION >= 6)
+-			/* Independent of sta_table: this is keyed by the leg. */
++			/* Independent of sta_table: this is keyed by the leg.
++			 *
++			 * dl_thput/ul_thput are the Estimated MAC Data Rate of
++			 * the Associated STA Link Metrics TLV, and that field is
++			 * Mb/s. It lands in wifi_stamld_element.dl_rate, which
++			 * says "latest data rate in Kbps" and is filled that way
++			 * everywhere else - from the Extended Link Metrics TLV,
++			 * which really is Kbps (cntlr_map.c:2712, :3331).
++			 *
++			 * So one column carried two units. Measured 2026-09-06
++			 * in sta_metrics_hist: 940 and 109 next to 65000 and
++			 * 450567, a thousandfold apart, and both readable as a
++			 * rate. Per series it is still homogeneous - sta_trend
++			 * groups by (macaddr, bssid) - so nothing was wrong
++			 * within one curve; anything comparing two curves, or
++			 * printing a number with a unit, was.
++			 *
++			 * Convert where the value enters, so the field means what
++			 * its declaration says. A graph drawn from this column
++			 * would have looked entirely plausible.
++			 */
+ 			cntlr_affiliated_sta_metrics(c, p->macaddr, b->bssid,
+ 						     b->ul_rcpi,
+-						     BUF_GET_BE32(b->dl_thput),
+-						     BUF_GET_BE32(b->ul_thput));
++						     BUF_GET_BE32(b->dl_thput) * 1000,
++						     BUF_GET_BE32(b->ul_thput) * 1000);
+ #endif
+ 
+ 			if (!s) {

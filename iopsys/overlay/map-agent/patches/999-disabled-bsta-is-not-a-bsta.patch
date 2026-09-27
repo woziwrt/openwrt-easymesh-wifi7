@@ -1,0 +1,57 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 999: a disabled bSTA is not a bSTA
+
+config_find_bsta_wireless() matches a wireless section on mode="sta" alone and
+never looks at `disabled`. config_generate_bsta_agent() then writes a mapagent
+bsta section for it -- ifname, device and band, but no priority, unlike the MLD
+path which sets priority, enabled, mld_id and is_mld.
+
+The interface never appears, because it is disabled. What remains is a mapagent
+section pointing at nothing, and it cannot be removed: delete it and the next
+pass over the radios regenerates it from the same wireless section. The missing
+priority then aborts an arithmetic test in /lib/wifi/multiap:
+
+  mapagent[...]: sh: out of range
+
+Measured on hardware 2026-07-28. Every node in the lab carried such sections --
+`default_sta_radio0 (ifname=wlan0, disabled=1)` on all three, plus
+`default_sta_radio1 (wlan1_0, disabled=1)` on the Pro-8X. Deleting the mapagent
+section by hand and watching it come back is what identified this path.
+
+Those wireless sections are sediment: sysupgrade runs keep-config, so a node
+carries them across generations, and nothing generates them any more -- they
+are in no image, in no map_genconfig, and in neither the wifimngr nor the
+mapagent binary. Clearing them is worth doing separately, but the agent should
+not have believed them in the first place.
+
+Note this fixes the source, not the symptom. Patch 998 gives the shell a
+default so the arithmetic stops failing; this stops the phantom section from
+being written at all. They are worth having both: 998 covers any other section
+that turns up without a priority.
+
+--- a/src/config.c
++++ b/src/config.c
+@@ -4000,7 +4000,7 @@
+ 
+ 	uci_foreach_element(&pkg->sections, e) {
+ 		struct uci_section *s = uci_to_section(e);
+-		const char *c_device, *mode;
++		const char *c_device, *mode, *disabled;
+ 
+ 		if (strncmp(s->type, UCI_WLAN_IFACE, strlen(UCI_WLAN_IFACE)))
+ 			continue;
+@@ -4013,6 +4013,14 @@
+ 		if (!mode || strcmp(mode, "sta"))
+ 			continue;
+ 
++		/* A disabled bSTA is not a bSTA. Without this the caller
++		 * generates a mapagent bsta section for an interface that is
++		 * never brought up, and that section outlives every attempt to
++		 * remove it because it is regenerated on the next pass. */
++		disabled = uci_lookup_option_string(ctx, s, "disabled");
++		if (disabled && (!strcmp(disabled, "1") || !strcmp(disabled, "true")))
++			continue;
++
+ 		return s;
+ 	}
+ 

@@ -1,0 +1,81 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: name the BTM-response AP by BSSID, not by ifname
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+process_sta_btm_resp_evt() resolves the source BSS through
+agent_get_ap_by_ifname(ifname). wifi_send_sta_report() needs that AP to put
+ap->bssid into the steering report, and the post-steer deauth timer needs its
+stalist.
+
+On an MLD there is no interface name that names an affiliated link. This
+agent holds wlan0, wlan1, wlan2, ap-mld-1, ap-mld-2 and bhmld5/6 - never
+ap-mld-1_link2, which is only the name of a hostapd control socket. So the
+event has to be published under the parent name, and the link identified some
+other way.
+
+The BSSID is that way, and it is not a new idea: the association path
+(process_sta_con_dis_evt) has always resolved by BSSID and never by name.
+This makes the BTM path do the same when the emitter supplies it.
+
+Without this, a steer that happened on one specific link is reported with the
+MLD's own BSS as its source - the same wrong-entity attribution that patches
+99994 and 99995 had to undo elsewhere.
+
+The field is optional: an emitter that does not send "bssid" leaves the
+existing ifname path untouched, so this cannot regress a non-MLO node.
+
+Pairs with libwifi 923, which publishes the event in the first place; before
+that patch this handler never ran at all.
+
+--- a/src/agent_ubus_events.c	2026-08-04 14:54:09.987582204 +0200
++++ b/src/agent_ubus_events.c	2026-08-04 14:54:09.987630567 +0200
+@@ -732,11 +732,14 @@
+ static void process_sta_btm_resp_evt(struct agent *a,
+ 		char *ifname, struct blob_attr *frm_data)
+ {
+-	struct blob_attr *data[3];
+-	static const struct blobmsg_policy data_attr[3] = {
++	struct blob_attr *data[4];
++	static const struct blobmsg_policy data_attr[4] = {
+ 		[0] = { .name = "macaddr", .type = BLOBMSG_TYPE_STRING },
+ 		[1] = { .name = "target_bssid", .type = BLOBMSG_TYPE_STRING },
+ 		[2] = { .name = "status", .type = BLOBMSG_TYPE_STRING },
++		/* 99996: the BSS the response arrived on. Optional - an emitter
++		 * that does not send it leaves the old ifname path untouched. */
++		[3] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
+ 	};
+ 	char mac_str[18] = {0};
+ 	uint8_t mac[6] = {0}, bssid[6] = {0};
+@@ -767,6 +770,32 @@
+ 	/* status */
+ 	status = strtol(blobmsg_data(data[2]), NULL, 10);
+ 
++	/* 99996: name the AP by BSSID, not by interface name.
++	 *
++	 * Everything below resolves the source BSS through
++	 * agent_get_ap_by_ifname(ifname): wifi_send_sta_report() needs it to put
++	 * ap->bssid in the steering report, and the deauth timer needs its
++	 * stalist. On an MLD there is no ifname that names an affiliated link -
++	 * this agent holds wlan0/1/2 and ap-mld-1/2, never ap-mld-1_link2 - so
++	 * the event has to be published under the parent name and the link
++	 * identified some other way. The BSSID is that way, and it is what the
++	 * association path (process_sta_con_dis_evt) has always used.
++	 *
++	 * Without this the report names the MLD's own BSS as the source of a
++	 * steer that happened on one specific link, which is the same
++	 * wrong-entity attribution patches 99994 and 99995 had to undo.
++	 */
++	if (data[3]) {
++		uint8_t src_bssid[6] = {0};
++		struct netif_ap *src_ap;
++
++		if (hwaddr_aton(blobmsg_data(data[3]), src_bssid)) {
++			src_ap = agent_get_ap(a, src_bssid);
++			if (src_ap)
++				ifname = src_ap->ifname;
++		}
++	}
++
+ 	/* notify event received */
+ 	snprintf(ev_data, sizeof(ev_data),
+ 			"{\"macaddr\":\""MACFMT"\""

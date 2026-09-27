@@ -1,0 +1,143 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-dhcp-probe - ask the mesh who hands out addresses.
+#
+# One DHCP server per mesh, and it is the controller's. A second one is the
+# worst thing a foreign box can bring: its clients get an address and a
+# gateway from somewhere else and the internet goes away for them, or for
+# some of them. Seen on 2026-09-17, when a MediaTek agent started in router
+# mode and handed 192.168.50.x to a phone of our own mesh.
+#
+# Listening is not enough. A rogue server answers a client behind its own
+# box, and that answer never has to come near the controller. So the
+# controller asks: a DISCOVER with the broadcast flag set, which every
+# server has to answer by broadcast, and a broadcast crosses the whole mesh.
+# Every offer that is not our own is written down.
+#
+# The probe runs on its own address - a macvlan on the mesh bridge with one
+# fixed, locally administered MAC - so it costs one lease in the pool, the
+# same one every time, and touches nothing on the bridge itself.
+#
+# Output, /tmp/easymesh-dhcp-servers:
+#   probed <epoch>
+#   <mac> <ip|-> <epoch> <dhcp4|dhcp6|ra>  one line per foreign address server
+#
+# Called in the background by the health call, at most every PROBE_EVERY_S.
+
+BR=${BR:-br-lan}
+OUT=/tmp/easymesh-dhcp-servers
+CAP=/tmp/easymesh-dhcp-probe.cap
+PIF=emdhcpprobe
+PMAC=02:e5:d4:00:00:01
+
+exec 9>/tmp/easymesh-dhcp-probe.lock
+flock -n 9 || exit 0
+
+# A probe that cannot run still has to say it tried.
+#
+# The caller re-runs this whenever the output file carries no fresh "probed"
+# line, and the caller is the health call - which the web UI polls. So an exit
+# that writes nothing does not mean "no answer yet", it means a new probe on
+# every poll, for as long as whatever stopped it stays broken. Say the time
+# and list nothing: a mesh with no second server and a probe that could not
+# ask read the same to the reader, and both are better than a fork per poll.
+give_up() {
+	printf 'probed %s\n' "$(date +%s)" > "$OUT.$$" && mv "$OUT.$$" "$OUT"
+	exit 0
+}
+
+command -v tcpdump >/dev/null 2>&1 || give_up
+[ -d "/sys/class/net/$BR" ] || give_up
+
+# Whose answer is ours?
+#
+# It used to be "the MAC of the bridge this runs on", which is true on the
+# controller and false everywhere else: on an agent that MAC is the agent's
+# own, and the controller's offer - the only right answer in the mesh - would
+# be written down as a foreign server. That single line is why this could only
+# ever run on the controller, and running it on every node is the point: a
+# server two hops away is a different problem from one on your own bridge.
+#
+# What identifies our server is where it answers FROM. Our nodes are static on
+# the mesh subnet; a foreign box answers out of a network of its own
+# (192.168.50.1, measured 2026-09-21). One /24, one mesh.
+own4=$(ip -4 -o addr show "$BR" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+[ -n "$own4" ] || give_up
+pfx="${own4%.*}."
+
+ip link del "$PIF" 2>/dev/null
+ip link add "$PIF" link "$BR" address "$PMAC" type macvlan mode private || give_up
+ip link set "$PIF" up
+
+# Three things can hand a client a place to live, and only one of them was
+# being listened for. A rogue DHCPv6 server and a rogue Router Advertisement
+# do the same damage as a rogue DHCPv4 server - the RA is arguably worse,
+# because it plants a default route without anybody asking. The foreign box
+# measured on 2026-09-21 announced itself on our bridge as an IPv6 router
+# (fe80::28da:67ff:fe1a:77cf) while this probe reported nothing at all.
+#
+# src port 67 with no "dst port 68": a reply to a relay travels 67 -> 67 and
+# is just as much a second server.
+timeout 9 tcpdump -l -n -e -i "$BR" \
+	"(udp src port 67) or (udp src port 547) or (icmp6 and ip6[40] == 134)" \
+	> "$CAP" 2>/dev/null &
+sleep 1
+udhcpc -i "$PIF" -n -q -B -t 2 -T 2 -s /bin/true >/dev/null 2>&1
+sleep 3
+ip link del "$PIF" 2>/dev/null
+wait
+
+# "hh:mm:ss.us <src mac> > <dst mac>, ... <src ip>.67 > <dst ip>.68: BOOTP/DHCP, Reply"
+now=$(date +%s)
+{
+	echo "probed $now"
+	# One pass to sort ours from theirs, and the verdict only at the end.
+	#
+	# IPv4 is decided on the source address: our nodes are static on the mesh
+	# subnet. IPv6 has no such tell - our own router advertisements leave from
+	# a link-local address like anybody else's - so they are judged by the MAC
+	# our IPv4 answer came from, which is the same bridge. That is why the
+	# verdict waits for END: the capture is not ordered, and the whitelist is
+	# built from lines that may arrive last.
+	#
+	# And when no answer of ours was captured at all, the whitelist is empty
+	# and every RA in the mesh would read as foreign - our own included. Say
+	# nothing rather than everything: a server that did not answer is a
+	# different fault and it has warnings of its own.
+	awk -v p="$pfx" -v t="$now" '
+		/BOOTP\/DHCP, Reply/ {
+			mac = tolower($2)
+			ip = ""
+			for (i = 1; i <= NF; i++)
+				if ($i ~ /\.67$/) { ip = $i; sub(/\.67$/, "", ip) }
+			# No source address at all means a line this did not
+			# understand; naming a server we cannot name is worse
+			# than staying quiet.
+			if (ip == "") next
+			if (index(ip, p) == 1) { ours[mac] = 1; mine = 1; next }
+			if (!(mac in v4)) { v4[mac] = ip; order[++n] = mac " dhcp4" }
+			next
+		}
+		/dhcp6/ {
+			mac = tolower($2)
+			if (!(mac in v6)) { v6[mac] = 1; order[++n] = mac " dhcp6" }
+			next
+		}
+		/ICMP6, router advertisement/ {
+			mac = tolower($2)
+			if (!(mac in ra)) { ra[mac] = 1; order[++n] = mac " ra" }
+			next
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				split(order[i], f, " ")
+				mac = f[1]; kind = f[2]
+				if (mac in ours) continue
+				if (kind != "dhcp4" && !mine) continue
+				print mac, (kind == "dhcp4" ? v4[mac] : "-"), t, kind
+			}
+		}' "$CAP"
+} > "$OUT.$$" && mv "$OUT.$$" "$OUT"
+rm -f "$CAP"

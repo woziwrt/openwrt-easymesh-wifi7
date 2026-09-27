@@ -1,0 +1,84 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: mapagent bound init onboarding blocking
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -2040,14 +2040,20 @@ void parse_i1905_info(struct ubus_reques
+ 	}
+ }
+ 
++/* Bounded retry so a wedged/absent ieee1905d can never park agent boot
++ * forever (onboarding blocker #2 hardening). ~2 min ceiling. */
++#define AGENT_IEEE1905_INIT_MAX_TRIES	60
+ void agent_init_ieee1905id(struct agent *a)
+ {
+-	for (;;) {
++	int tries;
++
++	for (tries = 0; tries < AGENT_IEEE1905_INIT_MAX_TRIES; tries++) {
+ 		int ret;
+ 
+ 		ret = ubus_lookup_id(a->ubus_ctx, "ieee1905", &a->i1905obj_id);
+ 		if (ret) {
+-			warn("%s: ieee1905 object missing over UBUS, retry in 2s\n", __func__);
++			warn("%s: ieee1905 object missing over UBUS, retry in 2s (%d/%d)\n",
++			     __func__, tries + 1, AGENT_IEEE1905_INIT_MAX_TRIES);
+ 			sleep(2);
+ 			continue;
+ 		}
+@@ -2055,12 +2061,18 @@ void agent_init_ieee1905id(struct agent
+ 		ret = ubus_call_object(a->ubus_ctx, a->i1905obj_id, "info",
+ 				       parse_i1905_info, a);
+ 		if (ret) {
+-			warn("%s: getting alid failed, retry in 2s\n", __func__);
++			warn("%s: getting alid failed, retry in 2s (%d/%d)\n",
++			     __func__, tries + 1, AGENT_IEEE1905_INIT_MAX_TRIES);
+ 			sleep(2);
+ 			continue;
+ 		}
+-		break;
++		return;
+ 	}
++
++	/* Non-fatal: proceed with a zero AL-MAC; it is refreshed later from the
++	 * ieee1905 'info' event handler (agent_ubus_events.c). */
++	warn("%s: ieee1905 AL-MAC not resolved after %d tries; continuing\n",
++	     __func__, AGENT_IEEE1905_INIT_MAX_TRIES);
+ }
+ 
+ #ifdef AGENT_ISLAND_PREVENTION
+@@ -4788,6 +4800,7 @@ int agent_subscribe_for_cmdus(struct age
+ 	mapmodule_cmdu_mask_t cmdu_mask = {0};
+ 	uint32_t map_id;
+ 	int ret;
++	int tries;
+ 
+ 
+ 	map_prepare_cmdu_mask(cmdu_mask,
+@@ -4845,14 +4858,23 @@ int agent_subscribe_for_cmdus(struct age
+ 	memcpy(a->cmdu_mask, cmdu_mask, sizeof(a->cmdu_mask));
+ 
+ 	trace("<----------------------------------- %s\n", __func__);
+-	for (;;) {
++	/* Bounded, non-fatal (onboarding blocker #2 hardening): don't park boot
++	 * forever if the ieee1905.map plugin never registers. */
++#define AGENT_MAP_PLUGIN_INIT_MAX_TRIES	30
++	for (tries = 0; tries < AGENT_MAP_PLUGIN_INIT_MAX_TRIES; tries++) {
+ 		ret = ubus_lookup_id(a->ubus_ctx, map_plugin, &map_id);
+ 		if (!ret)
+ 			break;
+ 
+-		trace("ieee1905.map not up yet, sleeping for 2s!\n");
++		trace("ieee1905.map not up yet, sleeping for 2s! (%d/%d)\n",
++		      tries + 1, AGENT_MAP_PLUGIN_INIT_MAX_TRIES);
+ 		sleep(2);
+ 	}
++	if (ret) {
++		warn("%s: %s not up after %d tries; skipping subscribe\n",
++		     __func__, map_plugin, AGENT_MAP_PLUGIN_INIT_MAX_TRIES);
++		return ret;
++	}
+ 
+ 	a->map_oid = map_id;
+ 

@@ -1,0 +1,206 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: read the links of a 4-address STA-MLD from its VLAN netdev
+
+A 4-address (WDS) STA-MLD - every backhaul bSTA of the mesh - is kept by the
+kernel on the AP_VLAN netdev hostapd creates for it, <bss>.staN. The station
+dump on the AP netdev does not list it with its links: on mt76 it misses
+the station altogether (`iw dev ap-mld-2 station dump` lists none), so
+iface_get_mlsta_info() falls back to iface_get_mlsta_4addr_info(), which
+reads hostapd per band and knows no rates; where the station does come
+back, it comes without NL80211_ATTR_MLO_LINKS and patch 941 reports the
+one-link skeleton. Both assumed the kernel does not expose links for
+4addr stations at all. It does - on the VLAN netdev.
+
+Measured 2026-09-24 on the controller, same station, same second:
+  iw dev ap-mld-2 station get 82:fe:45:7e:98:b1   no link
+  iw dev ap-mld-2.sta1 station dump                Link 0 and Link 1, each
+    with signal and TX/RX bitrate (432/648 Mbit/s on 5 GHz, 864/1297 Mbit/s
+    on 6 GHz)
+and wifi.apmld.ap-mld-2 stations gave tx_rate_latest/rx_rate_latest = 0 on
+both links, which map-agent sent as dl_rate/ul_rate 0 in the Associated STA
+Link Metrics of every backhaul station.
+
+When the AP-netdev query finds no station, or only that skeleton, look for
+the station on the <ifname>.sta* netdevs and take its links from there,
+with the MLD address that was asked and the AP netdev's own address as MLD
+BSSID. A station found on no VLAN takes the old way: the error goes back
+to the caller, or the skeleton stays.
+
+The per-band query nlwifi_get_sta_info_band() - the one map-agent reads its
+station rates from, through wifi.ap.<ifname> - came back empty for the same
+station - missing, or for one of two backhaul stations of the same AP listed
+with no bitrate at all. When it finds nothing, or no bitrate, it now takes
+the link on the asked band (or the first link for BAND_ANY) from the VLAN,
+under the address and BSSID that were asked for.
+
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -3411,8 +3411,43 @@
+ 	return nlwifi_cmd(ifname, &ctx);
+ }
+ 
++static int nlwifi_get_mlsta_info_vlan(const char *ifname, uint8_t *macaddr,
++				      struct wifi_mlsta *mlsta);
++
++/* The per-band view of a 4-address STA-MLD. The dump on the AP netdev does
++ * not list it (see nlwifi_get_mlsta_info_vlan()), and this query used to
++ * hand back an empty station - map-agent took its rates from here and
++ * reported a backhaul station at 0 Mbit/s both ways. Take the link on the
++ * asked band from the station's VLAN netdev, or its first link for
++ * BAND_ANY, under the address and BSSID that were asked for. */
++static void nlwifi_get_sta_info_vlan(const char *ifname, enum wifi_band band,
++				     uint8_t *addr, struct wifi_sta *info)
++{
++	struct wifi_mlsta *m;
++	size_t li;
++
++	m = calloc(1, sizeof(*m));
++	if (!m)
++		return;
++
++	if (!nlwifi_get_mlsta_info_vlan(ifname, addr, m)) {
++		for (li = 0; li < m->num_link; li++)
++			if (band == BAND_ANY || m->sta[li].band == band)
++				break;
++
++		if (li < m->num_link) {
++			*info = m->sta[li];
++			memcpy(info->macaddr, addr, 6);
++			if_gethwaddr(ifname, info->bssid);
++		}
++	}
++
++	free(m);
++}
++
+ int nlwifi_get_sta_info_band(const char *ifname, enum wifi_band band, uint8_t *addr, struct wifi_sta *info)
+ {
++	static const uint8_t zero[6] = {0};
+ 	struct stainfo {
+ 		const char *vif;
+ 		enum wifi_mode ifmode;
+@@ -3431,8 +3466,20 @@
+ 		.cb = nlwifi_get_station_cb,
+ 		.data = &sta,
+ 	};
++	int ret;
+ 
+-	return nlwifi_cmd(ifname, &ctx);
++	ret = nlwifi_cmd(ifname, &ctx);
++	if (ret || !addr)
++		return ret;
++
++	/* A 4-address station lives on its VLAN. On the AP netdev it is either
++	 * missing, or - seen 2026-09-24 for one of two backhaul stations of the
++	 * same AP - listed without any bitrate. */
++	if (!memcmp(info->macaddr, zero, 6) ||
++	    (!info->tx_rate.rate && !info->rx_rate.rate))
++		nlwifi_get_sta_info_vlan(ifname, band, addr, info);
++
++	return 0;
+ }
+ 
+ int nlwifi_get_sta_info(const char *ifname, uint8_t *addr, struct wifi_sta *info)
+@@ -3762,7 +3809,8 @@
+ 	return NL_SKIP;
+ }
+ 
+-int nlwifi_get_mlsta_info(const char *ifname, uint8_t *macaddr, struct wifi_mlsta *mlsta)
++static int nlwifi_query_mlsta(const char *ifname, uint8_t *macaddr,
++			      struct wifi_mlsta *mlsta)
+ {
+ 	struct mlsta_info {
+ 		const char *ifname;
+@@ -3797,6 +3845,92 @@
+ 	return 0;
+ }
+ 
++/* A 4-address STA-MLD is not listed with its links on its AP netdev: the
++ * station dump there either misses it altogether - then the caller falls
++ * back to the hostapd path, which knows no rates - or returns it without
++ * links, as the one-link skeleton the callback builds. The kernel does list
++ * the links on the AP_VLAN netdev hostapd created for that station,
++ * <ifname>.staN.
++ * Measured 2026-09-24 on the controller: `iw dev ap-mld-2 station get` of a
++ * backhaul bSTA showed no link at all; the same station on ap-mld-2.sta1
++ * showed both links with their own signal and TX/RX bitrate (432/648 Mbit/s
++ * on 5 GHz, 864/1297 on 6 GHz). The agent reported that station in its
++ * Associated STA Link Metrics with a downlink and uplink rate of 0.
++ *
++ * So ask the station's VLAN netdev, and take its links when it has them.
++ * The MLD BSSID stays the one of the AP netdev that was asked. */
++static int nlwifi_get_mlsta_info_vlan(const char *ifname, uint8_t *macaddr,
++				      struct wifi_mlsta *mlsta)
++{
++	static const uint8_t zero[6] = {0};
++	char prefix[IFNAMSIZ + 5];
++	struct wifi_mlsta *vlan;
++	size_t plen;
++	struct dirent *p;
++	int found = -1;
++	DIR *d;
++
++	snprintf(prefix, sizeof(prefix), "%s.sta", ifname);
++	plen = strlen(prefix);
++
++	vlan = calloc(1, sizeof(*vlan));
++	if (!vlan)
++		return -1;
++
++	d = opendir("/sys/class/net");
++	if (!d) {
++		free(vlan);
++		return -1;
++	}
++
++	while ((p = readdir(d))) {
++		if (strncmp(p->d_name, prefix, plen))
++			continue;
++
++		memset(vlan, 0, sizeof(*vlan));
++		if (nlwifi_query_mlsta(p->d_name, macaddr, vlan))
++			continue;
++
++		if (vlan->num_link == 0 ||
++		    vlan->sta[0].mlo_link_id == WIFI_MLO_INVALID_LINK_ID)
++			continue;
++
++		memcpy(mlsta->sta, vlan->sta, sizeof(mlsta->sta));
++		mlsta->num_link = vlan->num_link;
++		for (size_t i = 0; i < mlsta->num_link; i++)
++			if_gethwaddr(ifname, mlsta->sta[i].mld_bssid);
++		memcpy(mlsta->macaddr, macaddr, 6);
++		if (!memcmp(mlsta->bssid, zero, 6))
++			if_gethwaddr(ifname, mlsta->bssid);
++		found = 0;
++
++		libwifi_dbg("[%s] " MACFMT ": links read from %s (%zu)\n",
++			    ifname, MAC2STR(macaddr), p->d_name, mlsta->num_link);
++		break;
++	}
++
++	closedir(d);
++	free(vlan);
++	return found;
++}
++
++int nlwifi_get_mlsta_info(const char *ifname, uint8_t *macaddr, struct wifi_mlsta *mlsta)
++{
++	int ret;
++
++	ret = nlwifi_query_mlsta(ifname, macaddr, mlsta);
++	if (!macaddr)
++		return ret;
++
++	if (ret || (mlsta->num_link == 1 &&
++		    mlsta->sta[0].mlo_link_id == WIFI_MLO_INVALID_LINK_ID)) {
++		if (!nlwifi_get_mlsta_info_vlan(ifname, macaddr, mlsta))
++			return 0;
++	}
++
++	return ret;
++}
++
+ int nlwifi_mlsta_interface_info(const char *ifname, struct wifi_mlsta *mlsta)
+ {
+ 	struct wifi_interface_info info = {};

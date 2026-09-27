@@ -1,0 +1,62 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: take AKM suites from the BSSes, not from the radio
+
+The AKM Suite Capabilities TLV (0xCC) went out empty, so no peer could learn
+what security this device speaks - and a backhaul link is negotiated from
+exactly that. EasyMesh 6.1 section 5.2.3 requires an SAE-capable bSTA to be
+able to associate; with an empty TLV there is nothing to agree on.
+
+The generator was never at fault. agent_gen_akm_suite_cap() is complete and is
+called; it simply had nothing to publish, because both of its sources are
+empty. Measured 2026-09-01 on a live node:
+
+  - the HAL reports none:
+      ubus call wifi.radio.radioN status  ->  "ap_akms": [], "sta_akms": []
+    on all three radios.
+
+  - the fallback, agent_radio_init_default_akm_suite(), read encryption from
+    the *radio* config section. Those sections carry no encryption option at
+    all: /etc/config/mapagent holds twelve of them and every one is in an ap
+    section, none in a radio section. So enc was always 0 and
+    default_akm_suites_from_encryption() correctly returned zero suites.
+
+Encryption is a property of a BSS, not of a radio, which is why it lives in
+the ap sections and why the radio sections never grew one. Read it from there.
+
+Every AP on the radio is merged, because one radio can host BSSes with
+different security and the TLV advertises what the *device* can do: a
+fronthaul on sae-mixed and a backhaul on sae must both be visible, or a peer
+speaking only one of them concludes we cannot talk to it at all.
+
+Reading it from the running configuration also means existing nodes pick it up
+on their next start. A fix in the config generator would not have reached
+them - those sections are written once and sysupgrade keeps them.
+
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3906,8 +3906,23 @@
+ static void agent_radio_init_default_akm_suite(struct agent *a,
+ 					       struct wifi_radio_element *re)
+ {
+-	struct agent_config_radio *rcfg = get_agent_config_radio(&a->cfg, re->name);
+-	uint16_t enc = rcfg ? rcfg->encryption : 0;
++	struct netif_apcfg *apcfg;
++	uint16_t enc = 0;
++
++	/* Encryption is a property of the BSS, not of the radio. The radio
++	 * sections carry no encryption option at all - every one of them
++	 * lives in an ap section - so reading it from the radio yielded 0 and
++	 * the AKM Suite Capabilities TLV went out empty, leaving no peer able
++	 * to learn what security this device speaks.
++	 *
++	 * Merge every AP on this radio: one radio can host BSSes with
++	 * different security, and the TLV advertises what the device can do.
++	 */
++	list_for_each_entry(apcfg, &a->cfg.aplist, list) {
++		if (strncmp(apcfg->device, re->name, sizeof(apcfg->device)))
++			continue;
++		enc |= get_encryption(apcfg->encryption);
++	}
+ 
+ 	re->num_ap_akms = default_akm_suites_from_encryption(enc,
+ 			(uint8_t *)re->ap_akms, MAX_AKM_SUITES);

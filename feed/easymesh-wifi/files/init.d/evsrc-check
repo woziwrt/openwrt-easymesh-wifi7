@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# wifimngr (S95) reads /etc/wifi.json before hostapd's per-link control sockets
+# exist - 5 GHz alone waits out a 60 s DFS CAC - and libwifi then registers
+# every event source dormant, with no fd to poll and therefore no way to ever
+# re-attach. wifimngr ends up holding one socket and every event producer is
+# dead code, silently. See /usr/sbin/evsrc-check.
+#
+# Detached, like mld-link-check: it waits out the CAC and must not hold up the
+# rest of the boot. It does its own waiting, so no SETTLE here.
+
+START=99
+
+start() {
+	/usr/sbin/evsrc-check >/dev/null 2>&1 &
+}
+
+stop() {
+	return 0
+}

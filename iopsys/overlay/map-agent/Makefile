@@ -1,0 +1,162 @@
+#
+# Copyright (C) 2020-2024 IOPSYS Software Solutions AB
+# Copyright (C) 2025 Genexis Sweden AB
+#
+
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=map-agent
+PKG_VERSION:=6.5.4.6
+PKG_RELEASE:=$(shell echo $$((100 + $$(git rev-list --count HEAD -- . 2>/dev/null || echo 0))))
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_VERSION:=617a3226b4851c5bcaf621b583945ce256aed1f8
+PKG_MAINTAINER:=Jakob Olsson <jakob.olsson@iopsys.eu>
+
+PKG_LICENSE:=BSD-3-Clause
+PKG_LICENSE_FILES:=LICENSE
+
+LOCAL_DEV=0
+ifneq ($(LOCAL_DEV),1)
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://dev.iopsys.eu/multi-ap/map-agent
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)_$(PKG_SOURCE_VERSION).tar.xz
+PKG_MIRROR_HASH:=skip
+endif
+
+PKG_CONFIG_DEPENDS:= \
+	CONFIG_AGENT_USE_LIBDPP \
+	CONFIG_AGENT_ZEROTOUCH_DPP \
+	CONFIG_AGENT_EASYMESH_VERSION \
+	CONFIG_AGENT_SYNC_DYNAMIC_CNTLR_CONFIG \
+	CONFIG_AGENT_ISLAND_PREVENTION \
+	CONFIG_AGENT_EASYMESH_R2_CERT \
+	CONFIG_AGENT_EASYMESH_VENDOR_EXT \
+	CONFIG_AGENT_EASYMESH_VENDOR_EXT_OUI \
+	CONFIG_AGENT_UNAUTHORIZED_STA_IN_ASSOCLIST \
+	CONFIG_AGENT_CHANSWITCH_SKIP_DFS_UNAVAILABLE \
+	CONFIG_AGENT_LOCAL_ACS_SERVICE \
+	CONFIG_AGENT_STRICT_OPER_CHANNEL_REPORT \
+	CONFIG_AGENT_WIRELESS_EXPLICIT_RELOAD \
+	CONFIG_AGENT_OPER_CHANNEL_CHANGE_RELAY_MCAST \
+	CONFIG_AGENT_CHECK_PARTIAL_WIFI_RELOAD \
+	CONFIG_DYNBH \
+	CONFIG_DYNBH_DYNAMICALLY_PERSIST_CONTROLLER \
+	CONFIG_AGENT_UNASSOC_STA_CONT_MONITOR
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/map-agent
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Wi-Fi Multi-AP Agent (EasyMesh R6)
+  DEPENDS:=+libwifi +libuci +libubox +ubus +libeasy +libieee1905 +ieee1905 \
+	   +ieee1905-map-plugin +ip-bridge +AGENT_USE_LIBDPP:libdpp \
+	   +uuidgen +openssl-util +!TARGET_brcmbca:ebtables-legacy \
+	   +!TARGET_brcmbca:ebtables-legacy-utils
+endef
+
+ifeq ($(CONFIG_AGENT_USE_LIBDPP),y)
+  TARGET_CFLAGS += -DUSE_LIBDPP
+endif
+
+ifeq ($(CONFIG_AGENT_ZEROTOUCH_DPP),y)
+  TARGET_CFLAGS += -DZEROTOUCH_DPP
+endif
+
+define Package/map-agent/description
+  This package provides EasyMesh R6 compliant Wi-Fi Multi-AP Agent.
+endef
+
+define Package/map-agent/config
+	source "$(SOURCE)/Config.in"
+endef
+
+TARGET_CFLAGS += \
+	-I$(STAGING_DIR)/usr/include \
+	-I$(STAGING_DIR)/usr/include/libnl3 \
+	-Wno-error=deprecated-declarations \
+	-D_GNU_SOURCE
+
+TARGET_CFLAGS += -DEASYMESH_VERSION=$(CONFIG_AGENT_EASYMESH_VERSION)
+
+ifeq ($(CONFIG_AGENT_SYNC_DYNAMIC_CNTLR_CONFIG),y)
+TARGET_CFLAGS += -DAGENT_SYNC_DYNAMIC_CNTLR_CONFIG
+endif
+
+ifeq ($(CONFIG_AGENT_ISLAND_PREVENTION),y)
+TARGET_CFLAGS += -DAGENT_ISLAND_PREVENTION
+endif
+
+ifeq ($(CONFIG_AGENT_EASYMESH_R2_CERT),y)
+TARGET_CFLAGS += -DEASYMESH_R2_CERT
+endif
+
+ifeq ($(CONFIG_AGENT_EASYMESH_VENDOR_EXT),y)
+TARGET_CFLAGS += -DEASYMESH_VENDOR_EXT_OUI=$(CONFIG_AGENT_EASYMESH_VENDOR_EXT_OUI)
+TARGET_CFLAGS += -DEASYMESH_VENDOR_EXT
+endif
+
+ifeq ($(CONFIG_AGENT_UNAUTHORIZED_STA_IN_ASSOCLIST),y)
+TARGET_CFLAGS += -DUNAUTHORIZED_STA_IN_ASSOCLIST
+endif
+
+ifeq ($(CONFIG_AGENT_CHANSWITCH_SKIP_DFS_UNAVAILABLE),y)
+TARGET_CFLAGS += -DCHANSWITCH_SKIP_DFS_UNAVAILABLE
+endif
+
+ifeq ($(CONFIG_AGENT_LOCAL_ACS_SERVICE),y)
+TARGET_CFLAGS += -DLOCAL_ACS_SERVICE
+endif
+
+ifeq ($(CONFIG_AGENT_STRICT_OPER_CHANNEL_REPORT),y)
+TARGET_CFLAGS += -DSTRICT_OPER_CHANNEL_REPORT
+endif
+
+ifeq ($(CONFIG_AGENT_WIRELESS_EXPLICIT_RELOAD),y)
+TARGET_CFLAGS += -DWIRELESS_EXPLICIT_RELOAD
+endif
+
+ifeq ($(CONFIG_AGENT_OPER_CHANNEL_CHANGE_RELAY_MCAST),y)
+TARGET_CFLAGS += -DOPER_CHAN_CHANGE_RELAY_MCAST
+endif
+
+ifeq ($(CONFIG_AGENT_CHECK_PARTIAL_WIFI_RELOAD),y)
+TARGET_CFLAGS += -DCHECK_PARTIAL_WIFI_RELOAD
+endif
+
+ifeq ($(CONFIG_DYNBH),y)
+TARGET_CFLAGS += -DDYNBH
+endif
+
+ifeq ($(CONFIG_DYNBH_DYNAMICALLY_PERSIST_CONTROLLER),y)
+TARGET_CFLAGS += -DPERSIST_CONTROLLER
+endif
+
+ifeq ($(CONFIG_AGENT_UNASSOC_STA_CONT_MONITOR),y)
+TARGET_CFLAGS += -DUNASSOC_STA_CONT_MONITOR
+endif
+
+MAKE_PATH:=src
+
+define Package/map-agent/install
+	$(INSTALL_DIR) $(1)/etc
+	$(CP) ./files/* $(1)/
+ifeq ($(CONFIG_DYNBH),y)
+	$(RM) $(1)/etc/hotplug.d/ethernet/map-dynamic-backhaul
+	$(RM) $(1)/etc/hotplug.d/ethernet/map-topology-discovery
+endif
+	$(INSTALL_DIR) $(1)/usr/lib
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_DIR) $(1)/lib/wifi
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/script/* $(1)/lib/wifi/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/mapagent $(1)/usr/sbin/
+endef
+
+
+ifeq ($(LOCAL_DEV),1)
+define Build/Prepare
+        rsync -r --exclude=.* ~/git/map-agent/ $(PKG_BUILD_DIR)/
+endef
+endif
+
+$(eval $(call BuildPackage,map-agent))

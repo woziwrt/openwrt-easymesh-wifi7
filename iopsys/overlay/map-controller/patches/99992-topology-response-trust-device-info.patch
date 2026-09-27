@@ -1,0 +1,80 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99992: trust the Device Information TLV, not the frame source
+
+A CMDU that crossed a wireless backhaul cannot be attributed by its Ethernet
+source address. Measured on hardware 2026-08-03 with the mesh chained as
+controller <- 8g <- x8:
+
+  tcpdump on the controller, every 1905 frame that arrived:
+    19x 3e:fb:2f:94:72:7b     (8g bSTA)
+    10x 86:f7:56:41:01:d3     (own, outgoing)
+
+x8 never appeared under any address of its own. Everything originating beyond
+8g arrives wearing 8g. Worse, ieee1905 then holds two links for that single
+address:
+
+  3e:fb:2f:94:72:7b -> ca:8e:1d:ca:bc:ae  direct=true    (8g)
+  3e:fb:2f:94:72:7b -> e6:a9:d2:c1:98:3f  direct=false   (x8)
+
+i1905_link_lookup_partial() in cmdu_input.c takes whichever comes first, so the
+origin of a two-hop CMDU is decided by list order.
+
+CMDU_SA_IS_ALMAC does not rescue this. Three Topology Queries were sent from 8g
+with the source deliberately set to its AL MAC; all three arrived at the
+controller carrying 3e:fb:2f:94:72:7b. The uplink rewrites it.
+
+The measured consequence was a silent swap in the database - x8 uplink recorded
+against node 8g, and node x8 left holding a value that had been correct that
+morning - while both agents reported correctly over ubus the whole time. Node
+depth, apmld, affiliated_ap and metrics for the far node all follow from this.
+
+A Topology Response carries a Device Information TLV, which is the sender
+stating its own AL MAC and is mandatory in that message. Prefer it. When it
+disagrees with the frame, the frame is the relay and the TLV is the author.
+
+This does not fix messages that carry no such TLV; those still need the origin
+resolved another way.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -425,6 +425,41 @@
+ 		return -1;
+ 	}
+ 
++	/* The Ethernet source address cannot identify the sender across a
++	 * wireless backhaul. Measured on hardware 2026-08-03, mesh chained as
++	 * controller <- 8g <- x8: every CMDU originating beyond 8g arrived with
++	 * source 3e:fb:2f:94:72:7b, which is 8g bSTA, and ieee1905 held two links
++	 * for that one address - one to 8g (direct) and one to x8 - so
++	 * i1905_link_lookup_partial() resolved the origin to whichever entry came
++	 * first. Three Topology Queries sent with the source deliberately set to
++	 * an AL MAC all arrived carrying 8g bSTA instead, so CMDU_SA_IS_ALMAC does
++	 * not survive the uplink either.
++	 *
++	 * The visible result was x8 uplink recorded on node 8g and the morning
++	 * value left standing on node x8, while both agents reported correctly
++	 * over ubus. Nothing in the log said so, because from this side the
++	 * attribution succeeded.
++	 *
++	 * The Device Information TLV is the sender describing itself and is
++	 * mandatory in a Topology Response, so prefer it over the frame.
++	 */
++	if (tv[TOPOLOGY_RESPONSE_DEVICE_INFORMATION_TYPE_IDX][0]) {
++		const struct tlv_device_info *di = (struct tlv_device_info *)
++			tv[TOPOLOGY_RESPONSE_DEVICE_INFORMATION_TYPE_IDX][0]->data;
++
++		if (!hwaddr_is_zero((uint8_t *)di->aladdr) &&
++		    memcmp(di->aladdr, n->almacaddr, 6)) {
++			struct node *real = cntlr_find_node(c, (uint8_t *)di->aladdr);
++
++			if (real) {
++				dbg("%s: origin " MACFMT " is a relay; TLV says "
++				    MACFMT ", using that\n", __func__,
++				    MAC2STR(n->almacaddr), MAC2STR(di->aladdr));
++				n = real;
++			}
++		}
++	}
++
+ 	cntlr_mark_agent_if_supported(c, n->almacaddr,
+ 				      tv[TOPOLOGY_RESPONSE_SUPPORTED_SERVICE_IDX][0]);
+ 

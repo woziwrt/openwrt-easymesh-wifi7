@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# A backhaul AP drops a backhaul station that has gone quiet, without first
+# asking it whether it is still there.
+#
+# When a backhaul station moves to another parent, its old parent gets no
+# deauthentication - the station left for a different AP. hostapd notices only
+# after ap_max_inactivity (300 s), and then it polls the station with a null
+# data frame before dropping it. Every node of the mesh sits on the same
+# channel, so the station's radio still hears the old parent and answers the
+# poll with a hardware ACK, which it sends to any frame addressed to it,
+# associated or not. mac80211 counts the ACK as activity and the station stays
+# on the old parent for good. Measured 2026-09-25: a node back under the
+# controller at 05:24 was still a station of its previous parent at 07:10;
+# its inactivity climbed to 293 s and fell back to 47 s with not a single
+# frame received, and the controller filed it under the wrong parent.
+#
+# A live backhaul station is never quiet for 300 s (1905 topology and
+# link-metric messages every few seconds), so on the backhaul BSS silence is
+# proof enough and the poll only does harm. Fronthaul BSSes keep the poll:
+# a phone that sleeps is not gone.
+
+if ! uci -q show wireless >/dev/null 2>&1; then
+	echo "98-easymesh-bh-no-inactivity-poll: no wireless config yet, will retry at boot" >&2
+	exit 1
+fi
+
+changed=0
+for s in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+	[ "$(uci -q get wireless.$s.mode)" = "ap" ] || continue
+	[ "$(uci -q get wireless.$s.multi_ap)" = "1" ] || continue    # backhaul BSS only
+	[ "$(uci -q get wireless.$s.skip_inactivity_poll)" = "1" ] && continue
+	uci set "wireless.$s.skip_inactivity_poll=1"
+	changed=1
+done
+[ "$changed" = 1 ] && {
+	uci commit wireless
+	logger -t easymesh-config "backhaul BSS: drop a quiet station without polling it (poll ACK kept moved stations alive)"
+}
+exit 0

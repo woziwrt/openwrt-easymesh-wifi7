@@ -1,0 +1,74 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Late, and only on the controller. The worker checks the role itself and
+# exits quietly on an agent, so this may be enabled everywhere - a box that
+# is promoted to controller then starts doing it after one restart rather
+# than needing the service found and turned on.
+START=97
+
+start() {
+	# Idempotent on purpose. `restart` is stop-then-start, so anything
+	# stop() cannot see would survive into a second copy of the worker,
+	# and two convergence loops pushing names take turns overwriting each
+	# other's retry stamps - which reads exactly like a box that cannot be
+	# reached (measured 2026-09-20: three workers at once, alternating
+	# "could not reach" while the same round by hand went through).
+	stop
+	/usr/sbin/mesh-names-sync 30 >/dev/null 2>&1 &
+}
+
+stop() {
+	# The pidfile is the fast path, not the truth. The worker removes it
+	# on the way out, so anything that ends a run - a crash, a traced copy
+	# started by hand, a cleared /var/run - leaves a live worker with no
+	# pidfile, and a stop that trusted the file alone would report success
+	# while the old loop kept running.
+	#
+	# The slow path walks /proc instead of asking pgrep. `pgrep -f
+	# mesh-names-sync` matches its OWN command line - the pattern is in it
+	# - so it reports a match whether or not the worker is running and the
+	# kill lands on the asker (two false readings on 2026-09-05 alone).
+	# Plain `pgrep mesh-names-sync` finds nothing, because a shell script
+	# runs as "sh". Matching argv[1] of each process has neither fault.
+	local pid cmd
+
+	if [ -f /var/run/mesh-names-sync.pid ]; then
+		kill "$(cat /var/run/mesh-names-sync.pid)" 2>/dev/null
+		rm -f /var/run/mesh-names-sync.pid
+	fi
+
+	for pid in $(ls /proc 2>/dev/null); do
+		case "$pid" in ''|*[!0-9]*) continue ;; esac
+		[ "$pid" = "$$" ] && continue
+		# A process can die between the listing and the read, and then the
+		# REDIRECTION fails, not the command - so `2>/dev/null` on tr never
+		# caught it and procd logged "can't open /proc/NNN/cmdline" on every
+		# restart. Ask first; a pid that is already gone needs no killing.
+		[ -r "/proc/$pid/cmdline" ] || continue
+		cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+		case "$cmd" in
+		*" /usr/sbin/mesh-names-sync "*) kill "$pid" 2>/dev/null ;;
+		esac
+	done
+
+	# And make sure they went. A worker that ignores TERM - an old copy
+	# from before the trap was fixed, or one stuck inside ssh - would
+	# otherwise be reported stopped and keep running.
+	sleep 1
+	for pid in $(ls /proc 2>/dev/null); do
+		case "$pid" in ''|*[!0-9]*) continue ;; esac
+		[ "$pid" = "$$" ] && continue
+		# A process can die between the listing and the read, and then the
+		# REDIRECTION fails, not the command - so `2>/dev/null` on tr never
+		# caught it and procd logged "can't open /proc/NNN/cmdline" on every
+		# restart. Ask first; a pid that is already gone needs no killing.
+		[ -r "/proc/$pid/cmdline" ] || continue
+		cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+		case "$cmd" in
+		*" /usr/sbin/mesh-names-sync "*) kill -9 "$pid" 2>/dev/null ;;
+		esac
+	done
+	return 0
+}

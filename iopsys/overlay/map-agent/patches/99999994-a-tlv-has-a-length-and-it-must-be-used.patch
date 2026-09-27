@@ -1,0 +1,151 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: a TLV has a length, and the traffic-separation reader must use it
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+agent_fill_traffic_sep_policy() reads a TLV it is never told the size of.
+
+    static int agent_fill_traffic_sep_policy(struct agent *a,
+                                             struct tlv_traffic_sep_policy *p)
+    {
+        uint8_t *data = (uint8_t *)p;
+        num_ssid = data[offset++];
+        for (i = 0; i < num_ssid; i++) {
+                char ssid[32] = {0};
+                ssid_len = data[offset++];
+                memcpy(ssid, data + offset, ssid_len);
+
+num_ssid and ssid_len both come from the payload, neither is checked against
+anything, and the SSID is copied into a 32-byte buffer ON THE STACK. A length
+byte of 255 writes 223 bytes past the end of it. The walk over entries can also
+run off the end of the TLV entirely, because the function has no idea where it
+ends - all three call sites hand it tlv->data and drop tlv->len on the floor.
+
+Reached from three CMDUs - AP-Autoconfiguration WSC M2, Policy Config Request
+and BSS Configuration Response - so anything that can pass for the controller
+can do this to every agent in the mesh. On a lab bench that is nothing. In a
+product it is the one defect on our list that is not merely wrong data.
+
+The generic guard that should have caught it does not exist in practice.
+agent_map.c checks tlv_length(t) < tlv_minsize(type), and tlv_minsize()
+returns 0 for every MAP TLV, so the comparison is always false. tlv_validators[]
+is 2067 lines with no caller anywhere in iopsys or in our feed, and the fallback
+validator returns true unconditionally. There is no validation layer to repair -
+only the individual readers, one at a time, and this is one of them.
+
+So the length is passed in and every read is bounded by it. ssid_len is
+rejected above 32, which is both the SSID maximum and the size of the buffer -
+the same number for a reason. A short or malformed TLV stops the walk rather
+than failing the whole message: the entries read so far are well-formed and
+already applied, and refusing them would turn a truncated policy into no policy.
+
+Verified by reading the source on 2026-09-06, not by exploiting it:
+agent_tlv.c ssid[32] on the stack against a one-byte length, and all three
+callers in agent_map.c passing only the pointer.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
+
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -2817,7 +2817,7 @@
+ }
+ 
+ int agent_fill_traffic_sep_policy(struct agent *a,
+-		struct tlv_traffic_sep_policy *p)
++		struct tlv_traffic_sep_policy *p, uint16_t plen)
+ {
+ 	int ret, i;
+ 	int offset = 0;
+@@ -2838,13 +2838,50 @@
+ 		return -1;
+ 	}
+ 
++	/* Every read below is bounded by the length of the TLV, and the length
++	 * is now passed in because this function had no way to know it.
++	 *
++	 * What it did before: num_ssid came from the first byte of the payload,
++	 * ssid_len from one byte per entry - both attacker-supplied, neither
++	 * checked against anything - and the SSID was memcpy'd into a 32-byte
++	 * buffer ON THE STACK. A length byte of 255 writes 223 bytes past the
++	 * end of it. The walk over entries could also run off the end of the
++	 * TLV entirely, because nothing here knew where it ended.
++	 *
++	 * The generic guard that should have caught this does not: agent_map.c
++	 * checks tlv_length(t) < tlv_minsize(type), and tlv_minsize() returns 0
++	 * for every MAP TLV, so the comparison is always false. tlv_validators[]
++	 * is 2067 lines with no caller anywhere in iopsys or in our feed, and
++	 * the fallback validator returns true unconditionally. There is no
++	 * validation layer to fix - only the individual readers.
++	 *
++	 * Reached from three CMDUs (AP-Autoconfiguration WSC M2, Policy Config
++	 * Request, BSS Configuration Response), so anything that can pass for
++	 * the controller can do this to every agent in the mesh.
++	 *
++	 * A short or malformed TLV stops the walk rather than failing the whole
++	 * message: the entries read so far are well-formed and already applied,
++	 * and refusing them would turn a truncated policy into no policy.
++	 */
++	if (plen < 1) {
++		uci_unload(ctx, pkg);
++		uci_free_context(ctx);
++		return 0;
++	}
++
+ 	num_ssid = data[offset++];
+ 	for (i = 0; i < num_ssid; i++) {
+ 		int ssid_len;
+ 		uint16_t vid;
+ 		char ssid[32] = {0};
+ 
++		if (offset + 1 > plen)
++			break;
+ 		ssid_len = data[offset++];
++		/* 32 is the SSID maximum and the size of the buffer below;
++		 * they are the same number for a reason, not by accident. */
++		if (ssid_len > (int)sizeof(ssid) || offset + ssid_len + 2 > plen)
++			break;
+ 		memcpy(ssid, data + offset, ssid_len);
+ 		offset += ssid_len;
+ 		vid = BUF_GET_BE16(data[offset]);
+--- a/src/agent_map.c
++++ b/src/agent_map.c
+@@ -3101,7 +3101,8 @@
+ 		if (tlv->num_ssid > 0) {
+ 			a->reconfig_reason &= ~AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_SETUP;
+-			agent_fill_traffic_sep_policy(a, tlv);
++			agent_fill_traffic_sep_policy(a, tlv,
++				tlv_length(tv[AP_AUTOCONFIGURATION_WSC_M2_TRAFFIC_SEPARATION_POLICY_IDX][0]));
+ 		} else if (agent_is_ts_enabled(a)) {
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 		}
+@@ -3738,7 +3739,8 @@
+ 		if (p->num_ssid > 0) {
+ 			a->reconfig_reason &= ~AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_SETUP;
+-			agent_fill_traffic_sep_policy(a, p);
++			agent_fill_traffic_sep_policy(a, p,
++				tlv_length(tv[MAP_POLICY_CONFIG_REQ_TRAFFIC_SEPARATION_POLICY_IDX][0]));
+ 		} else if (agent_is_ts_enabled(a)) {
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 		}
+@@ -6684,7 +6686,7 @@
+ 		if (ts_tlv->num_ssid > 0) {
+ 			a->reconfig_reason &= ~AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_SETUP;
+-			agent_fill_traffic_sep_policy(a, ts_tlv);
++			agent_fill_traffic_sep_policy(a, ts_tlv, tlv_length(tlv));
+ 		} else if (agent_is_ts_enabled(a)) {
+ 			a->reconfig_reason |= AGENT_RECONFIG_REASON_VLAN_TEARDOWN;
+ 		}
+--- a/src/agent_tlv.h
++++ b/src/agent_tlv.h
+@@ -175,7 +175,7 @@
+ 		struct tlv_default_8021q_settings *p);
+ int agent_clear_traffic_sep(struct agent *a);
+ int agent_fill_traffic_sep_policy(struct agent *a,
+-		struct tlv_traffic_sep_policy *p);
++		struct tlv_traffic_sep_policy *p, uint16_t plen);
+ int agent_fill_ch_scan_rep_policy(struct agent *a,
+ 		struct tlv_channel_scan_report_policy *p,
+ 		struct uci_context *ctx, struct uci_package *pkg);

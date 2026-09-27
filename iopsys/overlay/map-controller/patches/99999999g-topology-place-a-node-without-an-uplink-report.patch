@@ -1,0 +1,694 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: place a node that reports no uplink of its own
+
+A node is placed in the backhaul tree only by what it says about its own
+uplink: the Backhaul STA MLD Config TLV (0xE1, sent only by our map-agent)
+or a Link Metric Response. A MediaTek R3 agent sends neither, and a wired
+agent has no bBSS for the Link Metric fallback to match, so both stayed at
+depth -1 for good, with no edge in topology_link and nothing in the picture.
+
+The tree now takes the uplink from three sources, in this order:
+
+1. the child's own claim, as before (source "child");
+2. the parent listing the child's backhaul STA among its associated
+   clients - by the bSTA the child named in its Backhaul STA Capability
+   Report, or by its bSTA MLD and link addresses (source "parent-assoc");
+3. 1905 neighbours in either direction, for a node none of the above
+   covers (source "neighbor", or "neighbor-mutual" when each side
+   lists the other).
+
+A 1905 neighbour is not a physical neighbour: Topology Discovery goes to
+01:80:c2:00:00:13, which a Linux bridge forwards. Seen on hardware
+2026-09-18: the MediaTek box wired to x8 was listed by our corridor agent,
+associated to x8 over Wi-Fi, as a neighbour on its bSTA, next to x8. So
+Y is not taken as X's parent when Y hears X on the interface it hears its
+own parent on, and of the remaining candidates the deepest wins. A device
+is placed from neighbours one per round, after the reports settle, so that
+what the reports say always takes precedence.
+
+For that the neighbour data has to survive: the tree build flushed every
+device, including the interfaces and neighbours handle_topology_response()
+had just stored. It now keeps the devices of known agents and resets only
+their backhaul info.
+
+topology_link gets a "source" column (schema v6), the media type of the
+uplink where known, and the parent's own address instead of the
+controller's when the parent interface is unknown. dump_topology shows the
+source.
+
+Also in the AP Operational BSS TLV: an SSID declared longer than 32 bytes
+discarded the whole Topology Response. The declared length now moves the
+offset, the SSID is what comes before the first zero, and a TLV that ends
+early stops the parse without sweeping radios it did not get to read.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff --git a/src/cntlr_commands_impl.c b/src/cntlr_commands_impl.c
+index fd0020b..f8400d9 100644
+--- a/src/cntlr_commands_impl.c
++++ b/src/cntlr_commands_impl.c
+@@ -4246,6 +4246,8 @@ int COMMAND(dump_topology)(void *priv, void *args, void *out)
+ 		}
+ 		blobmsg_add_u32(bb, "depth", dev->bh.depth);
+ 		blobmsg_add_u32(bb, "depth_wifi", dev->bh.wifi_hops_from_root);
++		if (dev->bh.parent)
++			blobmsg_add_string(bb, "source", bh_source_str(dev->bh.source));
+ 
+ 		blobmsg_close_table(bb, tt);
+ 	}
+diff --git a/src/cntlr_map.c b/src/cntlr_map.c
+index e4fb280..5b9a745 100644
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -696,12 +696,14 @@ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n
+ 		struct tlv_ap_oper_bss *tlv;
+ 		uint8_t *tv_data;
+ 		int i, offset = 0;
++		int oper_len;
+ 
+ 		tlv = (struct tlv_ap_oper_bss *)tv[TOPOLOGY_RESPONSE_AP_OPERATIONAL_BSS_IDX][0]->data;
+ 		if (!tlv)
+ 			return -1;
+ 
+ 		tv_data = (uint8_t *)tlv;
++		oper_len = tlv_length(tv[TOPOLOGY_RESPONSE_AP_OPERATIONAL_BSS_IDX][0]);
+ 
+ 		offset += 1; /* num_radio */
+ 
+@@ -719,6 +721,9 @@ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n
+ 			struct netif_iface *p = NULL;
+ 			int j;
+ 
++			if (offset + 6 + 1 > oper_len)
++				goto oper_bss_end;
++
+ 			r = cntlr_node_add_radio(c, n, &tv_data[offset]);
+ 			if (!r)
+ 				return -1; /* FIXME: continue + proper offset shift */
+@@ -741,22 +746,34 @@ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n
+ 				struct netif_iface *fh;
+ 				uint8_t ssidlen = 0;
+ 
++				if (offset + 6 + 1 > oper_len)
++					goto oper_bss_end;
+ 				offset += 6; /* macaddr */
+ 				ssidlen = tv_data[offset];
+-				if (ssidlen > 32) {
+-					warn("%s: Discard Topology Response. Invalid ssidlen %d \
+-					     in AP Operational BSS TLV\n", __func__, ssidlen);
+-					return -1;
+-				}
+ 				offset += 1; /* ssidlen */
+ 
++				/* Same trap as in the BSS Configuration Report: a
++				 * MediaTek R3 agent declares the SSID field longer
++				 * than 32 and pads it with zeros. Discarding the
++				 * whole Topology Response for that lost every BSS of
++				 * the node. The declared length is what moves the
++				 * offset; the SSID is what comes before the first
++				 * zero, at most 32 bytes.
++				 */
++				if (offset + ssidlen > oper_len) {
++					warn("%s: AP Operational BSS TLV ends inside an SSID\n",
++					     __func__);
++					goto oper_bss_end;
++				}
++
+ 				fh = cntlr_radio_add_iface(c, r, macaddr);
+ 				if (!fh)
+ 					return -1; /* FIXME: continue + proper offset shift */
+ 
+ 				memset(fh->bss->ssid, 0, sizeof(fh->bss->ssid));
+-				memcpy(fh->bss->ssid, &tv_data[offset], ssidlen);
+-				fh->bss->ssidlen = ssidlen;
++				memcpy(fh->bss->ssid, &tv_data[offset],
++				       ssidlen > 32 ? 32 : ssidlen);
++				fh->bss->ssidlen = strlen(fh->bss->ssid);
+ 				offset += ssidlen; /* ssid */
+ 
+ 				/* Update measurement time */
+@@ -766,6 +783,11 @@ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n
+ 	
+ 		cntlr_node_sweep_radios(c, n);	/* reconcile stale radios (fix b) */
+ 		cntlr_node_sweep_ifaces(c, n, pass_start);	/* 989: stale ifaces */
++
++		/* A TLV that ends early leaves the sweep out: what it did not
++		 * list is not gone, we just did not get to read it. */
++oper_bss_end:
++		;
+ 	}
+ 
+ 	/* map profile info stored for each node */
+diff --git a/src/db/mapc_sync.c b/src/db/mapc_sync.c
+index 6e924df..dd82de1 100644
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -821,10 +821,12 @@ void mapc_sync_topology(struct controller *c)
+ {
+ 	static const char *ins_sql =
+ 		"INSERT INTO topology_link(child_almac, parent_almac, iface_mac, "
+-		"parent_iface_mac, media_type, depth, wifi_hops) VALUES(?,?,?,?,?,?,?) "
++		"parent_iface_mac, media_type, depth, wifi_hops, source) "
++		"VALUES(?,?,?,?,?,?,?,?) "
+ 		"ON CONFLICT(child_almac, parent_almac, iface_mac) DO UPDATE SET "
+ 		"parent_iface_mac=excluded.parent_iface_mac, media_type=excluded.media_type, "
+-		"depth=excluded.depth, wifi_hops=excluded.wifi_hops";
++		"depth=excluded.depth, wifi_hops=excluded.wifi_hops, "
++		"source=excluded.source";
+ 	struct bh_topology_dev *dev = NULL;
+ 	mapdb_stmt *st = NULL;
+ 	time_t now_mono;
+@@ -903,11 +905,15 @@ void mapc_sync_topology(struct controller *c)
+ 
+ 		downstream_mac = dev->bh.own_iface ? dev->bh.own_iface->macaddr
+ 						   : dev->al_macaddr;
++		upstream_al = dev->bh.parent->al_macaddr;
++		/* No parent interface known (an uplink inferred from 1905
++		 * neighbours that the parent does not list): name the parent
++		 * itself. The controller's address here drew such a link as
++		 * going into the controller. */
+ 		upstream_mac = dev->bh.parent_iface ? dev->bh.parent_iface->macaddr
+-						    : c->almacaddr;
+-		upstream_al = dev->bh.parent ? dev->bh.parent->al_macaddr
+-					     : c->almacaddr;
+-		media_type = dev->bh.own_iface ? dev->bh.own_iface->media_type : 0;
++						    : upstream_al;
++		media_type = dev->bh.own_iface ? dev->bh.own_iface->media_type
++					       : dev->bh.media_type;
+ 
+ 		mac2str(dev->al_macaddr, child);
+ 		mac2str(upstream_al, parent);
+@@ -928,6 +934,7 @@ void mapc_sync_topology(struct controller *c)
+ 		mapdb_bind_int(st, 5, media_type);
+ 		mapdb_bind_int(st, 6, dev->bh.depth);
+ 		mapdb_bind_int(st, 7, dev->bh.wifi_hops_from_root);
++		mapdb_bind_text(st, 8, bh_source_str(dev->bh.source));
+ 		if (stmt_finish(c->db, st) != MAPDB_OK) {
+ 			mapdb_rollback(c->db);
+ 			return;
+diff --git a/src/db/mapdb.c b/src/db/mapdb.c
+index 1ddc682..71e21e2 100644
+--- a/src/db/mapdb.c
++++ b/src/db/mapdb.c
+@@ -114,6 +114,10 @@ static int mapdb_migrate(mapdb *db)
+ 	mapdb_exec(db, "ALTER TABLE topology_link_history "
+ 		       "ADD COLUMN rcpi_at_start INTEGER");
+ 
++	/* v5 -> v6: the edge says where it came from - the child's report,
++	 * the parent's client list, or 1905 neighbours. */
++	mapdb_exec(db, "ALTER TABLE topology_link ADD COLUMN source TEXT");
++
+ 	if (mapdb_prepare(db, "UPDATE schema_version SET version=?, applied_at=?",
+ 			  &st) != MAPDB_OK)
+ 		return MAPDB_ERR;
+diff --git a/src/db/mapdb_schema.h b/src/db/mapdb_schema.h
+index ff9e605..db6fcdc 100644
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -16,7 +16,7 @@
+ #define MAPDB_SCHEMA_H
+ 
+ /* Bump when the DDL below changes; drives the schema_version migration gate. */
+-#define MAPDB_SCHEMA_VERSION 5
++#define MAPDB_SCHEMA_VERSION 6
+ 
+ /* schema.sql, verbatim. CREATE TABLE IF NOT EXISTS throughout -> idempotent. */
+ static const char MAPDB_SCHEMA_SQL[] =
+@@ -183,6 +183,7 @@ static const char MAPDB_SCHEMA_SQL[] =
+ 	"    media_type           INTEGER,            -- local_iface.media_type [topology.h:28]\n"
+ 	"    depth                INTEGER,            -- backhaul_info.depth [topology.h:40]\n"
+ 	"    wifi_hops            INTEGER,            -- wifi_hops_from_root [topology.h:41]\n"
++	"    source               TEXT,               -- child | parent-assoc | neighbor (enum bh_source)\n"
+ 	"    PRIMARY KEY (child_almac, parent_almac, iface_mac)\n"
+ 	");\n"
+ 	"\n"
+diff --git a/src/topology.c b/src/topology.c
+index 7c71fd6..b410885 100644
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -23,6 +23,7 @@
+ #include "cntlr_events.h"
+ #include "db/mapc_sync.h"
+ #include "cntlr.h"
++#include "sta.h"
+ 
+ 
+ void init_topology(struct bh_topology_data *topology)
+@@ -75,19 +76,273 @@ static struct node *find_node_with_mld_macaddr(struct controller *c,
+ 	return NULL;
+ }
+ 
++const char *bh_source_str(uint8_t source)
++{
++	switch (source) {
++	case BH_SRC_CHILD:		return "child";
++	case BH_SRC_PARENT_ASSOC:	return "parent-assoc";
++	case BH_SRC_NEIGHBOR:		return "neighbor";
++	case BH_SRC_NEIGHBOR_MUTUAL:	return "neighbor-mutual";
++	default:			return "none";
++	}
++}
++
++static void bh_reset(struct bh_topology_dev *dev)
++{
++	dev->bh.depth = UNKNOWN_TREE_LEVEL;
++	dev->bh.wifi_hops_from_root = 0;
++	dev->bh.parent = NULL;
++	dev->bh.parent_iface = NULL;
++	dev->bh.own_iface = NULL;
++	dev->bh.source = BH_SRC_NONE;
++	dev->bh.media_type = 0xFFFF;
++}
++
++static void place_dev(struct bh_topology_dev *dev,
++		      const struct bh_topology_dev *pdev,
++		      const uint8_t *parent_iface_mac, uint16_t media_type,
++		      uint8_t source)
++{
++	bool wifi = (media_type & 0xff00) == 0x0100;
++
++	dev->bh.parent = pdev;
++	dev->bh.depth = pdev->bh.depth + 1;
++	/* An uplink of unknown media counts as wired: we only claim a
++	 * Wi-Fi hop when something told us it is one.
++	 */
++	dev->bh.wifi_hops_from_root = pdev->bh.wifi_hops_from_root + (wifi ? 1 : 0);
++	dev->bh.source = source;
++	dev->bh.media_type = media_type;
++
++	/* Hand mapc_sync_topology the parent interface as a local_iface,
++	 * so it emits parent_iface_mac.
++	 *
++	 * The copy lives in the child. It used to be appended to the
++	 * parent's ifaces[]: that raised the parent's interface count above
++	 * what its Device Information TLV says, so the next Topology
++	 * Response from the parent counted as a change and rewrote ifaces[]
++	 * under the child's pointer, and a parent with a full ifaces[] gave
++	 * its children no parent_iface at all.
++	 */
++	memset(&dev->parent_iface_store, 0, sizeof(dev->parent_iface_store));
++	if (parent_iface_mac) {
++		memcpy(dev->parent_iface_store.macaddr, parent_iface_mac, 6);
++		dev->parent_iface_store.media_type = media_type;
++		dev->bh.parent_iface = &dev->parent_iface_store;
++	}
++}
++
++/* Source 1: the node the child itself says it is attached to. */
++static struct node *claimed_parent(struct controller *c, struct node *cn)
++{
++	static const uint8_t zmac[6] = {0};
++	struct node *pn;
++
++	if (!memcmp(cn->upstream_bssid, zmac, 6))
++		return NULL;
++
++	pn = cntlr_find_node_with_bssid(c, cn->upstream_bssid);
++	if (!pn)
++		pn = find_node_with_mld_macaddr(c, cn->upstream_bssid);
++
++	return pn;
++}
++
++static bool sta_is_backhaul_of(const struct sta *s, const struct node *xn)
++{
++	if (s->state == STA_DISCONNECTED)
++		return false;
++
++	/* Backhaul STA Capability Report: the agent named this bSTA its own. */
++	if (s->is_bsta && !memcmp(s->bsta_agent_almacaddr, xn->almacaddr, 6))
++		return true;
++
++	/* An MLO bSTA is listed by its MLD address, while the capability
++	 * report above names the links. The child's Backhaul STA MLD
++	 * Config ties both to it.
++	 */
++	if (xn->bstamld) {
++		struct wifi_affiliated_sta_element *a = NULL;
++
++		if (!memcmp(s->macaddr, xn->bstamld->mld_macaddr, 6))
++			return true;
++		list_for_each_entry(a, &xn->bstamld->affbstalist, list) {
++			if (!memcmp(s->macaddr, a->macaddr, 6))
++				return true;
++		}
++	}
++
++	return false;
++}
++
++/* Source 2: a node that reports the child's backhaul STA among its
++ * associated clients. That is the parent confirming the link from its own
++ * side, and it is all we get from an agent that answers neither Link
++ * Metric Query nor sends Backhaul STA MLD Config (a MediaTek R3 agent).
++ */
++static struct node *assoc_parent(struct controller *c, struct node *xn,
++				 struct sta **bsta)
++{
++	struct node *yn = NULL;
++
++	list_for_each_entry(yn, &c->agentlist, list) {
++		struct sta *s = NULL;
++
++		if (yn == xn)
++			continue;
++		list_for_each_entry(s, &yn->stalist, list) {
++			if (sta_is_backhaul_of(s, xn)) {
++				*bsta = s;
++				return yn;
++			}
++		}
++	}
++
++	return NULL;
++}
++
++/* Index of the interface on which @dev lists @al as a 1905 neighbour. */
++static int iface_listing(const struct bh_topology_dev *dev, const uint8_t *al)
++{
++	int i, k;
++
++	for (i = 0; i < dev->number_of_interfaces && i < IFACE_MAX_NUM; i++) {
++		const struct local_iface *li = &dev->ifaces[i];
++
++		for (k = 0; k < li->number_of_neighbors && k < NEIGHBORS_MAX_NUM; k++) {
++			if (hwaddr_equal(li->neighbors_al_macs[k], al))
++				return i;
++		}
++	}
++
++	return -1;
++}
++
++/* Source 3: 1905 neighbours, either direction.
++ *
++ * A 1905 neighbour is not a physical neighbour. Topology Discovery goes to
++ * 01:80:c2:00:00:13, which a Linux bridge forwards, so a node hears every
++ * node its uplink bridges to. Seen on hardware 2026-09-18: the MediaTek box
++ * wired to x8's LAN, and our corridor agent, associated to x8 over Wi-Fi,
++ * listing it as a neighbour on its bSTA - next to x8, its real parent.
++ *
++ * Two rules keep such a leak from being taken for the uplink:
++ * - Y is not X's parent when Y hears X on the same interface Y hears its
++ *   own parent on: X is then upstream of Y, not below it;
++ * - of the candidates left, the deepest one wins. A leak reaches X through
++ *   the bridge of every node between, so the real parent is the nearest,
++ *   and the nearest is the deepest.
++ *
++ * A candidate that has no place yet may be the real parent: *pending says
++ * so, and the caller waits for it unless nothing else moves.
++ */
++static struct bh_topology_dev *neighbor_parent(struct bh_topology_data *topology,
++					       struct bh_topology_dev *dev,
++					       int *x_if, int *y_if,
++					       bool *pending)
++{
++	struct bh_topology_dev *y = NULL, *best = NULL;
++
++	*pending = false;
++	list_for_each_entry(y, &topology->dev_list, list) {
++		int xi, yi;
++
++		if (y == dev || y->bh.parent == dev)
++			continue;
++
++		xi = iface_listing(dev, y->al_macaddr);
++		yi = iface_listing(y, dev->al_macaddr);
++		if (xi < 0 && yi < 0)
++			continue;
++
++		if (y->bh.depth == UNKNOWN_TREE_LEVEL) {
++			*pending = true;
++			continue;
++		}
++
++		if (y->bh.parent && yi >= 0 &&
++		    yi == iface_listing(y, y->bh.parent->al_macaddr))
++			continue;	/* X is on Y's uplink side */
++
++		if (!best || y->bh.depth > best->bh.depth) {
++			best = y;
++			*x_if = xi;
++			*y_if = yi;
++		}
++	}
++
++	return best;
++}
++
++/* Place one device from sources 1 and 2. Returns true if it was placed. */
++static bool place_from_reports(struct controller *c,
++			       struct bh_topology_data *topology,
++			       struct bh_topology_dev *dev, struct node *cn,
++			       bool *has_evidence)
++{
++	struct bh_topology_dev *pdev;
++	struct sta *bsta = NULL;
++	struct node *pn;
++
++	pn = claimed_parent(c, cn);
++	if (pn) {
++		*has_evidence = true;
++		pdev = topology_find_device(topology, pn->almacaddr);
++		if (!pdev || pdev == dev || pdev->bh.depth == UNKNOWN_TREE_LEVEL)
++			return false;	/* parent not placed yet */
++
++		place_dev(dev, pdev, cn->upstream_bssid, 0x0100, BH_SRC_CHILD);
++		return true;
++	}
++
++	pn = assoc_parent(c, cn, &bsta);
++	if (pn) {
++		*has_evidence = true;
++		pdev = topology_find_device(topology, pn->almacaddr);
++		if (!pdev || pdev == dev || pdev->bh.depth == UNKNOWN_TREE_LEVEL)
++			return false;
++
++		place_dev(dev, pdev, bsta->bssid, 0x0100, BH_SRC_PARENT_ASSOC);
++		return true;
++	}
++
++	*has_evidence = false;
++	return false;
++}
++
+ void topology_build_tree_from_assoc(struct controller *c,
+ 				    struct bh_topology_data *topology,
+ 				    const uint8_t *ctrl_al_macaddr)
+ {
+-	static const uint8_t zmac[6] = {0};
+-	struct bh_topology_dev *root, *dev;
++	struct bh_topology_dev *root, *dev, *tmp;
+ 	struct node *n;
+-	bool progress;
+ 	time_t now;
+ 
+-	topology_remove_all_devices(topology);
++	/* Keep the devices, and with them what their Topology Responses told
++	 * us - interfaces and 1905 neighbours. This used to flush the whole
++	 * list, so the neighbour data handle_topology_response() had just
++	 * stored was gone before anything could read it, and a node that
++	 * reports no uplink of its own had nothing else to be placed by.
++	 *
++	 * Only the backhaul info is rebuilt. It is cleared on every device
++	 * first, so no pointer into a device freed below survives.
++	 */
++	list_for_each_entry(dev, &topology->dev_list, list)
++		bh_reset(dev);
++
++	list_for_each_entry_safe(dev, tmp, &topology->dev_list, list) {
++		if (!memcmp(dev->al_macaddr, ctrl_al_macaddr, 6) ||
++		    cntlr_find_node(c, dev->al_macaddr))
++			continue;
+ 
+-	root = topology_add_device(topology, ctrl_al_macaddr);
++		list_del(&dev->list);
++		free(dev);
++		topology->num_devs--;
++	}
++
++	root = topology_find_device(topology, ctrl_al_macaddr);
++	if (!root)
++		root = topology_add_device(topology, ctrl_al_macaddr);
+ 	if (!root)
+ 		return;
+ 	root->bh.depth = 0;
+@@ -101,51 +356,91 @@ void topology_build_tree_from_assoc(struct controller *c,
+ 			topology_add_device(topology, n->almacaddr);
+ 	}
+ 
+-	/* place each dev under its upstream parent; repeat until stable (N-hop) */
+-	do {
+-		progress = false;
+-		list_for_each_entry(dev, &topology->dev_list, list) {
+-			struct bh_topology_dev *pdev;
+-			struct node *cn, *pn;
+-
+-			if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
+-				continue;
+-			cn = cntlr_find_node(c, dev->al_macaddr);
+-			if (!cn || !memcmp(cn->upstream_bssid, zmac, 6))
+-				continue;
+-			pn = cntlr_find_node_with_bssid(c, cn->upstream_bssid);
+-			if (!pn)
+-				pn = find_node_with_mld_macaddr(c, cn->upstream_bssid);
+-			if (!pn)
+-				continue;
+-			pdev = topology_find_device(topology, pn->almacaddr);
+-			if (!pdev || pdev->bh.depth == UNKNOWN_TREE_LEVEL)
+-				continue;	/* parent not placed yet */
+-
+-			dev->bh.parent = pdev;
+-			dev->bh.depth = pdev->bh.depth + 1;
+-			dev->bh.wifi_hops_from_root =
+-				pdev->bh.wifi_hops_from_root + 1;
+-
+-			/* Hand mapc_sync_topology the parent bBSS as a local_iface,
+-			 * so it emits parent_iface_mac == upstream_bssid.
+-			 *
+-			 * The copy lives in the child. It used to be appended to
+-			 * the parent's ifaces[]: that raised the parent's interface
+-			 * count above what its Device Information TLV says, so the
+-			 * next Topology Response from the parent counted as a
+-			 * change and rewrote ifaces[] under the child's pointer,
+-			 * and a parent with a full ifaces[] gave its children no
+-			 * parent_iface at all.
+-			 */
+-			memset(&dev->parent_iface_store, 0,
+-			       sizeof(dev->parent_iface_store));
+-			memcpy(dev->parent_iface_store.macaddr, cn->upstream_bssid, 6);
+-			dev->parent_iface_store.media_type = 0x0100;	/* Wi-Fi */
+-			dev->bh.parent_iface = &dev->parent_iface_store;
+-			progress = true;
++	/* Sources 1 and 2 until stable, then one device from source 3, and
++	 * again. Source 3 places a single device per round so that what it
++	 * decides is always seen by the reports first: a child of the device
++	 * just placed is then placed by what it reports, not by a guess.
++	 */
++	for (;;) {
++		struct bh_topology_dev *best = NULL, *pbest = NULL;
++		int bx = -1, by = -1;
++		bool progress, relaxed;
++
++		do {
++			progress = false;
++			list_for_each_entry(dev, &topology->dev_list, list) {
++				bool evidence;
++
++				if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
++					continue;
++				n = cntlr_find_node(c, dev->al_macaddr);
++				if (!n)
++					continue;
++				if (place_from_reports(c, topology, dev, n, &evidence))
++					progress = true;
++			}
++		} while (progress);
++
++		/* Neighbours only for a device nobody reported an uplink for.
++		 * First pass waits for unplaced candidates; the relaxed one
++		 * runs when the strict one found nothing to do.
++		 */
++		for (relaxed = false; !best; relaxed = true) {
++			list_for_each_entry(dev, &topology->dev_list, list) {
++				struct bh_topology_dev *p;
++				bool evidence, pending;
++				int xi = -1, yi = -1;
++
++				if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
++					continue;
++				n = cntlr_find_node(c, dev->al_macaddr);
++				if (!n)
++					continue;
++				place_from_reports(c, topology, dev, n, &evidence);
++				if (evidence)
++					continue;
++
++				p = neighbor_parent(topology, dev, &xi, &yi, &pending);
++				if (!p || (pending && !relaxed))
++					continue;
++
++				best = dev;
++				pbest = p;
++				bx = xi;
++				by = yi;
++				break;
++			}
++			if (relaxed)
++				break;
+ 		}
+-	} while (progress);
++		if (!best)
++			break;
++
++		{
++			uint16_t media = 0xFFFF;
++			const uint8_t *pif = NULL;
++
++			/* the child's own interface says best what the link is */
++			if (bx >= 0)
++				media = best->ifaces[bx].media_type;
++			if (by >= 0) {
++				pif = pbest->ifaces[by].macaddr;
++				if (media == 0xFFFF)
++					media = pbest->ifaces[by].media_type;
++			}
++			/* Each side listing the other is the link seen from both
++			 * ends - still no report of an uplink, but no longer one
++			 * side's word. A leak through a bridge is symmetric too,
++			 * which is why the leak rule in neighbor_parent() runs
++			 * first and this only grades what survives it. */
++			place_dev(best, pbest, pif, media,
++				  (bx >= 0 && by >= 0) ? BH_SRC_NEIGHBOR_MUTUAL
++						       : BH_SRC_NEIGHBOR);
++			dbg("%s: " MACFMT " placed under " MACFMT " from 1905 neighbours\n",
++			    __func__, MAC2STR(best->al_macaddr),
++			    MAC2STR(pbest->al_macaddr));
++		}
++	}
+ 
+ 	/* The tree is valid once it is built, even if some devices found no
+ 	 * place in it. A device without a place simply has depth UNKNOWN; the
+@@ -206,7 +501,7 @@ struct bh_topology_dev *topology_add_device(struct bh_topology_data *topology, c
+ 		return NULL;
+ 
+ 	memcpy(bh_topo_dev->al_macaddr, al_macaddr, 6);
+-	bh_topo_dev->bh.depth = UNKNOWN_TREE_LEVEL;
++	bh_reset(bh_topo_dev);
+ 
+ 	memset(bh_topo_dev->prev_parent_aladdr, 0, 6);
+ 	memset(bh_topo_dev->prev_iface_mac, 0, 6);
+diff --git a/src/topology.h b/src/topology.h
+index c7a9519..30e33e9 100644
+--- a/src/topology.h
++++ b/src/topology.h
+@@ -40,12 +40,29 @@ struct local_iface {
+   * parent/parent_iface <--own_iface->media_type-< own_iface
+   */
+ #define UNKNOWN_TREE_LEVEL -1
++
++/* Where a device's place in the tree came from. It travels with the edge
++ * into the DB, so a reader can tell an uplink the child reported from one
++ * the controller inferred.
++ */
++enum bh_source {
++	BH_SRC_NONE = 0,
++	BH_SRC_CHILD,		/* the child named its uplink (0xE1, Link Metric) */
++	BH_SRC_PARENT_ASSOC,	/* the parent lists the child's bSTA as a client */
++	BH_SRC_NEIGHBOR,	/* 1905 neighbour, heard by one side only */
++	BH_SRC_NEIGHBOR_MUTUAL,	/* 1905 neighbours, each lists the other */
++};
++
++const char *bh_source_str(uint8_t source);
++
+ struct backhaul_info {
+ 	int8_t depth;			/** total number of BH links from root node */
+ 	uint8_t wifi_hops_from_root;	/** number of Wi-Fi BH links from root node */
+ 	const struct bh_topology_dev *parent;
+ 	const struct local_iface *parent_iface;
+ 	const struct local_iface *own_iface;
++	uint8_t source;			/** enum bh_source */
++	uint16_t media_type;		/** of the uplink; 0xFFFF when unknown */
+ };
+ 
+ /** Represents single device and its relation to neighbors in BH tree. */

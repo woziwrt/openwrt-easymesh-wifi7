@@ -1,0 +1,284 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Make sure the agent actually REPORTS the AP-MLDs it is running.
+#
+# agent_init_interfaces() tears the AP-MLD's affiliated-AP attribution down
+# unconditionally (mld_del_ap on every affiliated AP) and rebuilds it behind a
+# band gate. When that gate does not pass, mld.c schedules another init pass -
+# which wipes it again. The teardown is unconditional, the refill is not, and
+# the failure path re-arms the teardown, so once the gate starts failing the
+# set can only stay at zero.
+#
+# Nothing recovers from that on its own: the controller asks (Topology Query,
+# AP Capability Query) and gets the same empty TLV every time, so apmld /
+# affiliated_ap / ttlm quietly collapse in the controller's database while
+# `iw` and `wifi.apmld` on the node still show a perfectly healthy three-link
+# MLD. Every local check says the node is fine.
+#
+# See docs/diagnosis/apmld-affiliated-wiped-by-refresh-2026-07-22.md. This tool
+# treats the symptom; the fix belongs in the teardown, which must not replace a
+# known set with nothing.
+#
+# Measured on the BPI-R4 Pro 8X, 2026-07-22: after a reboot the node ran 3/3 links and the
+# controller held apmld=1, affiliated_ap=3, ttlm=24 instead of 2 / 6 / 48. A
+# plain query did not recover it - only restarting map-agent did. And a restart
+# can lose the same race again (seen twice on the same node, minutes apart),
+# which is why this retries instead of restarting once and hoping.
+#
+# Runs once per boot from /etc/init.d/mld-report-check, after mld-link-check
+# has had its chance to repair the links themselves - repairing the report
+# before the links exist would only enumerate the same deficit.
+
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+ATTEMPTS=3
+# map-agent re-onboards after a restart; the affiliated list is populated well
+# before that finishes, but reading too early sees the empty starting state.
+SETTLE=45
+
+# A node has more than one AP-MLD, and the broken one is not the first.
+#
+# Until 2026-08-01 every number here came from wireless.mld0 alone - the
+# fronthaul. A node whose fronthaul is healthy therefore exited at the first
+# comparison no matter what state its backhaul MLD was in, and the backhaul is
+# the one that carries the mesh.
+#
+# Measured on the colocated controller that morning, after a night of uptime:
+#
+#   ap-mld-1 (fronthaul)  3 links running   3 affiliated APs reported
+#   ap-mld-2 (backhaul)   2 links running   0 affiliated APs reported
+#
+# want was 3, have was 3, and the check exited 0. The controller's own backhaul
+# MLD held no affiliated AP at all, its two BSSIDs were absent from the bss
+# table, and the two backhaul STAs associated to them became rows pointing at a
+# BSSID the database did not know. The node's boot was recorded as needing no
+# repair - which is the one thing this class of watchdog must never get wrong.
+#
+# So count every AP-MLD the node runs, not the first one it was configured
+# with. The repair below was always node-wide; only the trigger was not.
+mld_ifnames() {
+	ubus list 2>/dev/null | sed -n 's/^wifi\.apmld\.//p'
+}
+
+# What the node is actually running right now, summed over all its AP-MLDs.
+# Deliberately not the configured radio count: if a link is genuinely missing,
+# that is mld-link-check's problem, and this tool must not spin restarting
+# map-agent over a deficit it cannot fix.
+links() {
+	local i n=0
+	for i in $(mld_ifnames); do
+		n=$(( n + $(ubus -t 5 call "wifi.apmld.$i" status 2>/dev/null |
+			    grep -c '"enabled": true') ))
+	done
+	echo "$n"
+}
+
+# What the node tells the controller, summed the same way.
+#
+# Counted with awk on purpose. `ubus call map.agent status` is NOT valid JSON:
+# the backhaul block opens an object and then puts an unkeyed object inside it,
+#
+#	"backhaul": {
+#		{
+#			"name": "wlan2",
+#
+# where an array was meant. Every parser rejects the whole document for it -
+# jsonfilter with "quoted object property name expected", python with
+# "Expecting property name enclosed in double quotes". A jsonfilter version of
+# this function therefore returned 0 for every node, healthy or not, which
+# would have made this tool restart map-agent three times on every boot and
+# then declare a failure that was not there. Measured 2026-07-22.
+#
+# This already counted every ap_mld block, which is why the fix above is only
+# to the other side of the comparison.
+reported() {
+	ubus -t 5 call map.agent status 2>/dev/null | awk '
+		/"ap_mld":/                     { inmld = 1 }
+		inmld && /"affiliated_ap":/     { inaff = 1; next }
+		inaff && /\]/                   { inaff = 0 }
+		inaff && /"ifname"/             { n++ }
+		END                             { print n + 0 }'
+}
+
+# Only meaningful where an AP-MLD is configured in the first place.
+uci -q get wireless.mld0.ifname >/dev/null 2>&1 || exit 0
+
+# The wifi.apmld objects appear only once hostapd and wifimngr are up, which on
+# a cold boot is well after S99. Asking before that returns 0 and the check
+# exits silently, which is the worst possible outcome: the node is left broken
+# and the log says nothing at all.
+#
+# Measured 2026-07-29 on the colocated controller: it came up with no mapagent
+# mld section, reported num_ap=0 for both its MLDs, and this script never wrote
+# a single line. Run by hand two minutes later, once the object existed, it
+# repaired the node on the first attempt.
+#
+# So wait for the objects rather than assuming them. WAIT_MAX bounds it, because
+# a node that genuinely has no AP-MLD must still be able to exit.
+WAIT_MAX=300
+waited=0
+while [ "$(links)" -eq 0 ] 2>/dev/null && [ "$waited" -lt "$WAIT_MAX" ]; do
+	sleep 10
+	waited=$(( waited + 10 ))
+done
+[ "$waited" -eq 0 ] || logger -t mld-report-check "waited ${waited}s for the AP-MLDs to appear"
+
+# The second AP-MLD comes up after the first, so a total read the moment the
+# first one answers would set want too low and let a real deficit pass. One
+# settling read costs nothing here; this script has already waited minutes.
+sleep 20
+
+want="$(links)"
+[ "$want" -gt 0 ] 2>/dev/null || exit 0
+
+have="$(reported)"
+
+# The damage can be latent: correct report, poisoned configuration.
+#
+# apmld_parse() runs once, early, while the backhaul MLD placeholders are still
+# in the configuration. Whatever removes them afterwards leaves the runtime
+# attribution intact, so the node keeps reporting all its affiliated APs while
+# /etc/config/mapagent no longer describes them. The report-based test below
+# sees nothing wrong - and it is right, nothing is wrong yet. It breaks at the
+# next re-parse, which may be hours away.
+#
+# Measured 2026-08-01 on the boot after a flash: the controller lost both
+# placeholders at 33 s and an agent one at 171 s, and only the controller's
+# report was deficient. The BPI-R4 (8 GB) kept reporting 5 of 5 with a placeholder already
+# gone - a node that every check would have called healthy.
+#
+# So repair the configuration whenever it is incomplete, regardless of what is
+# being reported - but do NOT restart the agent for it. A restart is what the
+# deficit below is for; here there is nothing wrong in the running state, and
+# disturbing a healthy node to correct a file is the worse trade.
+# Count them, do not test that any exist. On 2026-08-01 the controller lost
+# both placeholders and an agent lost exactly one of two - a presence test would
+# have called that agent healthy, which is the same half-measurement that let
+# the whole defect run for a day.
+bh_if="$(uci -q get wireless.ap_mld_2.ifname)"
+if [ -n "$bh_if" ]; then
+	bh_links=$(ubus -t 5 call "wifi.apmld.$bh_if" status 2>/dev/null | grep -c '"enabled": true')
+	have_ph=$(uci show mapagent 2>/dev/null | grep -c "^mapagent\.bhmld_ap_[0-9]*\.mld_id=")
+	if [ "$bh_links" -gt 0 ] && [ "$have_ph" -lt "$bh_links" ] 2>/dev/null; then
+		logger -t mld-report-check \
+			"backhaul MLD runs $bh_links links but config has $have_ph placeholder(s), reporting $have of $want - regenerating without restart"
+		/lib/wifi/multiap conf
+		now_ph=$(uci show mapagent 2>/dev/null | grep -c "^mapagent\.bhmld_ap_[0-9]*\.mld_id=")
+		logger -t mld-report-check "placeholders after regeneration: $now_ph of $bh_links"
+		# Counted apart from a restart repair: this one cost the node nothing
+		# and says something different about the boot.
+		_c=$(cat /tmp/mld-config-repairs 2>/dev/null || echo 0)
+		echo $(( _c + 1 )) > /tmp/mld-config-repairs
+	fi
+fi
+
+[ "$have" -lt "$want" ] 2>/dev/null || exit 0
+
+# A restart cannot fix a configuration that is not there.
+#
+# map_genconfig writes mapagent.apmld0 and the backhaul MLD placeholders only
+# inside its mt76 branch, and that branch is entered on [ -d /sys/module/mt76 ].
+# A boot where genconfig runs before the driver module is loaded takes the
+# non-MLO path instead: it rebuilds the ap sections without a single mld
+# section, and the node ends up advertising an AP-MLD with no affiliated links.
+#
+# Measured on the colocated controller 2026-07-29: hostapd ran ap-mld-1 with
+# three links, mapagent had six ap sections and no mld section at all, and the
+# three restarts below changed nothing - the give-up line was written and the
+# controller stored num_ap=0 for both of its own MLDs. Running map_genconfig by
+# hand and restarting the agent once brought them back to 2 and 3.
+#
+# The placeholders can also be written correctly and then be lost again. On the
+# boot of 2026-07-31 the tripwire recorded, on the colocated controller:
+#
+#   up=9s   ap=6 mld_id=3      before genconfig
+#   up=17s  ap=8 mld_id=5      genconfig wrote bhmld_ap_5 and bhmld_ap_6
+#   up=34s  ap=7 mld_id=4      one gone
+#   up=35s  ap=6 mld_id=3      both gone
+#
+# and the uci CLI shim recorded no `uci delete` at all in that window - only
+# commits - so whatever removed them writes through libuci from inside
+# map-agent. That is still open. Until it is closed, this check is what puts
+# them back, which is why the test below is made here at S99 as well as in
+# mld-config-check at S96: at S96 the sections are still present and the guard
+# is therefore false.
+#
+# Record which of the two halves tripped, and the state that made it trip,
+# before repairing it.
+#
+# Both halves shared one log line, and by the time anyone can look at the node
+# the repair has already run - /etc/config/mapagent is rewritten and its mtime is
+# the repair, not the boot. Measured the cost of that on 2026-07-30: the wrong
+# half was patched (map-agent renaming the sections, 979 - a real defect, but not
+# this trigger), the watchdog fired again on the next flash, and the day lost a
+# build cycle to a guess that two shell commands would have settled.
+#
+# Three flashes that day repaired; one plain reboot and one map-agent restart did
+# not. So the trigger is specific to the boot after a flash, and the evidence
+# needed is what the configuration looked like at S99 on such a boot. Nothing
+# else can capture it: querying from outside is too late, and logread wraps.
+_ev=/etc/mapc/mld-report-evidence.log
+mkdir -p /etc/mapc 2>/dev/null
+_apmld0=missing
+_bhmld_id=missing
+uci -q get mapagent.apmld0 >/dev/null 2>&1 && _apmld0=present
+uci show mapagent 2>/dev/null | grep -q "^mapagent\\.bhmld_ap_[0-9]*\\.mld_id=" &&
+	_bhmld_id=present
+
+if [ "$_apmld0" = missing ] || [ "$_bhmld_id" = missing ]; then
+	{
+		echo "=== $(date '+%Y-%m-%d %H:%M:%S')  uptime $(cut -d. -f1 /proc/uptime)s ==="
+		echo "apmld0=$_apmld0  bhmld_ap_*.mld_id=$_bhmld_id"
+		echo "runs $want affiliated links, reports $have"
+		echo "-- mapagent sections --"
+		uci show mapagent 2>/dev/null | grep -E "=(mld|ap|bsta|radio)$"
+		echo "-- mld_id options --"
+		uci show mapagent 2>/dev/null | grep "mld_id="
+		echo "-- /etc/config/mapagent mtime --"
+		ls -la /etc/config/mapagent 2>/dev/null
+		echo
+	} >> "$_ev" 2>&1
+
+	logger -t mld-report-check \
+		"mapagent is missing its MLD configuration (apmld0=$_apmld0 bhmld_id=$_bhmld_id) - regenerating before restart"
+	/lib/wifi/multiap conf
+
+	# Leave a durable mark, because the log is not one. logread is a ring
+	# buffer and on a booting node it wraps within minutes: measured
+	# 2026-07-29, the repair line was already gone six minutes after it was
+	# written, so a census taken at the recommended twelve minutes reported a
+	# boot that needed no help. That is the one thing the reliability series
+	# must never get wrong - it is what separates "the boot succeeded" from
+	# "the boot failed and the watchdog covered it".
+	#
+	# /tmp is right: the count belongs to this boot and must not survive one.
+	_n=$(cat /tmp/mld-repairs 2>/dev/null || echo 0)
+	echo $(( _n + 1 )) > /tmp/mld-repairs
+fi
+
+n=1
+while [ "$n" -le "$ATTEMPTS" ]; do
+	logger -t mld-report-check \
+		"AP-MLDs run $want affiliated links but report $have affiliated APs - restarting map-agent ($n/$ATTEMPTS)"
+	/etc/init.d/mapagent restart >/dev/null 2>&1
+	sleep "$SETTLE"
+
+	have="$(reported)"
+	if [ "$have" -ge "$want" ] 2>/dev/null; then
+		logger -t mld-report-check "AP-MLDs now report $have of $want affiliated APs"
+		exit 0
+	fi
+	n=$(( n + 1 ))
+done
+
+# Out of attempts. Say so loudly: a silent failure here looks exactly like a
+# healthy node from every angle except the controller's database.
+logger -t mld-report-check \
+	"AP-MLDs still report $have of $want affiliated APs after $ATTEMPTS restarts - controller will not see them all"
+exit 1

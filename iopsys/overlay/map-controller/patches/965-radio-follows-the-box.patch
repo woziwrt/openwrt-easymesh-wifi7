@@ -1,0 +1,100 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a radio follows the box, not the address
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Re-parent a known radio when it reports under a different node.
+
+These boards have no stable hardware MAC, so a node draws a fresh AL-MAC on
+every boot: a box that comes back is a stranger. The controller files a new
+node object for the new address - and the radios stay on the old one, because
+cntlr_node_add_radio() finds them by ruid and hands them back untouched:
+
+	r = cntlr_find_radio(c, macaddr);
+	if (r) {
+		r->invalidate = 0;
+		return r;		/* r->agent still points at the old node */
+	}
+
+The new node therefore never receives a radio, and the old one is kept alive by
+the reports of the box that left it: patch 961 marks a node's radios
+invalidate=1 before parsing a live Topology Response and sweeps what the agent
+did not confirm, and the line above clears that mark. The confirmation arrives
+under the NEW address while the radios hang off the OLD object, so the sweep on
+the old node never fires. The ghost is refreshed by its successor.
+
+Measured 2026-08-20, three-node lab, after one agent was power-cycled:
+
+  model (map.controller status)   aa:f5=3  92:fd=3  2e:c5=3  de:36=0
+  database (mapc.db)              aa:f5=3  92:fd=3  2e:c5=3  de:36=0
+
+de:36 is the returning box and holds nothing; 92:fd is the address it used
+before the reboot and holds all three of its radios - and was the FRESHER of
+the two, last_seen 15 s against 54 s. No age test can separate them, which is
+why this ghost showed a green dot where every ghost before it had been orange.
+The topology view drew the returning node's child hanging off the dead half.
+
+This is not the duplicate-node class that patches 963 and 964 close. Those are
+two objects sharing ONE AL-MAC, where mac_table points at exactly one and the
+other can never be filled in. Here both addresses are legitimate and both are in
+mac_table; what is stale is the association between a box and the name it used
+last time.
+
+The radio is the stable half. A ruid comes from the hardware and survives the
+reboot - verified across the same power cycle - so a radio reporting under a
+different node is not an error to reject but a box that has been renamed. Move
+it, with everything that points back at the node: the list membership, r->agent,
+and the agent pointer in every fBSS/bBSS beneath it. Miss the last one and the
+ghost simply moves down a level.
+
+Nothing else needs changing. The orphan stops receiving its radios' reports,
+expires after NODE_EXPIRE_TIME (cntlr.h: 180 s) and cntlr_clean_node() reaps it
+- correctly, since it owns its own mac_table entry. The persistence layer needs
+no patch either: sync_radio_row() already carries
+ON CONFLICT(ruid) DO UPDATE SET agent_almac=excluded.agent_almac, so the
+database follows the model on the next sync.
+
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -948,6 +948,32 @@ static struct wifi_radio_element *cntlr_alloc_wifi_radio(
+ 	return radio_el;
+ }
+ 
++/* Hand a radio, and everything hanging off it, to another node object.
++ *
++ * Called when a box comes back under a new AL-MAC. Three things point at the
++ * node and all three have to move together; the BSS list is the one that is
++ * easy to forget, and forgetting it only moves the ghost one level down.
++ */
++static void cntlr_radio_reparent(struct netif_radio *r, struct node *n)
++{
++	struct netif_iface *iface = NULL;
++
++	if (!r || !n || r->agent == n)
++		return;
++
++	info("%s: radio " MACFMT " moves from " MACFMT " to " MACFMT
++	     " (same box, new AL-MAC)\n", __func__,
++	     MAC2STR(r->radio_el->macaddr),
++	     MAC2STR(r->agent->almacaddr), MAC2STR(n->almacaddr));
++
++	list_del(&r->list);
++	list_add(&r->list, &n->radiolist);
++	r->agent = n;
++
++	list_for_each_entry(iface, &r->iflist, list)
++		iface->agent = n;
++}
++
+ struct netif_radio *cntlr_node_add_radio(struct controller *c, struct node *n,
+ 		uint8_t *macaddr)
+ {
+@@ -965,7 +991,9 @@ struct netif_radio *cntlr_node_add_radio(struct controller *c, struct node *n,
+ 	r = cntlr_find_radio(c, macaddr);
+ 	if (r) {
+ 		r->invalidate = 0;
++		if (r->agent != n)
++			cntlr_radio_reparent(r, n);
+ 		return r;
+ 	}
+ 
+ 	r = calloc(1, sizeof(*r));

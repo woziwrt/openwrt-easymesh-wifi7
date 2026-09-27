@@ -1,0 +1,51 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: wireless_reload skips a config that is already applied
+
+map-agent calls "multiap wireless_reload" after every credential it applies.
+On mt76 the reload (`wifi`) tears down every radio, the MLD backhaul the
+node talks through included, even when /etc/config/wireless did not change.
+
+Measured 2026-09-19 on BPI-R4 (mt7996): wireless config byte-identical
+before and after the reload, the backhaul built a minute earlier knocked
+off and never offered an address again.
+
+Keep a fingerprint (md5 of `uci export wireless`) of what was last brought
+up and skip the reload when nothing changed. Without a fingerprint (fresh
+boot) the reload runs as before.
+---
+--- a/src/script/multiap	2026-09-19 17:08:34.293204673 +0200
++++ b/src/script/multiap	2026-09-19 17:08:34.301806736 +0200
+@@ -295,16 +295,33 @@
+ 	json_cleanup
+ }
+ 
++# The wireless config as it was when the radios were last brought up, as a
++# fingerprint (written here and by easymesh-soft-restart). map-agent calls
++# wireless_reload after every credential it applies, and on mt76 the reload
++# tears down every radio - including the MLD backhaul the node is talking
++# through - even when the config did not change. A reload that would apply
++# nothing does nothing. No fingerprint (fresh boot) means reload as always.
++WIRELESS_APPLIED=/tmp/wireless.applied.md5
++wireless_fingerprint() { uci -q export wireless 2>/dev/null | md5sum | cut -d" " -f1; }
++
+ wireless_reload() {
++	local now
++	now=$(wireless_fingerprint)
++	if [ -s "$WIRELESS_APPLIED" ] && [ "$now" = "$(cat "$WIRELESS_APPLIED")" ]; then
++		logger -t multiap "wireless reload: config unchanged since it was applied - skipped"
++		return 0
++	fi
+ 	logger -t multiap "wireless reload"
+ 
+ 	[ -d /sys/module/ath12k ] && {
+ 		wifi down
+ 		wifi up
++		echo "$now" > "$WIRELESS_APPLIED"
+ 		return
+ 	}
+ 
+ 	wifi
++	echo "$now" > "$WIRELESS_APPLIED"
+ }
+ 
+ write_credentials() {

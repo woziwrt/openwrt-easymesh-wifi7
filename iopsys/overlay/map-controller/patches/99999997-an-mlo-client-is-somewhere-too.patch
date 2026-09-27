@@ -1,0 +1,115 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: an MLO client is somewhere too
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+sta.agent_almac was never updated for an MLO client, on any path.
+
+A legacy client is carried in the Associated Clients TLV and that is where its
+node is learned. An MLO client is not: agent_gen_assoc_client_tlv() skips
+affiliated stations by design, because they belong in the Associated STA MLD
+Config TLV instead - and the MLD address does not appear in the first TLV at
+all. So the row for an MLO client stays wherever it last was, forever, and
+nothing corrects it.
+
+Measured 2026-09-06 on the lab mesh:
+
+    hardware   ba:a9:1b:53:17:82 on the corridor node, three legs
+               (2.4 / 5 / 6 GHz), all affiliated, live
+    sta        attached to the controller, 1862 s old
+    sta_mld    right AP-MLD, 2184 s old
+
+Every reader that asks which node a client is on - the topology picture, the
+per-node client count, steering, assoc_control - was answered wrongly for
+exactly the client type this project exists for.
+
+The Associated STA MLD Config TLV is that client's own statement of where it
+is. It names the client and the AP-MLD, and the AP-MLD is matched against the
+reporting node's own list before this runs, so nothing is inferred.
+
+Two nodes do report the same client, and num_aff settles it. A node the client
+has left keeps the STA-MLD in its list for a while and reports it with ZERO
+affiliated stations - measured the same day, the corridor node reporting ba:a9
+with 0 legs while the bedroom node reported 2 (6 GHz at -52 dBm and 5 GHz) and
+the corridor node's wifi layer had nothing at all. An MLD with no affiliated
+station is not attached anywhere, so such a report is not read as a claim.
+That is not a tie-breaker bolted on; it is what the field means. Without it the
+two reports alternate and the client's node flips with each - measured twice
+within one second.
+
+Only a client already in the model is moved. Creating one from this path would
+add a second way for stations to enter the model, and 99999996 is what that
+costs.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
+
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -5112,6 +5112,67 @@
+ 		if (!match)
+ 			continue;
+ 
++		/* Say where this client is, in the table everything else reads.
++		 *
++		 * An MLO client never appears in the Associated Clients TLV:
++		 * agent_gen_assoc_client_tlv() skips affiliated stations by
++		 * design - they belong here instead - and the MLD address is
++		 * not in that TLV at all. So the path that keeps a legacy
++		 * client's node current simply does not exist for an MLO one,
++		 * and its row stays wherever it last was.
++		 *
++		 * Measured 2026-09-06: ba:a9:1b:53:17:82 live on one node with
++		 * three legs and recorded in sta as attached to another, 1862 s
++		 * old. Every reader that asks which node a client is on - the
++		 * picture, the client count, steering, assoc_control - was
++		 * answered wrongly for the one client type this project exists
++		 * for.
++		 *
++		 * num_aff is what settles it when two nodes report the same
++		 * client, and they do: a node the client has left keeps the
++		 * STA-MLD in its list for a while and reports it with ZERO
++		 * affiliated stations. Measured the same day, minutes apart -
++		 * the corridor node reported ba:a9 with 0 legs while the
++		 * bedroom node reported it with 2 (6 GHz at -52 dBm and 5 GHz),
++		 * and the wifi layer on the corridor node had nothing at all.
++		 *
++		 * An MLD with no affiliated station is not attached anywhere.
++		 * Such a report says nothing about where the client is, so it
++		 * is not read as a claim. This is not a tie-breaker bolted on;
++		 * it is what the field means.
++		 *
++		 * Without it the two reports alternate and the client's node
++		 * flips with each one - measured, twice within a single second.
++		 *
++		 * Only a client already known is moved. Creating one from this
++		 * path would add a second way for stations to enter the model,
++		 * and 99999996 is what that costs.
++		 */
++		if (num_aff > 0) {
++			struct sta *cs;
++
++			cs = cntlr_find_sta(c->sta_table, (uint8_t *)sta_mac);
++			if (cs) {
++				if (memcmp(cs->agent_almacaddr, n->almacaddr, 6)) {
++					struct node *old_n;
++
++					cntlr_info(LOG_STA, "%s: MLD client " MACFMT
++						   " is on node " MACFMT " with %u link(s)"
++						   " (was " MACFMT ")\n",
++						   __func__, MAC2STR(cs->macaddr),
++						   MAC2STR(n->almacaddr), num_aff,
++						   MAC2STR(cs->agent_almacaddr));
++
++					old_n = cntlr_find_node(c, cs->agent_almacaddr);
++					if (old_n)
++						node_del_sta(old_n, cs);
++
++					node_add_sta(n, cs);
++				}
++				cs->state = STA_CONNECTED;
++			}
++		}
++
+ 		list_for_each_entry(e, &match->stamldlist, list) {
+ 			if (!memcmp(e->mld_macaddr, sta_mac, 6)) {
+ 				sm = e;

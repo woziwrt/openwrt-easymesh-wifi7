@@ -1,0 +1,736 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: phase1 write hooks
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+diff -ruN a/src/db/mapc_sync.h b/src/db/mapc_sync.h
+--- /dev/null
++++ b/src/db/mapc_sync.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapc_sync.h - live-model -> mapdb write hooks for map-controller.
++ *
++ * Phase 1 (ADR-0003): the marshalling seam between the controller's in-memory
++ * topology model (struct node -> netif_radio -> netif_iface, plus the backhaul
++ * topology tree) and the SQLite persistence layer (db/mapdb.h). The rest of the
++ * controller never touches SQL: the CMDU handlers keep mutating the live structs
++ * and the dispatcher calls one of the targeted upsert helpers below afterwards.
++ *
++ * Everything here is best-effort and non-fatal: if c->db is NULL (open failed,
++ * degraded mode) every function returns immediately, and any engine error rolls
++ * the txn back and continues. The DB is a warm-cache recovery graph - it must
++ * never be able to break the controller (design doc s5).
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#ifndef MAPC_SYNC_H
++#define MAPC_SYNC_H
++
++struct controller;
++struct node;
++struct netif_radio;
++struct netif_iface;
++
++/* Upsert the single 'network' identity row (controller AL-MAC). */
++void mapc_sync_network(struct controller *c);
++
++/* Upsert the 'agent' row for @n from its live struct node fields. */
++void mapc_sync_agent(struct controller *c, struct node *n);
++
++/* Upsert 'radio' + 'radio_caps' + 'operating_class' rows for @r, one txn. */
++void mapc_sync_radio(struct controller *c, struct node *n, struct netif_radio *r);
++
++/* Upsert the 'bss' row for @iface (parent radio must already be synced). */
++void mapc_sync_bss(struct controller *c, struct netif_iface *iface);
++
++/* Rebuild the 'topology_link' edge set from c->topology.dev_list, one txn. */
++void mapc_sync_topology(struct controller *c);
++
++/* Fold the WAL back into the main DB file (PRAGMA wal_checkpoint(TRUNCATE)). */
++void mapc_db_checkpoint(struct controller *c);
++
++#endif /* MAPC_SYNC_H */
+diff -ruN a/src/db/mapc_sync.c b/src/db/mapc_sync.c
+--- /dev/null
++++ b/src/db/mapc_sync.c
+@@ -0,0 +1,494 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapc_sync.c - live-model -> mapdb write hooks for map-controller.
++ *
++ * Phase 1 (ADR-0003): targeted upserts that mirror the controller's in-memory
++ * topology model into mapc.db so the mesh graph survives a powercycle. Each
++ * helper reads the already-mutated live structs (Model A: struct node ->
++ * netif_radio -> netif_iface, plus the backhaul topology tree) and writes the
++ * matching row(s) with prepared statements + binds (never string-formatted SQL).
++ *
++ * Best-effort by contract: c->db == NULL -> no-op; any engine error is logged,
++ * the txn (if any) is rolled back, and the controller continues. The DB is a
++ * warm-cache recovery graph, never a hard dependency (design doc s5).
++ *
++ * Only the 7 tables with a live producer are written here: network, agent,
++ * radio, radio_caps, operating_class, bss, topology_link. Columns with no
++ * in-memory producer are left NULL (see the per-column notes below).
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#include "cntlr.h"
++#include "wifi_opclass.h"
++#include "db/mapdb.h"
++#include "db/mapc_sync.h"
++#include "utils/debug.h"
++
++/* ---- small marshalling helpers ---------------------------------------- */
++
++/* Lowercase colon-separated MAC into @buf (>= 18 bytes). Reuses the tree-wide
++ * hwaddr_ntoa() idiom so PKs match the format used elsewhere. */
++static const char *mac2str(const uint8_t *mac, char *buf)
++{
++	hwaddr_ntoa(mac, buf);
++	return buf;
++}
++
++/* Lowercase contiguous hex (no separators) of @len bytes into @out. Used for
++ * the capability byte-blobs stored as TEXT (ht/vht/he, est_wmm_*). */
++static const char *bytes2hex(const uint8_t *in, size_t len, char *out, size_t outsz)
++{
++	size_t i;
++
++	if (outsz < len * 2 + 1) {
++		out[0] = '\0';
++		return out;
++	}
++	for (i = 0; i < len; i++)
++		snprintf(out + i * 2, 3, "%02x", in[i]);
++	out[len * 2] = '\0';
++	return out;
++}
++
++/* Step a write statement to completion and finalize it. Logs + returns ERR on
++ * failure so callers can roll a txn back. */
++static int stmt_finish(mapdb *db, mapdb_stmt *st)
++{
++	int rc = mapdb_step(st);
++
++	mapdb_finalize(st);
++	if (rc != MAPDB_DONE) {
++		warn("mapc_sync: step failed: %s\n", mapdb_last_error(db));
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++/* ---- network ---------------------------------------------------------- */
++
++void mapc_sync_network(struct controller *c)
++{
++	static const char *sql =
++		"INSERT INTO network(id, controller_almac) VALUES(?, ?) "
++		"ON CONFLICT(id) DO UPDATE SET "
++		"controller_almac=excluded.controller_almac";
++	char almac[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	/* No separate network-id producer in this tree -> key the single logical
++	 * mesh by the controller AL-MAC string. */
++	mac2str(c->almacaddr, almac);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: network prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, almac);
++	mapdb_bind_text(st, 2, almac);
++	stmt_finish(c->db, st);
++}
++
++/* ---- agent ------------------------------------------------------------ */
++
++void mapc_sync_agent(struct controller *c, struct node *n)
++{
++	static const char *sql =
++		"INSERT INTO agent(almac, is_agent, node_type, profile, multiap_caps, "
++		"depth, uplink_type, upstream_bssid, est_thput_ul, est_thput_dl, "
++		"scan_supported, sta_count, max_mld_num, max_aplink_num, "
++		"max_bstalink_num, tid_link_caps, last_seen) "
++		"VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(almac) DO UPDATE SET "
++		"is_agent=excluded.is_agent, node_type=excluded.node_type, "
++		"profile=excluded.profile, multiap_caps=excluded.multiap_caps, "
++		"depth=excluded.depth, uplink_type=excluded.uplink_type, "
++		"upstream_bssid=excluded.upstream_bssid, est_thput_ul=excluded.est_thput_ul, "
++		"est_thput_dl=excluded.est_thput_dl, scan_supported=excluded.scan_supported, "
++		"sta_count=excluded.sta_count, max_mld_num=excluded.max_mld_num, "
++		"max_aplink_num=excluded.max_aplink_num, "
++		"max_bstalink_num=excluded.max_bstalink_num, "
++		"tid_link_caps=excluded.tid_link_caps, last_seen=excluded.last_seen";
++	char almac[18], upbssid[18], caps[3];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	mac2str(n->almacaddr, almac);
++	mac2str(n->upstream_bssid, upbssid);
++	bytes2hex(&n->ap_cap, 1, caps, sizeof(caps));	/* multiap AP-capability byte */
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: agent prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, almac);
++	mapdb_bind_int(st, 2, n->is_agent);
++	mapdb_bind_int(st, 3, n->type);
++	mapdb_bind_int(st, 4, n->map_profile);
++	mapdb_bind_text(st, 5, caps);
++	mapdb_bind_int(st, 6, n->depth);
++	mapdb_bind_int(st, 7, n->ul_type);
++	mapdb_bind_text(st, 8, upbssid);
++	mapdb_bind_int(st, 9, n->est_thput_ul);
++	mapdb_bind_int(st, 10, n->est_thput_dl);
++	mapdb_bind_int(st, 11, n->scan_supported);
++	mapdb_bind_int(st, 12, n->sta_count);
++#if (EASYMESH_VERSION >= 6)
++	mapdb_bind_int(st, 13, n->max_mld_num);
++	mapdb_bind_int(st, 14, n->max_aplink_num);
++	mapdb_bind_int(st, 15, n->max_bstalink_num);
++	mapdb_bind_int(st, 16, n->tid_link_caps);
++#else
++	mapdb_bind_null(st, 13);	/* no producer < R6 */
++	mapdb_bind_null(st, 14);
++	mapdb_bind_null(st, 15);
++	mapdb_bind_null(st, 16);
++#endif
++	mapdb_bind_int(st, 17, (long long)n->last_tsp_seen.tv_sec);
++	/* backhaul_*, manufacturer/model/serial/sw_version/exec_env, country_code,
++	 * traffic_sep_allowed, coordinated_cac: no Model-A producer -> left NULL. */
++	stmt_finish(c->db, st);
++}
++
++/* ---- radio (+ radio_caps + operating_class) --------------------------- */
++
++static int sync_radio_row(struct controller *c, struct node *n, struct netif_radio *r)
++{
++	static const char *sql =
++		"INSERT INTO radio(ruid, agent_almac, band, enabled, cur_opclass, "
++		"channel, tx_streams, rx_streams, max_bssnum, num_bss, steer_policy, "
++		"channel_util_thresh, rcpi_steer_thresh, anpi_noise, total_utilization, "
++		"ts_combined_fh, ts_combined_bh, chipset_vendor) "
++		"VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(ruid) DO UPDATE SET "
++		"agent_almac=excluded.agent_almac, band=excluded.band, "
++		"enabled=excluded.enabled, cur_opclass=excluded.cur_opclass, "
++		"channel=excluded.channel, tx_streams=excluded.tx_streams, "
++		"rx_streams=excluded.rx_streams, max_bssnum=excluded.max_bssnum, "
++		"num_bss=excluded.num_bss, steer_policy=excluded.steer_policy, "
++		"channel_util_thresh=excluded.channel_util_thresh, "
++		"rcpi_steer_thresh=excluded.rcpi_steer_thresh, "
++		"anpi_noise=excluded.anpi_noise, "
++		"total_utilization=excluded.total_utilization, "
++		"ts_combined_fh=excluded.ts_combined_fh, "
++		"ts_combined_bh=excluded.ts_combined_bh, "
++		"chipset_vendor=excluded.chipset_vendor";
++	struct wifi_radio_element *re = r->radio_el;
++	char ruid[18], almac[18];
++	uint8_t opclass = 0, channel = 0;
++	mapdb_stmt *st = NULL;
++
++	mac2str(re->macaddr, ruid);
++	mac2str(n->almacaddr, almac);
++	wifi_get_widest_opclass_and_channel(re, &opclass, &channel);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: radio prepare: %s\n", mapdb_last_error(c->db));
++		return MAPDB_ERR;
++	}
++	mapdb_bind_text(st, 1, ruid);
++	mapdb_bind_text(st, 2, almac);
++	mapdb_bind_int(st, 3, re->band);
++	mapdb_bind_int(st, 4, re->enabled);
++	mapdb_bind_int(st, 5, opclass);
++	mapdb_bind_int(st, 6, channel);
++	mapdb_bind_int(st, 7, re->tx_streams);
++	mapdb_bind_int(st, 8, re->rx_streams);
++	mapdb_bind_int(st, 9, re->max_bssnum);
++	mapdb_bind_int(st, 10, re->num_bss);
++	mapdb_bind_int(st, 11, re->steer_policy);
++	mapdb_bind_int(st, 12, re->channel_util_threshold);
++	mapdb_bind_int(st, 13, re->rcpi_steer_threshold);
++	mapdb_bind_int(st, 14, re->anpi);
++	mapdb_bind_int(st, 15, re->total_utilization);
++	mapdb_bind_int(st, 16, re->ts_combined_fronthaul);
++	mapdb_bind_int(st, 17, re->ts_combined_backhaul);
++	mapdb_bind_text(st, 18, re->vendor[0] ? re->vendor : NULL);
++	/* cf1, cf2: no Model-A producer -> left NULL. */
++	return stmt_finish(c->db, st);
++}
++
++static int sync_radio_caps_row(struct controller *c, struct netif_radio *r)
++{
++	static const char *sql =
++		"INSERT INTO radio_caps(ruid, ht_caps, vht_caps, he_caps, wifi7_emlmr, "
++		"wifi7_emlsr, wifi7_str, wifi7_nstr, wifi7_tidlinkmap, wifi7_nmlo_sta, "
++		"num_opclass) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(ruid) DO UPDATE SET "
++		"ht_caps=excluded.ht_caps, vht_caps=excluded.vht_caps, "
++		"he_caps=excluded.he_caps, wifi7_emlmr=excluded.wifi7_emlmr, "
++		"wifi7_emlsr=excluded.wifi7_emlsr, wifi7_str=excluded.wifi7_str, "
++		"wifi7_nstr=excluded.wifi7_nstr, "
++		"wifi7_tidlinkmap=excluded.wifi7_tidlinkmap, "
++		"wifi7_nmlo_sta=excluded.wifi7_nmlo_sta, num_opclass=excluded.num_opclass";
++	struct wifi_radio_element *re = r->radio_el;
++	char ruid[18], ht[3], vht[13], he[31];
++	mapdb_stmt *st = NULL;
++
++	mac2str(re->macaddr, ruid);
++	bytes2hex(&re->caps.ht, 1, ht, sizeof(ht));
++	bytes2hex(re->caps.vht, sizeof(re->caps.vht), vht, sizeof(vht));
++	bytes2hex(re->caps.he, sizeof(re->caps.he), he, sizeof(he));
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: radio_caps prepare: %s\n", mapdb_last_error(c->db));
++		return MAPDB_ERR;
++	}
++	mapdb_bind_text(st, 1, ruid);
++	mapdb_bind_text(st, 2, ht);
++	mapdb_bind_text(st, 3, vht);
++	mapdb_bind_text(st, 4, he);
++	/* eht_caps: no wifi_caps_element producer in this tree -> NULL (position 4
++	 * is he_caps; eht_caps column omitted from the INSERT list). */
++#if (EASYMESH_VERSION >= 6)
++	mapdb_bind_int(st, 5, re->wifi7caps_ap.emlmr);
++	mapdb_bind_int(st, 6, re->wifi7caps_ap.emlsr);
++	mapdb_bind_int(st, 7, re->wifi7caps_ap.str);
++	mapdb_bind_int(st, 8, re->wifi7caps_ap.nstr);
++	mapdb_bind_int(st, 9, re->wifi7caps_ap.tidlinkmap);
++	mapdb_bind_int(st, 10, re->wifi7caps_ap_support_nmlo_sta);
++#else
++	mapdb_bind_null(st, 5);	/* no Wi-Fi 7 producer < R6 */
++	mapdb_bind_null(st, 6);
++	mapdb_bind_null(st, 7);
++	mapdb_bind_null(st, 8);
++	mapdb_bind_null(st, 9);
++	mapdb_bind_null(st, 10);
++#endif
++	mapdb_bind_int(st, 11, re->supp_opclass.num_opclass);
++	return stmt_finish(c->db, st);
++}
++
++static int sync_operating_class_rows(struct controller *c, struct netif_radio *r)
++{
++	static const char *del_sql = "DELETE FROM operating_class WHERE ruid=?";
++	static const char *ins_sql =
++		"INSERT INTO operating_class(ruid, opclass, channel, max_tx_power) "
++		"VALUES(?,?,?,?) ON CONFLICT(ruid, opclass, channel) DO UPDATE SET "
++		"max_tx_power=excluded.max_tx_power";
++	struct wifi_radio_element *re = r->radio_el;
++	char ruid[18];
++	mapdb_stmt *st = NULL;
++	int i, j;
++
++	mac2str(re->macaddr, ruid);
++
++	/* Replace the current-opclass set wholesale so removed opclasses don't
++	 * linger (recovery wants the current picture, not history). */
++	if (mapdb_prepare(c->db, del_sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: opclass del prepare: %s\n", mapdb_last_error(c->db));
++		return MAPDB_ERR;
++	}
++	mapdb_bind_text(st, 1, ruid);
++	if (stmt_finish(c->db, st) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	for (i = 0; i < re->cur_opclass.num_opclass; i++) {
++		struct wifi_radio_opclass_entry *e = &re->cur_opclass.opclass[i];
++
++		for (j = 0; j < e->num_channel; j++) {
++			st = NULL;
++			if (mapdb_prepare(c->db, ins_sql, &st) != MAPDB_OK) {
++				warn("mapc_sync: opclass ins prepare: %s\n",
++				     mapdb_last_error(c->db));
++				return MAPDB_ERR;
++			}
++			mapdb_bind_text(st, 1, ruid);
++			mapdb_bind_int(st, 2, e->id);
++			mapdb_bind_int(st, 3, e->channel[j].channel);
++			mapdb_bind_int(st, 4, e->max_txpower);
++			/* channel_list, pref_list, tx_power: no per-channel producer
++			 * for the current-opclass set -> left NULL. */
++			if (stmt_finish(c->db, st) != MAPDB_OK)
++				return MAPDB_ERR;
++		}
++	}
++	return MAPDB_OK;
++}
++
++void mapc_sync_radio(struct controller *c, struct node *n, struct netif_radio *r)
++{
++	if (!c->db)
++		return;
++
++	if (mapdb_begin(c->db) != MAPDB_OK) {
++		warn("mapc_sync: radio begin: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++
++	/* radio first (FK parent of radio_caps + operating_class). */
++	if (sync_radio_row(c, n, r) != MAPDB_OK ||
++	    sync_radio_caps_row(c, r) != MAPDB_OK ||
++	    sync_operating_class_rows(c, r) != MAPDB_OK) {
++		mapdb_rollback(c->db);
++		return;
++	}
++
++	if (mapdb_commit(c->db) != MAPDB_OK) {
++		warn("mapc_sync: radio commit: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++	}
++}
++
++/* ---- bss -------------------------------------------------------------- */
++
++void mapc_sync_bss(struct controller *c, struct netif_iface *iface)
++{
++	static const char *sql =
++		"INSERT INTO bss(bssid, ruid, ssid, enabled, is_fbss, is_bbss, "
++		"p1_bsta_disallowed, p2_bsta_disallowed, assoc_allowed, r1_disallowed, "
++		"r2_disallowed, multi_bssid, transmitted_bssid, est_wmm_be, est_wmm_bk, "
++		"est_wmm_vi, est_wmm_vo) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(bssid) DO UPDATE SET "
++		"ruid=excluded.ruid, ssid=excluded.ssid, enabled=excluded.enabled, "
++		"is_fbss=excluded.is_fbss, is_bbss=excluded.is_bbss, "
++		"p1_bsta_disallowed=excluded.p1_bsta_disallowed, "
++		"p2_bsta_disallowed=excluded.p2_bsta_disallowed, "
++		"assoc_allowed=excluded.assoc_allowed, r1_disallowed=excluded.r1_disallowed, "
++		"r2_disallowed=excluded.r2_disallowed, multi_bssid=excluded.multi_bssid, "
++		"transmitted_bssid=excluded.transmitted_bssid, est_wmm_be=excluded.est_wmm_be, "
++		"est_wmm_bk=excluded.est_wmm_bk, est_wmm_vi=excluded.est_wmm_vi, "
++		"est_wmm_vo=excluded.est_wmm_vo";
++	struct wifi_bss_element *b = iface->bss;
++	char bssid[18], ruid[18];
++	char wbe[7], wbk[7], wvi[7], wvo[7];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++	if (!b)
++		return;
++
++	mac2str(b->bssid, bssid);
++	mac2str(b->ruid, ruid);
++	bytes2hex(b->est_wmm_be, sizeof(b->est_wmm_be), wbe, sizeof(wbe));
++	bytes2hex(b->est_wmm_bk, sizeof(b->est_wmm_bk), wbk, sizeof(wbk));
++	bytes2hex(b->est_wmm_vi, sizeof(b->est_wmm_vi), wvi, sizeof(wvi));
++	bytes2hex(b->est_wmm_vo, sizeof(b->est_wmm_vo), wvo, sizeof(wvo));
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: bss prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, bssid);
++	mapdb_bind_text(st, 2, ruid);
++	mapdb_bind_text(st, 3, b->ssidlen ? b->ssid : NULL);
++	mapdb_bind_int(st, 4, b->enabled);
++	mapdb_bind_int(st, 5, b->is_fbss);
++	mapdb_bind_int(st, 6, b->is_bbss);
++	mapdb_bind_int(st, 7, b->p1_bsta_disallowed);
++	mapdb_bind_int(st, 8, b->p2_bsta_disallowed);
++	mapdb_bind_int(st, 9, b->sta_assoc_allowed);
++	mapdb_bind_int(st, 10, b->r1_disallowed);
++	mapdb_bind_int(st, 11, b->r2_disallowed);
++	mapdb_bind_int(st, 12, b->multi_bssid);
++	mapdb_bind_int(st, 13, b->transmitted_bssid);
++	mapdb_bind_text(st, 14, wbe);
++	mapdb_bind_text(st, 15, wbk);
++	mapdb_bind_text(st, 16, wvi);
++	mapdb_bind_text(st, 17, wvo);
++	/* fronthaul_use, backhaul_use, akms_fronthaul, akms_backhaul, vlan_id:
++	 * no per-BSS producer in Model A -> left NULL. */
++	stmt_finish(c->db, st);
++}
++
++/* ---- topology_link ---------------------------------------------------- */
++
++void mapc_sync_topology(struct controller *c)
++{
++	static const char *ins_sql =
++		"INSERT INTO topology_link(child_almac, parent_almac, iface_mac, "
++		"parent_iface_mac, media_type, depth, wifi_hops) VALUES(?,?,?,?,?,?,?) "
++		"ON CONFLICT(child_almac, parent_almac, iface_mac) DO UPDATE SET "
++		"parent_iface_mac=excluded.parent_iface_mac, media_type=excluded.media_type, "
++		"depth=excluded.depth, wifi_hops=excluded.wifi_hops";
++	struct bh_topology_dev *dev = NULL;
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	/* bh.* fields are undefined unless the tree is valid (topology.h). */
++	if (!c->topology.valid)
++		return;
++
++	if (mapdb_begin(c->db) != MAPDB_OK) {
++		warn("mapc_sync: topology begin: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++
++	/* Rebuild the edge set wholesale: cheap and keeps stale edges from lingering
++	 * after a re-parent. */
++	if (mapdb_exec(c->db, "DELETE FROM topology_link;") != MAPDB_OK) {
++		warn("mapc_sync: topology clear: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++		return;
++	}
++
++	list_for_each_entry(dev, &c->topology.dev_list, list) {
++		const uint8_t *downstream_mac, *upstream_mac, *upstream_al;
++		char child[18], parent[18], ifmac[18], pifmac[18];
++		uint16_t media_type;
++
++		/* Skip the controller root - it has no upstream BH link. */
++		if (!memcmp(dev->al_macaddr, c->almacaddr, 6))
++			continue;
++
++		downstream_mac = dev->bh.own_iface ? dev->bh.own_iface->macaddr
++						   : dev->al_macaddr;
++		upstream_mac = dev->bh.parent_iface ? dev->bh.parent_iface->macaddr
++						    : c->almacaddr;
++		upstream_al = dev->bh.parent ? dev->bh.parent->al_macaddr
++					     : c->almacaddr;
++		media_type = dev->bh.own_iface ? dev->bh.own_iface->media_type : 0;
++
++		mac2str(dev->al_macaddr, child);
++		mac2str(upstream_al, parent);
++		mac2str(downstream_mac, ifmac);
++		mac2str(upstream_mac, pifmac);
++
++		st = NULL;
++		if (mapdb_prepare(c->db, ins_sql, &st) != MAPDB_OK) {
++			warn("mapc_sync: topology ins prepare: %s\n",
++			     mapdb_last_error(c->db));
++			mapdb_rollback(c->db);
++			return;
++		}
++		mapdb_bind_text(st, 1, child);
++		mapdb_bind_text(st, 2, parent);
++		mapdb_bind_text(st, 3, ifmac);
++		mapdb_bind_text(st, 4, pifmac);
++		mapdb_bind_int(st, 5, media_type);
++		mapdb_bind_int(st, 6, dev->bh.depth);
++		mapdb_bind_int(st, 7, dev->bh.wifi_hops_from_root);
++		if (stmt_finish(c->db, st) != MAPDB_OK) {
++			mapdb_rollback(c->db);
++			return;
++		}
++	}
++
++	if (mapdb_commit(c->db) != MAPDB_OK) {
++		warn("mapc_sync: topology commit: %s\n", mapdb_last_error(c->db));
++		mapdb_rollback(c->db);
++	}
++}
++
++/* ---- maintenance ------------------------------------------------------ */
++
++void mapc_db_checkpoint(struct controller *c)
++{
++	if (!c->db)
++		return;
++
++	if (mapdb_exec(c->db, "PRAGMA wal_checkpoint(TRUNCATE);") != MAPDB_OK)
++		warn("mapc_sync: wal_checkpoint: %s\n", mapdb_last_error(c->db));
++}
+diff -ruN a/src/cntlr.h b/src/cntlr.h
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -29,6 +29,7 @@
+ #include "wifi_dataelements.h"
+ #include "cntlr_events.h"
+ #include "1905_tlvs.h"
++#include "db/mapdb.h"
+ 
+ struct blob_attr;
+ struct cmdu_buff;
+@@ -280,6 +281,11 @@
+ 	son_func_t son_doit;
+ 
+ 	struct wifi_data_element dlem; /* wifi data elements */
++
++	/* Appended at struct END to preserve existing field offsets for the
++	 * prebuilt plugin .so's that dereference struct controller* opaquely. */
++	atimer_t db_checkpoint;	/* periodic WAL checkpoint of mapc.db */
++	mapdb *db;		/* persistence handle (mapc.db); NULL = degraded */
+ };
+ 
+ #define STA_CHANNEL_REPORT_MAX_NUM 32
+diff -ruN a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -58,6 +58,7 @@
+ #include "steer.h"
+ #include "son.h"
+ #include "scan.h"
++#include "db/mapc_sync.h"
+ 
+ #define map_plugin	"ieee1905.map"
+ 
+@@ -2116,6 +2117,16 @@
+ 	timer_set(&c->heartbeat, 1 * 1000);
+ }
+ 
++/* Fold the mapc.db WAL back into the main file every 5 min (self-rearming),
++ * so the -wal doesn't grow unbounded between reboots. Best-effort. */
++static void cntlr_db_checkpoint_run(atimer_t *t)
++{
++	struct controller *c = container_of(t, struct controller, db_checkpoint);
++
++	mapc_db_checkpoint(c);
++	timer_set(&c->db_checkpoint, 300 * 1000);
++}
++
+ void run_controller(void *opts)
+ {
+ 	struct log_options *lopts = (struct log_options *)opts;
+@@ -2205,6 +2216,15 @@
+ 		goto out_exit;
+ 	memcpy(c->cfg.id, c->almacaddr, 6);
+ 
++	/* Open the persistence layer once the AL-MAC (network identity) is known.
++	 * Best-effort: on failure keep running in degraded mode (no recovery graph);
++	 * every mapc_sync_*() is a no-op while c->db is NULL. */
++	c->db = mapdb_open(NULL);
++	if (!c->db)
++		warn("%s: mapdb_open failed, running without persistence\n", __func__);
++	else
++		mapc_sync_network(c);
++
+ 	cmdu_ackq_init(&c->cmdu_ack_q);
+ 	c->cmdu_ack_q.timeout_cb = cntlr_ackq_timeout_cb;
+ 	c->cmdu_ack_q.delete_cb = cntlr_ackq_delete_cb;
+@@ -2243,6 +2263,7 @@
+ 	timer_init(&c->acs, cntlr_acs_run);
+ 	timer_init(&c->steer_sched_timer, cntlr_steer_sched_run);
+ 	timer_init(&c->son_timer, cntlr_son_timer_cb);
++	timer_init(&c->db_checkpoint, cntlr_db_checkpoint_run);
+ 
+ 	timer_set(&c->heartbeat, 1 * 1000);
+ 	timer_set(&c->start_timer, waitext ? 5 * 1000 : 0);
+@@ -2253,6 +2274,9 @@
+ 	if (c->cfg.acs && c->cfg.acs_timeout)
+ 		timer_set(&c->acs, c->cfg.acs_timeout * 1000);
+ 
++	if (c->db)
++		timer_set(&c->db_checkpoint, 300 * 1000);	/* 5 min */
++
+ 	c->evh.cb = cntlr_event_handler;
+ 	ubus_register_event_handler(ctx, &c->evh, "ubus.object.*");
+ 
+@@ -2288,6 +2312,8 @@
+ 	//cntlr_remove_dbg_object(c);	//TODO
+ 	cmdu_ackq_free(&c->cmdu_ack_q);
+ 	cntlr_config_clean(&c->cfg);
++	mapdb_close(c->db);
++	c->db = NULL;
+ 	uloop_done();
+ 	stop_logging();
+ 	free(c);
+diff -ruN a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -56,6 +56,7 @@
+ #include "wifi_dataelements.h"
+ #include "wifi_opclass.h"
+ #include "cntlr_extension.h"
++#include "db/mapc_sync.h"
+ 
+ /* Length of data in CMDU after which we consider that CMDU might might be fragmentized */
+ #define FRAG_DATA_SIZE         (1400)
+@@ -4439,6 +4440,45 @@
+ 	if (n)
+ 		timestamp_update(&n->last_cmdu);
+ 
++	/* Phase 1 persistence: mirror the just-mutated live model into mapc.db.
++	 * Best-effort (no-op while c->db == NULL); delegate all SQL to mapc_sync.c
++	 * and keep this switch to routing which CMDU touched which rows. */
++	if (ret == 0 && n && c->db) {
++		struct netif_radio *r;
++		struct netif_iface *bss;
++
++		switch (cmdutype) {
++		case CMDU_TYPE_TOPOLOGY_RESPONSE:
++			/* topology_link is synced authoritatively from
++			 * topology_build_tree(); don't duplicate it here. */
++			mapc_sync_agent(c, n);
++			list_for_each_entry(r, &n->radiolist, list) {
++				mapc_sync_radio(c, n, r);
++				list_for_each_entry(bss, &r->iflist, list)
++					mapc_sync_bss(c, bss);
++			}
++			break;
++		case CMDU_AP_CAPABILITY_REPORT:
++#if (EASYMESH_VERSION > 5)
++		case CMDU_EARLY_AP_CAPABILITY_REPORT:
++#endif
++			mapc_sync_agent(c, n);
++			list_for_each_entry(r, &n->radiolist, list)
++				mapc_sync_radio(c, n, r);
++			break;
++		case CMDU_OPERATING_CHANNEL_REPORT:
++			/* agent first: radio.agent_almac FKs agent(almac), and an
++			 * Operating Channel Report can arrive before any Topology
++			 * Response on a fresh DB. */
++			mapc_sync_agent(c, n);
++			list_for_each_entry(r, &n->radiolist, list)
++				mapc_sync_radio(c, n, r);
++			break;
++		default:
++			break;
++		}
++	}
++
+ 	cmdu_free(cmdu);
+ 	return ret;
+ }
+diff -ruN a/src/topology.c b/src/topology.c
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -21,6 +21,7 @@
+ #include "utils/utils.h"
+ #include "cntlr_ubus.h"
+ #include "cntlr_events.h"
++#include "db/mapc_sync.h"
+ 
+ static bool is_wifi(uint16_t media_type)
+ {
+@@ -533,6 +534,10 @@
+ 		else
+ 			cntlr_notify_event(c, CNTLR_EVENT_TOPOLOGY_CHANGE, ev_data);
+ 	}
++
++	/* Persist the freshly-built backhaul edge set (topology->valid is now true,
++	 * so bh.* is safe to read). Best-effort; no-op without persistence. */
++	mapc_sync_topology(c);
+ }
+ 
+ #define BH_TOPO_PREFIX "BH:"
+diff -ruN a/src/Makefile b/src/Makefile
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -41,7 +41,8 @@
+ 	son.o \
+ 	cntlr_plugin.o \
+ 	db/mapdb.o \
+-	db/mapdb_sqlite.o
++	db/mapdb_sqlite.o \
++	db/mapc_sync.o
+ 
+ 
+ INCDIR=/usr/include/map-controller

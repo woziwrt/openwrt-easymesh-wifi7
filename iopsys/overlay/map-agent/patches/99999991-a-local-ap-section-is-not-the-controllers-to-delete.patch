@@ -1,0 +1,303 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9999998: an 'ap' section the controller never sent is not the controller's to delete
+
+The autoconfiguration path deletes local 'ap' sections it never created, and on
+the way there it also hands their section to a WSC M2 as if it were a free BSS
+slot. Both are the same mistake: map-agent treats every mapagent 'ap' section as
+controller-provisioned, when two producers write them.
+
+There are two independent routes into the deletion, and both were live.
+
+  handle_ap_autoconfig_wsc()            per WSC M2, per radio
+    wifi_teardown_map_ifaces_by_radio() marks every 'ap' on the radio torndown
+    the M2 loop                         clears the mark only on what the M2 sent
+    wifi_clean_torndown_ifaces_on_radio()
+      "multiap clean_stale_ifaces <ifname>"  ->  uci -q delete
+
+  mlo_process_ap_mld_config()           per AP-MLD Config TLV
+    step 1                              marks every 'ap' that carries an mld_id
+    step 2                              re-affiliates only what the TLV listed
+    wifi_clean_torndown_ifaces()        same deletion, no M2 needed
+
+The victims are bhmld_ap_5 and bhmld_ap_6: the backhaul MLD bookkeeping
+placeholders map_genconfig writes, with ifname='bhmld5'/'bhmld6', mld_id='3' and
+the real radio in 'device'. They exist so that apmld_refresh_data_cb() runs
+apmld_parse() for ap-mld-2 - it only iterates netif_aps whose cfg->mld_id equals
+the MLD id - and they deliberately name an interface that is not a netdev, which
+is why they are separate sections and not mld_id on wlan1-1/wlan2-1 (map-agent
+989 and the note in map_genconfig). The controller has never heard of them. They
+can therefore never survive a mark-and-sweep whose only un-marking rule is "the
+controller sent it back".
+
+Worse than the deletion, and measured on the running controller 2026-09-04: the
+M2 handler does not always get as far as deleting a placeholder, because it
+claims it first. wifi_get_first_available_ifname() returns the first torndown AP
+on the radio, and on radio1 - which no longer had a legacy backhaul section to
+absorb the backhaul M2 - that was bhmld_ap_5:
+
+  mapagent.bhmld_ap_5.ssid='MAP--BH'
+  mapagent.bhmld_ap_5.key=...
+  mapagent.bhmld_ap_5.encryption='sae'
+  mapagent.bhmld_ap_5.bss_index='1'
+  mapagent.bhmld_ap_5.hidden='1'
+
+With an ssid on it the placeholder then answers
+agent_config_get_ap_by_ssid_on_band() for band 5, so it is reused as *the* 5 GHz
+affiliated AP of the backhaul MLD and the real link is never affiliated. On that
+node wlan1-1 is gone from the configuration entirely; a healthy agent has it.
+
+What this costs downstream: re->aplist, the whole runtime AP model, is built
+exclusively from 'ap' sections (agent.c:4762), and mld_parse_affiliated_ap()
+pairs a link to its MLD by ap->band (mld.c:346-348). With the section gone the
+link is not in the TTLM map (agent_tlv.c:4809-4826), assoc_control returns -1 on
+`if (!ap || !ap->cfg)` (agent.c:6198-6200), steering cannot find the client and
+num_sta does not count it.
+
+Fix the ownership, not the sweep. map_genconfig marks its own bookkeeping
+sections with 'option placeholder 1' - it is the producer, so it is the one that
+knows - and map-agent skips them at the two places that raise ap->torndown. That
+covers both deletion routes at their single common cause rather than adding a
+predicate to each of the two sweepers, and it leaves the sweepers doing exactly
+what they should: a section the controller genuinely stopped sending is still
+anonymous, still unmarked, still marked torndown and still deleted. Only
+sections whose producer has declared them non-provisionable are exempt, and
+map_genconfig rewrites those on every boot anyway, so exempting them costs
+nothing even if one were stale.
+
+The candidate-selection sites get the same guard rather than relying on the
+teardown guard alone, because agent_init_interfaces() raises ap->torndown for
+the duration of a refresh cycle too, and since 970 that cycle is asynchronous.
+Two of them are reachable without any torndown flag at all: the "expected_id /
+unaffiliated" loop in mlo_process_ap_mld_config() matches on multi_ap and
+mld_id, and a placeholder is backhaul type carrying the local backhaul mld_id -
+it matches both.
+
+The sweep itself gets the guard too, at wifi_clean_torndown_ifaces() and
+wifi_clean_torndown_ifaces_on_radio(). On the paths known today that is
+unreachable - the two places that raise the flag already skip placeholders - so
+it is a second line rather than the fix. It is there because ap->torndown is
+raised wholesale in agent_init_interfaces() as well, for the duration of a
+refresh cycle that has been asynchronous since 970, and that is the one function
+where the deletion is actually carried out.
+
+Not fixed here, deliberately: clean_stale_ifaces does not run "wifi reload", so
+a deletion is invisible to hostapd until something else reloads. That is a
+separate matter and it should stay separate. Since 989 map-agent does not own a
+wireless section for an MLD-affiliated link at all, so there is nothing for a
+reload to apply on this hardware; the agent has its own reload_scheduler and
+AGENT_RECONFIG_REASON_* path for what it does own; and a reload inside a
+per-interface cleanup that runs in a loop would restart every BSS on the box
+once per removed section - the deauth/reassoc storm 979 argues against. The
+right fix for the divergence is that these sections stop being deleted, which is
+this patch.
+
+How to tell this worked, on hardware: after a sysupgrade of the controller,
+
+  uci show mapagent | grep bhmld_ap_
+
+must list bhmld_ap_5 and bhmld_ap_6 with type, device, ifname, band, mld_id and
+placeholder - and with no ssid, key, encryption, bss_index or hidden - while
+`uci show mapagent | grep -c "ifname='wlan1-1'"` returns 1. If instead a
+placeholder carries an ssid again, the claim is coming from a selection site
+this patch did not cover.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/config.h
++++ b/src/config.h
+@@ -120,6 +120,15 @@
+ 	bool enabled;
+ 	bool sta_steer_enabled;
+ 	bool assoc_control;
++	/** Locally owned bookkeeping section, never a BSS the controller
++	 *  provisions. Set from 'option placeholder' which map_genconfig writes
++	 *  on the bhmld_ap_<band> sections: they exist so that apmld_parse()
++	 *  runs for the backhaul AP-MLD and they name an interface that is
++	 *  deliberately not a netdev. The controller never sends them in an M2,
++	 *  so the mark-and-sweep in the autoconfiguration path would delete
++	 *  them on every WSC M2 - see wifi_teardown_map_ifaces_by_radio().
++	 */
++	bool placeholder;
+ #if (EASYMESH_VERSION > 2)
+ 	bool advertise_cce;
+ #endif
+--- a/src/config.c
++++ b/src/config.c
+@@ -3192,6 +3192,7 @@
+ 		AP_TYPE,
+ 		AP_BSTA_DISALLOW,
+ 		AP_DISALLOW_ASSOC,
++		AP_PLACEHOLDER,
+ #if (EASYMESH_VERSION >= 6)
+ 		AP_MLD_ID,
+ 		AP_HIDDEN,
+@@ -3215,6 +3216,7 @@
+ 		[AP_TYPE] = { .name = "type", .type = UCI_TYPE_STRING },
+ 		[AP_BSTA_DISALLOW] = { .name = "disallow_bsta_profile", .type = UCI_TYPE_LIST },
+ 		[AP_DISALLOW_ASSOC] = { .name = "disallow_assoc", .type = UCI_TYPE_STRING },
++		[AP_PLACEHOLDER] = { .name = "placeholder", .type = UCI_TYPE_STRING },
+ #if (EASYMESH_VERSION >= 6)
+ 		[AP_MLD_ID] = { .name = "mld_id", .type = UCI_TYPE_STRING },
+ 		[AP_HIDDEN] = { .name = "hidden", .type = UCI_TYPE_STRING },
+@@ -3371,6 +3373,14 @@
+ 	if (tb[AP_DISALLOW_ASSOC])
+ 		ap->disallow_assoc = atoi(tb[AP_DISALLOW_ASSOC]->v.string);
+ 
++	/* Who owns this section. Default false: every section map-agent itself
++	 * writes through uci_apply_wps_credentials() is controller-provisioned
++	 * and stays subject to the ordinary teardown sweep. Only map_genconfig
++	 * sets the option, and only on its bhmld_ap_<band> bookkeeping sections.
++	 */
++	if (tb[AP_PLACEHOLDER])
++		ap->placeholder = !!atoi(tb[AP_PLACEHOLDER]->v.string);
++
+ #if (EASYMESH_VERSION >= 6)
+ 	if (tb[AP_MLD_ID])
+ 		ap->mld_id = atoi(tb[AP_MLD_ID]->v.string);
+--- a/src/agent_map.c
++++ b/src/agent_map.c
+@@ -1788,6 +1788,18 @@
+ 		if (strncmp(apcfg->device, device, sizeof(apcfg->device) - 1))
+ 			continue;
+ 
++		/* A locally owned bookkeeping section is not the controller's
++		 * to tear down. This sweep marks every 'ap' section on the
++		 * radio and relies on the M2 loop below to clear the mark on
++		 * the ones the controller re-sent; the bhmld_ap_<band>
++		 * placeholders are never sent in an M2 - they exist only so
++		 * that apmld_parse() runs for the backhaul AP-MLD - so the
++		 * mark always survives and wifi_clean_torndown_ifaces_on_radio()
++		 * deletes them through 'multiap clean_stale_ifaces'.
++		 */
++		if (apcfg->placeholder)
++			continue;
++
+ 		wifi_teardown_iface(apcfg->name);
+ 		ap = agent_get_ap_by_ifname(a, apcfg->name);
+ 		if (ap)
+@@ -1901,6 +1913,12 @@
+ 		if (!ap->cfg)
+ 			continue;
+ 
++		/* Never hand controller credentials to a locally owned
++		 * bookkeeping section - see wifi_get_first_available_ifname().
++		 */
++		if (ap->cfg->placeholder)
++			continue;
++
+ 		if (strncmp(ap->cfg->ssid, ssid, 32))
+ 			continue;
+ 
+@@ -1920,6 +1938,26 @@
+ 		if (!ap->torndown)
+ 			continue;
+ 
++		/* A locally owned bookkeeping section is not a free BSS slot.
++		 *
++		 * Measured on the controller 2026-09-04: radio1 had no legacy
++		 * backhaul section left, so the backhaul M2 fell through to
++		 * this function, got bhmld_ap_5 - which had just been marked
++		 * torndown by wifi_teardown_map_ifaces_by_radio() - and wrote
++		 * ssid='MAP--BH', key, encryption='sae', bss_index='1' and
++		 * hidden='1' into it. The placeholder then answered
++		 * agent_config_get_ap_by_ssid_on_band() for band 5, so the
++		 * real 5 GHz backhaul link was never affiliated and wlan1-1
++		 * was gone from the configuration altogether.
++		 *
++		 * The teardown guard above already keeps placeholders out of
++		 * the torndown set; this check stands on its own because
++		 * agent_init_interfaces() also raises ap->torndown for the
++		 * duration of an (asynchronous, see 970) refresh cycle.
++		 */
++		if (ap->cfg && ap->cfg->placeholder)
++			continue;
++
+ 		strncpy(ifname, ap->ifname, IFNAMSIZ - 1);
+ 		return ap;
+ 	}
+@@ -2214,6 +2252,20 @@
+ 
+ 	/* 1: mark affiliated APs as torndown; keep mld_id as a hint for step 2 */
+ 	list_for_each_entry(apcfg, &a->cfg.aplist, list) {
++		/* Second, independent route to the same deletion, and the one
++		 * that fires even when no WSC M2 is involved: this marks every
++		 * 'ap' section that carries an mld_id, and the bhmld_ap_<band>
++		 * placeholders carry mld_id='3' by construction - that is the
++		 * whole reason they exist. The controller has no MLD 3 to send
++		 * back, so step 2 never clears the mark and
++		 * wifi_clean_torndown_ifaces() at the end of this function
++		 * deletes them. The local backhaul MLD is owned by
++		 * map_genconfig, exactly as 978 and 979 established for the
++		 * mld sections themselves.
++		 */
++		if (apcfg->placeholder)
++			continue;
++
+ 		if (apcfg->mld_id) {
+ 			struct netif_ap *ap;
+ 
+@@ -2316,6 +2368,9 @@
+ 					list_for_each_entry(existing, &re->aplist, list) {
+ 						if (!existing->cfg)
+ 							continue;
++						/* not a provisionable BSS */
++						if (existing->cfg->placeholder)
++							continue;
+ 						if (!strcmp(existing->cfg->ssid,
+ 							    (char *)ssid)) {
+ 							ap = existing;
+@@ -2331,7 +2386,15 @@
+ 
+ 					list_for_each_entry(existing,
+ 							    &re->aplist, list) {
++						/* A placeholder is backhaul type
++						 * and already carries the local
++						 * backhaul mld_id, so it matches
++						 * both tests below and would be
++						 * handed the credentials. It is
++						 * not a BSS - skip it.
++						 */
+ 						if (!existing->cfg ||
++						    existing->cfg->placeholder ||
+ 						    existing->cfg->multi_ap !=
+ 						    apcfg->multi_ap)
+ 							continue;
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -5473,6 +5473,26 @@
+ 		if (!ap->torndown)
+ 			continue;
+ 
++		/* The last stop before the uci delete.
++		 *
++		 * wifi_clean_iface() runs "multiap clean_stale_ifaces <ifname>",
++		 * which deletes every mapagent 'ap' section carrying that name
++		 * (script/multiap:927). The claim being acted on is "the
++		 * controller stopped sending this one", and that claim can only
++		 * be made about a section the controller provisions at all.
++		 *
++		 * The two places that raise the flag already skip placeholders,
++		 * so on the paths known today this is unreachable - it is a
++		 * second line, not the fix. It is here because ap->torndown is
++		 * also raised wholesale in agent_init_interfaces() for the
++		 * duration of a refresh cycle, and since 970 that cycle is
++		 * asynchronous: a path that leaves the flag set on a placeholder
++		 * arrives here, at the one place where the deletion is actually
++		 * carried out. Cheap to hold the line at the gate as well.
++		 */
++		if (ap->cfg && ap->cfg->placeholder)
++			continue;
++
+ 		wifi_clean_iface(ap->ifname);
+ 		clean_ap(ap->cfg);
+ 		netif_free(ap);
+@@ -5492,6 +5512,9 @@
+ 		list_for_each_entry_safe(ap, ap_tmp, &re->aplist, list) {
+ 			if (!ap->torndown)
+ 				continue;
++			/* see wifi_clean_torndown_ifaces_on_radio() */
++			if (ap->cfg && ap->cfg->placeholder)
++				continue;
+ 			wifi_clean_iface(ap->ifname);
+ 			clean_ap(ap->cfg);
+ 			netif_free(ap);

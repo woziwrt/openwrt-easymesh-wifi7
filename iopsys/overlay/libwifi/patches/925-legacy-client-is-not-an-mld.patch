@@ -1,0 +1,90 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: a legacy client on an MLD AP is not an MLD
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Fixes a second defect in 922. An AP-MLD also serves ordinary, non-MLO
+clients, and 922 published the mlo_* fields for every station on an MLD link
+regardless. map-agent then called stamld_update() for a legacy client and
+stored it as a single-link MLD that is its own MLD.
+
+Measured on bpi-4g, 2026-08-04. The controller held a sta_mld row for
+b8:09:8a:50:f2:2a - a Mac reporting [HT][VHT] and no EHT - plus an
+affiliated_sta row pointing at itself. In the mesh table that showed as two
+MLO clients where only one of the three stations is actually MLO.
+
+The discriminator is the affiliated address itself: hostapd reports
+peer_addr[] only for a real MLO station. Measured on the same link socket:
+three peer_addr lines for the MLO phone, none for the legacy Mac. So publish
+the MLO block only when that lookup produced an address, and otherwise emit
+plain macaddr + bssid, which is the truth about a legacy client.
+
+A disconnect arriving after the mapping was lost - a wifimngr restart clears
+it - now also publishes without the MLO fields. That is the safer of the two
+failure modes: an incomplete event rather than an invented MLD.
+
+Applies on top of 924-bss-entry-of-this-socket.patch.
+
+--- a/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 17:48:51.902733513 +0200
++++ b/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 17:48:51.902777563 +0200
+@@ -1047,23 +1047,49 @@
+ 	if (hapdctrl_sock_info(s))
+ 		return;
+ 
++	/* 925: an MLD AP also serves ordinary clients, and they are not MLDs.
++	 *
++	 * Emitting the mlo_* fields for every station on an MLD link made
++	 * map-agent call stamld_update() for a legacy client, which stored it
++	 * as a single-link MLD that is its own MLD. Measured on bpi-4g
++	 * 2026-08-04: the Mac (legacy, [HT][VHT], no EHT) had a sta_mld row of
++	 * its own and an affiliated_sta row pointing at itself.
++	 *
++	 * The discriminator is the affiliated address itself: "STA <mac>"
++	 * reports peer_addr[] only for a real MLO station - three lines for the
++	 * MLO phone, none for the legacy Mac. So publish the MLO block only
++	 * when that lookup actually produced an address, and otherwise emit a
++	 * plain macaddr + bssid, which is the truth about a legacy client.
++	 *
++	 * A disconnect after the mapping was lost (a wifimngr restart clears
++	 * it) also lands here and is published without the MLO fields. That is
++	 * the safer of the two failure modes: an incomplete event, not an
++	 * invented MLD.
++	 */
+ 	if (s->link_id >= 0) {
++		bool have_aff = false;
++
+ 		if (add) {
+-			if (!hapdctrl_affiliated_mac(s, mld, aff))
++			if (hapdctrl_affiliated_mac(s, mld, aff) == 0) {
+ 				hapdctrl_stamap_store(s, mld, aff);
+-			else if (hapdctrl_stamap_get(s, mld, aff, false))
+-				memcpy(aff, mld, 6);
+-		} else if (hapdctrl_stamap_get(s, mld, aff, true)) {
+-			memcpy(aff, mld, 6);
++				have_aff = true;
++			} else if (hapdctrl_stamap_get(s, mld, aff, false) == 0) {
++				have_aff = true;
++			}
++		} else if (hapdctrl_stamap_get(s, mld, aff, true) == 0) {
++			have_aff = true;
+ 		}
+-		sta = aff;
+ 
+-		snprintf(mlo, sizeof(mlo),
+-			 ", \"mlo_macaddr\":\"" HAPD_MACFMT "\""
+-			 ", \"mlo_bssid\":\"" HAPD_MACFMT "\""
+-			 ", \"mlo_link_id\":%d",
+-			 HAPD_MACARG(mld), HAPD_MACARG(s->mld_addr),
+-			 s->link_id);
++		if (have_aff) {
++			sta = aff;
++
++			snprintf(mlo, sizeof(mlo),
++				 ", \"mlo_macaddr\":\"" HAPD_MACFMT "\""
++				 ", \"mlo_bssid\":\"" HAPD_MACFMT "\""
++				 ", \"mlo_link_id\":%d",
++				 HAPD_MACARG(mld), HAPD_MACARG(s->mld_addr),
++				 s->link_id);
++		}
+ 	}
+ 
+ 	len = snprintf((char *)resp->data, resp->maxlen,

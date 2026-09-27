@@ -1,0 +1,79 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: initialise the list head a station hangs on
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+sta_alloc() calloc's the station and then initialises every list in it except
+the one that attaches it to a node. That head stays {NULL, NULL}.
+
+It is not cosmetic. A station carries ONE such head, so linking it into a
+second node's list without unlinking it from the first splices the two lists
+together and an iteration over either never ends. The guard that would prevent
+that - "is this station already attached to somebody?" - is list_empty(), and
+on {NULL, NULL} list_empty() answers false for a station attached to nothing.
+The question cannot be asked correctly today.
+
+What it costs when it goes wrong, measured on the live mesh 2026-09-06 14:55:
+
+    95642 log lines in 32 seconds, ~3000 a second
+    from a collection whose timer fires once a second
+
+The walk was not being repeated 3000 times. It was never returning. VSZ went
+20 MB -> 850 MB, ubus stopped answering, no agent was processed for nine
+minutes, every node aged past NODE_DRAW_MAX_AGE, and the entire topology
+disappeared from the web UI.
+
+The trigger needs no client misbehaviour: a client that moves ONCE leaves the
+old AP holding a stale association - measured the same day, ba:a9:1b:53:17:82
+idle for 279 s on the node it had left while live on another. Two nodes then
+report the same client, which is a normal state during any handover, and the
+controller runs remove-from-old / add-to-new. One missed removal is enough.
+
+This patch does not fix the splice. It makes a correct fix possible: any guard
+written on top of {NULL, NULL} is guessing.
+
+An earlier attempt in this series dropped stations whose agent address was
+zero. That was a symptom treatment and is withdrawn: it would have silenced
+the one message that says the lists are corrupt, and it deleted entries while
+walking a list already known to be broken.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
+
+--- a/src/sta.c
++++ b/src/sta.c
+@@ -56,6 +56,35 @@
+ 		return NULL;
+ 
+ 	memcpy(s->macaddr, macaddr, 6);
++
++	/* The list head a station is attached to a node by.
++	 *
++	 * calloc leaves it {NULL, NULL}, and every other list in this struct is
++	 * initialised right below - this one was simply missed. It matters in
++	 * two ways that only show up later:
++	 *
++	 *   list_empty(&s->list) answers "false" on a station that is attached
++	 *   to nothing, so the one question worth asking before linking it -
++	 *   "is this station already in somebody's list?" - cannot be asked at
++	 *   all;
++	 *
++	 *   list_del() on a station that was never linked walks a NULL prev.
++	 *
++	 * A station carries ONE such head, so linking it into a second node's
++	 * list without unlinking it from the first splices the two lists
++	 * together, and an iteration over either of them never ends. Measured
++	 * 2026-09-06: 95642 log lines in 32 seconds, ~3000 a second, from a
++	 * loop whose timer fires once a second - the walk was not being
++	 * repeated, it was never returning. VSZ 20 MB -> 850 MB, ubus mute, no
++	 * agent processed for nine minutes, and the whole topology gone from
++	 * the web UI.
++	 *
++	 * This does not fix that. It makes it possible to fix: without a valid
++	 * head there is no correct way to ask whether a station is already
++	 * attached, and any guard written on top of {NULL, NULL} is guessing.
++	 */
++	INIT_LIST_HEAD(&s->list);
++
+ 	timer_init(&s->bcn_metrics_timer, cntlr_bcn_metrics_timer_cb);
+ 	timer_init(&s->btm_req_timer, cntlr_btm_req_timer_cb);
+ 	timer_init(&s->ageout_timer, cntlr_sta_ageout_timer_cb);

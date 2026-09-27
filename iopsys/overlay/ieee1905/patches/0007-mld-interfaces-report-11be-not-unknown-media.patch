@@ -1,0 +1,73 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905 0007: an MLD interface knows its media type by name
+
+Every Wi-Fi interface on our nodes advertises mediatype 0xffff
+(I1905_MEDIA_UNKNOWN) in the Device Information TLV. Measured on the wire
+2026-07-31 with LOG_TX at debug level, on all three nodes:
+
+  [ap-mld-1]    media = 0xffff  ->  WARN mediainfo == NULL
+  [ap-mld-2]    media = 0xffff  ->  WARN mediainfo == NULL
+  [bsta-mld-3]  media = 0xffff  ->  WARN mediainfo == NULL
+
+Those three are the only live Wi-Fi interfaces of the node. The correct value
+for all of them is 0x0109 (802.11be).
+
+The cause is our own patch 0001. It stops i1905_add_interface() from probing
+mediainfo for 4addr children and MLD affiliated APs, because that probe blocks
+the daemon on hostapd's control socket. (0001 used to blame an unterminated mt76
+GET_STATION dump; that was never measured and is wrong - see its correction.) The
+bypass is right and stays. What it also did, silently, was give up the media
+type - and the media type never needed the probe at all, because an MLD is
+802.11be by definition and the name already says so.
+
+The value goes straight onto the wire:
+
+  BUF_PUT_BE16(liface->mediatype, ifs->media);      cmdu_output.c:311
+
+and the same function shows that leaving mediainfo NULL costs nothing here: for
+11ax and 11be it sets sizeof_mediainfo = 0 and emits no ieee80211_info block at
+all. The TLV produced after this patch is therefore byte for byte identical to
+the one a successful probe would have produced, with the one field that was
+wrong now right.
+
+Only the creation path needs changing. i1905_al.c also assigns
+I1905_MEDIA_UNKNOWN while refreshing an interface, but that assignment sits
+inside "if (!iface->skip_wifi_probe)", so for exactly these interfaces it never
+runs and the value set here survives.
+
+".staN" children are handled by name rather than by assumption: such a child is
+802.11be only when its parent is an MLD. A legacy backhaul keeps UNKNOWN, which
+is wrong but no more wrong than before, and it is not something this patch can
+learn without the syscall it exists to avoid.
+
+--- a/src/i1905.c	2026-08-01 12:08:30.764469964 +0200
++++ b/src/i1905.c	2026-08-01 12:08:30.764532665 +0200
+@@ -367,7 +367,27 @@
+ 		if (priv->add_iface_wifi_backhaul ||
+ 		    strstr(ifname, ".sta") || !strncmp(ifname, "ap-mld", 6)) {
+ 			info("%s: 4addr/MLD affiliated - skip wifi probe\n", ifname);
+-			n->media = I1905_MEDIA_UNKNOWN;
++			/* What we skip here is the probe, not the media type.
++			 * For an interface that belongs to an MLD the type is
++			 * known from the name alone - MLD is 802.11be by
++			 * definition - and reporting I1905_MEDIA_UNKNOWN made
++			 * every Wi-Fi interface of this node advertise 0xffff
++			 * in its Device Information TLV.
++			 *
++			 * Nothing is lost by leaving mediainfo NULL. For 11ax
++			 * and 11be cmdu_output.c omits the ieee80211_info block
++			 * regardless (sizeof_mediainfo = 0), so the TLV this
++			 * produces is byte for byte the one a successful probe
++			 * would have produced.
++			 *
++			 * A ".staN" 4addr child is 11be only when its parent is
++			 * an MLD, so test the name for "-mld" rather than
++			 * assuming it: a legacy backhaul keeps UNKNOWN, which is
++			 * at least honest. No syscall either way, which is the
++			 * whole point of this branch.
++			 */
++			n->media = strstr(ifname, "-mld") ? I1905_802_11BE
++							  : I1905_MEDIA_UNKNOWN;
+ 			n->num_mediainfo = 0;
+ 			n->mediainfo = NULL;
+ 			n->authenticated = true;

@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# START=18: before wnm-enable (19) and before netifd brings wifi up (20), so a
+# legacy BSS that genconfig recreated during driver probe never goes on the air
+# and never takes a BSS slot from the MLD interfaces.
+#
+# The work hangs on boot(), not start(), and that distinction is the whole
+# point. rcS calls every S* script with "boot"; base-files default_postinst
+# calls "start" on every init script a package ships, on install and on upgrade
+# alike. Same script, two moments that could not be more different - one is a
+# node coming up with no radios yet, the other is a node already on the air.
+#
+# The worker also refuses to run outside a ten-minute boot window, but that is
+# a guess from uptime and it guesses wrong exactly when it matters: installing
+# the package a few minutes after a flash lands inside the window, so the
+# cleanup deleted BSSes from underneath a running hostapd anyway. Measured
+# 2026-08-12 - the air went from four interfaces to one during an apk add, and
+# an identical procedure run at a different minute did something different.
+# Asking the init system what it is doing beats inferring it from a clock.
+
+START=18
+
+boot() {
+	/usr/sbin/drop-legacy-fronthaul
+}
+
+start() {
+	echo "drop-legacy-fronthaul: boot only - it runs itself on the next restart" >&2
+}

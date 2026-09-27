@@ -1,0 +1,390 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: phase2 recovery
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+map-controller: Phase 2 DB recovery - db_restore() on controller boot
+
+ADR-0003 Phase 2 (the flagship payoff of the mapdb persistence layer): on
+controller boot, hydrate the live model from mapc.db so the mesh topology is
+"warm" at t=0 and a powercycle recovers deterministically instead of a cold
+rediscovery. The inverse of the Phase-1 write hooks, using the same
+engine-neutral mapdb read primitives (mapdb_prepare/step/column_*/finalize).
+
+- src/db/mapc_sync.c: add db_restore() + reverse marshalling helpers
+  (str2mac/hex2bytes) and per-table restore functions for the 7 recovery-graph
+  tables (agent/radio/operating_class/radio_caps/bss/topology_link). It is a
+  strict no-op on a fresh/empty DB (guarded by an agent-count probe) so it never
+  perturbs the normal cold-boot discovery + Phase-1 write path. Warm entries are
+  seeded via the keyed find-or-alloc constructors (in-place upsert, no dup);
+  live Topology/Cap responses confirm-or-overwrite them, and any ghost ages out
+  via the existing NODE_EXPIRE_TIME(65s) path. It deliberately does NOT force
+  c->topology.valid (that would skip the live topology build that persists
+  agent/radio/bss) - the live tree build re-confirms and re-writes.
+- src/db/mapc_sync.h: db_restore() prototype.
+- src/cntlr.c: include db/mapc_sync.h and call db_restore(c) in run_controller()
+  after the AL-MAC + UCI nodelist are ready, before the discovery timers arm.
+
+No struct fields added (append-only ABI rule preserved). Best-effort: a NULL
+c->db or any prepare/step error degrades to today's cold-discovery behaviour.
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -28,6 +28,7 @@
+ #include "db/mapdb.h"
+ #include "db/mapc_sync.h"
+ #include "utils/debug.h"
++#include "timeutils.h"
+ 
+ /* ---- small marshalling helpers ---------------------------------------- */
+ 
+@@ -492,3 +493,326 @@
+ 	if (mapdb_exec(c->db, "PRAGMA wal_checkpoint(TRUNCATE);") != MAPDB_OK)
+ 		warn("mapc_sync: wal_checkpoint: %s\n", mapdb_last_error(c->db));
+ }
++
++/* ====================================================================== */
++/* Phase 2 (ADR-0003): RECOVERY - db_restore().                           */
++/* On controller boot, hydrate the live model from mapc.db so the topology */
++/* is "warm" at t=0; live discovery only confirms-or-overwrites it, and    */
++/* any ghost (node powered off while the controller was down) ages out via */
++/* the existing NODE_EXPIRE_TIME(65s) path. Inverse of the Phase-1 write   */
++/* helpers, using the same engine-neutral mapdb read primitives. Best-     */
++/* effort throughout: c->db == NULL or any prepare/step error -> the graph  */
++/* is simply not seeded and the controller falls back to cold discovery.   */
++/* ====================================================================== */
++
++/* "aa:bb:.." TEXT column -> 6-byte MAC. Returns 0 on success. */
++static int str2mac(const char *s, uint8_t *mac)
++{
++	if (!s || !hwaddr_aton(s, mac))
++		return -1;
++	return 0;
++}
++
++/* Contiguous lowercase hex TEXT -> up to @max bytes; returns #bytes decoded. */
++static int hex2bytes(const char *s, uint8_t *out, size_t max)
++{
++	size_t n = 0;
++
++	if (!s)
++		return 0;
++	while (s[0] && s[1] && n < max) {
++		unsigned int v;
++
++		if (sscanf(s, "%2x", &v) != 1)
++			break;
++		out[n++] = (uint8_t)v;
++		s += 2;
++	}
++	return (int)n;
++}
++
++/* ---- 1. agents (nodes -> agentlist) ---------------------------------- */
++static void restore_agents(struct controller *c)
++{
++	static const char *sql =
++		"SELECT almac, node_type, profile, multiap_caps, depth, uplink_type, "
++		"upstream_bssid, est_thput_ul, est_thput_dl, scan_supported, sta_count, "
++		"max_mld_num, max_aplink_num, max_bstalink_num, tid_link_caps FROM agent";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("db_restore: agent prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t almac[6], upbssid[6], capbuf[1];
++		struct node *n;
++
++		if (str2mac(mapdb_column_text(st, 0), almac))
++			continue;
++		if (!memcmp(almac, c->almacaddr, 6))	/* never re-materialize self */
++			continue;
++
++		n = cntlr_alloc_node(c, almac);		/* find-or-alloc, keyed by AL-MAC */
++		if (!n)
++			continue;
++
++		n->type          = (enum nodetype)mapdb_column_int(st, 1);
++		n->map_profile   = (uint8_t)mapdb_column_int(st, 2);
++		if (hex2bytes(mapdb_column_text(st, 3), capbuf, 1) == 1)
++			n->ap_cap = capbuf[0];
++		n->depth         = (int)mapdb_column_int(st, 4);
++		n->ul_type       = (int)mapdb_column_int(st, 5);
++		if (!str2mac(mapdb_column_text(st, 6), upbssid))
++			memcpy(n->upstream_bssid, upbssid, 6);
++		n->est_thput_ul   = (uint32_t)mapdb_column_int(st, 7);
++		n->est_thput_dl   = (uint32_t)mapdb_column_int(st, 8);
++		n->scan_supported = (bool)mapdb_column_int(st, 9);
++		n->sta_count      = (uint32_t)mapdb_column_int(st, 10);
++#if (EASYMESH_VERSION >= 6)
++		n->max_mld_num      = (int)mapdb_column_int(st, 11);
++		n->max_aplink_num   = (int)mapdb_column_int(st, 12);
++		n->max_bstalink_num = (int)mapdb_column_int(st, 13);
++		n->tid_link_caps    = (int)mapdb_column_int(st, 14);
++#endif
++		timestamp_update(&n->last_tsp_seen);	/* grace; reaped at 65s if unconfirmed */
++		cntlr_mark_agent(c, n);
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- 2. radios (scalars) --------------------------------------------- */
++static void restore_radios(struct controller *c)
++{
++	static const char *sql =
++		"SELECT ruid, agent_almac, band, enabled, tx_streams, rx_streams, "
++		"max_bssnum, num_bss, steer_policy, channel_util_thresh, rcpi_steer_thresh, "
++		"anpi_noise, total_utilization, ts_combined_fh, ts_combined_bh, chipset_vendor "
++		"FROM radio";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t ruid[6], almac[6];
++		struct node *n;
++		struct netif_radio *r;
++		struct wifi_radio_element *re;
++		const char *vendor;
++
++		if (str2mac(mapdb_column_text(st, 0), ruid) ||
++		    str2mac(mapdb_column_text(st, 1), almac))
++			continue;
++		n = cntlr_find_node(c, almac);		/* parent restored above */
++		if (!n)
++			continue;
++		r = cntlr_node_add_radio(c, n, ruid);	/* find-or-alloc, keyed by RUID */
++		if (!r)
++			continue;
++		re = r->radio_el;
++		re->band                  = (enum wifi_band)mapdb_column_int(st, 2);
++		re->enabled               = (bool)mapdb_column_int(st, 3);
++		re->tx_streams            = (uint8_t)mapdb_column_int(st, 4);
++		re->rx_streams            = (uint8_t)mapdb_column_int(st, 5);
++		re->max_bssnum            = (uint8_t)mapdb_column_int(st, 6);
++		re->num_bss               = (uint32_t)mapdb_column_int(st, 7);
++		re->steer_policy          = (uint8_t)mapdb_column_int(st, 8);
++		re->channel_util_threshold = (uint8_t)mapdb_column_int(st, 9);
++		re->rcpi_steer_threshold  = (uint8_t)mapdb_column_int(st, 10);
++		re->anpi                  = (uint8_t)mapdb_column_int(st, 11);
++		re->total_utilization     = (uint8_t)mapdb_column_int(st, 12);
++		re->ts_combined_fronthaul = (int)mapdb_column_int(st, 13);
++		re->ts_combined_backhaul  = (int)mapdb_column_int(st, 14);
++		vendor = mapdb_column_text(st, 15);
++		if (vendor)
++			snprintf(re->vendor, sizeof(re->vendor), "%s", vendor);
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- 3. operating classes (cur_opclass; BEFORE bss for band derivation) */
++static void restore_opclasses(struct controller *c)
++{
++	static const char *sql =
++		"SELECT ruid, opclass, channel, max_tx_power FROM operating_class ORDER BY ruid";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t ruid[6];
++		struct netif_radio *r;
++		struct wifi_radio_opclass *oc;
++		struct wifi_radio_opclass_entry *e;
++
++		if (str2mac(mapdb_column_text(st, 0), ruid))
++			continue;
++		r = cntlr_find_radio(c, ruid);
++		if (!r)
++			continue;
++		oc = &r->radio_el->cur_opclass;
++		if (oc->num_opclass >= (int)(sizeof(oc->opclass) / sizeof(oc->opclass[0])))
++			continue;
++		e = &oc->opclass[oc->num_opclass++];
++		e->id                 = (uint8_t)mapdb_column_int(st, 1);
++		e->max_txpower        = (int)mapdb_column_int(st, 3);
++		e->num_channel        = 1;
++		e->channel[0].channel = (uint8_t)mapdb_column_int(st, 2);
++		e->band               = wifi_opclass_get_band(e->id);
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- 4. radio_caps (R6 Wi-Fi7 scalars + num_opclass) ----------------- */
++static void restore_radio_caps(struct controller *c)
++{
++	static const char *sql =
++		"SELECT ruid, wifi7_emlmr, wifi7_emlsr, wifi7_str, wifi7_nstr, "
++		"wifi7_tidlinkmap, wifi7_nmlo_sta, num_opclass FROM radio_caps";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t ruid[6];
++		struct netif_radio *r;
++		struct wifi_radio_element *re;
++
++		if (str2mac(mapdb_column_text(st, 0), ruid))
++			continue;
++		r = cntlr_find_radio(c, ruid);
++		if (!r)
++			continue;
++		re = r->radio_el;
++#if (EASYMESH_VERSION >= 6)
++		re->wifi7caps_ap.emlmr      = (uint8_t)mapdb_column_int(st, 1);
++		re->wifi7caps_ap.emlsr      = (uint8_t)mapdb_column_int(st, 2);
++		re->wifi7caps_ap.str        = (uint8_t)mapdb_column_int(st, 3);
++		re->wifi7caps_ap.nstr       = (uint8_t)mapdb_column_int(st, 4);
++		re->wifi7caps_ap.tidlinkmap = (uint8_t)mapdb_column_int(st, 5);
++		re->wifi7caps_ap_support_nmlo_sta = (bool)mapdb_column_int(st, 6);
++#endif
++		re->supp_opclass.num_opclass = (int)mapdb_column_int(st, 7);
++		/* raw ht/vht/he blobs intentionally not rehydrated; live AP Cap Report
++		 * refills them within the discovery window. */
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- 5. BSSes -------------------------------------------------------- */
++static void restore_bss(struct controller *c)
++{
++	static const char *sql =
++		"SELECT bssid, ruid, ssid, enabled, is_fbss, is_bbss, p1_bsta_disallowed, "
++		"p2_bsta_disallowed, assoc_allowed, r1_disallowed, r2_disallowed, "
++		"multi_bssid, transmitted_bssid, est_wmm_be, est_wmm_bk, est_wmm_vi, "
++		"est_wmm_vo FROM bss";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t bssid[6], ruid[6];
++		struct netif_radio *r;
++		struct netif_iface *iface;
++		struct wifi_bss_element *b;
++		const char *ssid;
++
++		if (str2mac(mapdb_column_text(st, 0), bssid) ||
++		    str2mac(mapdb_column_text(st, 1), ruid))
++			continue;
++		r = cntlr_find_radio(c, ruid);
++		if (!r)
++			continue;
++		iface = cntlr_radio_add_iface(c, r, bssid);	/* find-or-alloc by BSSID */
++		if (!iface || !iface->bss)
++			continue;
++		b = iface->bss;
++		memcpy(b->ruid, ruid, 6);
++		ssid = mapdb_column_text(st, 2);
++		if (ssid) {
++			snprintf(b->ssid, sizeof(b->ssid), "%s", ssid);
++			b->ssidlen = (uint8_t)strlen(b->ssid);
++		}
++		b->enabled            = (bool)mapdb_column_int(st, 3);
++		b->is_fbss            = (bool)mapdb_column_int(st, 4);
++		b->is_bbss            = (bool)mapdb_column_int(st, 5);
++		b->p1_bsta_disallowed = (uint8_t)mapdb_column_int(st, 6);
++		b->p2_bsta_disallowed = (uint8_t)mapdb_column_int(st, 7);
++		b->sta_assoc_allowed  = (bool)mapdb_column_int(st, 8);
++		b->r1_disallowed      = (uint8_t)mapdb_column_int(st, 9);
++		b->r2_disallowed      = (uint8_t)mapdb_column_int(st, 10);
++		b->multi_bssid        = (uint8_t)mapdb_column_int(st, 11);
++		b->transmitted_bssid  = (uint8_t)mapdb_column_int(st, 12);
++		hex2bytes(mapdb_column_text(st, 13), b->est_wmm_be, sizeof(b->est_wmm_be));
++		hex2bytes(mapdb_column_text(st, 14), b->est_wmm_bk, sizeof(b->est_wmm_bk));
++		hex2bytes(mapdb_column_text(st, 15), b->est_wmm_vi, sizeof(b->est_wmm_vi));
++		hex2bytes(mapdb_column_text(st, 16), b->est_wmm_vo, sizeof(b->est_wmm_vo));
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- 6. backhaul topology edges (depth/parent; pointers left to live) - */
++static void restore_topology(struct controller *c)
++{
++	static const char *sql =
++		"SELECT child_almac, parent_almac, media_type, depth, wifi_hops "
++		"FROM topology_link";
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK)
++		return;
++	while (mapdb_step(st) == MAPDB_ROW) {
++		uint8_t child[6], parent[6];
++		struct bh_topology_dev *dev;
++
++		if (str2mac(mapdb_column_text(st, 0), child))
++			continue;
++		if (!memcmp(child, c->almacaddr, 6))	/* root has no uplink edge */
++			continue;
++		dev = topology_find_device(&c->topology, child);
++		if (!dev)
++			dev = topology_add_device(&c->topology, child);
++		if (!dev)
++			continue;
++		dev->bh.depth = (int8_t)mapdb_column_int(st, 3);
++		dev->bh.wifi_hops_from_root = (uint8_t)mapdb_column_int(st, 4);
++		if (!str2mac(mapdb_column_text(st, 1), parent))
++			dev->bh.parent = topology_find_device(&c->topology, parent);
++		/* own_iface/parent_iface left NULL: the first live Topology Response
++		 * runs clear_backhaul_tree_relations() + topology_build_tree() and
++		 * fully rebuilds the tree from live TLVs. */
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- public entry ---------------------------------------------------- */
++void db_restore(struct controller *c)
++{
++	if (!c->db)
++		return;
++
++	/* No-op on a fresh/empty DB: with nothing to recover, do not perturb the
++	 * normal cold-boot discovery + Phase-1 write path (a premature topology
++	 * mutation would skip the live tree build that persists agent/radio/bss). */
++	{
++		mapdb_stmt *cst = NULL;
++		int nagents = 0;
++
++		if (mapdb_prepare(c->db, "SELECT count(*) FROM agent", &cst) == MAPDB_OK) {
++			if (mapdb_step(cst) == MAPDB_ROW)
++				nagents = (int)mapdb_column_int(cst, 0);
++			mapdb_finalize(cst);
++		}
++		if (nagents == 0)
++			return;
++	}
++
++	info("db_restore: hydrating live model from mapc.db\n");
++	restore_agents(c);	/* nodes -> agentlist         */
++	restore_radios(c);	/* radio_el scalars           */
++	restore_opclasses(c);	/* cur_opclass (before bss!)  */
++	restore_radio_caps(c);	/* R6 wifi7 caps              */
++	restore_bss(c);		/* ifaces + bss               */
++	restore_topology(c);	/* backhaul edges             */
++}
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -41,4 +41,7 @@
+ /* Fold the WAL back into the main DB file (PRAGMA wal_checkpoint(TRUNCATE)). */
+ void mapc_db_checkpoint(struct controller *c);
+ 
++/* Phase 2: hydrate the live model from mapc.db on boot (recovery). */
++void db_restore(struct controller *c);
++
+ #endif /* MAPC_SYNC_H */
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -2253,6 +2253,12 @@
+ 		}
+ 	}
+ 
++	/* Phase 2 recovery: hydrate the live model from mapc.db so the topology
++	 * is warm at t=0; live discovery confirms-or-overwrites it, and any
++	 * ghost (node powered off while we were down) ages out via the
++	 * existing NODE_EXPIRE_TIME(65s) path. Best-effort; no-op if !db. */
++	db_restore(c);
++
+ 	c->state = CNTLR_INIT;
+ 	timer_init(&c->discovery_timer, cntlr_discovery);
+ 	timer_init(&c->start_timer, cntlr_start);

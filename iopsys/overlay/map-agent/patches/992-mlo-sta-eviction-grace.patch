@@ -1,0 +1,55 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 992 - grace before evicting an MLO client
+
+wifi_sta_periodic_run polls wifi.apmld every 1s for affiliated APs and, on an
+empty reply, immediately wifi_del_sta()'d the MLO client -- zero grace, while
+the legacy path tolerates STA_STALE_STATS_CNT_MAX(60) stale ticks. wifi.apmld
+is racy/often-empty, so a single bad snapshot evicted a still-connected MLO
+client from ap->stalist (and stamldlist) until the 60s async refresh re-added
+it, under-reporting it to the controller the whole time. Give the MLO path the
+same grace: count stale ticks and only evict past the threshold; reset on a
+good reply. Genuine disconnects still come through the assoc/disassoc event.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1498,18 +1498,29 @@
+ 			goto rearm_periodic;
+ 
+ 		if (hwaddr_is_zero(mlsta.sta[0].macaddr)) {
+-			uint8_t macaddr[6];
++			/* 992: an empty apmld reply is usually a transient race (the
++			 * per-STA timer polls the flaky wifi.apmld every 1s), not a
++			 * real disconnect. Give the MLO client the same grace as the
++			 * legacy path instead of evicting on one bad snapshot, which
++			 * under-reports it to the controller for up to a full async
++			 * refresh interval. A genuine disconnect still arrives via the
++			 * assoc/disassoc event; this is only the safety-net poll. */
++			if (s->stale_stats_cnt++ > STA_STALE_STATS_CNT_MAX) {
++				uint8_t macaddr[6];
+ 
+-			dbg("%s: sta:"MACFMT" is no longer connected\n",
+-			    __func__, MAC2STR(s->macaddr));
++				dbg("%s: sta:"MACFMT" is no longer connected\n",
++				    __func__, MAC2STR(s->macaddr));
+ 
+-			memcpy(macaddr, s->macaddr, 6);
+-			wifi_topology_notification(a, s, ap,
+-					0x00 /* left */,
+-					0x01 /* unspecified reason */);
+-			wifi_del_sta(a, ap->ifname, macaddr);
+-			return;
++				memcpy(macaddr, s->macaddr, 6);
++				wifi_topology_notification(a, s, ap,
++						0x00 /* left */,
++						0x01 /* unspecified reason */);
++				wifi_del_sta(a, ap->ifname, macaddr);
++				return;
++			}
++			goto rearm_periodic;
+ 		}
++		s->stale_stats_cnt = 0;	/* found: reset grace counter */
+ 
+ 		if (mlsta.mlo_capable == true &&
+ 		    !hwaddr_is_zero(mlsta.sta[0].bssid))

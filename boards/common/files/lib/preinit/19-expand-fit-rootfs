@@ -1,0 +1,111 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# /lib/preinit/19-expand-fit-rootfs   (BPI-R4 / FIT-fitblk, SD-card only)
+#
+# First-boot auto-expand for OpenWrt FIT/fitblk images.  The image is flashed
+# small; the 'production' GPT partition holds the FIT, and the read-write
+# overlay (/dev/fitrw, rootfs_data) is the free space *after* the FIT inside
+# 'production'.  On a bigger card the rest is unused.
+#
+# This hook runs in PREINIT, BEFORE the overlay is mounted, so /dev/fitrw is
+# OFFLINE and resizable.  It is purely ADDITIVE: it only extends the tail of
+# 'production' and grows the overlay; it never touches the FIT, the boot
+# environment, or any other partition.  Self-detecting + idempotent.
+#
+#   boot 1: production doesn't reach card end -> fix backup GPT + grow -> reboot
+#   boot 2: fitblk now shows big fitrw -> resize.f2fs (offline) to fill it
+#   later : nothing to do
+#
+# SAFETY GATES (must ALL hold, else silent no-op):
+#   gate 1: booted from a *proven SD card* (fail-closed positive test). The
+#           boot disk must be an mmcblk that (a) exposes NO hw boot area
+#           (mmcblkXboot0 -> eMMC) and (b) reports device/type = "SD". eMMC is
+#           MMC_TYPE_MMC ("MMC") and has boot0; NVMe/NAND are not mmcblk at
+#           all. Anything not positively identified as SD is skipped.
+#   gate 2: 'production' is the *last* partition on the disk (nothing extends
+#           past it). Protects multi-partition layouts (NVMe data/protect,
+#           UniFi) where production is intentionally small with data after it.
+
+expand_fit_rootfs() {
+	[ -e /dev/fitrw ] || return 0
+	command -v parted     >/dev/null 2>&1 || return 0
+	command -v resize.f2fs >/dev/null 2>&1 || return 0
+
+	# --- resolve the BOOT disk from the rootdisk phandle (cf. fit.sh) -------
+	[ -e /sys/firmware/devicetree/base/chosen/rootdisk ] || return 0
+	local rd disk="" ph b
+	rd=$(cat /sys/firmware/devicetree/base/chosen/rootdisk)
+	for ph in /sys/class/block/*/of_node/phandle; do
+		[ -e "$ph" ] || continue
+		[ "$rd" = "$(cat "$ph")" ] || continue
+		b="${ph%/of_node/phandle}"; disk="/dev/$(basename "$b")"; break
+	done
+	# rootdisk usually points at the production *partition*; reduce to its disk
+	case "$disk" in
+		/dev/mmcblk*p*) disk="${disk%p*}" ;;
+		/dev/nvme*p*)   disk="${disk%p*}" ;;
+		/dev/sd*[0-9])  disk="${disk%[0-9]}" ;;
+	esac
+	[ -b "$disk" ] || return 0
+
+	# --- GATE 1: act ONLY on a proven SD card (fail-closed) ----------------
+	# Everything not positively identified as an SD card is skipped. The mmc
+	# core sets the card type at init: a real SD card reports device/type="SD"
+	# and has no hw boot area; eMMC reports "MMC" (MMC_TYPE_MMC) AND exposes
+	# mmcblkXboot0; NVMe/NAND are not mmcblk devices at all.
+	case "$disk" in
+		/dev/mmcblk*) ;;			# candidate, verify below
+		*) return 0 ;;				# not mmc (NVMe/NAND/...) -> no-op
+	esac
+	[ -e "${disk}boot0" ] && return 0		# eMMC hw boot area -> no-op
+	[ "$(cat /sys/class/block/$(basename "$disk")/device/type 2>/dev/null)" = "SD" ] \
+		|| return 0				# not a proven SD card -> no-op
+
+	# --- find the 'production' partition number on that disk ----------------
+	local pnum
+	pnum=$(parted -ms "$disk" print 2>/dev/null | awk -F: '$6=="production"{print $1}')
+	[ -n "$pnum" ] || return 0
+
+	# --- disk size + production end (sectors) ------------------------------
+	local dsz pend
+	dsz=$(parted -ms "$disk" unit s print 2>/dev/null | awk -F: 'NR==2{sub("s","",$2);print $2}')
+	pend=$(parted -ms "$disk" unit s print 2>/dev/null | awk -F: -v n="$pnum" '$1==n{sub("s","",$3);print $3}')
+	[ -n "$dsz" ] && [ -n "$pend" ] || return 0
+
+	# --- GATE 2: 'production' must be the LAST partition -------------------
+	# If any partition ends past production, production is not last (something
+	# is deliberately placed after it) -> never grow into it.
+	local maxend
+	maxend=$(parted -ms "$disk" unit s print 2>/dev/null | \
+		awk -F: 'NR>2 && $1 ~ /^[0-9]+$/ {e=$3; sub("s","",e); if(e+0>m+0) m=e} END{print m}')
+	[ "$pend" = "$maxend" ] || return 0		# production not last -> no-op
+
+	# --- 1) grow production if it doesn't (nearly) reach the card end -------
+	if [ $((dsz - pend)) -gt 8192 ]; then
+		echo "preinit: expanding ${disk} production (p${pnum}) to fill SD card" > /dev/console
+		# post-dd the backup GPT sits at the image end; relocate it to the
+		# real card end first ("OK" = use primary, "Fix" = use all space)
+		printf 'OK\nFix\n' | parted ---pretend-input-tty "$disk" print > /dev/console 2>&1
+		parted -s -- "$disk" resizepart "$pnum" 100% > /dev/console 2>&1 && {
+			sync; sleep 1
+			echo "preinit: production grown -> rebooting to re-probe fitblk" > /dev/console
+			reboot -f
+		}
+		return 0
+	fi
+
+	# --- 2) production is full: grow the fitrw f2fs to fill its block dev ----
+	# fitrw is offline here. Mount/umount once to replay the f2fs log, then
+	# resize. resize.f2fs is a fast no-op if the fs already fills the device.
+	local m=/tmp/.fitrw-chk
+	mkdir -p "$m"
+	if mount -t f2fs /dev/fitrw "$m" 2>/dev/null; then
+		umount "$m" 2>/dev/null
+	fi
+	echo "preinit: growing fitrw f2fs to fill overlay" > /dev/console
+	resize.f2fs /dev/fitrw > /dev/console 2>&1
+	rmdir "$m" 2>/dev/null
+}
+
+boot_hook_add preinit_main expand_fit_rootfs

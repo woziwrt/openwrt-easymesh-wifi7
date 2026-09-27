@@ -1,0 +1,153 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-dhcpguard - only the LAN's own DHCP server may answer.
+#
+# A mesh is one bridged segment, and anything plugged into any node of it - a
+# forgotten router, a printer with a DHCP server, a foreign mesh box left in
+# router mode - can hand clients addresses in a network with no way out. This
+# drops, on the mesh bridge, DHCPv4 and DHCPv6 server replies and IPv6 router
+# advertisements from every MAC but the one that is supposed to send them.
+#
+# Which MAC that is, without any per-site knowledge:
+#   - a node whose own dnsmasq serves the LAN (our controller): its br-lan MAC,
+#   - any other node: the MAC of its default gateway on br-lan (our controller's
+#     VIP, or the ISP router when the mesh sits behind one).
+# By source MAC, not IP: the controller answers DHCP from 172.16.20.1 and is
+# the gateway as .254 - same MAC, two addresses.
+#
+# Fail-open: when that MAC cannot be learned, nothing is installed and the log
+# says so. Kill switch: touch /etc/easymesh-no-dhcpguard and run this again.
+# 1905 is ethertype 0x893a and is never matched.
+#
+# Proposed by an independent review (2026-09-23) as a general bridge defence.
+#
+# ONLY on the mesh bridge. The hooks of a bridge table see every bridge on the
+# box, and an R4 carries its WAN on a bridge too (br-wan). Until 2026-09-25 the
+# guard dropped the ISP's DHCP offers there as "rogue": a cable plugged into
+# any R4 got no address (75 offers from the upstream router dropped in one minute on the
+# kitchen node) and the mesh could never fail over to a WAN on an agent. The
+# controller was spared only because its WAN (eth1) is not a bridge.
+
+KILL=/etc/easymesh-no-dhcpguard
+TABLE=em_dhcpguard
+BR=br-lan
+WAITPID=/var/run/easymesh-dhcpguard-wait.pid
+# At boot a node usually runs this before its backhaul is up, so the gateway
+# cannot answer yet and its MAC is unknown. Measured 2026-09-23: all four
+# agents logged "server MAC unknown" at boot and stayed unguarded for good.
+# So an unknown MAC is not the end: one waiter in the background tries again
+# every WAIT_S seconds, WAIT_N times, and stops at the first success.
+WAIT_S=${WAIT_S:-10}
+WAIT_N=${WAIT_N:-90}
+
+log() { logger -t easymesh-dhcpguard "$*"; }
+
+# 0 = installed, or nothing to install (kill switch, no bridge)
+# 1 = nft refused the table
+# 3 = the server's MAC is not known yet - worth trying again
+guard() {
+	nft delete table bridge $TABLE 2>/dev/null
+	[ -e "$KILL" ] && { log "disabled by $KILL"; return 0; }
+	[ -d /sys/class/net/$BR ] || return 0
+
+	if [ "$(uci -q get dhcp.lan.ignore)" != 1 ] && [ "$(uci -q get dhcp.lan.dhcpv4)" = server ] &&
+	   pgrep -x dnsmasq >/dev/null 2>&1; then
+		SRV_MAC=$(cat /sys/class/net/$BR/address)
+		who="this node (dnsmasq serves the LAN)"
+	else
+		GW=$(ip -4 route show default dev $BR 2>/dev/null | awk '{ print $3; exit }')
+		[ -n "$GW" ] || GW=$(uci -q get network.lan.gateway)
+		# The gateway is the DHCP server only when the mesh sits behind an
+		# ISP router. In our own mesh the gateway is the VIP (.254), which
+		# mesh-gwd moves to whichever node has the uplink, while DHCP stays
+		# on the controller. Until 2026-09-25 a node learned the VIP holder
+		# here: one booting while the LTE node held it would have dropped
+		# the controller's offers for good, and the node holding the cable
+		# (default route on br-wan) learned nothing and ran unguarded.
+		# The controller is found the way the API finds it:
+		# easymesh.mesh.controller, else .1 of our own mesh subnet.
+		if [ -z "$GW" ] || [ "${GW##*.}" = 254 ]; then
+			GW=$(uci -q get easymesh.mesh.controller 2>/dev/null)
+			[ -n "$GW" ] || GW=$(ip -4 -o addr show $BR 2>/dev/null | awk '{print $4}' |
+				cut -d/ -f1 | grep -vE '\.(253|254)$' | head -1 | sed 's/\.[0-9]*$/.1/')
+			who_is="the controller"
+		else
+			who_is="the gateway"
+		fi
+		[ -n "$GW" ] || { [ -n "$quiet" ] || log "no DHCP server address on $BR yet"; return 3; }
+		ping -c 1 -W 1 "$GW" >/dev/null 2>&1
+		# the field after "lladdr" - with "dev" in the query, ip leaves "dev X" out
+		# of the line and the column moves
+		SRV_MAC=$(ip neigh show "$GW" dev $BR 2>/dev/null |
+			awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
+		who="$who_is $GW"
+	fi
+	case "$SRV_MAC" in
+	[0-9a-f][0-9a-f]:*:[0-9a-f][0-9a-f]) ;;
+	*) [ -n "$quiet" ] || log "server MAC unknown yet ($who)"; return 3 ;;
+	esac
+
+	# Ports of every OTHER bridge (br-wan: "wan"). Matched by port, because
+	# `meta ibrname` needs nft_meta_bridge, which this kernel does not have
+	# (2026-09-25: "Could not process rule: Not supported"). Those ports do
+	# not change at run time; the mesh bridge's own do (a VLAN per backhaul
+	# station), which is why this is a list of what to skip, not of what
+	# to guard.
+	others=""
+	for b in /sys/class/net/*/brif; do
+		b=${b%/brif}; b=${b##*/}
+		[ "$b" = "$BR" ] && continue
+		for p in /sys/class/net/$b/brif/*; do
+			[ -e "$p" ] && others="$others${others:+, }\"${p##*/}\""
+		done
+	done
+	SKIP=""
+	[ -n "$others" ] && SKIP="		iifname { $others } return comment \"not the mesh bridge\""
+
+	nft -f - <<EOF || { log "nft refused the table - not installed"; return 1; }
+table bridge $TABLE {
+	chain guard {
+$SKIP
+		ether type ip udp sport 67 udp dport 68 ether saddr != $SRV_MAC counter drop comment "rogue-dhcpv4"
+		ether type ip6 udp sport 547 udp dport 546 ether saddr != $SRV_MAC counter drop comment "rogue-dhcpv6"
+		ether type ip6 icmpv6 type nd-router-advert ether saddr != $SRV_MAC counter drop comment "rogue-ra"
+	}
+	chain guard_fwd { type filter hook forward priority -150; policy accept; jump guard; }
+	chain guard_in { type filter hook input priority -150; policy accept; jump guard; }
+}
+EOF
+	log "installed: DHCP/RA only from $SRV_MAC ($who)${others:+, ports of other bridges skipped: $others}"
+	return 0
+}
+
+waiter_alive() {
+	p=$(cat "$WAITPID" 2>/dev/null)
+	[ -n "$p" ] && tr "\\0" " " < "/proc/$p/cmdline" 2>/dev/null | grep -q -- " --wait" 
+}
+
+quiet=
+if [ "${1:-}" = --wait ]; then
+	quiet=1; n=0
+	while [ $n -lt "$WAIT_N" ]; do
+		sleep "$WAIT_S"; n=$((n + 1))
+		guard; rc=$?
+		[ $rc -eq 3 ] || { rm -f "$WAITPID"; exit $rc; }
+	done
+	rm -f "$WAITPID"
+	# Fail-open stays the rule: after WAIT_N tries the node runs unguarded
+	# and says so; the next lan ifup starts a new waiter.
+	quiet=; guard || log "gave up after $((WAIT_S * WAIT_N)) s - running unguarded"
+	exit 0
+fi
+
+guard; rc=$?
+if [ $rc -eq 3 ] && ! waiter_alive; then
+	log "trying again in the background every ${WAIT_S}s"
+	# the pid is written HERE, not by the waiter: a second call a moment later
+	# (init and the lan ifup hotplug run back to back at boot) must already see it
+	setsid "$0" --wait </dev/null >/dev/null 2>&1 &
+	echo $! > "$WAITPID"
+fi
+exit 0

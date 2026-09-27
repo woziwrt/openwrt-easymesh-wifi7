@@ -1,0 +1,167 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: author attribution for oper-channel, early-caps and MLD config; steer dst records the MLD
+
+The 2026-08-06 review counted the handlers the origin rollout missed -
+and this patch names EXACTLY which self-attributing paths it covers,
+having learned from the last header that said "remaining":
+
+- handle_oper_channel_report: resolve the author from the radio id the
+  first TLV opens with; a relayed report used to persist - and CREATE
+  radios - under the relay.
+- handle_early_ap_cap_report: same via the first WiFi7 agent radio id.
+- handle_ap_mld_config_response: resolve via MLD ownership. Extra
+  weight: the parser flushes the target node\x27s AP-MLD list before
+  rebuilding, so a relayed response wiped the RELAY\x27s own MLDs
+  (matches the long-standing "apmld under the wrong node" symptom).
+  First-ever onboarding through a relay still lands on the frame
+  origin - that residue is the 1905-layer attribution gap, not fixable
+  in a handler.
+NOT covered, deliberately: handle_bsta_mld_config_response (0xE1 peek
+helper not written yet - follow-up), and any handler with no
+self-identifying TLV.
+
+Also: the steer-success bookkeeping recorded resp->target_bssid[0]
+raw, undoing the link->MLD resolution three lines above it (the
+review\x27s "third link-addressed site in the same handler"); it now
+records the resolved MLD address.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2297,6 +2297,23 @@
+ 		return -1;
+ 	}
+ 
++	/* The 99994 idiom, oper-channel flavour: every Operating Channel
++	 * Report TLV opens with the radio id, and a radio belongs to exactly
++	 * one node. Without this a relayed report is persisted under the
++	 * relay - and unknown radios are CREATED under the relay below. */
++	if (tv[OPER_CHANNEL_REPORT_OPERATING_CHANNEL_IDX][0]) {
++		uint8_t *rmac =
++			(uint8_t *)tv[OPER_CHANNEL_REPORT_OPERATING_CHANNEL_IDX][0]->data;
++		struct netif_radio *own = cntlr_find_radio(c, rmac);
++
++		if (own && own->agent && own->agent != n) {
++			dbg("%s: report is about " MACFMT ", relayed by " MACFMT "\n",
++			    __func__, MAC2STR(own->agent->almacaddr), MAC2STR(n->almacaddr));
++			n = own->agent;
++			memcpy(cmdu->origin, n->almacaddr, 6);
++		}
++	}
++
+ 	while (idx < TLV_MAXNUM && tv[OPER_CHANNEL_REPORT_OPERATING_CHANNEL_IDX][idx]) {
+ 		int i;
+ 		int offset = 0;
+@@ -3720,7 +3737,11 @@
+ 		/* Record tsp for most recent steer success */
+ 		timestamp_update(&s->de_sta->mapsta.steer_summary.last_steer_tsp);
+ 		attempt->duration = timestamp_elapsed_sec(&attempt->time);
+-		memcpy(attempt->dst_bssid, resp->target_bssid[0], 6);
++		/* dst_bssid was resolved to the owning AP-MLD above; recording
++		 * the raw link address here would undo the MLD bookkeeping the
++		 * rest of this handler just did (review: third link-addressed
++		 * site in the same handler). */
++		memcpy(attempt->dst_bssid, dst_bssid, 6);
+ 		attempt->complete = 1;
+ 	}
+ 
+@@ -4594,6 +4615,9 @@
+ 		offset += 17;
+ 
+ 		for (i = 0; i < agnt_caps->num_radio; i++) {
++			/* First radio names the author (99994 idiom): a relayed
++			 * Early AP Capability Report would otherwise write caps
++			 * - and create radios - under the relay. */
+ 			struct wifi7_agent_radio_caps *agnt_rad_caps = (struct wifi7_agent_radio_caps *)
+ 				&tv[EARLY_AP_CAP_REPORT_WIFI7_AGENT_CAPS_IDX][0]->data[offset];
+ 			struct wifi_wifi7_capabilities *ap7_caps, *bsta7_caps;
+@@ -4603,6 +4627,18 @@
+ 			int cap_iter;
+ 			int j;
+ 
++			if (i == 0) {
++				struct netif_radio *own =
++					cntlr_find_radio(c, agnt_rad_caps->ruid);
++
++				if (own && own->agent && own->agent != n) {
++					dbg("%s: report is about " MACFMT ", relayed by " MACFMT "\n",
++					    __func__, MAC2STR(own->agent->almacaddr),
++					    MAC2STR(n->almacaddr));
++					n = own->agent;
++					memcpy(cmdu->origin, n->almacaddr, 6);
++				}
++			}
+ 			r = cntlr_node_add_radio(c, n, agnt_rad_caps->ruid);
+ 			if (!r) {
+ 				warn("%s: failed to add radio:"MACFMT"\n",
+@@ -5195,9 +5231,43 @@
+  * The AP-MLD Config TLV (0xE0) also rides Topology Response; we pull it
+  * directly with cmdu_peek_tlv() so we do not depend on the CMDU validation
+  * policy (which additionally requires an EHT Operations TLV). */
++/* Peek the first AP-MLD address out of an AP MLD Config TLV (0xE0)
++ * without committing anything: num_mlds(1), then per-mld flag(1)+
++ * ssidlen(1)+ssid+mac(6)+... (mirrors cntlr_parse_ap_mld_config_tlv). */
++static const uint8_t *ap_mld_config_first_mac(const uint8_t *data, uint16_t len)
++{
++	uint8_t ssidlen;
++
++	if (!data || len < 3 || data[0] == 0)
++		return NULL;
++
++	ssidlen = data[2];
++	if ((size_t)1 + 30 + ssidlen > len)
++		return NULL;
++
++	return data + 3 + ssidlen;
++}
++
++static struct node *find_apmld_owner(struct controller *c, const uint8_t *mld_mac)
++{
++	struct node *n;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		struct wifi_apmld_element *mld;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			if (!memcmp(mld->mld_macaddr, mld_mac, 6))
++				return n;
++		}
++	}
++
++	return NULL;
++}
++
+ int handle_ap_mld_config_response(void *cntlr, struct cmdu_buff *cmdu,
+ 				  struct node *n)
+ {
++	struct controller *c = (struct controller *)cntlr;
+ 	struct tlv *t;
+ 
+ 	trace("%s:--->\n", __func__);
+@@ -5206,8 +5276,27 @@
+ 		return -1;
+ 
+ 	t = cmdu_peek_tlv(cmdu, MAP_TLV_AP_MLD_CONFIG);
+-	if (t)
++	if (t) {
++		/* The 99994 idiom via MLD ownership. Extra weight here: the
++		 * parser below FLUSHES the target node's AP-MLD list before
++		 * rebuilding, so a relayed response does not merely persist
++		 * under the relay - it wipes the relay's own MLDs. A response
++		 * for MLDs the model has never seen (first onboarding through
++		 * a relay) still lands on the frame origin; that residue is
++		 * the 1905-layer attribution gap (review 1.2), not fixable
++		 * here. */
++		const uint8_t *m = ap_mld_config_first_mac(t->data, tlv_length(t));
++		struct node *owner = m ? find_apmld_owner(c, m) : NULL;
++
++		if (owner && owner != n) {
++			dbg("%s: response is about " MACFMT ", relayed by " MACFMT "\n",
++			    __func__, MAC2STR(owner->almacaddr), MAC2STR(n->almacaddr));
++			n = owner;
++			memcpy(cmdu->origin, n->almacaddr, 6);
++		}
++
+ 		cntlr_parse_ap_mld_config_tlv(n, t->data, tlv_length(t));
++	}
+ 
+ 	/* TID-to-Link Mapping Policy (0xE6, step 3): fold into the ttlmlist
+ 	 * of the AP-MLD(s) parsed above (matched by MLD MAC). No-op if the

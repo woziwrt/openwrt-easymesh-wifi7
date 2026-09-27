@@ -1,0 +1,166 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-trace-install - put the trace hook into every shell script in the
+# boot chain, and take it out again.
+#
+#     easymesh-trace-install on        hook everything, arm the watcher
+#     easymesh-trace-install off       remove every hook, stop the watcher
+#     easymesh-trace-install status    what is hooked right now
+#     easymesh-trace-install list      what WOULD be hooked (dry run)
+#
+# The hook is one line after the shebang. It is idempotent, it is marked, and
+# every file that gets one is written into a manifest so "off" removes exactly
+# what "on" added and nothing else.
+#
+# /etc/init.d scripts are NOT hooked individually: they all run through
+# /etc/rc.common, and hooking that one file traces every service on the box -
+# ours, map-agent, mapcontroller, ieee1905, netifd, the lot - including the
+# ones we would not have thought to list.
+
+HOOK='. /usr/share/easymesh/trace.sh 2>/dev/null || :   # EASYMESH-TRACE'
+MARK='EASYMESH-TRACE'
+MANIFEST=/root/easymesh-trace/.hooked
+LIB=/usr/share/easymesh/trace.sh
+
+# Directories swept for shell scripts, plus single files that matter and live
+# nowhere near the others.
+SWEEP_DIRS="/etc/uci-defaults /etc/hotplug.d /usr/sbin /lib/multiap /lib/netifd/wireless /lib/wifi /usr/libexec /usr/libexec/rpcd /usr/share/easymesh"
+EXTRA_FILES="/etc/rc.common /sbin/wifi /etc/rc.local /sbin/netifd-wireless.sh /sbin/hotplug-call /lib/multiap/map_genconfig"
+
+# Never hook the tracer itself, or we recurse. And never hook the scripts that
+# have nothing to do with the mesh but run constantly: a snapshot costs about
+# half a second, so hooking login.sh would put one on every ssh login and
+# hooking odhcpd-update would put one on every DHCP lease. The point is the
+# boot chain, not the whole box.
+SKIP='trace\.sh|easymesh-trace|/login\.sh|egrep-gnu|fgrep-gnu|syslog-wrapper|package-manager-call|luci-peeraddr|validate_firmware_image|nlbwmon|miniupnpd|ddns|odhcpd-update|ntpd-hotplug|/hotplug\.d/(ipsec|tty|usb|usbmisc|ntp)/|iwpriv|mwctl|/ated|ephy-utils|fw_printsys|fw_setsys|easymesh-logkeep|p910nd|usbmuxd|multiap\.orig'
+
+is_shell() {
+	head -c 2 "$1" 2>/dev/null | grep -q '#!' || return 1
+	head -1 "$1" 2>/dev/null | grep -qE '^#!.*(/bin/sh|/bin/ash|/bin/bash)' || return 1
+	# rc.common scripts are covered by rc.common itself
+	head -1 "$1" 2>/dev/null | grep -q 'rc.common' && return 1
+	return 0
+}
+
+# Hotplug fragments have no shebang at all - they are sourced. They still get
+# the hook, at the top instead of after line one.
+is_fragment() {
+	case "$1" in
+		/etc/hotplug.d/*) head -c 2 "$1" 2>/dev/null | grep -q '#!' || return 0 ;;
+	esac
+	return 1
+}
+
+candidates() {
+	local d f
+	for d in $SWEEP_DIRS; do
+		[ -d "$d" ] || continue
+		find "$d" -type f 2>/dev/null
+	done
+	for f in $EXTRA_FILES; do
+		[ -f "$f" ] && echo "$f"
+	done
+}
+
+selected() {
+	local f
+	candidates | sort -u | while read -r f; do
+		echo "$f" | grep -qE "$SKIP" && continue
+		if is_fragment "$f" || is_shell "$f"; then
+			echo "$f"
+		fi
+	done
+}
+
+# A hook makes the file look locally modified, so a package upgrade refuses to
+# replace it and drops the new version beside it as <file>.apk-new. The node
+# then keeps running the OLD code while apk reports success - measured
+# 2026-08-19, when an upgraded map-agent left four hotplug handlers at their
+# previous version and nobody would have noticed.
+#
+# Only files this tool hooked are taken: the mark is the evidence that the
+# local modification is ours and not somebody's edit. Config files are never
+# touched - /etc/config/mapagent.apk-new is a real conffile conflict and
+# belongs to the owner, not to us.
+merge_apk_new() {
+	local f new n=0
+	for new in $(find /etc /lib /usr /sbin -name '*.apk-new' 2>/dev/null); do
+		f="${new%.apk-new}"
+		case "$f" in /etc/config/*) continue ;; esac
+		hooked_already "$f" || continue
+		mv "$new" "$f" && n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] && echo "easymesh-trace: took $n upgraded files back from .apk-new"
+	return 0
+}
+
+hooked_already() { grep -q "$MARK" "$1" 2>/dev/null; }
+
+hook_file() {
+	local f="$1"
+	hooked_already "$f" && return 0
+	if is_fragment "$f"; then
+		sed -i "1i $HOOK" "$f" || return 1
+	else
+		sed -i "1a $HOOK" "$f" || return 1
+	fi
+	echo "$f" >> "$MANIFEST"
+	return 0
+}
+
+unhook_file() {
+	local f="$1"
+	[ -f "$f" ] || return 0
+	sed -i "/$MARK/d" "$f"
+}
+
+case "$1" in
+on)
+	[ -f "$LIB" ] || { echo "missing $LIB - copy the trace files onto the box first" >&2; exit 1; }
+	mkdir -p /root/easymesh-trace
+	# Before hooking, let any upgrade that our own hooks blocked land.
+	merge_apk_new
+	: > "$MANIFEST"
+	n=0
+	for f in $(selected); do
+		hook_file "$f" && n=$((n + 1))
+	done
+	echo "easymesh-trace: hooked $n files, manifest $MANIFEST"
+	echo "easymesh-trace: log /root/easymesh-trace/trace.log"
+	;;
+off)
+	n=0
+	if [ -f "$MANIFEST" ]; then
+		while read -r f; do
+			unhook_file "$f"; n=$((n + 1))
+		done < "$MANIFEST"
+	fi
+	# Belt and braces: anything carrying the mark goes, manifest or not.
+	for d in $SWEEP_DIRS $EXTRA_FILES; do
+		[ -e "$d" ] || continue
+		grep -rl "$MARK" "$d" 2>/dev/null | grep -vE "$SKIP" | while read -r f; do
+			sed -i "/$MARK/d" "$f"
+		done
+	done
+	rm -f "$MANIFEST"
+	echo "easymesh-trace: unhooked $n files from the manifest, swept the rest"
+	;;
+status)
+	echo "hook library : $([ -f "$LIB" ] && echo present || echo MISSING)"
+	echo "hooked files :"
+	for d in $SWEEP_DIRS $EXTRA_FILES; do
+		[ -e "$d" ] || continue
+		grep -rl "$MARK" "$d" 2>/dev/null | grep -vE "$SKIP"
+	done | sort -u | sed 's/^/  /'
+	echo "trace size   : $(du -sh /root/easymesh-trace 2>/dev/null | cut -f1)"
+	;;
+list)
+	selected
+	;;
+*)
+	echo "usage: easymesh-trace-install on|off|status|list" >&2
+	exit 1
+	;;
+esac

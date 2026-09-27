@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Give the mesh a button on hardware whose button does not exist.
+#
+# BPI-R4 has a single gpio key and mainline describes it as
+#
+#	wps { label = "WPS"; linux,code = <KEY_RESTART>; };
+#
+# so the kernel announces every press as "reset", procd runs
+# /etc/rc.button/reset, and /etc/rc.button/wps - where the mesh handler lives -
+# is never called at all. Measured 2026-08-22 on two chassis at once, one 8 GB
+# and one 4 GB, on their own cards: the keycode is the image, not a board. It is
+# also why pressing the button did nothing for months no matter how it was held.
+#
+# Fixing the device tree would be the honest place, and it is worth sending
+# upstream - every other mediatek board in that directory pairs label "wps" with
+# KEY_WPS_BUTTON, BPI-R3 included. But it needs a kernel and this does not, and
+# the two do not conflict: once the keycode is right, rc.button/wps is called,
+# this splice finds nothing to do, and the code below simply never fires.
+#
+# base-files owns rc.button/reset, so shipping our own copy would mean fighting
+# it on every upgrade. Splice instead, and do it from uci-defaults - which runs
+# again after every firstboot, including the one a five-second hold performs.
+# That is not incidental: the hold IS the way back from a configuration broken
+# past logging in, and it must not be a way to lose the button that offers it.
+
+RESET=/etc/rc.button/reset
+
+[ -f "$RESET" ] || exit 0
+grep -q '30-easymesh' "$RESET" && exit 0
+
+# Anchor on the line base-files has had for years. If it ever moves, do nothing
+# rather than write a file we did not recognise - a broken rc.button/reset takes
+# the factory reset with it, and that is the one thing that always has to work.
+grep -q '^[[:space:]]*if \[ "\$SEEN" -lt 1 \]' "$RESET" || {
+	logger -t easymesh "button: rc.button/reset does not look as expected - not splicing"
+	exit 0
+}
+
+awk '
+/^[[:space:]]*if \[ "\$SEEN" -lt 1 \]/ && !spliced {
+	print "\t# The mesh handler looks first. It is deliberately narrow: a short"
+	print "\t# press only on a box that is already ours, a 3-4 s hold only on a"
+	print "\t# box with no role, and it declines everything else - including the"
+	print "\t# five second hold below. A join can be retried; a wipe is the only"
+	print "\t# way back from a box that cannot be logged into, so it wins."
+	print "\t#"
+	print "\t# Environment is passed explicitly: procd sets these for this"
+	print "\t# script, and whether they are exported is not ours to assume."
+	print "\t[ -x /etc/rc.wps/30-easymesh ] && \\"
+	print "\t\tACTION=\"$ACTION\" SEEN=\"$SEEN\" BUTTON=\"$BUTTON\" \\"
+	print "\t\t/etc/rc.wps/30-easymesh && return 0"
+	print ""
+	spliced = 1
+}
+{ print }
+' "$RESET" > "$RESET.easymesh-new" || exit 0
+
+# Never install a file that will not parse: this one runs as root on a button
+# press and carries the factory reset.
+if sh -n "$RESET.easymesh-new" 2>/dev/null && grep -q '30-easymesh' "$RESET.easymesh-new"; then
+	[ -f "$RESET.pre-easymesh" ] || cp "$RESET" "$RESET.pre-easymesh"
+	cat "$RESET.easymesh-new" > "$RESET"
+	chmod +x "$RESET"
+	logger -t easymesh "button: mesh handler spliced into rc.button/reset"
+else
+	logger -t easymesh "button: splice produced an unusable file - left rc.button/reset alone"
+fi
+rm -f "$RESET.easymesh-new"
+
+# Move the wipe from five seconds to ten.
+#
+# Stock base-files erases the box at five seconds, and the mesh join above
+# ends at nine - which on stock would leave a single second between adding a
+# box and wiping it. People hold buttons longer than they are told to, exactly
+# when they are least sure the press registered, so one second is not a margin
+# at all. Ten is also what consumer gear trains people to expect (UniFi holds
+# ten to reset), so nobody is surprised by it and nobody reaches it by accident.
+#
+# Same rule as the splice: anchor on what base-files actually ships, and do
+# nothing if it is not there. Losing the wipe would cost the only way back
+# from a box that cannot be logged into.
+if grep -q '"\$SEEN" -ge 5 -a -n "\$OVERLAY"' "$RESET"; then
+	sed -i 's/"\$SEEN" -ge 5 -a -n "\$OVERLAY"/"$SEEN" -ge 10 -a -n "$OVERLAY"/' "$RESET"
+	if sh -n "$RESET" 2>/dev/null; then
+		logger -t easymesh "button: factory reset moved from 5 s to 10 s"
+	else
+		cp "$RESET.pre-easymesh" "$RESET" 2>/dev/null
+		logger -t easymesh "button: moving the wipe broke the file - reverted"
+	fi
+fi
+
+exit 0

@@ -1,0 +1,166 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: fix nodedup mld recovery
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/db/mapc_sync.c	2026-07-18 19:52:41.000000000 +0200
++++ b/src/db/mapc_sync.c	2026-07-19 11:53:07.783995658 +0200
+@@ -762,7 +762,9 @@
+ 		if (!memcmp(almac, c->almacaddr, 6))	/* never re-materialize self */
+ 			continue;
+ 
+-		n = cntlr_alloc_node(c, almac);		/* find-or-alloc, keyed by AL-MAC */
++		n = cntlr_find_node(c, almac);   /* FIX: reuse pre-existing (nodelist) node */
++		if (!n)
++			n = cntlr_alloc_node(c, almac);
+ 		if (!n)
+ 			continue;
+ 
+@@ -996,6 +998,138 @@
+ }
+ 
+ /* ---- public entry ---------------------------------------------------- */
++
++#if (EASYMESH_VERSION >= 6)
++/* ---- 7. AP-MLD world-first recovery (apmld + affiliated_ap + ttlm) ------ */
++/* Rehydrate the MLD/TTLM live model from mapc.db on boot. Mirrors the live
++ * cntlr_parse_ap_mld_config_tlv() constructors; find-or-alloc throughout so a
++ * pre-existing entry is reused in place (no duplicate, cf. the node-dup fix). */
++static struct wifi_apmld_element *restore_find_apmld(struct controller *c,
++						    const uint8_t *mldmac)
++{
++	struct node *n;
++	struct wifi_apmld_element *m;
++
++	list_for_each_entry(n, &c->agentlist, list)
++		list_for_each_entry(m, &n->apmld_list, list)
++			if (!memcmp(m->mld_macaddr, mldmac, 6))
++				return m;
++	list_for_each_entry(n, &c->devlist, list)
++		list_for_each_entry(m, &n->apmld_list, list)
++			if (!memcmp(m->mld_macaddr, mldmac, 6))
++				return m;
++	return NULL;
++}
++
++static void restore_apmld(struct controller *c)
++{
++	mapdb_stmt *st = NULL;
++
++	if (mapdb_prepare(c->db,
++		"SELECT mld_macaddr, agent_almac, ssid, enabled, emlmr_enabled, "
++		"emlsr_enabled, str_enabled, nstr_enabled, ttlm_enabled, num_ap "
++		"FROM apmld", &st) == MAPDB_OK) {
++		while (mapdb_step(st) == MAPDB_ROW) {
++			uint8_t mldmac[6], almac[6];
++			struct node *n;
++			struct wifi_apmld_element *mld;
++			const char *ssid;
++
++			if (str2mac(mapdb_column_text(st, 0), mldmac) ||
++			    str2mac(mapdb_column_text(st, 1), almac))
++				continue;
++			n = cntlr_find_node(c, almac);
++			if (!n)
++				continue;
++			mld = restore_find_apmld(c, mldmac);
++			if (!mld) {
++				mld = calloc(1, sizeof(*mld));
++				if (!mld)
++					continue;
++				INIT_LIST_HEAD(&mld->aplist);
++				INIT_LIST_HEAD(&mld->stamldlist);
++				INIT_LIST_HEAD(&mld->ttlmlist);
++				memcpy(mld->mld_macaddr, mldmac, 6);
++				list_add_tail(&mld->list, &n->apmld_list);
++				n->num_apmld++;
++			}
++			ssid = mapdb_column_text(st, 2);
++			if (ssid) {
++				snprintf(mld->ssid, sizeof(mld->ssid), "%s", ssid);
++				mld->ssidlen = (uint8_t)strlen(mld->ssid);
++			}
++			mld->enabled       = (bool)mapdb_column_int(st, 3);
++			mld->emlmr_enabled = (bool)mapdb_column_int(st, 4);
++			mld->emlsr_enabled = (bool)mapdb_column_int(st, 5);
++			mld->str_enabled   = (bool)mapdb_column_int(st, 6);
++			mld->nstr_enabled  = (bool)mapdb_column_int(st, 7);
++			mld->ttlm_enabled  = (bool)mapdb_column_int(st, 8);
++			mld->num_ap        = (uint8_t)mapdb_column_int(st, 9);
++		}
++		mapdb_finalize(st);
++	}
++
++	st = NULL;
++	if (mapdb_prepare(c->db,
++		"SELECT bssid, mld_macaddr, ruid, link_id FROM affiliated_ap",
++		&st) == MAPDB_OK) {
++		while (mapdb_step(st) == MAPDB_ROW) {
++			uint8_t bssid[6], mldmac[6], ruid[6];
++			struct wifi_apmld_element *mld;
++			struct wifi_affiliated_ap_element *ap, *a;
++
++			if (str2mac(mapdb_column_text(st, 0), bssid) ||
++			    str2mac(mapdb_column_text(st, 1), mldmac))
++				continue;
++			mld = restore_find_apmld(c, mldmac);
++			if (!mld)
++				continue;
++			ap = NULL;
++			list_for_each_entry(a, &mld->aplist, list)
++				if (!memcmp(a->bssid, bssid, 6)) { ap = a; break; }
++			if (!ap) {
++				ap = calloc(1, sizeof(*ap));
++				if (!ap)
++					continue;
++				memcpy(ap->bssid, bssid, 6);
++				list_add_tail(&ap->list, &mld->aplist);
++			}
++			if (!str2mac(mapdb_column_text(st, 2), ruid))
++				memcpy(ap->ruid, ruid, 6);
++			ap->linkid = (uint8_t)mapdb_column_int(st, 3);
++		}
++		mapdb_finalize(st);
++	}
++
++	st = NULL;
++	if (mapdb_prepare(c->db,
++		"SELECT mld_macaddr, tid, direction, link_id FROM ttlm",
++		&st) == MAPDB_OK) {
++		while (mapdb_step(st) == MAPDB_ROW) {
++			uint8_t mldmac[6];
++			struct wifi_apmld_element *mld;
++			struct wifi_ttlm_element *e;
++
++			if (str2mac(mapdb_column_text(st, 0), mldmac))
++				continue;
++			mld = restore_find_apmld(c, mldmac);
++			if (!mld)
++				continue;
++			e = calloc(1, sizeof(*e));
++			if (!e)
++				continue;
++			e->tid    = (uint8_t)mapdb_column_int(st, 1);
++			e->dir    = (uint8_t)mapdb_column_int(st, 2);
++			e->linkid = (uint8_t)mapdb_column_int(st, 3);
++			list_add_tail(&e->list, &mld->ttlmlist);
++			mld->num_ttlm++;
++		}
++		mapdb_finalize(st);
++	}
++
++}
++#endif /* EASYMESH_VERSION >= 6 */
++
+ void db_restore(struct controller *c)
+ {
+ 	if (!c->db)
+@@ -1023,5 +1157,8 @@
+ 	restore_opclasses(c);	/* cur_opclass (before bss!)  */
+ 	restore_radio_caps(c);	/* R6 wifi7 caps              */
+ 	restore_bss(c);		/* ifaces + bss               */
+-	restore_topology(c);	/* backhaul edges             */
++	restore_topology(c);
++#if (EASYMESH_VERSION >= 6)
++	restore_apmld(c);	/* world-first MLD state       */
++#endif	/* backhaul edges             */
+ }

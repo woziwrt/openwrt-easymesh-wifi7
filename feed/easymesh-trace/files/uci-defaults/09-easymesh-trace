@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Hook the boot chain the moment this package lands - on a flashed image that
+# is the first boot, on a live box it is the install. Numbered 09 so it runs
+# before the uci-defaults that actually configure the node, which are then
+# recorded like everything else.
+
+[ -x /usr/sbin/easymesh-trace-install ] || exit 0
+/usr/sbin/easymesh-trace-install on >/dev/null 2>&1
+logger -t easymesh-trace "boot chain hooked - trace in /root/easymesh-trace/trace.log"
+exit 0

@@ -1,0 +1,119 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# mesh-role - which node hands out addresses and routes to the internet.
+#
+# The mesh is one L2 domain, so from L3 it is an ordinary multi-router LAN:
+# exactly ONE node runs DHCP/DNS and NAT (the gateway), the others are plain
+# APs pointing at it. That choice is the user's and it is static - nothing
+# here detects or switches anything by itself.
+#
+# Until now the two roles differed by four UCI values edited by hand, with no
+# way to ask a node what it thinks it is. Getting it wrong is the failure
+# mode from 2026-07-25: a second DHCP server answers first, hands the client
+# itself as gateway, and the client has an address, a strong signal and no
+# internet - it looks like a radio fault.
+#
+#   mesh-role status            what am I, and does it hold together
+#   mesh-role gateway           I have the WAN: serve DHCP/DNS, no upstream gw
+#   mesh-role ap <gateway-ip>   plain AP: no DHCP, route and resolve via <ip>
+#
+# Both setters are idempotent and print what they changed. -n = dry run.
+set -e
+
+DRY=0
+[ "$1" = "-n" ] && { DRY=1; shift; }
+
+uci_get() { uci -q get "$1"; }
+
+run() {
+	if [ "$DRY" = 1 ]; then
+		echo "  [dry-run] $*"
+	else
+		"$@"
+	fi
+}
+
+role_now() {
+	if [ "$(uci_get dhcp.lan.ignore)" = "0" ]; then
+		echo gateway
+	elif [ -n "$(uci_get dhcp.lan.ignore)" ]; then
+		echo ap
+	else
+		echo unset
+	fi
+}
+
+status() {
+	role=$(role_now)
+	echo "node:      $(uname -n)  ($(uci_get network.lan.ipaddr))"
+	echo "role:      $role"
+	echo "dhcp:      ignore=$(uci_get dhcp.lan.ignore)"
+	echo "upstream:  gateway=$(uci_get network.lan.gateway) dns=$(uci_get network.lan.dns)"
+	echo "default:   $(ip route | awk '/^default/{print $3, "dev", $5; exit}')"
+
+	# The one mistake worth shouting about, in both directions.
+	if [ "$role" = gateway ] && [ -n "$(uci_get network.lan.gateway)" ]; then
+		echo "WARNING:   gateway role but lan.gateway is set - two upstreams disagree"
+	fi
+	if [ "$role" = ap ] && [ -z "$(uci_get network.lan.gateway)" ]; then
+		echo "WARNING:   ap role without lan.gateway - this node has no way out"
+	fi
+
+	if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+		echo "internet:  reachable"
+	else
+		echo "internet:  NOT reachable"
+	fi
+}
+
+set_gateway() {
+	echo "$(uname -n): role -> gateway (serves DHCP/DNS + IPv6 RA, routes out its own WAN)"
+	run uci set dhcp.lan.ignore=0
+	run uci set dhcp.lan.ra=server
+	run uci set dhcp.lan.dhcpv6=server
+	run uci -q delete network.lan.gateway || true
+	run uci -q delete network.lan.dns || true
+	run uci commit dhcp
+	run uci commit network
+	echo "  reload with: /etc/init.d/dnsmasq restart; /etc/init.d/network reload"
+}
+
+set_ap() {
+	gw="$1"
+	case "$gw" in
+	*.*.*.*) ;;
+	*) echo "usage: mesh-role ap <gateway-ip>" >&2; exit 1 ;;
+	esac
+
+	# Refuse to strand the network: the gateway must answer before this node
+	# stops being one. Skipped in dry-run so a plan can be printed anywhere.
+	if [ "$DRY" = 0 ] && ! ping -c 2 -W 2 "$gw" >/dev/null 2>&1; then
+		echo "refusing: $gw does not answer - set the gateway node first" >&2
+		exit 1
+	fi
+
+	echo "$(uname -n): role -> ap (no DHCP, no RA; route and resolve via $gw)"
+	run uci set dhcp.lan.ignore=1
+	# Same rule for IPv6: one router per L2 domain announces itself, not
+	# all of them. All three nodes shipped as ra=server, each advertising
+	# its OWN ULA prefix into the shared bridge, so a client collected
+	# three IPv6 sets that led nowhere - iOS calls that "limited
+	# compatibility" and it surfaced the moment the cable moved
+	# (2026-08-05). Harmless-looking and wrong for the same reason two
+	# DHCP servers are wrong.
+	run uci set dhcp.lan.ra=disabled
+	run uci set dhcp.lan.dhcpv6=disabled
+	run uci set network.lan.gateway="$gw"
+	run uci set network.lan.dns="$gw"
+	run uci commit dhcp
+	run uci commit network
+	echo "  reload with: /etc/init.d/dnsmasq restart; /etc/init.d/network reload"
+}
+
+case "$1" in
+status|"")	status ;;
+gateway)	set_gateway ;;
+ap)		set_ap "$2" ;;
+*)		echo "usage: mesh-role [-n] status|gateway|ap <gateway-ip>" >&2; exit 1 ;;
+esac

@@ -1,0 +1,86 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: prefer direct neighbours when stamping a CMDU sender
+
+i1905_link_lookup_partial() returns the first entry that matches, without
+looking at whether the link is direct. The neighbour list can hold several
+entries for one peer address: one learned from the peer itself, and one from
+another device's topology report -- which carries that reporter's AL address,
+not the peer's.
+
+cmdu_input.c uses this function to decide who sent a received CMDU. It first
+sets rxf->aladdr to the frame's source address, which is correct, and then
+overwrites it with the AL address of whatever link the lookup returned. When
+that is the indirect entry, every frame from one agent is attributed to
+another.
+
+Measured on hardware 2026-07-28 on a three-node mesh where both agents were
+associated to the same backhaul AP-MLD, so their traffic arrived on
+ap-mld-2.staN interfaces of the controller:
+
+  ap-mld-2.sta1
+    nbr_macaddress 3e:fb:2f:94:72:7b  nbr_ieee1905id e6:a9:...  direct=false
+    nbr_macaddress 3e:fb:2f:94:72:7b  nbr_ieee1905id ca:8e:...  direct=true
+
+The indirect entry came first and won. All 372 notifications from that agent
+reached map-controller with the other agent's AL address, which then filed its
+radios, MLD configuration and metrics under the wrong node -- the mesh looked
+like it kept losing track of a device that was in fact healthy and connected.
+
+Note the macaddr test cannot separate the two interfaces either: .sta1 and
+.sta2 inherit their MAC from the AP-MLD and are identical.
+
+Walk the list twice and take a direct neighbour if there is one. Behaviour is
+unchanged wherever only one entry exists for a peer.
+
+--- a/src/i1905_dm.c
++++ b/src/i1905_dm.c
+@@ -407,15 +407,42 @@
+ 							   uint8_t *r_aladdr)
+ {
+ 	struct i1905_neighbor_interface *ifpeer = NULL;
++	int pass;
+ 
+-	list_for_each_entry(ifpeer, &iface->nbriflist, list) {
+-		prlink("Lookup link partial ", ifpeer->macaddr, iface->aladdr, ifpeer->r_macaddr, ifpeer->aladdr);
++	/* Two passes: a direct neighbour wins over one we only know second-hand.
++	 *
++	 * The list can hold several entries for the same peer address -- one
++	 * learned from the peer itself (direct) and one from somebody else's
++	 * topology report, which carries that reporter's AL address. Returning
++	 * whichever comes first then hands back a foreign AL address, and
++	 * cmdu_input.c uses exactly this call to stamp the sender of every
++	 * received CMDU.
++	 *
++	 * Measured on hardware 2026-07-28, three-node mesh with both agents
++	 * associated to the same backhaul AP-MLD. ap-mld-2.sta1 held:
++	 *
++	 *   nbr_macaddress 3e:fb:2f:94:72:7b  nbr_ieee1905id e6:a9:...  direct=false
++	 *   nbr_macaddress 3e:fb:2f:94:72:7b  nbr_ieee1905id ca:8e:...  direct=true
++	 *
++	 * The indirect entry came first and won, so all 372 messages from that
++	 * agent were attributed to the other one and the controller filed its
++	 * radios, MLDs and metrics under the wrong node. Both .staN interfaces
++	 * share one MAC (they inherit it from the AP-MLD), so the macaddr test
++	 * below cannot separate them either.
++	 */
++	for (pass = 0; pass < 2; pass++) {
++		list_for_each_entry(ifpeer, &iface->nbriflist, list) {
++			if (pass == 0 && !ifpeer->direct)
++				continue;
+ 
+-		if (hwaddr_equal(ifpeer->macaddr, iface->macaddr) &&
+-		    (hwaddr_equal(ifpeer->aladdr, r_aladdr) || hwaddr_equal(ifpeer->r_macaddr, r_macaddr))) {
+-			ifpeer->tsp = time(NULL);
+-			timer_set(&ifpeer->staletimer, I1905_IFLINK_AGEOUT);
+-			return ifpeer;
++			prlink("Lookup link partial ", ifpeer->macaddr, iface->aladdr, ifpeer->r_macaddr, ifpeer->aladdr);
++
++			if (hwaddr_equal(ifpeer->macaddr, iface->macaddr) &&
++			    (hwaddr_equal(ifpeer->aladdr, r_aladdr) || hwaddr_equal(ifpeer->r_macaddr, r_macaddr))) {
++				ifpeer->tsp = time(NULL);
++				timer_set(&ifpeer->staletimer, I1905_IFLINK_AGEOUT);
++				return ifpeer;
++			}
+ 		}
+ 	}
+ 

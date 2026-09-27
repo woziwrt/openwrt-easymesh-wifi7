@@ -1,0 +1,37 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: register 1905 wireless backhaul interface
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+multiap: register wireless backhaul STA as ieee1905 AL interface
+
+On an agent the wireless backhaul STA netdev (e.g. bstaX) associates and
+joins the AL bridge only after ieee1905d has enumerated its interfaces, and
+its name matches none of the al-iface include patterns. It is therefore
+never registered as a 1905 interface, so AP-Autoconfiguration Search and
+Topology Discovery are only emitted on the fronthaul APs and never traverse
+the backhaul to the controller: the agent never onboards (num_nodes stays 0).
+
+map-agent already runs "/lib/wifi/multiap set_uplink wifi <ifname> <hwaddr>"
+when the wireless backhaul comes up (backhaul.c). Hook that point to register
+the STA netdev directly via the ieee1905 add_interface ubus method, which
+binds a raw socket to the netdev (TX + RX on the backhaul) independent of
+bridge multicast local-delivery behaviour.
+--- a/src/script/multiap
++++ b/src/script/multiap
+@@ -1533,6 +1533,16 @@
+ 		handle_uplink_switch $ifname
+ 	fi
+ 
++	if [ "$type" = "wifi" ] && [ -n "$ifname" ]; then
++		# Register the wireless backhaul STA (e.g. bstaX) as an ieee1905
++		# AL interface. It joins the AL bridge only after ieee1905d has
++		# enumerated interfaces and matches no al-iface include pattern,
++		# so it is otherwise never registered. Without it AP-Autoconfig
++		# Search / Topology Discovery never egress the backhaul and the
++		# agent cannot onboard to the controller.
++		ubus -t 5 call ieee1905 add_interface "{\"ifname\":\"$ifname\",\"wifi_backhaul\":true}" >/dev/null 2>&1
++	fi
++
+ 	update_acs
+ 	update_isolate_ebtables
+ }

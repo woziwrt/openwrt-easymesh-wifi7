@@ -1,0 +1,83 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99993: do not let an unmeasured link erase a measured rcpi
+
+An MLO client is reported once per affiliated link. A link the client is not
+transmitting on has nothing to measure and honestly sends rcpi 0. All of those
+reports land on the single row that MLD has in the sta table, and both writers
+of de_sta->rcpi are unconditional, so whichever report arrives last decides.
+With three links and one carrying traffic, the measured value loses two times
+out of three.
+
+Measured on hardware 2026-08-03, iPhone associated with three links on 4g:
+
+    map.agent status                     mapc.db
+    c6:f7:66:1a:0f:91  rssi -43          rcpi 0
+    7a:c0:11:cb:0a:f3  rssi 0
+    1a:37:b1:44:c0:70  rssi 0
+
+The client sat at -43 dBm and the database said nothing was measured. Every
+rcpi-based decision - steering thresholds, hysteresis, reporting - was taken on
+that. The value had already travelled correctly from the driver through libwifi
+(patch 940) and through map-agent; it was destroyed at the last step.
+
+Note this is not an agent bug. Reporting 0 for an idle link is correct: that
+BSS really did not measure anything. The defect is that the controller keeps one
+row per MLD and treats an absent reading as a reading.
+
+Both 0 and 255 mean no reading here - 255 is the not-available value from the
+spec, 0 is what rssi_to_rcpi() produces for an unmeasured link - so neither is
+allowed to overwrite a real one. A first report is still stored even when empty,
+so a client that has genuinely never been measured does not appear to have been.
+
+Cost: a client that leaves keeps its last rcpi until the row is released. That
+is the right trade. Association state says whether the client is there; rcpi
+says how well it was heard while it was.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2513,7 +2513,31 @@
+ 		if (s) {
+ 			s->de_sta->dl_est_thput = dl_est_thput;
+ 			s->de_sta->ul_est_thput = ul_est_thput;
+-			s->de_sta->rcpi = rcpi;
++			/* An MLO client is reported once per affiliated link, and a link
++			 * the client is not transmitting on has nothing to measure, so it
++			 * honestly sends rcpi 0. All those reports land on the one row this
++			 * MLD has and the last writer wins, so a measured value is routinely
++			 * erased by an unmeasured one.
++			 *
++			 * Measured on hardware 2026-08-03, iPhone with three links on 4g:
++			 *   link 2  rssi -43   -> rcpi 134
++			 *   link 1  rssi   0   -> rcpi 0
++			 *   link 0  rssi   0   -> rcpi 0
++			 * and mapc.db held rcpi 0 while the client sat at -43 dBm.
++			 *
++			 * Keep what was actually measured. Both 0 and 255 mean no reading:
++			 * 255 is the not-available value from the spec, 0 is what
++			 * rssi_to_rcpi() produces for an unmeasured link. Neither may
++			 * overwrite a real one.
++			 *
++			 * Cost: a client that leaves keeps its last rcpi until the row is
++			 * released. That is the right trade, because association state says
++			 * whether the client is there and rcpi says how well it was heard.
++			 */
++			if (rcpi && rcpi != 255)
++				s->de_sta->rcpi = rcpi;
++			else if (!s->de_sta->rcpi)
++				s->de_sta->rcpi = rcpi;
+ 
+ 			if (s->is_bsta) {
+ 				int est_thput = cntlr_estimate_max_throughput_for_node(c, n->almacaddr);
+@@ -2938,7 +2962,12 @@
+ 			s->de_sta->time_delta = BUF_GET_BE32(b->time_delta);
+ 			/* record link-metrics-response receive time */
+ 			time(&s->de_sta->tsp);
+-			s->de_sta->rcpi = b->ul_rcpi;
++			/* Same reason as above: do not let an unmeasured link erase a
++			 * measured one on the single row an MLD client has. */
++			if (b->ul_rcpi && b->ul_rcpi != 255)
++				s->de_sta->rcpi = b->ul_rcpi;
++			else if (!s->de_sta->rcpi)
++				s->de_sta->rcpi = b->ul_rcpi;
+ 
+ 			offset += sizeof(*b);
+ 		}

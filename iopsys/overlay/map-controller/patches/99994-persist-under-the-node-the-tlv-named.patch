@@ -1,0 +1,104 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99994: persist under the node the TLV named, not the relay
+
+99992 taught handle_topology_response() to believe the Device Information TLV
+over the frame source. It works - the live model of the far node is correct -
+but only the live model. The caller keeps its own copy of the node pointer, and
+that is the one every mapc_sync_*() call in cntlr_handle_map_event() uses:
+
+	n = cntlr_find_node(c, origin);		/* the relay */
+	...
+	ret = f[idx].handle(c, cmdu, n);	/* handler corrects its own n */
+	...
+	mapc_sync_agent(c, n);			/* still the relay */
+	mapc_sync_radio(c, n, r);
+	mapc_sync_apmld(c, n);
+	mapc_sync_bstamld(c, n);
+
+So a Topology Response from a two-hop node updates that node in memory and then
+writes the relay to the database - and the relay's rows are rebuilt from its
+own, correct model, so nothing looks wrong. The far node simply never gets
+written and keeps whatever it had.
+
+Measured on hardware 2026-08-04, mesh chained as controller <- 8g <- x8, with
+99992 already deployed:
+
+	iw:	x8 -> ca:8e:1d:ca:bc:af (8g),  8g -> 86:f7:56:41:01:d4 (4g)
+
+	agent		x8 -> 86:f7:56:41:01:d4  depth 1   <- yesterday's value
+			8g -> 86:f7:56:41:01:d4  depth 1   correct
+	topology_link	correct for both		   (built elsewhere)
+	apmld		4 rows: 4g and 8g only, x8 absent
+	bss		x8 has 4 of its 5
+	bstamld		06:0c:43:26:81:10 -> ca:8e:1d:ca:bc:ae
+
+That last row is the whole defect in one line: 06:0c:43:26:81:10 is the bSTA MLD
+of x8, filed under the AL MAC of 8g. Both agents reported correctly over ubus
+the entire time.
+
+Which rows survive is decided by list order in i1905_link_lookup_partial(),
+because ieee1905 holds two links for the relay's address - one to the relay,
+one to the node behind it. That is why x8 has radio rows but not apmld rows:
+some responses were attributed correctly by luck and some were not.
+
+Let a handler that has identified the true author say so by rewriting
+cmdu->origin, and re-resolve the node from it once the handler returns, before
+anything is persisted. handle_topology_response() is the only handler that does
+this today; the rest fall through unchanged, because cmdu->origin still holds
+what the caller put there.
+
+Also refresh last_tsp_seen on the author. Node expiry runs off that timestamp,
+and until now a node two hops out only had it refreshed when the origin
+happened to resolve its way.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -456,6 +456,13 @@
+ 				    MACFMT ", using that\n", __func__,
+ 				    MAC2STR(n->almacaddr), MAC2STR(di->aladdr));
+ 				n = real;
++
++				/* Correcting our own copy is not enough. The
++				 * caller persists the node *it* resolved, not
++				 * the one we settled on, so say it somewhere
++				 * the caller reads back.
++				 */
++				memcpy(cmdu->origin, real->almacaddr, 6);
+ 			}
+ 		}
+ 	}
+@@ -5160,8 +5167,33 @@
+ 		cntlr_notify_plugins(c, cmdu);
+ 	}
+ 
+-	if (!n)
+-		n = cntlr_find_node(c, origin);
++	/* A handler may have found that `origin` was only the relay and left the
++	 * real author in cmdu->origin. Everything below here writes to the
++	 * database, so resolve it once, in one place, instead of in every
++	 * mapc_sync_*() call.
++	 *
++	 * When no handler touched it, cmdu->origin still holds `origin` and this
++	 * lookup returns the same node - including the case where the node did
++	 * not exist until the handler created it, which is what the `if (!n)`
++	 * this replaces was for.
++	 */
++	{
++		struct node *author = cntlr_find_node(c, cmdu->origin);
++
++		if (author && author != n) {
++			dbg("%s: cmdu %04x is from " MACFMT ", relayed by " MACFMT
++			    "; persisting under the former\n", __func__, cmdutype,
++			    MAC2STR(author->almacaddr), MAC2STR(origin));
++
++			/* Node expiry runs off this timestamp. A node two hops
++			 * out only ever had it refreshed when the origin
++			 * happened to resolve its way. */
++			timestamp_update(&author->last_tsp_seen);
++		}
++
++		if (author)
++			n = author;
++	}
+ 
+ 	if (n)
+ 		timestamp_update(&n->last_cmdu);

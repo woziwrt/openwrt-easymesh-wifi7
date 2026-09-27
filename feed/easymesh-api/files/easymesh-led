@@ -1,0 +1,213 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-led - the only thing a box can say to someone standing next to it.
+#
+# The button interface has two halves and we built one. A user presses a button
+# on a box with no screen, whose web interface is the very thing we are trying
+# not to send them to, and then stands there. Nothing tells them whether it
+# heard, whether it is working, or whether they pressed the wrong box - and a
+# person who gets no answer presses again, which is how a join in progress gets
+# restarted from the beginning.
+#
+# blue:wps is FREE, and it took until 2026-08-22 to establish that.
+#
+# There are TWO blue lamps side by side on this board, and everything written
+# here before that date confused them:
+#
+#   blue:wps (gpio-575)   driven from sysfs, trigger 'none' out of the box,
+#                         never lit by anything - this is the one we use
+#   the one beside it     wired straight from the M.2 activity pin, blinks
+#                         with the disk, silkscreened SSD, and the kernel
+#                         has no idea it exists
+#
+# Proven by lighting blue:wps steady while the disk was idle: the lamp that
+# came on was the one that had never come on before, and the disk lamp next to
+# it stayed dark. Under load, that neighbour blinks and blue:wps does not.
+#
+# So nothing is being taken from anybody. The disk indication is not ours to
+# break and we never touch it. The earlier text here said the opposite - that
+# blue:wps IS the disk lamp and that a join makes the disk indication wrong for
+# a couple of minutes - and that was simply not true.
+#
+# The saved trigger is still restored afterwards. Not because a disk depends on
+# it, but because leaving a lamp lit that nothing else ever lights is a signal
+# with no meaning, and because if some future image does assign this LED a
+# trigger, giving it back is what should happen.
+#
+# It is still the only lamp available for this. green:status narrates the boot
+# and its owner reads that too, so borrowing it would make a node in the middle
+# of joining look like a node in the middle of failing. The three mt76-phy*
+# entries ignore sysfs entirely - the card drives those.
+#
+# ⚠️ Two ways to fool yourself about these lamps, both paid for:
+#
+# Every negative result is worthless unless the person looking and the box being
+# written to are the same box. An hour went into "nothing happens" that was one
+# of us watching the controller while the other watched the agent.
+#
+# And a disk load started over ssh as `( ... ) &` dies with the connection
+# before it reads a byte. Twice on 2026-08-22 that produced "the lamp does not
+# follow the disk", which read exactly like a fact about the hardware. Use
+# `setsid ... </dev/null &`, then confirm it is running - process count AND a
+# rising /sys/block/*/stat - before believing anything the lamp does or does
+# not do.
+#
+# A warning paid for on the day: every negative result about these LEDs is
+# worthless unless the person looking and the box being written to are the same
+# box. An hour went into "nothing happens" that was one of us watching the
+# controller while the other watched the agent.
+#
+#   armed     slow blink      "waiting for you"
+#   joining   fast blink      "I am working"        - same as booting, on purpose
+#   ok        steady          "done"                - same as system up
+#   refused   long flashes    "not here / not like that"
+#   hold      see below       "let go NOW and this happens"
+#
+# `hold` is the one that runs while a finger is on the button, and it says one
+# thing only: what letting go at this instant would do.
+#
+#   slow blink   let go now and it does the useful thing
+#   dark         let go now and nothing happens
+#   fast blink   let go now and it ERASES the box
+#
+# Written that way on purpose, because the seconds do not mean the same thing
+# on every box. A box with no role joins a mesh between 3 s and 9 s; a box
+# already in a mesh opens its pairing window on a SHORT press and a hold does
+# nothing until the wipe. Telling people "hold three seconds" is therefore
+# wrong half the time, and nobody counts seconds anyway - but everybody notices
+# a lamp changing rhythm. So the lamp reports consequence, not duration, and
+# reads identically on both.
+#
+# ⚠️ On the box being ADDED this lamp goes dark at every reboot, and a join has
+# three of them. So what a user sees there is fast, dark, fast, dark, fast,
+# steady - which reads as work in progress and ends in the right place, but the
+# gaps are real and are not us saying anything. The signal that is continuously
+# ours is "armed" on the controller, which does not reboot during any of this.
+
+LED=/sys/class/leds/blue:wps
+
+[ -d "$LED" ] || exit 0
+ON=$(cat "$LED/max_brightness" 2>/dev/null); ON=${ON:-1}
+
+SAVED=/tmp/.easymesh-led-was
+
+# Remember what had the lamp, once per borrow. Re-arming must not overwrite the
+# note with our own trigger - that is how a borrowed thing stops being returned.
+remember() {
+	[ -f "$SAVED" ] && return 0
+	cat "$LED/trigger" 2>/dev/null | grep -o '\[[a-z0-9-]*\]' | tr -d '[]' > "$SAVED" 2>/dev/null
+}
+give_back() {
+	local was
+	was=$(cat "$SAVED" 2>/dev/null)
+	rm -f "$SAVED"
+	[ -n "$was" ] || was=none
+	echo "$was" > "$LED/trigger" 2>/dev/null
+	[ "$was" = none ] && echo 0 > "$LED/brightness" 2>/dev/null
+}
+
+set_trigger() { [ -w "$LED/trigger" ] && echo "$1" > "$LED/trigger" 2>/dev/null; }
+blink() {
+	remember
+	set_trigger timer
+	echo "$1" > "$LED/delay_on" 2>/dev/null
+	echo "$2" > "$LED/delay_off" 2>/dev/null
+}
+
+HOLDPID=/tmp/.easymesh-led-hold.pid
+
+case "$1" in
+armed)   blink 700 700 ;;
+hold)
+	# hold <good_from> <good_to> <wipe_at>, all in seconds of hold.
+	#
+	# Runs until the button comes back up, which is `hold-stop` below. It is
+	# deliberately its own process rather than a loop inside the button
+	# handler: procd calls the handler once at press and once at release, and
+	# nothing in between, so the only way to say anything DURING the hold is
+	# to leave something behind that watches the clock itself.
+	/usr/sbin/easymesh-led hold-stop
+	setsid /usr/sbin/easymesh-led --hold-watch "${2:-3}" "${3:-9}" "${4:-10}" \
+		>/dev/null 2>&1 &
+	;;
+--hold-watch)
+	echo $$ > "$HOLDPID" 2>/dev/null
+	_from=${2:-3}; _to=${3:-9}; _wipe=${4:-10}
+	remember
+	t=0
+	last=""
+	# A ceiling, not a timeout: if the release event is ever missed the lamp
+	# must still be handed back rather than left blinking at a wall forever.
+	while [ "$t" -lt 60 ]; do
+		if   [ "$t" -ge "$_wipe" ];                        then want=wipe
+		elif [ "$t" -ge "$_from" ] && [ "$t" -le "$_to" ]; then want=good
+		else                                                    want=dark
+		fi
+		if [ "$want" != "$last" ]; then
+			case "$want" in
+			good) set_trigger timer
+			      echo 700 > "$LED/delay_on" 2>/dev/null
+			      echo 700 > "$LED/delay_off" 2>/dev/null ;;
+			wipe) set_trigger timer
+			      echo 100 > "$LED/delay_on" 2>/dev/null
+			      echo 100 > "$LED/delay_off" 2>/dev/null ;;
+			dark) set_trigger none
+			      echo 0 > "$LED/brightness" 2>/dev/null ;;
+			esac
+			last="$want"
+		fi
+		sleep 1
+		t=$((t + 1))
+	done
+	rm -f "$HOLDPID"
+	give_back
+	;;
+hold-stop)
+	# The lamp is NOT handed back here. Whatever the release decides to say
+	# next - armed, joining, refused - says it immediately, and a give_back
+	# in between would show as a blink of nothing at the exact moment the
+	# user is looking for an answer. The only path that returns the lamp is
+	# a release that decides nothing at all.
+	_p=$(cat "$HOLDPID" 2>/dev/null)
+	[ -n "$_p" ] && kill "$_p" 2>/dev/null
+	rm -f "$HOLDPID"
+	;;
+joining) blink 150 150 ;;
+ok)
+	# Steady for five seconds, then the lamp goes back to whoever had it. An
+	# answer to a press is not a state of the box, and this one is on loan.
+	remember
+	set_trigger none
+	echo "$ON" > "$LED/brightness" 2>/dev/null
+	setsid /usr/sbin/easymesh-led --return-after 5 >/dev/null 2>&1 &
+	;;
+off)
+	give_back
+	;;
+--return-after)
+	sleep "${2:-5}"
+	give_back
+	;;
+refused)
+	remember
+	# Long and deliberate, and it has to read differently from the fast one:
+	# this says "wrong place", not "busy". Ends by handing the lamp back.
+	setsid /bin/sh -c "
+		i=0
+		while [ \$i -lt 3 ]; do
+			echo none > $LED/trigger 2>/dev/null
+			echo $ON > $LED/brightness 2>/dev/null
+			sleep 1
+			echo 0 > $LED/brightness 2>/dev/null
+			sleep 1
+			i=\$((i+1))
+		done
+		/usr/sbin/easymesh-led off" >/dev/null 2>&1 &
+	;;
+*)
+	echo "usage: easymesh-led {armed|joining|ok|refused|off|hold <from> <to> <wipe>|hold-stop}" >&2
+	exit 1 ;;
+esac
+exit 0

@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Which boxes hear their own radio card (see /usr/sbin/easymesh-card-check).
+# It reads mapc.db, so it runs on the controller and nowhere else.
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	[ "$(cat /etc/mapc/role 2>/dev/null)" = "controller" ] || return 0
+	procd_open_instance
+	procd_set_param command /usr/sbin/easymesh-card-check 300
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_close_instance
+}

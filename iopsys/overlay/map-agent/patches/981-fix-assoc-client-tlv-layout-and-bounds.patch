@@ -1,0 +1,155 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: keep the Associated Clients TLV self-consistent
+
+agent_gen_assoc_client_tlv() writes one entry per enabled BSS as
+
+    bssid (6) | num_sta (2) | num_sta * (macaddr (6) + conntime (2))
+
+but it counted the BSS and emitted the BSSID *before* looking the AP up,
+and returned early when the lookup failed:
+
+    data->num_bss++;
+    memcpy(&t->data[offset], bss->bssid, 6);
+    offset += 6;
+    ...
+    ap = agent_get_ap(a, bss->bssid);
+    if (!ap)
+            continue;               /* num_sta never written */
+    num_sta_ptr = &t->data[offset];
+    offset += 2;
+
+A failed lookup therefore leaves a 6-byte entry where every later reader
+expects 8, while num_bss still counts it.
+
+The EASYMESH_VERSION >= 6 pass that follows re-parses this buffer to find
+an existing entry for each AP-MLD, stepping forward by a length it reads
+back out of the buffer:
+
+    bssid_offset += 6;
+    num_sta = BUF_GET_BE16(t->data[bssid_offset]);
+    bssid_offset += 2;
+    bssid_offset += (num_sta * 8);
+
+Against the shifted layout it reads part of a MAC address as num_sta,
+multiplies it by eight, and walks far outside the 512-byte reservation.
+The following memcmp() then faults on an unmapped address. Observed on a
+colocated controller+agent carrying an AP-MLD and one associated MLO
+client: mapagent died of SIGSEGV roughly six times per twenty minutes,
+with a core showing a six-byte compare against an address outside every
+mapping (2026-07-21).
+
+Resolve the AP before anything is written, so a failed lookup skips the
+entry entirely, and bound the re-parsing walk by the number of bytes
+actually written. None of the writes were checked against the fixed
+512-byte reservation either - add those bounds so a full buffer costs a
+truncated TLV rather than a smashed heap.
+
+--- a/src/agent_tlv.c	2026-07-21 10:39:44.664492097 +0200
++++ b/src/agent_tlv.c	2026-07-21 10:39:44.665586362 +0200
+@@ -3532,6 +3532,8 @@
+ 	return 0;
+ }
+ 
++#define ASSOC_CLIENT_TLV_RESERVE 512
++
+ int agent_gen_assoc_client_tlv(struct agent *a, struct cmdu_buff *frm)
+ {
+ 	struct wifi_radio_element *re = NULL;
+@@ -3540,7 +3542,7 @@
+ 	struct tlv *t;
+ 	int ret;
+ 
+-	t = cmdu_reserve_tlv(frm, 512);
++	t = cmdu_reserve_tlv(frm, ASSOC_CLIENT_TLV_RESERVE);
+ 	if (!t)
+ 		return -1;
+ 
+@@ -3560,26 +3562,36 @@
+ 			if (!bss->enabled)
+ 				continue;
+ 
+-			data->num_bss++;
+-			/* bssid */
+-			memcpy(&t->data[offset], bss->bssid, 6);
+-			offset += 6;
+-
+ #if 1 /* TODO: replace with stalist when ready for use */
+ 			{
+-				struct netif_ap *ap;
++				struct netif_ap *bss_ap;
+ 				struct sta *s = NULL;
+ 				uint8_t *num_sta_ptr;
+ 				uint16_t num_sta = 0;
+ 
+-				ap = agent_get_ap(a, bss->bssid);
+-				if (!ap)
++				/* Resolve the AP before anything is written.
++				 * Bailing out after the BSSID has been emitted
++				 * leaves a 6-byte entry where every later reader
++				 * expects 6 + 2 + N*8 - the AP-MLD pass below then
++				 * walks straight off the end of the buffer.
++				 */
++				bss_ap = agent_get_ap(a, bss->bssid);
++				if (!bss_ap)
+ 					continue;
+ 
++				/* bssid + sta counter */
++				if (offset + 8 > ASSOC_CLIENT_TLV_RESERVE)
++					break;
++
++				data->num_bss++;
++				/* bssid */
++				memcpy(&t->data[offset], bss->bssid, 6);
++				offset += 6;
++
+ 				num_sta_ptr = &t->data[offset];
+ 				offset += 2;
+ 
+-				list_for_each_entry(s, &ap->stalist, list) {
++				list_for_each_entry(s, &bss_ap->stalist, list) {
+ 					uint16_t conntime = 0;
+ 
+ #if (EASYMESH_VERSION >= 6)
+@@ -3588,6 +3600,10 @@
+ 						continue;
+ 					}
+ #endif
++					/* macaddr + conntime */
++					if (offset + 8 > ASSOC_CLIENT_TLV_RESERVE)
++						break;
++
+ 					/* macaddr */
+ 					memcpy(&t->data[offset], s->macaddr, 6);
+ 					offset += 6;
+@@ -3644,6 +3660,10 @@
+ 		 * AP macaddr are same.
+ 		 */
+ 		for (i = 0; i < data->num_bss; i++) {
++			/* Never read past what has actually been written. */
++			if (bssid_offset + 8 > offset)
++				break;
++
+ 			if (memcmp(&t->data[bssid_offset], mld->macaddr, 6)) {
+ 				/* Macaddr did not match, step past */
+ 				bssid_offset += 6;
+@@ -3657,6 +3677,9 @@
+ 		}
+ 
+ 		if (!found_bssid) {
++			if (offset + 8 > ASSOC_CLIENT_TLV_RESERVE)
++				break;
++
+ 			bssid_offset = offset;
+ 			data->num_bss++;
+ 			/* bssid */
+@@ -3677,6 +3700,10 @@
+ 		list_for_each_entry(smld, &mld->stamldlist, list) {
+ 			uint16_t conntime = 0;
+ 
++			/* the shift below touches up to offset + 8 */
++			if (offset + 8 > ASSOC_CLIENT_TLV_RESERVE)
++				break;
++
+ 			if (found_bssid && bssid_offset != offset) {
+ 				/* shift data to make room for new STA entry */
+ 				memmove(&t->data[bssid_offset + 8], &t->data[bssid_offset], offset - bssid_offset);

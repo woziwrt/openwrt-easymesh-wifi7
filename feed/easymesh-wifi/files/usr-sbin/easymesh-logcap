@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# easymesh-logcap - keep the daemon logs in check, but do not throw them away.
+#
+# WHY: /tmp is tmpfs, i.e. RAM. Daemons write into it via `-o /tmp/<name>.log`
+# and nothing limits them. Measured 2026-09-06 after 13 hours of running on
+# five nodes:
+#
+#     .1  ieee1905 38.4 M + mapagent 10.8 M + mapcontroller 8.0 M = 57.3 M
+#     .2  24.6 M | .3  24.8 M | .4  27.0 M | .5  34.0 M
+#     ------------------------------------------------ total 167.7 MB RAM
+#
+# The rate is 2-3 MB/h per node. Over a week that is 350-500 MB, 10-13 % of
+# the memory on the BPI-R4 (4 GB) nodes. It is not a disaster, it is a SLOW
+# VERSION of the same thing that brought the controller down in 78 minutes
+# on 5. 9.
+#
+# WHY NOT TURN THEM OFF: on the morning of 6. 9. these logs revealed the root
+# cause of a fault nobody had seen for a month. A log that does not exist
+# proves nothing. So it is capped, not removed.
+#
+# ⚠️ /tmp/mapagent.log and /tmp/mapcontroller.log are often a FIFO, not a file.
+# `tail -c` on a FIFO HANGS and the watchdog would silently die. So only a
+# regular file is taken - `[ -f ]` rules the FIFO out.
+set -u
+
+CAP_MB=${CAP_MB:-8}      # above this, act
+KEEP_MB=${KEEP_MB:-4}    # keep this much of the newest
+ITV=${ITV:-60}
+LOG=/etc/mapc/logcap.log
+
+cap_one() {
+	f="$1"
+	[ -f "$f" ] || return 0                  # FIFO, symlink, does not exist
+	sz=$(wc -c < "$f" 2>/dev/null) || return 0
+	[ "${sz:-0}" -gt $((CAP_MB * 1048576)) ] || return 0
+
+	tmp="$f.logcap"
+	tail -c $((KEEP_MB * 1048576)) "$f" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+	# `cat >` truncates to zero and writes the tail back. If the daemon does not
+	# write with O_APPEND, a hole appears behind it - on tmpfs a hole costs
+	# nothing and the RAM is freed.
+	cat "$tmp" > "$f" 2>/dev/null
+	rm -f "$tmp"
+
+	echo "$(date '+%F %T') $f  $((sz / 1048576)) MB -> $KEEP_MB MB" >> "$LOG" 2>/dev/null
+}
+
+while :; do
+	for f in /tmp/ieee1905.log /tmp/mapagent.log /tmp/mapcontroller.log \
+	         /tmp/wifimngr.log /tmp/bh-adopt-wps.log; do
+		cap_one "$f"
+	done
+	sleep "$ITV"
+done

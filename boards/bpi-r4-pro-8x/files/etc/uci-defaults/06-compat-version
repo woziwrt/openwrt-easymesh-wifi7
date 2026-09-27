@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# Pro-8X compat_version fix (2026-07-24, HW-confirmed).
+#
+# Stock /etc/board.d/05_compat-version sets ucidef_set_compat_version "1.1" only
+# for bananapi,bpi-r4 / -2g5 / -poe (+ a few others). Our custom board
+# bananapi,bpi-r4-pro-8x is NOT in that list → board.json gets no compat_version
+# → config_generate leaves system.compat_version unset → the sysupgrade check
+# (lib/upgrade/fwtool.sh) defaults the DEVICE to "1.0", while our image metadata
+# is "1.1" → keep-config is refused ("Image version mismatch") on EVERY upgrade,
+# forcing `-n`/`-F` forever (which wipes config → the whole baked-identity mess).
+#
+# Pro-8X IS a BPI-R4 variant with the same non-switch-port rename, so it belongs
+# on 1.1 exactly like the others. Record it here so the device matches the image
+# and keep-config works like the classics (→ node-config.sh per-node identity).
+. /lib/functions.sh
+[ "$(board_name)" = "bananapi,bpi-r4-pro-8x" ] && {
+	uci -q set system.@system[0].compat_version='1.1'
+	uci -q commit system
+}
+exit 0

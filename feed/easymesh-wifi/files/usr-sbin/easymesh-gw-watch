@@ -1,0 +1,116 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-gw-watch - which box carries the internet, and since when.
+#
+# mesh-gwd moves the gateway address (VIP, .254) to whichever box has a working
+# uplink. Until 2026-09-26 the only record of a move was the syslog of the box
+# that made it, and the Events page read only the controller's own - so a move
+# to the LTE box, or to an agent with a cable, never showed up, and a line
+# about the controller's cable could be printed under the wrong box.
+#
+# The controller can see it for itself, without asking anyone:
+#   who   - the MAC that answers for the VIP, matched to a box's address
+#   what  - the primary mark (.253) is held only where the ACTIVE uplink is a
+#           cable; the same MAC on both means cable, the VIP alone means the
+#           mobile modem
+#   none  - nobody answers for the VIP: the mesh has no way out
+# Every change is one row in gateway_history. Events turns the rows into
+# "Internet moved from X (cable) to Y (mobile modem) - no internet for N s".
+#
+# Every INTERVAL seconds: one ping, a few ARP lookups. Controller only.
+
+for _lib in db names; do
+	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
+		logger -t easymesh-gw-watch "cannot read /usr/share/easymesh/$_lib.sh - refusing to start"
+		exit 0
+	}
+	# shellcheck source=/dev/null
+	. "/usr/share/easymesh/$_lib.sh"
+done
+unset _lib
+
+INTERVAL=${1:-5}
+KEEP_DAYS=${KEEP_DAYS:-30}
+LAN=br-lan
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = "controller" ] || exit 0
+
+schema() {
+	sq1 "CREATE TABLE IF NOT EXISTS gateway_history (
+		ts    INTEGER NOT NULL,
+		almac TEXT,
+		class TEXT);"
+	sq1 "CREATE INDEX IF NOT EXISTS idx_gateway_history_ts ON gateway_history(ts);"
+}
+
+mac_of() {
+	ip neigh show "$1" dev "$LAN" 2>/dev/null |
+		awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }'
+}
+
+local_has() { ip -4 -o addr show "$LAN" 2>/dev/null | grep -q " $1/"; }
+
+# "almac class" of the holder, or nothing when no box answers for the VIP.
+holder() {
+	_me=$(ip -4 -o addr show "$LAN" 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1 |
+		grep -vE '\.(253|254)$' | head -1)
+	[ -n "$_me" ] || return 1
+	_vip=${_me%.*}.254; _mark=${_me%.*}.253
+	if local_has "$_vip"; then
+		_al=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+		local_has "$_mark" && echo "$_al cable" || echo "$_al modem"
+		return 0
+	fi
+	ping -c 1 -W 1 "$_vip" >/dev/null 2>&1 || return 0
+	_vmac=$(mac_of "$_vip")
+	[ -n "$_vmac" ] || return 0
+	ping -c 1 -W 1 "$_mark" >/dev/null 2>&1
+	[ "$(mac_of "$_mark")" = "$_vmac" ] && _cls=cable || _cls=modem
+	for _pair in $(live_addrs_json | tr -d '{}" ' | tr ',' ' '); do
+		_ip=${_pair##*:}; _al=${_pair%:*}
+		_m=$(mac_of "$_ip")
+		# A box not in the ARP table yet: one ping, then look again.
+		[ -n "$_m" ] || { ping -c 1 -W 1 "$_ip" >/dev/null 2>&1; _m=$(mac_of "$_ip"); }
+		[ "$_m" = "$_vmac" ] && { echo "$_al $_cls"; return 0; }
+	done
+	# Someone answers, but not a box we know: say so rather than guess.
+	echo "unknown $_cls"
+}
+
+schema
+# "none" rather than an empty string: an empty candidate compared equal to an
+# empty reading, and the first "nobody" went in after one reading, stamped
+# with the time the daemon started (2026-09-26).
+last=$(echo $(sq1 "SELECT ifnull(almac,'none') || ' ' || ifnull(class,'') FROM gateway_history ORDER BY ts DESC LIMIT 1;"))
+last=${last:-start}
+cand=""
+pass=0
+while :; do
+	now=$(date +%s)
+	h=$(holder)
+	h=${h:-none}
+	# Two readings in a row before a change is written: one lost ping is not
+	# an outage, and a row per lost ping would fill Events with ghosts.
+	if [ "$h" != "$last" ]; then
+		if [ "$h" = "$cand" ]; then
+			set -- $h
+			if [ "$1" != none ]; then
+				sq1 "INSERT INTO gateway_history VALUES($cand_ts,'$1','$2');"
+			else
+				sq1 "INSERT INTO gateway_history VALUES($cand_ts,NULL,NULL);"
+			fi
+			logger -t easymesh-gw-watch "gateway: $h"
+			last=$h; cand=""
+		else
+			cand=$h; cand_ts=$now
+		fi
+	else
+		cand=""
+	fi
+	pass=$((pass + 1))
+	[ $((pass % 720)) -eq 1 ] &&
+		sq1 "DELETE FROM gateway_history WHERE ts < $now - $KEEP_DAYS * 86400;"
+	sleep "$INTERVAL"
+done

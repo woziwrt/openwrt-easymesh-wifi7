@@ -1,0 +1,991 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# [ -r ] FIRST, and never `if ! . file` or `. file || :`.
+#
+# In ash `.` is a special built-in: a file it cannot open ends the script
+# outright, so neither an `||` nor an `if !` around it is ever reached. This
+# daemon is a procd respawn service, so "ends outright" is a crash loop - of
+# the one daemon that holds the join's single fallback reboot. The promise
+# the old comment made here ("the fallback disarms itself instead, and says
+# so") could not be kept: nothing was said, because nothing ran.
+#
+# /etc/init.d/bh-key-adopt already gets this right for boot-window.sh and
+# says why. This is the same rule applied to the worker's own two sources.
+if [ -r /usr/share/easymesh/addr.sh ]; then
+	. /usr/share/easymesh/addr.sh
+else
+	logger -t bh-key-adopt "addr.sh will not load - the mesh address finisher is off"
+fi
+# Without join-health.sh there is no verdict, every node would look healthy,
+# and the fuse would record "after reboot: healthy" for a box that is broken
+# - a lie in the one record that survives. join_final_check() already treats
+# a missing join_health_verdict as "disarmed"; this only makes sure we are
+# still alive to reach it, and that the reason is on the record.
+if [ -r /usr/share/easymesh/join-health.sh ]; then
+	. /usr/share/easymesh/join-health.sh
+else
+	logger -t bh-key-adopt "join-health.sh will not load - fallback reboot disarmed"
+fi
+#
+# /usr/sbin/bh-key-adopt - turn credentials the mesh delivered into a backhaul.
+#
+# A joining node gets its credentials over the wire: the WSC exchange writes
+# them into the mapagent ap sections. That is where the chain used to end -
+# nothing built the STA side from them, because the only code that creates
+# bsta sections (map_genconfig) is gated on a U-Boot variable no image ever
+# sets. The first from-scratch join (2026-08-10) stalled exactly there: keys
+# delivered, node with no way to use them.
+#
+# So this daemon watches for that moment. When the mapagent backhaul section
+# carries a key and the MLD STA either does not exist or carries a different
+# one, it builds both backhaul sides with the delivered key, turns the radios
+# back on (the join left them dark on purpose - a keyless box has nothing
+# safe to put on the air), sweeps the legacy BSSes that would steal the MLD's
+# slots, and reboots. Reboot, not wifi reload: a runtime reload assigns
+# chanctx wrongly on MT7996 - mlo-backhaul-setup says so on its own doorstep.
+#
+# Converged is the steady state: sta_mld_1 exists and its key matches the
+# delivered one, so after the one reboot this loop never acts again - until a
+# key rotation makes the same drift reappear, which is then handled the same
+# way. The attempt counter is the reboot-loop fuse: if adoption does not
+# converge, it goes loud and stops instead of power-cycling the node forever.
+
+INTERVAL=30
+MARK=/etc/mapc/bh-adopt.count
+MAX_TRIES=3
+
+# The backhaul network's name. Both readers below match on it, so a backhaul
+# rename touches one line instead of two that can drift apart.
+#
+# MAP--BH is our mesh's. Under a controller that is not ours the backhaul is
+# whatever that controller calls it (MediaTek R3: Multi-AP-1), and the name
+# arrives with the key. It is kept in /etc/mapc/bh-ssid and read on every
+# pass, because it can change while this loop runs: a WPS join to a foreign
+# controller writes it a moment before the key is adopted.
+BH_SSID_FILE=/etc/mapc/bh-ssid
+bh_ssid_name() {
+	[ -s "$BH_SSID_FILE" ] && { cat "$BH_SSID_FILE"; return; }
+	echo MAP--BH
+}
+BH_SSID=$(bh_ssid_name)
+
+log() { logger -t bh-key-adopt "$1"; }
+
+# Reboot, or the part of a boot that matters here without one.
+#
+# The join restarts the box to raise what it has just written: the MLD
+# backhaul, a delivered fronthaul, a mesh address. easymesh-soft-restart
+# replays that part of the boot - service order, the radios' hotplug, network
+# reload - and was measured against the reboot phase by phase (2026-09-19).
+# This is now the default. It proved itself on hardware: 10/10 rounds on
+# corridor (2026-09-19) and then four joins from a factory state on three
+# different 4 GB boxes plus corridor (2026-09-20), none of which restarted
+# once, where the same join used to cost four reboots and some eight minutes.
+#
+# The way back is an opt-OUT: /etc/mapc/join-with-reboot restores the old
+# path. A box that gets into trouble can be put back to the behaviour we have
+# shipped for months by touching one file, without a downgrade.
+#
+# The old marker is still honoured, because boxes in the field carry it and
+# taking it away would silently change what they do.
+# Returns only on the soft path; the reboot does not return.
+JOIN_WITH_REBOOT=/etc/mapc/join-with-reboot
+# There is no join-without-reboot file to look for: not rebooting is what
+# happens unless JOIN_WITH_REBOOT asks otherwise. The name outlived the
+# opt-in it belonged to (soft join became the default 2026-09-20) and then
+# cost an afternoon on 2026-09-21, when a stale box still carried the file
+# and it read as the switch that decides this.
+soft_join() {
+	[ -f "$JOIN_WITH_REBOOT" ] && return 1
+	[ -x /usr/sbin/easymesh-soft-restart ]
+}
+
+# The way back from a join that ended half-done.
+#
+# A join without reboots has no restart left to hide behind: whatever it
+# failed to raise stays down, quietly, and the node looks joined. So the join
+# gets one last look at itself, and one reboot to spend if that look is bad.
+#
+# One. Not a retry loop - if a reboot did not fix it, that is a finding, and
+# a second one only buys a longer outage and a worse record of what happened.
+#
+# The fuse is the record, not the permission slip: it is written at the moment
+# the box is actually going down, and the line that says how it turned out is
+# appended after it comes back. A fuse burned before the work would switch
+# this off forever while reading as done - measured 2026-09-04, a box kept its
+# factory address with a marker in place saying it had been given one.
+FALLBACK=/etc/mapc/join-fallback-reboot
+JOIN_STARTED=/etc/mapc/join-started
+JOIN_DEADLINE=600
+
+# Only the soft path. The reboot-driven join already restarts three times and
+# has never needed a net; adding one there would change a path that works.
+fallback_armed() { soft_join; }
+
+now_iso() { date -Is 2>/dev/null || date; }
+
+# This box, this boot. The fuse says which boot decided to reboot, so the
+# line that reports the outcome can prove a reboot actually happened rather
+# than assuming it did - `reboot` can fail to take, and an outcome written
+# after a reboot that never occurred is a fabricated record.
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+# The last word of the join. Returns on every path that does not reboot.
+join_final_check() {
+	local why="$1" bad
+
+	# Nothing left to watch for means the STAMP goes, not only the check.
+	#
+	# 778fbe4 closed the healthy path; these two stayed. They return 0 without
+	# touching JOIN_STARTED, so on a box carrying the reboot opt-out (or with
+	# the health rules missing) the stamp outlives the join - and both callers
+	# create it with `[ -s ] ||`, so the NEXT join on that box inherits it,
+	# starts past a deadline meant to give it ten minutes, and has its one
+	# fallback reboot available to spend in the first second of it.
+	#
+	# The rule is the one the temporary-fuse lesson states: a fuse ends in a
+	# STATE ("this join is over"), never in a deadline - `age >= DEADLINE` is
+	# true for ever once it is true at all.
+	fallback_armed || { rm -f "$JOIN_STARTED"; return 0; }
+	command -v join_health_verdict >/dev/null 2>&1 ||
+		{ rm -f "$JOIN_STARTED"; return 0; }
+
+	# Before the looking, not after: the verdict costs 20 s, and once the
+	# fuse is spent there is nothing left to decide. Paying it every 30 s
+	# round would slow down the adopt work below by 40 % for ever.
+	if [ -s "$FALLBACK" ] && grep -q "after reboot:" "$FALLBACK" 2>/dev/null; then
+		rm -f "$JOIN_STARTED"
+		# The verdict after the reboot is already on record. If it was bad,
+		# this node is failed and stays failed: saying "settled" a moment
+		# later would hide the one join the fallback could not repair.
+		grep -q "after reboot: still broken" "$FALLBACK" 2>/dev/null && return 1
+		return 0
+	fi
+
+	join_health_verdict final
+	bad="$JOIN_HEALTH_BAD"
+
+	# A fuse without an outcome means this is the round after the reboot:
+	# say what it bought, whichever way it went, and never reboot again.
+	if [ -s "$FALLBACK" ]; then
+		if grep -q "boot=$(boot_id)" "$FALLBACK" 2>/dev/null; then
+			# Same boot as the one that wrote the fuse, so the reboot
+			# did not happen. Say that, and do not call it an outcome.
+			#
+			# The fuse stays open so the outcome can still be written if
+			# the box does go down later. The stamp does not: this join is
+			# over whichever way it ended, and leaving it behind hands the
+			# next join on this box a deadline that is already past.
+			log "fallback reboot did not take (same boot) - leaving the fuse open"
+			rm -f "$JOIN_STARTED"
+			return 0
+		fi
+		if [ -n "$bad" ]; then
+			printf '%s after reboot: still broken:%s (looks:%s)\n' \
+				"$(now_iso)" "$bad" "$JOIN_HEALTH_LOOKS" >> "$FALLBACK"
+			log "the fallback reboot did not finish the join:$bad"
+			state failed
+			sync
+			rm -f "$JOIN_STARTED"
+			return 1
+		else
+			printf '%s after reboot: healthy\n' "$(now_iso)" >> "$FALLBACK"
+			log "the fallback reboot finished the join"
+		fi
+		sync
+		rm -f "$JOIN_STARTED"
+		return 0
+	fi
+
+	# The join is over and it came out good, so the stamp has to go.
+	#
+	# It used to stay, and that is worse than it looks: easymesh-wps-join
+	# and easymesh both create it with `[ -s ... ] ||`, so they stamp only
+	# when there is no stamp. A leftover one is therefore INHERITED by the
+	# next join on this box, which then starts life already past a deadline
+	# meant to give it ten minutes. Measured 2026-09-21: three of four nodes
+	# were carrying a stamp 13 hours old, so their next join would have had
+	# no grace at all and could have spent its one fallback reboot in the
+	# first second of it.
+	[ -z "$bad" ] && { rm -f "$JOIN_STARTED"; return 0; }
+
+	# Write first, prove the write, THEN go down. An overlay that is full or
+	# read-only would otherwise leave an empty file, which reads as "no fuse"
+	# - and the box would reboot again every ten minutes, for ever.
+	log "join incomplete at $why:$bad - spending the one fallback reboot"
+	printf '%s reboot because (%s):%s boot=%s (looks:%s)\n' \
+		"$(now_iso)" "$why" "$bad" "$(boot_id)" "$JOIN_HEALTH_LOOKS" >> "$FALLBACK"
+	sync
+	if ! grep -q "reboot because" "$FALLBACK" 2>/dev/null; then
+		log "could not write the fuse - not rebooting"
+		return 0
+	fi
+	reboot
+	sleep 120
+	log "reboot did not take"
+}
+
+# Has the join been going too long to still be going?
+#
+# Measured in wall clock, because it has to survive the reboot that resets
+# uptime - and guarded, because a box that has just found NTP moves its clock
+# under us. A stamp in the future, or a day old, is not a measurement; it is
+# a clock that jumped, so the stamp is reset and the count starts again.
+join_overdue() {
+	local started now age
+	[ -s "$JOIN_STARTED" ] || return 1
+	started=$(cat "$JOIN_STARTED" 2>/dev/null)
+	now=$(date +%s 2>/dev/null)
+	[ -n "$now" ] || return 1
+	# Validate BEFORE the arithmetic, not after: in ash a non-numeric word
+	# inside $(( )) is read as a variable name (so "abc" quietly becomes 0),
+	# and something like "1 2" is a hard error that kills the whole daemon.
+	# `x 2>/dev/null || return 1` on an assignment catches neither.
+	case "$started" in
+		''|*[!0-9]*) echo "$now" > "$JOIN_STARTED"; return 1 ;;
+	esac
+	age=$((now - started))
+	if [ "$age" -lt 0 ] || [ "$age" -gt 86400 ]; then
+		echo "$now" > "$JOIN_STARTED"
+		log "join stamp is $age s away from now - the clock moved, restarting the count"
+		return 1
+	fi
+	[ "$age" -ge "$JOIN_DEADLINE" ] 2>/dev/null
+}
+
+restart_to_apply() {
+	if soft_join; then
+		log "$1 - soft restart instead of a reboot"
+		/usr/sbin/easymesh-soft-restart "bh-key-adopt: $1" || true
+		return 0
+	fi
+	log "$1 - rebooting"
+	sync; reboot
+	# reboot returns at once and the box goes down behind it; nothing
+	# after this line should do work.
+	sleep 60
+}
+
+# One word for the setup overlay: working | settled | failed. setup_state
+# publishes it over the null rpcd session, which is the only channel that
+# answers while the box is rebooting and no sysauth session exists.
+#
+# It lives on the rootfs, not in /tmp, and that is the point: right after a
+# reboot the loop has not run yet (it sleeps its full interval first), and a
+# state that vanished with the reboot would read as "nothing to wait for" at
+# exactly the moment there is. Measured 2026-08-15: an over-the-air join takes
+# THREE restarts - role, join, finisher - and the wizard narrated two. The gap
+# between the second and the third is the dangerous one: the login screen is
+# back, so the user signs in and starts working, and then the box disappears
+# under their hands and reads as dead rather than as busy.
+STATE=/etc/mapc/adopt-state
+state() {
+	mkdir -p /etc/mapc 2>/dev/null
+	[ "$(cat $STATE 2>/dev/null)" = "$1" ] && return 0
+	echo "$1" > $STATE 2>/dev/null
+	# The lamp says "joining" from the button press on, and nothing ever
+	# said "done": a reboot used to clear it by accident. Without reboots it
+	# blinked on for good (2026-09-19). Answer it where the join ends.
+	[ -x /usr/sbin/easymesh-led ] || return 0
+	case "$1" in
+	settled) /usr/sbin/easymesh-led ok >/dev/null 2>&1 ;;
+	failed)  /usr/sbin/easymesh-led refused >/dev/null 2>&1 ;;
+	esac
+}
+
+# Raise a fronthaul that has just been written, without spending a restart -
+# and say honestly whether it worked.
+#
+# The restart is here because it is reliable, and that is worth more than the
+# time it costs. But measured 2026-08-25 on the controller, 20 times out of 20:
+# changing the fronthaul ssid and key on an existing MLD section and reloading
+# put the new name on the air in 7 s with every link present. The operation
+# that is NOT safe is a different one - adding a scanning STA beside a running
+# MLD took a link away 9 times in 30 and never gave it back. This one only
+# rewrites sections that already exist.
+#
+# So try the cheap way and keep the reliable one behind it. Success is not
+# "the interface came back": it is the air carrying a name AND the AP-MLD
+# holding every link it was built from. A reload that returns a link short
+# leaves the node broadcasting on fewer bands than it should, silently, and
+# that is worse than a restart nobody minds. When in any doubt, return 1 and
+# let the caller reboot.
+fh_raise_by_reload() {
+	fr_if=$(uci -q get wireless.ap_mld_1.ifname)
+	[ -n "$fr_if" ] || return 1
+
+	# How many links this MLD was built from. A radio held down in config is
+	# not expected to carry one.
+	fr_want=0
+	for fr_r in $(uci -q get wireless.ap_mld_1.device); do
+		[ "$(uci -q get wireless.$fr_r.disabled)" = "1" ] || fr_want=$((fr_want + 1))
+	done
+	[ "$fr_want" -gt 0 ] || return 1
+
+	wifi down >/dev/null 2>&1
+	sleep 4
+	wifi up >/dev/null 2>&1
+
+	fr_n=0
+	while [ $fr_n -lt 60 ]; do
+		fr_air=$(iw dev "$fr_if" info 2>/dev/null | sed -n 's/^[[:space:]]*ssid //p')
+		fr_have=$(iw dev "$fr_if" info 2>/dev/null | grep -c '^[[:space:]]*channel')
+		[ -n "$fr_air" ] && [ "$fr_have" -ge "$fr_want" ] && {
+			log "reload raised $fr_if with $fr_have/$fr_want links"
+			return 0
+		}
+		fr_n=$((fr_n + 1))
+		sleep 1
+	done
+	log "reload left $fr_if with $(iw dev "$fr_if" info 2>/dev/null | grep -c '^[[:space:]]*channel')/$fr_want links after 60 s"
+	return 1
+}
+
+delivered_bh_key() {
+	# Match the SSID, not just the type - and never the position.
+	#
+	# uci addresses @ap[N] by order of appearance, and the order is a
+	# genconfig implementation detail. Measured 2026-08-15 on the BPI-R4 Pro 8X: the
+	# bhmld_ap_5/6 sections came out FIRST there (they sit last, and empty,
+	# on the classic boards) and carried the fronthaul credential under
+	# type=backhaul. Matching on type alone therefore handed back the
+	# fronthaul key, which never equals wireless.sta_mld_1.key - so the node
+	# re-adopted a backhaul it already had until the fuse blew, and the
+	# finisher below, which lives in the converged branch, never ran once.
+	# The fronthaul stayed on the rescue SSID and the legacy BSSes it left
+	# standing took radio1+radio2 out from under the backhaul.
+	#
+	# wps_delivered_key() already matched on the name. This is the same rule
+	# applied to the door the wire comes in through.
+	local i=0 t s k
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		t=$(uci -q get mapagent.@ap[$i].type)
+		s=$(uci -q get mapagent.@ap[$i].ssid)
+		k=$(uci -q get mapagent.@ap[$i].key)
+		if [ "$t" = "backhaul" ] && [ "$s" = "$BH_SSID" ] && [ -n "$k" ]; then
+			echo "$k"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# radios_on - being on is a condition this daemon holds, not a side effect.
+#
+# adopt() is what deletes wireless.radioN.disabled, and there is a path that
+# never reaches adopt(): when the key the mesh delivers already equals the one
+# in the config - every re-registration, and every node that kept its config
+# across the join - the converged branch runs instead. easymesh-role turned the
+# radios off on its way out, nothing turned them back on, and the node sat dark
+# while adopt-state said "settled". Measured 2026-08-19 on bpi-r4-sd, and it is
+# the same silence that ended 2026-08-18.
+radios_on() {
+	local r changed=0
+	for r in radio0 radio1 radio2; do
+		uci -q get wireless.$r >/dev/null 2>&1 || continue
+		[ -n "$(uci -q get wireless.$r.disabled)" ] || continue
+		uci -q delete wireless.$r.disabled
+		changed=1
+	done
+	[ "$changed" = "1" ] && {
+		uci commit wireless
+		log "radios were dark with the backhaul already in place - turning them back on"
+	}
+
+	# The config saying "on" is not the same as radios being on, and only the
+	# second one carries traffic. Measured 2026-08-19: the flag was cleared and
+	# committed, `wifi reload` was launched detached from a service that apk
+	# was in the middle of restarting, and the box came up with an empty
+	# `iw dev` - no wireless interfaces at all - while every uci value said the
+	# radios were enabled. It took `wifi up` by hand.
+	#
+	# So the state to hold is the interface list, not the flag. `up` and not
+	# `reload`: reload reconfigures what exists, and here nothing does.
+	iw dev 2>/dev/null | grep -q Interface && return 0
+
+	# Not more than once every five minutes. Repeated wifi restarts are how
+	# the MT7996 MCU gets wedged, and a box that needs this twice in a row has
+	# a different problem that another reload will not solve.
+	#
+	# The stamp is uptime, so it belongs in /tmp and nowhere else. Written to
+	# /etc it survives the reboot that resets the clock it is measured in: the
+	# file then holds a number larger than "now", the difference comes out
+	# negative, negative is less than 300, and the one thing this function
+	# exists to do never happens again. Caught before it shipped, on the test
+	# that would have measured it instead of the fix.
+	local now last
+	now=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	last=$(cat /tmp/radios-up.at 2>/dev/null)
+	[ -n "$last" ] && [ "$last" -le "$now" ] 2>/dev/null &&
+		[ $((now - last)) -lt 300 ] 2>/dev/null && return 0
+	echo "$now" > /tmp/radios-up.at
+
+	log "radios enabled in config but no wireless interfaces exist - bringing them up"
+	# setsid so it outlives a service restart that may be what got us here.
+	if command -v setsid >/dev/null 2>&1; then
+		setsid wifi up >/dev/null 2>&1 &
+	else
+		wifi up >/dev/null 2>&1 &
+	fi
+}
+
+adopt() {
+	local key="$1" tries fp prev
+
+	# Count attempts PER KEY, not per node.
+	#
+	# Every attempt ends in a reboot, so a plain counter spends itself in
+	# three restarts and then locks the node out of adoption for good -
+	# including from settings that arrive afterwards and would have worked.
+	# Measured 2026-08-15 on a from-scratch BPI-R4 Pro 8X join: the early attempts
+	# ran while mapagent still carried an older backhaul key, the right one
+	# was delivered a little later, and by then the fuse was spent. The node
+	# sat with a correct key in mapagent, a wrong one in wireless, and a
+	# daemon that refused to look. Clearing the counter by hand converged it
+	# on the first pass.
+	#
+	# A different delivered key is a different situation, not another go at
+	# the same one, so it starts its own count. The fuse still stops a real
+	# loop - the same key failing three times - which is all it was for.
+	fp=$(printf %s "$key" | md5sum | cut -c1-12)
+	prev=$(cat "$MARK" 2>/dev/null)
+	case "$prev" in
+		"$fp":*) tries=${prev#*:} ;;
+		*)       tries=0; rm -f /etc/mapc/bh-adopt.loud ;;
+	esac
+	[ "$tries" -ge 0 ] 2>/dev/null || tries=0
+	if [ "$tries" -ge "$MAX_TRIES" ] 2>/dev/null; then
+		# Once, not once every INTERVAL seconds forever. The blown fuse is
+		# a standing condition, not an event; on 2026-08-15 it wrote the
+		# same sentence into the log every 30 s for over an hour.
+		state failed
+		[ -f /etc/mapc/bh-adopt.loud ] || {
+			: > /etc/mapc/bh-adopt.loud
+			log "gave up after $tries attempts - backhaul config does not converge, leaving the node alone"
+		}
+		return 1
+	fi
+	mkdir -p /etc/mapc 2>/dev/null
+	echo "$fp:$((tries + 1))" > "$MARK"
+	state working
+
+	log "mesh delivered a backhaul key - building the MLD backhaul from it (attempt $((tries + 1)))"
+
+	# Radios first, sections second - the order is load-bearing. The tool's
+	# emitters skip every radio that is missing or disabled, so applied
+	# against the dark radios the join left behind they write a STA section
+	# with an empty device list, which netifd silently ignores: a backhaul
+	# that exists in uci and nowhere else. Cost of learning this: three
+	# reboots and a powercycle on 2026-08-10.
+	local r
+	for r in radio0 radio1 radio2; do
+		uci -q get wireless.$r >/dev/null 2>&1 && uci -q delete wireless.$r.disabled
+	done
+	uci commit wireless
+
+	/usr/sbin/mlo-backhaul-setup --apply-ap --key "$key" --ssid "$BH_SSID" >/dev/null 2>&1 ||
+		{ log "apply-ap failed"; return 1; }
+	/usr/sbin/mlo-backhaul-setup --apply-sta --key "$key" --ssid "$BH_SSID" >/dev/null 2>&1 ||
+		{ log "apply-sta failed"; return 1; }
+
+	[ -x /usr/sbin/drop-legacy-fronthaul ] && /usr/sbin/drop-legacy-fronthaul
+
+	# Run the canonical writer here, where the settings are known to exist.
+	#
+	# easymesh-genconfig owns /etc/config/wireless: it reconciles every MLD
+	# section from the mapagent ap sections, fronthaul included. At boot it
+	# runs from S19 - before map-agent has been told anything by the
+	# controller - so it writes whatever the config happens to hold at that
+	# moment and calls it done. Measured 2026-08-15 on a from-scratch BPI-R4 Pro 8X
+	# join: three boots in a row it wrote a backhaul key that was not the
+	# delivered one and left the fronthaul on the rescue SSID, this daemon
+	# corrected it, rebooted, and S19 undid the correction again. Running
+	# genconfig by hand once the credentials had arrived fixed both values in
+	# a single pass.
+	#
+	# So the writer runs on the event rather than on the boot order: the
+	# moment adoption has a delivered key is exactly the moment there is
+	# something true to write. The apply steps above create the sections;
+	# genconfig only updates sections that already exist, so it has to follow
+	# them, not lead.
+	[ -x /usr/sbin/easymesh-genconfig ] && /usr/sbin/easymesh-genconfig
+
+	restart_to_apply "backhaul built, radios on"
+	return 0
+}
+
+# The wire is no longer the only messenger: a WPS push-button join
+# (wps_pbc with multi_ap=1 against an armed fronthaul) delivers the
+# backhaul credential as a wps_credentials ubus event instead of a WSC
+# write into the mapagent config. Spool those events and lift the key
+# into the same mapagent sections the wire would have written - one
+# adoption path, two doors in. Proven on hardware 2026-08-11.
+WPS_SPOOL=/tmp/bh-adopt-wps.log
+ubus listen wps_credentials > "$WPS_SPOOL" 2>/dev/null &
+WPS_PID=$!
+trap '[ -n "$WPS_PID" ] && kill "$WPS_PID" 2>/dev/null' EXIT
+
+wps_delivered_key() {
+	# Only the backhaul credential matters here; the fronthaul one from a
+	# plain (no multi_ap) WPS round must not build a backhaul.
+	#
+	# Which one it is used to be told by the name: MAP--BH or nothing. That
+	# held while the only registrar was our own controller. A foreign one
+	# names its backhaul itself (MediaTek R3: Multi-AP-1), and its credential
+	# was thrown away here (2026-09-18). So the rule is now who ASKED: our
+	# station interface only ever runs WPS with multi_ap=1, and a Multi-AP
+	# registrar answers that with the backhaul credential, whatever it is
+	# called. MAP--BH still wins when both are in the spool.
+	# Prints "<ssid> <key>"; the SSID carries no spaces in the WPS event we
+	# read, and a name with spaces is refused rather than mangled.
+	local line key ssid
+	[ -s "$WPS_SPOOL" ] || return 1
+	line=$(grep "\"ssid\":\"MAP--BH\"" "$WPS_SPOOL" | tail -1)
+	[ -n "$line" ] || line=$(grep "\"ifname\":\"[^\"]*sta" "$WPS_SPOOL" | tail -1)
+	[ -n "$line" ] || return 1
+	ssid=$(echo "$line" | sed -n "s/.*\"ssid\":\"\([^\"]*\)\".*/\1/p")
+	key=$(echo "$line" | sed -n "s/.*\"key\":\"\([^\"]*\)\".*/\1/p")
+	[ -n "$ssid" ] && [ -n "$key" ] || return 1
+	case "$ssid" in *" "*) return 1 ;; esac
+	echo "$ssid $key"
+}
+
+while :; do
+	sleep "$INTERVAL"
+
+	# The controller is handed its key at setup; this path is for the nodes
+	# that have to be told theirs.
+	[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] && continue
+
+	# A join that never reaches its end never reaches the check at the end
+	# of it either - a fronthaul that is not sent, a controller that went
+	# away mid-join. Ten minutes after the button is long enough that the
+	# slowest good round (7.8 min, 2026-09-19) is not disturbed, and short
+	# enough that somebody standing at the box has not yet given up.
+	if [ "$(cat $STATE 2>/dev/null)" != settled ] && join_overdue; then
+		join_final_check "10 minutes after the button"
+	fi
+
+	# A WPS-delivered key lands in the spool first; stage it where the
+	# wired path would have written it, then the normal flow below takes
+	# over (including the radios-first ordering the adopt step owns).
+	wcred=$(wps_delivered_key) && [ -n "$wcred" ] && {
+		wssid=${wcred%% *}
+		wkey=${wcred#* }
+		mkdir -p /etc/mapc
+		echo "$wssid" > "$BH_SSID_FILE"
+		BH_SSID=$wssid
+		i=0
+		while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+			[ "$(uci -q get mapagent.@ap[$i].type)" = "backhaul" ] && {
+				uci set mapagent.@ap[$i].ssid="$wssid"
+				uci set mapagent.@ap[$i].key="$wkey"
+			}
+			i=$((i + 1))
+		done
+		uci commit mapagent
+		: > "$WPS_SPOOL"
+		log "WPS delivered a backhaul credential for '$wssid' - staged into mapagent config"
+	}
+
+	# The name can have been changed by someone else meanwhile (wps-join).
+	BH_SSID=$(bh_ssid_name)
+
+	# A WPS join in progress has not delivered anything yet. The key in the
+	# mapagent sections at this point is the one `multiap conf` generated for
+	# this box itself; adopting it rebuilt the radios for nothing - a reboot
+	# (or a 2 min soft restart) before every WPS, and it took the join's own
+	# station off the air while the controller's WPS window was open
+	# (2026-09-19). wps-join removes the note once the real credential is
+	# written, and the next pass adopts that one.
+	if [ -f /etc/easymesh-wps-pending ]; then
+		# A note with nobody behind it is worse than no note at all:
+		# easymesh-genconfig exits at its first line, the button answers
+		# "press the controller instead", and phase 1 has already deleted
+		# every wifi-iface. The box then has no radios, no config writer
+		# and no button, and the only way back is the ten second wipe.
+		#
+		# Twenty minutes is past the slowest good join measured (7.8 min,
+		# 2026-09-19) with room for the band walk's restarts on top.
+		_st=$(awk '{print $3}' /etc/easymesh-wps-pending 2>/dev/null)
+		case "$_st" in ''|*[!0-9]*) _st="" ;; esac
+		if [ -n "$_st" ] && [ $(($(date +%s) - _st)) -gt 1200 ] &&
+		   ! grep -lq easymesh-wps-join /proc/[0-9]*/cmdline 2>/dev/null; then
+			log "a WPS join note has been lying about for 20 min with no worker - clearing it"
+			rm -f /etc/easymesh-wps-pending /etc/mapc/wps-join-band
+			echo "error: the join was abandoned - press the button again" \
+				> /tmp/wps-join.state
+			state failed
+		fi
+		continue
+	fi
+
+	key=$(delivered_bh_key) || continue
+
+	# Converged means the STA carries what WE build, not only the key.
+	#
+	# OpenWrt's own WPS handler writes the credential straight into the
+	# station section - SSID, key and the encryption the registrar named.
+	# A MediaTek registrar names WPA2-PSK, which an MLO station cannot use
+	# (the supplicant drops it right after association). The key then
+	# matched and this branch called it done, so mlo-backhaul-setup, which
+	# writes sae and the right name on both sides, never ran (2026-09-18).
+	cur=$(uci -q get wireless.sta_mld_1.key)
+	[ "$(uci -q get wireless.sta_mld_1.ssid)" = "$BH_SSID" ] &&
+		[ "$(uci -q get wireless.sta_mld_1.encryption)" = "sae" ] || cur=""
+	if [ "$cur" = "$key" ]; then
+		# The backhaul is in place, so whatever else is true, the radios
+		# have no reason to be off.
+		radios_on
+		# Converged. Clear the fuse so a future rotation starts fresh.
+		[ -f "$MARK" ] && rm -f "$MARK"
+		[ -f /etc/mapc/bh-adopt.loud ] && rm -f /etc/mapc/bh-adopt.loud
+		# Backhaul is done - but the fronthaul name arrives one step
+		# later. On an over-the-air join the credential comes by WPS
+		# for the backhaul only; the mesh SSID (the fronthaul one) is handed over by
+		# WSC M2 *after* the node has associated, i.e. after the boot
+		# where genconfig already ran. So this is the finisher: once
+		# the backhaul stands, if the fronthaul the controller now
+		# advertises does not match what this box broadcasts, run the
+		# one writer and, if it actually changed the air, reboot once
+		# to raise it - the second restart the user is warned about.
+		# The fuse remembers WHICH credential it settled on, not merely
+		# that it fired once. A rename or a password change later in the
+		# node's life is a new value and has to be finished the same way;
+		# the same value twice still cannot loop.
+		#
+		# Measured 2026-08-24: the fuse was an empty file written at the
+		# first join, and the promise above - that a rotation clears it -
+		# was never kept, because the converged path clears $MARK and
+		# bh-adopt.loud and not this one. So every rename after the join
+		# was swallowed: the controller sent the renew, map-agent stored
+		# the new name within five seconds, and the air kept the old one
+		# for as long as the box stayed up. Two renames were measured on
+		# one afternoon, neither reached a radio without a hand-made reboot.
+		fh=""; fhk=""
+		i=0
+		while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+			[ "$(uci -q get mapagent.@ap[$i].type)" = "fronthaul" ] &&
+				[ -n "$(uci -q get mapagent.@ap[$i].ssid)" ] &&
+				{ fh="$(uci -q get mapagent.@ap[$i].ssid)"
+				  fhk="$(uci -q get mapagent.@ap[$i].key)"; break; }
+			i=$((i + 1))
+		done
+		want="$fh|$fhk"
+		if [ -n "$fh" ] &&
+		   { [ "$fh" != "$(uci -q get wireless.ap_mld_1.ssid)" ] ||
+		     [ "$fhk" != "$(uci -q get wireless.ap_mld_1.key)" ]; } &&
+		   [ "$want" != "$(cat /etc/mapc/fh-finish.done 2>/dev/null)" ]; then
+			mkdir -p /etc/mapc
+			before="$(uci -q get wireless.ap_mld_1.ssid)|$(uci -q get wireless.ap_mld_1.key)"
+			/usr/sbin/easymesh-genconfig
+			if [ "$(uci -q get wireless.ap_mld_1.ssid)|$(uci -q get wireless.ap_mld_1.key)" != "$before" ]; then
+				printf '%s\n' "$want" > /etc/mapc/fh-finish.done
+				sync
+				if fh_raise_by_reload; then
+					log "fronthaul settled to '$fh' - raised without a restart"
+					continue
+				fi
+				state working
+				restart_to_apply "fronthaul settled to '$fh', the reload did not raise it"
+				continue
+			fi
+			# Ran the writer and the air did not change: the fronthaul
+			# the controller advertises is not what this box ended up
+			# broadcasting, and nothing here will fix it by repeating.
+			# Say so once instead of running genconfig every INTERVAL.
+			state failed
+			# Say it once per value, not once every INTERVAL. The marker holds
+			# the credential it was said about, so a later rename is complained
+			# about again and the same one is not. An earlier version cleared
+			# the marker whenever the value differed from the fuse - which is
+			# every pass while it is failing, so "once" never held and the log
+			# filled up: measured 2026-08-25, the same line every 30 s for as
+			# long as it was watched.
+			[ "$want" = "$(cat /etc/mapc/fh-finish.loud 2>/dev/null)" ] || {
+				printf '%s\n' "$want" > /etc/mapc/fh-finish.loud
+				log "controller advertises '$fh' but this box still broadcasts '${before%%|*}' - genconfig did not move it"
+			}
+			continue
+		fi
+		# "settled" means the join is over, and for a node that never got a
+		# fronthaul it is a lie.
+		#
+		# The finisher above only runs when the controller has actually named
+		# a fronthaul. When $fh is empty nothing here fires and the node used
+		# to fall straight through to settled - so a box waiting for
+		# credentials that were never sent reported itself finished. That is
+		# how the endless wait for the third restart went unnoticed on
+		# 2026-08-19 until somebody restarted the controller by hand and the
+		# join completed: the agent was never stuck, it was patiently done.
+		#
+		# The state file has three meanings for the wizard - keep waiting,
+		# failed, finished - and this is "keep waiting", so it stays "working"
+		# and the page goes on spinning until its own give-up fires. The
+		# precision goes next to it rather than into it: a reason file for
+		# anything that wants to know WHAT is missing, and one line in the log
+		# so the answer is in the record instead of in somebody's memory.
+		if [ -z "$fh" ]; then
+			state working
+			echo "fronthaul" > /etc/mapc/adopt-waiting 2>/dev/null
+			[ -f /etc/mapc/adopt-waiting.loud ] || {
+				: > /etc/mapc/adopt-waiting.loud
+				log "backhaul stands, but the controller has named no fronthaul yet - still waiting, not settled"
+			}
+			continue
+		fi
+		rm -f /etc/mapc/adopt-waiting /etc/mapc/adopt-waiting.loud 2>/dev/null
+
+		# The mesh address, asked for rather than typed in.
+		#
+		# A button join carries no address - not carrying one is its whole
+		# point - so the worker calls easymesh-role without --mesh-addr and
+		# the node keeps the address the image ships with. Measured
+		# 2026-08-22: an agent joined by button, carried client traffic
+		# perfectly, and was invisible from the mesh, because 192.168.1.1 is
+		# not in it. It also answered to the same address as the controller's
+		# service port, so two boxes in one mesh had one address.
+		#
+		# Asking the controller directly is not open to us: reaching it needs
+		# an address in its network, which is the thing we do not have. DHCP
+		# has no such problem - it is broadcast, it works before any address
+		# exists, and the controller answering it is the same node that would
+		# have answered the question anyway. It also already knows which
+		# addresses are free, which is the hard half of the problem.
+		#
+		# Done here because this is the point where the backhaul stands and
+		# the controller is reachable, and the restart it costs replaces the
+		# one this loop was going to spend anyway. The fuse keeps it a
+		# finisher rather than something that runs every interval.
+		# Not before the controller's own credentials (WSC M2) have arrived.
+		# The step below runs easymesh-role, whose forget_baked_credentials
+		# keeps the keys only when /etc/multiap/wsc_m2.json exists - without
+		# it the WPS-delivered backhaul key reads as a factory one: keys
+		# wiped, radios disabled, adopt-state gone, node off the mesh for
+		# good. Measured 2026-09-19: the controller offered an address 31 s
+		# after adopt, before M2. A reboot in between usually hid the race.
+		if [ ! -f /etc/mapc/addr-finish.done ] &&
+		   [ -f /etc/multiap/wsc_m2.json ] &&
+		   [ "$(uci -q get network.lan.proto)" = "static" ] &&
+		   [ -z "$(uci -q get network.lan.gateway)" ]; then
+			mkdir -p /etc/mapc
+			# The fuse is burnt where the work SUCCEEDS, further down,
+			# not here.
+			#
+			# It used to be burnt at the top, on the reasoning that the
+			# success path ends in a reboot and must not repeat. True of
+			# the success path, and wrong for every other one: the probe
+			# below returns nothing whenever the backhaul is not up yet,
+			# which is exactly what an early boot looks like. The fuse
+			# was then already gone, so the step never ran again and the
+			# box kept its factory 192.168.1.1 for good - with a working
+			# backhaul, a controller that answered, and no way left to
+			# ask it anything.
+			#
+			# Found 2026-09-04 on a box that had joined properly:
+			# addr-finish.done present from a boot at 09:14, and
+			# addr-finish.log - written only on success - missing
+			# entirely. The marker recorded that we had tried, when the
+			# only thing worth recording is that we got somewhere.
+			#
+			# Retrying costs one DHCP probe per 30 s interval, and only
+			# while this node still has no mesh address: taking one
+			# clears the condition above.
+
+			# The bridge the mesh lives on, asked rather than assumed - a
+			# node that keeps the mesh on a bridge of its own would send the
+			# request down the wrong wire and never hear an answer.
+			br=$(uci -q get network.easymesh.device)
+			[ -n "$br" ] || br=$(uci -q get network.lan.device)
+			[ -n "$br" ] || br=br-lan
+
+			cat > /tmp/addr-probe.sh <<'PROBE'
+#!/bin/sh
+[ "$1" = bound ] || [ "$1" = renew ] || exit 0
+printf '%s %s\n' "$ip" "$router" > /tmp/addr-probe.out
+PROBE
+			chmod +x /tmp/addr-probe.sh
+			rm -f /tmp/addr-probe.out
+			# -n give up rather than wait forever, -q quit once bound.
+			# Nothing is applied by this: the probe script only records.
+			udhcpc -i "$br" -n -q -t 4 -T 3 \
+				-s /tmp/addr-probe.sh >/dev/null 2>&1
+
+			addr=$(cut -d' ' -f1 /tmp/addr-probe.out 2>/dev/null)
+			gw=$(cut -d' ' -f2 /tmp/addr-probe.out 2>/dev/null)
+			rm -f /tmp/addr-probe.sh /tmp/addr-probe.out
+
+			case "$addr" in
+			''|*[!0-9.]*)
+				log "no address offered on $br - staying where we are"
+				;;
+			*)
+				# The offer told us the one thing only DHCP could: which network
+				# the mesh is on. It is not where this node should live. The
+				# answer comes out of the client pool - measured 2026-08-23, .170
+				# out of .100-.249, leased for 12 h - and a node that pins itself
+				# there statically holds an address dnsmasq hands to a phone as
+				# soon as the lease lapses. The clash would surface a day later,
+				# somewhere else, and read as a wireless fault.
+				#
+				# So the offer is used as a way in, and the place to live is
+				# picked from the low end - .2 upwards, which is also the number
+				# the controller shows next to "Pair a new box".
+				# Ask the controller, which is the only box that keeps a
+				# record of what it has already promised.
+				#
+				# Picking locally cannot be made safe, however well this box
+				# probes: between the pick and the moment easymesh-role
+				# applies it, every probe anywhere still reports the number as
+				# free. On 2026-09-04 two boxes were configured minutes apart,
+				# with reboots in between, and both ended up on .2 - the owner
+				# waited, the network answered honestly, and the answer was
+				# stale by the time it mattered. Only a written promise fixes
+				# that, and only the controller can hold the pen.
+				#
+				# The DHCP offer above is what makes the question askable: it
+				# is an address on the controller's network, which is exactly
+				# what this box lacked. The controller sits at .1 of it by the
+				# same convention the whole product uses.
+				alm=$(uci -q get ieee1905.ieee1905.macaddress 2>/dev/null | tr 'A-Z' 'a-z')
+				[ -n "$alm" ] && [ "$alm" != "00:00:00:00:00:00" ] ||
+					alm=$(cat "/sys/class/net/$br/address" 2>/dev/null | tr 'A-Z' 'a-z')
+
+				# Knowing the offer is not the same as being able to use it.
+				#
+				# The probe above runs udhcpc with -n -q and a script that
+				# only records, so nothing is configured: the box learns the
+				# mesh is on 172.16.20.0/24 and still has no address on it.
+				# The request below then has no route to the controller, and
+				# the code fell to "the controller did not answer - picking
+				# locally, which nothing writes down" every single time.
+				# Measured 2026-09-04: the ledger held a reservation the
+				# joining node never collected, the node picked its own
+				# number, and the two matched only by luck. Called by hand a
+				# minute later, from the same box once it HAD an address, the
+				# claim went through and returned source "window".
+				#
+				# So the offered address is held on the bridge for the length
+				# of one question and taken off again. Nothing is committed to
+				# uci, the box still lives where the controller tells it to,
+				# and the address is the one the mesh's own DHCP just said was
+				# free - so borrowing it for a few seconds collides with
+				# nobody.
+				#
+				# Deliberately NO trap here: this script already has one on
+				# EXIT for the wps_credentials listener, and a second would
+				# silently replace it - trading a borrowed address for an
+				# orphaned ubus process. The only path out of the block that
+				# does not reach the removal below ends in reboot, which takes
+				# the address with it.
+				_borrowed=""
+				if [ -n "$addr" ] && ! ip -4 addr show "$br" 2>/dev/null |
+						grep -q "inet ${addr%%/*}/"; then
+					ip addr add "$addr/24" dev "$br" 2>/dev/null && _borrowed="$addr"
+				fi
+				node=$(ask_controller_addr "${addr%.*}.1" "$alm" 2>/dev/null)
+				[ -n "$_borrowed" ] && {
+					ip addr del "$_borrowed/24" dev "$br" 2>/dev/null
+					_borrowed=""
+				}
+
+				if [ -n "$node" ]; then
+					log "the controller reserved $node for $alm"
+				else
+					log "the controller did not answer - picking locally, which nothing writes down"
+
+					# pick_mesh_addr vetoes on what 1905 reports rather than
+					# on ARP silence, and this box has only just become a 1905
+					# member - the view it reads is the one thing here that is
+					# not ready the instant the backhaul is. Measured
+					# 2026-09-04: an agent at depth 3 sees the full five-node
+					# topology with every address, which is exactly what the
+					# ARP walk could not see. Wait a bounded moment for it,
+					# and say so if it never fills.
+					t1905_try=0; t1905_seen=0
+					while [ $t1905_try -lt 5 ]; do
+						t1905_seen=$(ubus -t 5 call ieee1905.topology dump 2>/dev/null |
+							sed -n 's/^[[:space:]]*"ip":[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' |
+							grep -c "^${addr%.*}\.")
+						[ "${t1905_seen:-0}" -gt 0 ] && break
+						t1905_try=$((t1905_try + 1))
+						sleep 2
+					done
+					if [ "${t1905_seen:-0}" -le 0 ]; then
+						# Nothing corroborates this subnet: nobody answered
+						# at .1 of it, and no 1905 member lives in it. That
+						# is not a slow mesh, it is somebody else's DHCP
+						# server - measured 2026-09-21, a foreign agent
+						# handing out 192.168.50.x on our own bridge, with
+						# 192.168.50.1 answering nothing. Picking from ARP
+						# inside it would settle this box in the stranger's
+						# network and keep asking the stranger for more.
+						#
+						# Dropped, not worked around: the fuse below is not
+						# burnt on this path, so the next interval asks
+						# again - and once the real server answers, or 1905
+						# fills, the same offer is accepted normally.
+						log "nothing in ${addr%.*}.0/24 belongs to this mesh - the offer of $addr came from somewhere else, ignoring it"
+						addr=""
+					else
+						node=$(pick_mesh_addr "$addr" "$br" 2>/dev/null)
+					fi
+				fi
+				if [ -n "$addr" ] && [ -z "$node" ]; then
+					# Better a node inside the pool than a node with no address
+					# at all - but say so, because it is a lease waiting to lapse.
+					log "no free node address under ${addr%.*}.2-99 - keeping the offered $addr, which is inside the client pool"
+					node="$addr"
+				fi
+				if [ -n "$addr" ] && [ -x /usr/sbin/easymesh-role ]; then
+					log "mesh offered $addr (gateway ${gw:-none}) - taking $node, one restart to apply"
+					# And again somewhere that survives the reboot this line is
+					# about. logger works - a test line reached /var/log/messages
+					# in under two seconds - but on 2026-08-23 the real one never
+					# landed: the box goes down moments later and rsyslog had not
+					# reached the disk. The single line that proves this ran is
+					# exactly the line that cannot afford to be lost, so it also
+					# goes next to the fuse, on the rootfs, appended not truncated.
+					printf '%s mesh offered %s, taking %s (gateway %s)\n' \
+						"$(date -Is 2>/dev/null || date)" \
+						"$addr" "$node" "${gw:-none}" >> /etc/mapc/addr-finish.log 2>/dev/null
+					# Burn the fuse HERE - after an address has been
+					# decided and before the reboot that applies it.
+					# This is the one moment where "done" is true.
+					: > /etc/mapc/addr-finish.done
+					state working
+					/usr/sbin/easymesh-role agent "${gw:-}" --mesh-addr "$node" \
+						>/dev/null 2>&1
+					restart_to_apply "mesh address $node applied"
+					continue
+				fi
+				;;
+			esac
+		fi
+
+		# Only on the way IN to settled: state() is reached every interval
+		# once the join is over, and the check costs 20 s of looking.
+		#
+		# And "settled" is the check's to withhold. Measured 2026-09-20 with
+		# a forced fault: the check set `failed`, this line set `settled` one
+		# instruction later, and a node the fallback reboot had failed to
+		# repair reported itself finished - with the truth sitting in the
+		# fuse right next to it.
+		if [ "$(cat $STATE 2>/dev/null)" = settled ]; then
+			# A settled node is not joining, whatever a leftover
+			# stamp says. This is the only line a box that leaked
+			# one before the fix above existed will ever reach, so
+			# the repair for the installed base belongs here.
+			rm -f "$JOIN_STARTED"
+			state settled
+		elif join_final_check "settled"; then
+			state settled
+		fi
+		continue
+	fi
+
+	adopt "$key"
+done

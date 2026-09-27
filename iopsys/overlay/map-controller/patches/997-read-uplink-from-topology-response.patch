@@ -1,0 +1,100 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 997: the uplink is in the Topology Response too - read it
+
+agent_gen_topology_response() puts a Backhaul STA MLD Config TLV into every
+Topology Response. This file already has a slot for it in the parse table
+(TOPOLOGY_RESPONSE_BACKHAUL_STA_MLD_CONFIG_IDX) and already has the parser that
+turns it into node::upstream_bssid. Nothing connected the two, so the TLV arrived
+on every topology update and was dropped.
+
+Until now upstream_bssid was refreshed only from a Backhaul STA MLD Config
+Response, and the controller asks for one of those in exactly two situations:
+when its own configuration changes (cntlr.c:1579, CONFIG_DIFF_BSTA_MLD) and when
+a node has not acked such a change (cntlr.c:1848). A node that reassociates to a
+different parent changes no configuration, so nobody ever asked - and the
+controller kept the parent it learned at onboarding for the rest of that node's
+uptime. EasyMesh defines no notification for a change of backhaul parent either,
+so there was nothing else to fall back on.
+
+Measured on hardware 2026-07-31, mesh formed as a chain controller <- 8g <- x8
+after a simultaneous flash. The far agent had it right at every level and said so:
+
+  iw dev bsta-mld-3 link      Connected to ca:8e:1d:ca:bc:af   (8g)
+  bstamld->bssid              ca:8e:1d:ca:bc:af
+  ubus map.agent backhaul_info  ca:8e:1d:ca:bc:af
+
+while the controller reported that same node as its own child at depth 1, and the
+census flagged topo_ok=0 with affiliated_ap down at 8 of 15. Sending a Topology
+Query changed nothing, because the answer was parsed by a handler that ignores
+this TLV.
+
+Placed before topology_build_tree_from_assoc() deliberately: that builder reads
+upstream_bssid, so refreshing it afterwards would surface a whole topology update
+late.
+
+The parser is defined further down in the file, hence the forward declaration.
+
+No change on the wire. The agent already sends this; the controller already knows
+how to read it; this stops it from being thrown away.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/cntlr_map.c	2026-07-31 21:00:46.671777367 +0200
++++ b/src/cntlr_map.c	2026-07-31 21:00:46.672084830 +0200
+@@ -401,6 +401,11 @@
+ 	}
+ }
+ 
++/* Defined further down; needed here because a Topology Response carries this
++ * TLV too and the uplink must be refreshed before the tree is rebuilt. */
++static void cntlr_parse_bsta_mld_config_tlv(struct node *n, const uint8_t *data,
++					    uint16_t len);
++
+ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n)
+ {
+ 	trace("%s: from node " MACFMT " --->\n", __func__, MAC2STR(n->almacaddr));
+@@ -799,6 +804,44 @@
+ 		cntlr_send_channel_preference_query(c, n->almacaddr);
+ 	}
+ 
++	/* The uplink is in this message too - read it.
++	 *
++	 * agent_gen_topology_response() puts a Backhaul STA MLD Config TLV into
++	 * every Topology Response, this table already has a slot for it, and
++	 * cntlr_parse_bsta_mld_config_tlv() below knows how to turn it into
++	 * node::upstream_bssid. Nothing connected the two, so the TLV arrived and
++	 * was dropped.
++	 *
++	 * Until now upstream_bssid was refreshed only from a Backhaul STA MLD
++	 * Config Response, and the controller asks for one of those only when its
++	 * own configuration changes (cntlr.c:1579 on CONFIG_DIFF_BSTA_MLD, and
++	 * cntlr.c:1848 for a node that has not acked such a change). A node that
++	 * reassociates to a different parent changes no configuration, so nobody
++	 * ever asked - and the controller kept the parent from onboarding for the
++	 * rest of the node's uptime. EasyMesh has no notification for a change of
++	 * backhaul parent either, so there was nothing else to fall back on.
++	 *
++	 * Measured on hardware 2026-07-31 with the mesh formed as a chain,
++	 * controller <- 8g <- x8. The far agent had it right on every level and
++	 * said so:
++	 *
++	 *   iw dev bsta-mld-3 link      Connected to ca:8e:1d:ca:bc:af  (8g)
++	 *   bstamld->bssid              ca:8e:1d:ca:bc:af
++	 *   ubus backhaul_info          ca:8e:1d:ca:bc:af
++	 *
++	 * while the controller reported that same node as its own child at depth
++	 * 1, and the census flagged topo_ok=0.
++	 *
++	 * This runs before topology_build_tree_from_assoc() on purpose: the tree
++	 * is built from upstream_bssid, so refreshing it afterwards would show up
++	 * a whole topology update late.
++	 */
++	if (tv[TOPOLOGY_RESPONSE_BACKHAUL_STA_MLD_CONFIG_IDX][0]) {
++		struct tlv *bt = tv[TOPOLOGY_RESPONSE_BACKHAUL_STA_MLD_CONFIG_IDX][0];
++
++		cntlr_parse_bsta_mld_config_tlv(n, bt->data, tlv_length(bt));
++	}
++
+ 	/* When all topology responses collected, build topology tree. */
+ 	/* 992: build the backhaul tree from association data (per-node
+ 	 * upstream_bssid) on every topology update, and do it here so the tree is

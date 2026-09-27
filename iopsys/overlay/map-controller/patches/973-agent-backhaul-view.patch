@@ -1,0 +1,66 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: derive an agent backhaul view instead of storing it
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -66,10 +66,15 @@
+ 	"    depth                INTEGER,            -- [cntlr.h:154]\n"
+ 	"    uplink_type          INTEGER,            -- ul_type [cntlr.h:155]\n"
+ 	"    upstream_bssid       TEXT,               -- [cntlr.h:162]\n"
+-	"    backhaul_mac         TEXT,               -- bh bsta_macaddr [wifi_network_device_backhaul:756]\n"
+-	"    backhaul_upstream_al TEXT,               -- upstream_device_macaddr [:757]\n"
+-	"    backhaul_media       TEXT,               -- linktype [:755]\n"
+-	"    backhaul_type        INTEGER,            -- node_policy.type [config.h:111]\n"
++	"    -- DEPRECATED, never written. An agent's backhaul is already described\n"
++	"    -- by topology_link, and a second stored copy is the defect that made\n"
++	"    -- agent.depth disagree with the 1905 tree until 2026-07-21. Read the\n"
++	"    -- agent_backhaul view instead. Kept only until schema_version has a\n"
++	"    -- migration able to drop a column from an existing database.\n"
++	"    backhaul_mac         TEXT,               -- use agent_backhaul.backhaul_mac\n"
++	"    backhaul_upstream_al TEXT,               -- use agent_backhaul.backhaul_upstream_al\n"
++	"    backhaul_media       TEXT,               -- use agent_backhaul.backhaul_band\n"
++	"    backhaul_type        INTEGER,            -- use agent_backhaul.backhaul_band\n"
+ 	"    est_thput_ul         INTEGER,            -- [cntlr.h:156]\n"
+ 	"    est_thput_dl         INTEGER,            -- [cntlr.h:157]\n"
+ 	"    scan_supported       INTEGER,            -- [cntlr.h:158]\n"
+@@ -337,6 +342,39 @@
+ 	"    bytes_tx INTEGER, bytes_rx INTEGER,      -- [:431/:432]\n"
+ 	"    PRIMARY KEY (macaddr, bssid)\n"
+ 	");\n"
++
++	"-- 20. an agent's backhaul, derived rather than stored.\n"
++	"--     Everything here already exists elsewhere; duplicating it into\n"
++	"--     agent columns is what let agent.depth and the 1905 tree hold two\n"
++	"--     different answers. A view cannot drift from its source.\n"
++	"--\n"
++	"--     backhaul_band is the point of this view. media_type stays\n"
++	"--     MEDIA_TYPE_UNKNOWN (0xFFFF) for a wireless backhaul because\n"
++	"--     ieee1905 skips the mediainfo probe on a bSTA interface - upstream\n"
++	"--     already skipped it for .sta and ap-mld, and we extended that to the\n"
++	"--     4addr bSTA because probing it blocks on hostapd's control socket and\n"
++	"--     the stall breaks onboarding. Rather than restore a probe that costs\n"
++	"--     onboarding, the band is recovered from data already in the DB:\n"
++	"--       topology_link.parent_iface_mac -> bss.bssid -> radio.band\n"
++	"--     because the parent interface of a wireless backhaul IS the parent\n"
++	"--     node's backhaul BSS. Verified 2026-07-21: bpi-8g associated to\n"
++	"--     76:04:1c:81:bc:2d at 6135 MHz, and this join returns band 8 (6 GHz).\n"
++	"--     Band values are libwifi enum wifi_band: 1=2.4, 2=5, 8=6 GHz.\n"
++	"--     NULL means no wireless backhaul was resolved - the controller root\n"
++	"--     has no upstream at all, which is why its whole row is NULL.\n"
++	"CREATE VIEW IF NOT EXISTS agent_backhaul AS\n"
++	"  SELECT a.almac            AS almac,\n"
++	"         a.depth            AS depth,\n"
++	"         t.iface_mac        AS backhaul_mac,\n"
++	"         t.parent_almac     AS backhaul_upstream_al,\n"
++	"         t.parent_iface_mac AS upstream_bssid,\n"
++	"         t.media_type       AS media_type,\n"
++	"         t.wifi_hops        AS wifi_hops,\n"
++	"         r.band             AS backhaul_band\n"
++	"  FROM agent a\n"
++	"  LEFT JOIN topology_link t ON t.child_almac = a.almac\n"
++	"  LEFT JOIN bss b           ON b.bssid = t.parent_iface_mac\n"
++	"  LEFT JOIN radio r         ON r.ruid  = b.ruid;\n"
+ ;
+ 
+ #endif /* MAPDB_SCHEMA_H */

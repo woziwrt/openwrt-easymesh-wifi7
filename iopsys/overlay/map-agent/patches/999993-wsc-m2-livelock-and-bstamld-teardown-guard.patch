@@ -1,0 +1,167 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: stop the WSC M2 livelock and the empty-BSTA-MLD teardowns
+
+Three surgical fixes around AP-Autoconfiguration:
+
+1. WSC M1 key stability. Every autoconfig response regenerated M1 and
+   its private key (agent_gen_wsc), so an M2 answering the previous M1
+   failed decryption (DIFF_ERR) and the radio re-probed in
+   AUTOCFG_ACTIVE every 5 s with a fresh key each time - a livelock
+   whenever the controller answers slower than the probe interval.
+   Store a creation timestamp next to m1_frame and re-send the SAME
+   stored M1 while it is younger than WSC_M1_MAX_AGE_SEC (30 s); only
+   an older or absent M1 is freed and rebuilt, so a lost M2 still
+   recovers.
+
+2. Empty BSTA MLD data is not a teardown order - the same rule
+   mlo_process_ap_mld_config() already applies to AP MLD config (an
+   empty TLV is a no-op). Three sites tore the running backhaul down
+   on missing/empty data: the M2 handler when the TLV is absent, the
+   BSTA MLD Config Request handler when processing fails, and the
+   empty-caps early exit in mlo_process_bsta_mld_config() which
+   returned -1 and made both callers tear down. Log and keep the
+   local config instead; the empty-caps exit now returns 0.
+
+3. The M2 handler dropped the message silently when no local radio
+   matched the AP Radio Identifier. Log the RUID at warn level.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+--- a/src/agent_map.c
++++ b/src/agent_map.c
+@@ -2463,9 +2463,14 @@
+ 	    (caps & BSTA_MLD_CONFIG_NSTR) == 0 &&
+ 	    (caps & BSTA_MLD_CONFIG_EMLSR) == 0 &&
+ 	    (caps & BSTA_MLD_CONFIG_EMLMR) == 0) {
+-		dbg("%s: BSTA MLD config with emtpy caps, teardown\n",
++		/* Empty caps are not an instruction to tear down the
++		 * backhaul this node configured for itself - same rule as
++		 * mlo_process_ap_mld_config(): an empty TLV is a no-op.
++		 * Return 0 so no caller tears down on it either.
++		 */
++		dbg("%s: BSTA MLD config with empty caps -- keeping local bSTA MLD config\n",
+ 		    __func__);
+-		return -1;
++		return 0;
+ 	}
+ 
+ 	offset += 17; /* step past reserved bytes */
+@@ -2764,8 +2769,11 @@
+ 	memcpy(bssid, tv[AP_AUTOCONFIGURATION_WSC_M2_AP_RADIO_IDENTIFIER_IDX][0]->data, 6);
+ 
+ 	radio = agent_get_radio(a, bssid);
+-	if (!radio)
++	if (!radio) {
++		agnt_warn(LOG_APCFG, "%s: no radio matches WSC M2 RUID " MACFMT ", drop\n",
++				__func__, MAC2STR(bssid));
+ 		return -1;
++	}
+ 
+ 	agnt_dbg(LOG_APCFG, "%s: found radio = %s\n", __func__, radio->name);
+ 
+@@ -3025,9 +3033,13 @@
+ 		if (diff & DIFF_BSTA_MLD)
+ 			autoconfig_bsta_mld_hash_to_file(a->bsta_mld_cfg_sha256);
+ 	} else {
+-		agnt_dbg(LOG_APCFG, "%s: Missing BSTA MLD config TLV, teardown\n",
++		/* A missing BSTA MLD config TLV is not an instruction to
++		 * tear down the backhaul this node configured for itself -
++		 * same rule as mlo_process_ap_mld_config(): an empty TLV
++		 * is a no-op. Keep the local config.
++		 */
++		agnt_dbg(LOG_APCFG, "%s: Missing BSTA MLD config TLV -- keeping local bSTA MLD config\n",
+ 		    __func__);
+-		bstamld_teardown_band(a, radio->band);
+ 	}
+ 
+ 	{
+@@ -6984,9 +6996,12 @@
+ 				tv[BSTA_MLD_CONFIG_REQUEST_BSTA_MLD_CONFIG_IDX][0]->data);
+ 
+ 		if (ret) {
+-			uint32_t band_all = BAND_2 | BAND_5 | BAND_6;
+-
+-			bstamld_teardown_band(a, band_all);
++			/* Do not nuke the running backhaul on a request the
++			 * agent could not apply - keep the local bSTA MLD
++			 * config (same rule as mlo_process_ap_mld_config()).
++			 */
++			agnt_warn(LOG_MLO, "%s: BSTA MLD config not applied -- keeping local bSTA MLD config\n",
++					__func__);
+ 		} else {
+ 			/* re-do all MLD configuration in case TLV has changed */
+ 			agnt_dbg(LOG_MLO, "%s: MLD configuration changed, schedule reconfig\n",
+--- a/src/agent_tlv.c
++++ b/src/agent_tlv.c
+@@ -406,6 +406,35 @@
+ 		return -1;
+ 	}
+ 
++	/* A pending M1 must stay stable while the controller may still
++	 * answer it: rebuilding M1 here also rebuilds the private key, so
++	 * an M2 that answers the earlier M1 no longer decrypts (DIFF_ERR)
++	 * and autoconfig livelocks in AUTOCFG_ACTIVE, re-probing every 5 s
++	 * with a fresh key each time. Re-send the stored M1 unchanged and
++	 * only rebuild once it is old enough to be presumed lost.
++	 */
++	if (radio->autconfig.m1_frame && radio->autconfig.key &&
++	    radio->autconfig.m1_size &&
++	    (time(NULL) - radio->autconfig.m1_created) <= WSC_M1_MAX_AGE_SEC) {
++		t = cmdu_reserve_tlv(frm, 1024);
++		if (!t)
++			return -1;
++
++		t->type = TLV_TYPE_WSC;
++		t->len = radio->autconfig.m1_size;
++		memcpy(t->data, radio->autconfig.m1_frame, radio->autconfig.m1_size);
++
++		if (cmdu_put_tlv(frm, t)) {
++			agnt_warn(LOG_APCFG, "%s: error: cmdu_put_tlv()\n", __func__);
++			return -1;
++		}
++
++		agnt_dbg(LOG_APCFG, "%s: re-sending pending M1 for %s (age %lds), key kept\n",
++				__func__, radio->name,
++				(long)(time(NULL) - radio->autconfig.m1_created));
++		return 0;
++	}
++
+ 	wps.auth_type = rcfg->encryption;
+ 	wps.band = radio->band;
+ 	memcpy(wps.uuid, radio->uuid, 16);
+@@ -439,6 +468,7 @@
+ 	radio->autconfig.m1_frame = m1;
+ 	radio->autconfig.m1_size = m1_size;
+ 	radio->autconfig.key = key;
++	radio->autconfig.m1_created = time(NULL);
+ 
+ 	agnt_dbg(LOG_APCFG, "size = %d\n", m1_size);
+ 	return 0;
+--- a/src/autoconfig.h
++++ b/src/autoconfig.h
+@@ -3,11 +3,18 @@
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <time.h>
+ 
+ #include "utils/libcrypto.h"
+ 
+ #define HEARTBEAT_AUTOCFG_INTERVAL 70
+ 
++/* Keep a pending WSC M1 (and its private key) for this long: an M2 that
++ * answers it can still be decrypted instead of regenerating the key on
++ * every autoconfig response and livelocking in AUTOCFG_ACTIVE.
++ */
++#define WSC_M1_MAX_AGE_SEC 30
++
+ #define AUTOCFG_FILE "/etc/multiap/wsc_m2.json"
+ 
+ struct wifi_radio_element;
+@@ -34,6 +41,7 @@
+ 	uint16_t m1_size;
+ 	struct wsc_key *key;
+ 	uint8_t sha256[SHA256_LENGTH];
++	time_t m1_created;
+ };
+ 
+ void autoconfig_clean_wsc_hash(struct wsc_data *wsc);

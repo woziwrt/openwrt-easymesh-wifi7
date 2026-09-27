@@ -1,0 +1,131 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] cntlr: offer a renew to a node that has never configured itself
+
+An agent is supposed to ask for its configuration with an
+AP-Autoconfiguration Search, and ours do. A foreign one may simply not.
+
+Measured 2026-09-21. A MediaTek agent joined our backhaul over 6 GHz, was
+placed in the topology at depth 1 with its parent derived from the
+association, and answered Topology Query 45 times in a minute - a healthy
+member of the mesh by every reading we had. It kept its own SSID.
+
+60 s of 1905 on the interface it joined through, by CMDU type:
+
+    0002/0003  90/90  Topology Query / Response
+    000d/000e  35/17  Higher Layer Query / Response  (none of the responses
+                      were its own - it never answers those)
+    0007       11     AP-Autoconfiguration Search: 6 from our agent,
+                      5 from the controller, NONE from it
+    0008/0009   0/0   no Response, no M2 - because nobody had asked
+    000a        0     and no Renew either
+
+So it never asked, and we never offered. It then sat in the mesh with a
+foreign SSID: one network on paper, two in the air.
+
+We do send Renew, but only to nodes that have already been configured once.
+Both paths start from node->last_config being valid - cntlr_check_config_diff()
+on a credential change, and the chain in cntlr_renew_nodes_configuration()
+comparing last_config against cfg.last_change. A node that has never been
+configured has no last_config, so it falls through every arm. The node that
+needs a renew most is the only one that cannot get one.
+
+Renew is the standard way of saying "ask me again", so offer it to a node
+that is alive on 1905 and has never been configured, with a holdoff so an
+agent that ignores it costs one multicast a minute and nothing more. Our own
+nodes pass through this state only for the seconds before their own Search
+lands.
+
+Placed before the chain and not as an arm of it, for the same reason the
+backhaul STA-MLD re-ask is: every arm there requires the timestamp this case
+is defined by not having, and the first arm leaves the loop outright.
+
+⚠️ Not yet shown to make the foreign agent accept the configuration - it is
+not known whether it acts on a Renew it did not ask for. What is shown is
+that nobody was offering one.
+diff -u -r a/src/cntlr.c b/src/cntlr.c
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -2051,6 +2051,42 @@
+ }
+ #endif
+ 
++#define UNCONFIGURED_RENEW_HOLDOFF 60	/* seconds between offers, per node */
++
++/* A node that has NEVER been configured falls through every arm below: each
++ * of them starts from node->last_config being valid, so they only refresh a
++ * node that configured itself once already.
++ *
++ * An agent is supposed to ask for its configuration - AP-Autoconfiguration
++ * Search - and ours do. A foreign one may simply not. Measured 2026-09-21 on
++ * a MediaTek agent that had joined our backhaul and was answering Topology
++ * Query normally: 60 s of 1905 on the interface it joined through carried 11
++ * Searches, six from our agent and five from the controller, and none of its
++ * own. It never received an M2, kept its own SSID, and the mesh was one
++ * network only on paper.
++ *
++ * Renew is the standard way of saying "ask me again", so offer it to a node
++ * that is alive on 1905 and has never been configured. Our own nodes pass
++ * through this state for the seconds before their own Search lands; a node
++ * that ignores the offer costs one multicast per holdoff and nothing else.
++ */
++static bool cntlr_unconfigured_renew_due(struct controller *c, struct node *n)
++{
++	if (!timestamp_invalid(&n->last_config))
++		return false;
++
++	/* Silent on 1905 is not "unconfigured", it is "not there yet". */
++	if (timestamp_invalid(&n->last_cmdu))
++		return false;
++
++	if (c->uptime < n->unconfigured_renew_at)
++		return false;
++
++	n->unconfigured_renew_at = c->uptime + UNCONFIGURED_RENEW_HOLDOFF;
++
++	return true;
++}
++
+ static void cntlr_renew_nodes_configuration(struct controller *c)
+ {
+ 	trace("%s: --->\n", __func__);
+@@ -2067,6 +2103,25 @@
+ 	/* When at least one running node was configured with older config, */
+ 	/* send autoconfig renew */
+ 	list_for_each_entry(node, &c->agentlist, list) {
++		/* Deliberately before the chain below and not an arm of it:
++		 * every arm there requires last_config to be valid, which is
++		 * exactly what a never-configured node does not have. Asking
++		 * from inside the chain would skip the one node that needs it.
++		 */
++		if (cntlr_unconfigured_renew_due(c, node)) {
++			uint8_t renew_addr[6] = {0x01, 0x80, 0xc2, 0x00, 0x00, 0x13};
++			struct cmdu_buff *cmdu =
++				cntlr_gen_ap_autoconfig_renew(c, renew_addr);
++
++			info("%s: " MACFMT " has never configured itself - offering a renew\n",
++			     __func__, MAC2STR(node->almacaddr));
++
++			if (cmdu) {
++				send_cmdu(c, cmdu);
++				cmdu_free(cmdu);
++			}
++		}
++
+ #if (EASYMESH_VERSION >= 6)
+ 		/* Deliberately before the chain below and not an arm of it: a
+ 		 * TTLM policy is unicast, carries no MLD configuration, and
+diff -u -r a/src/cntlr.h b/src/cntlr.h
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -229,6 +229,11 @@
+ 	uint64_t bstamld_requery_at;
+ #endif
+ 
++	/* Controller uptime (s) before which this node is not offered an
++	 * unsolicited AP-Autoconfiguration Renew again. Zero means "at the
++	 * next opportunity". See cntlr_unconfigured_renew_due(). */
++	uint64_t unconfigured_renew_at;
++
+ 	/* CLOCK_MONOTONIC seconds since the tree first failed to place this
+ 	 * node, 0 while it is placed (topology.c). APPEND ONLY - see the
+ 	 * note above. */

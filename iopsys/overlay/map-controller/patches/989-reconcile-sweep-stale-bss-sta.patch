@@ -1,0 +1,149 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 989 - reconcile-sweep stale bss and sta rows
+
+The bss sweep (mapc_sync_bss_sweep) deletes bss NOT IN r->iflist, but
+r->iflist was never reconciled at iface granularity: a ghost iface from a
+re-flash was merely set enabled=false and kept, so it stayed in the sweep's
+own protect-set forever. Add cntlr_node_sweep_ifaces(), a per-iface mirror of
+cntlr_node_sweep_radios keyed on bss->tsp (set fresh for every iface present
+in the AP Operational BSS TLV), run right after the radio sweep. r->iflist is
+then the current picture and the existing bss sweep removes the ghost rows.
+
+sta had no sweep at all -- a backhaul bSTA left by a re-flash never emits a
+disassoc event, so mapc_del_sta was never called and the row was immortal.
+Add mapc_sync_sta_sweep(): DELETE ... WHERE agent_almac=? AND macaddr NOT IN
+(live stalist), called after the Topology Response stalist persistence. Both
+sweeps no-op on an empty/oversized report so a half-parsed CMDU cannot wipe
+the tables.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1195,6 +1195,28 @@
+ 	}
+ }
+ 
++/* Drop ifaces of confirmed radios whose BSS was not in the latest AP
++ * Operational BSS TLV (bss->tsp older than this pass), so r->iflist -- and
++ * thus mapc_sync_bss_sweep's NOT IN protect-set -- is the current picture,
++ * not the union of every BSSID a radio ever had. Runs after
++ * cntlr_node_sweep_radios so only surviving (confirmed) radios are walked. */
++void cntlr_node_sweep_ifaces(struct controller *c, struct node *n, time_t since)
++{
++	struct netif_radio *r = NULL;
++	struct netif_iface *ni = NULL, *tmp;
++
++	list_for_each_entry(r, &n->radiolist, list) {
++		list_for_each_entry_safe(ni, tmp, &r->iflist, list) {
++			if (ni->bss->tsp >= since)
++				continue;	/* confirmed this pass */
++			mactable_del_entry(c->mac_table, ni->bss->bssid, MAC_ENTRY_FBSS);
++			free(ni->bss);
++			list_del(&ni->list);
++			free(ni);
++		}
++	}
++}
++
+ static void radio_clean_radio_el(struct netif_radio *r)
+ {
+ 	struct wifi_scanres_element *b = NULL, *tmp;
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -130,6 +130,7 @@
+ };
+ 
+ void cntlr_node_sweep_radios(struct controller *c, struct node *n);
++void cntlr_node_sweep_ifaces(struct controller *c, struct node *n, time_t since);
+ 
+ enum nodetype {
+ 	NODE_WIFI_EXTENDER,
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -496,6 +496,8 @@
+ 
+ 		offset += 1; /* num_radio */
+ 
++		time_t pass_start = time(NULL);	/* 989: iface reconcile marker */
++
+ 		{
+ 			struct netif_radio *_rm;
+ 			list_for_each_entry(_rm, &n->radiolist, list)
+@@ -554,6 +556,7 @@
+ 		}
+ 	
+ 		cntlr_node_sweep_radios(c, n);	/* reconcile stale radios (fix b) */
++		cntlr_node_sweep_ifaces(c, n, pass_start);	/* 989: stale ifaces */
+ 	}
+ 
+ 	/* map profile info stored for each node */
+@@ -4848,6 +4851,7 @@
+ 				list_for_each_entry(cs, &n->stalist, list)
+ 					mapc_sync_sta(c, n, cs);
+ 			}
++			mapc_sync_sta_sweep(c, n);	/* 989: drop bSTA ghosts (RESPONSE only) */
+ 			list_for_each_entry(r, &n->radiolist, list) {
+ 				mapc_sync_radio(c, n, r);
+ 				list_for_each_entry(bss, &r->iflist, list)
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -569,6 +569,46 @@
+ 	stmt_finish(c->db, st);
+ }
+ 
++/* Delete sta rows for node @n that are NOT in its live stalist -- the re-flash
++ * bSTA ghosts that never emit a disassoc event. Conservative: an empty (or
++ * absurdly wide) report deletes nothing, so a half-parsed CMDU cannot wipe the
++ * table. Keyed on agent_almac so only this node's rows are touched. */
++void mapc_sync_sta_sweep(struct controller *c, struct node *n)
++{
++	char almac[18], sql[128 + 3 * 32];
++	mapdb_stmt *st = NULL;
++	struct sta *s;
++	int cnt = 0, i;
++
++	if (!c->db)
++		return;
++
++	list_for_each_entry(s, &n->stalist, list)
++		cnt++;
++	if (cnt == 0 || cnt > 32)
++		return;
++
++	mac2str(n->almacaddr, almac);
++	snprintf(sql, sizeof(sql),
++		 "DELETE FROM sta WHERE agent_almac=? AND macaddr NOT IN (");
++	for (i = 0; i < cnt; i++)
++		strcat(sql, i ? ",?" : "?");
++	strcat(sql, ")");
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: sta sweep prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, almac);
++	i = 2;
++	list_for_each_entry(s, &n->stalist, list) {
++		char m[18];
++		mac2str(s->macaddr, m);
++		mapdb_bind_text(st, i++, m);
++	}
++	stmt_finish(c->db, st);
++}
++
+ /* ---- topology_link ---------------------------------------------------- */
+ 
+ void mapc_sync_topology(struct controller *c)
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -48,6 +48,9 @@
+ /* Delete the 'sta' row for @s. Call ONLY on a true disconnect. */
+ void mapc_del_sta(struct controller *c, struct sta *s);
+ 
++/* Reconcile sta rows for @n against its live stalist (drop re-flash ghosts). */
++void mapc_sync_sta_sweep(struct controller *c, struct node *n);
++
+ /* Rebuild the 'topology_link' edge set from c->topology.dev_list, one txn. */
+ void mapc_sync_topology(struct controller *c);
+ 

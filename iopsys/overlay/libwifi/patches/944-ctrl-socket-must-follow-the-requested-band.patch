@@ -1,0 +1,93 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: honour the requested band when picking a ctrl socket
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Each affiliated link of an AP-MLD has its own hostapd control socket,
+"<ifname>_link<id>"; the parent socket speaks for one link alone.
+get_ctrl_interface_band() ignored the band it was handed and always returned the
+bare ifname, so every caller asking for a specific band silently got the parent.
+
+There are nine such callers in this file - radio_info_band,
+radio_get_band_maxrate, iface_ap_info_band, iface_get_beacon_ies_band,
+iface_get_assoclist_band, iface_get_blocked_stas, iface_get_sta_info_band,
+iface_block_sta and iface_chan_switch - and each one reads or writes a single
+leg while believing it addressed the band it asked for. 943 fixed one of them
+by fanning out inside iface_block_sta; this fixes the cause the other eight
+share.
+
+HW-measured 2026-09-03 on ap-mld-1 with three links. A MAC blocked on
+ap-mld-1_link1 only:
+
+  hostapd_cli -i ap-mld-1_link1 deny_acl SHOW  ->  aa:bb:cc:dd:ee:01
+  ubus call wifi.ap.ap-mld-1    blocked_stas   ->  {"blocked":[]}
+  ubus call wifi.apmld.ap-mld-1 blocked_stas   ->  2.4GHz [] 5GHz [] 6GHz []
+
+The per-band path is the worse of the two: it reports three empty bands, so it
+does not merely miss the entry, it asserts it checked all three. It had queried
+the parent socket three times over.
+
+nlwifi_get_mlo_links() already filters by band - see "Check if specyfic band
+requested" just before links->num++ in nlwifi.c - so a specific band yields
+that leg and nothing else. qca.c:146 composes the socket name the same way.
+
+BAND_ANY keeps returning the parent: it is the "no particular band" request and
+picking a leg for it would be a guess. Callers that must reach every leg fan
+out themselves, which is what 943 does for the deny ACL.
+
+A non-MLO AP - a legacy single-leg node joining the backhaul - enumerates no
+links, so num stays 0 and it falls through to the bare ifname exactly as
+before.
+
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1205,8 +1205,49 @@
+ 
+ static int get_ctrl_interface_band(const char *ifname, enum wifi_band band, char **ctrl_interface)
+ {
++	struct wifi_mlo_link links[WIFI_NUM_LINK_PER_MLD] = {0};
++	int num = ARRAY_SIZE(links);
++	char link_iface[64];
++
++	/* Each affiliated link of an AP-MLD has its own hostapd control socket,
++	 * "<ifname>_link<id>"; the parent socket speaks for one link alone.
++	 * This function ignored the band it was handed and always returned the
++	 * bare ifname, so every caller that asked for a specific band silently
++	 * got the parent - and there are nine of them in this file
++	 * (radio_info_band, radio_get_band_maxrate, iface_ap_info_band,
++	 * iface_get_beacon_ies_band, iface_get_assoclist_band,
++	 * iface_get_blocked_stas, iface_get_sta_info_band, iface_block_sta,
++	 * iface_chan_switch). Each one reads or writes a single leg while
++	 * believing it addressed the band it asked for.
++	 *
++	 * Measured 2026-09-03 on ap-mld-1 with three links: a MAC blocked on
++	 * ap-mld-1_link1 was invisible to both ubus blocked_stas paths, and the
++	 * per-band one reported three empty bands - it had queried the parent
++	 * socket three times over.
++	 *
++	 * nlwifi_get_mlo_links() already filters by band (nlwifi.c, "Check if
++	 * specyfic band requested" just before links->num++), so a specific
++	 * band yields that leg and nothing else. qca.c:146 composes the name
++	 * the same way.
++	 *
++	 * BAND_ANY keeps returning the parent: it is the "no particular band"
++	 * request, and picking a leg for it would be a guess. Callers that must
++	 * reach every leg fan out themselves (see iface_block_sta).
++	 *
++	 * A non-MLO AP - a legacy single-leg node - enumerates no links, so
++	 * num stays 0 and it falls through to the bare ifname exactly as
++	 * before. Keep it that way.
++	 */
++	if (band != BAND_ANY &&
++	    nlwifi_get_mlo_links(ifname, band, links, &num) == 0 && num > 0) {
++		snprintf(link_iface, sizeof(link_iface), "%s_link%u",
++			 ifname, links[0].id);
++		*ctrl_interface = strdup(link_iface);
++		return *ctrl_interface ? 0 : -1;
++	}
++
+ 	*ctrl_interface = strdup(ifname);
+-	return 0;
++	return *ctrl_interface ? 0 : -1;
+ }
+ 
+ static int get_ctrl_interface(const char *ifname, char **ctrl_interface)

@@ -1,0 +1,142 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] Ask again for a backhaul STA-MLD the controller never received
+
+A node is asked for its backhaul STA-MLD only when the controller's own
+bstamld config changed after that node last acked. A node that misses that
+single window - it joined after the change, or its 0xE1 response was lost -
+is never asked again. The bstamld table then holds no row for it for the
+lifetime of the controller, while its links are demonstrably up.
+
+Measured twice on bpi-4g2: on 2026-08-08, and again on 2026-08-09 after a cold
+start in which that node happened to boot first and the controller last. Both
+backhaul links associated on 5 and 6 GHz, the agent's own status carrying a
+bsta_mld section, and nothing on record in the controller.
+
+The fix asks again, bounded two ways. Only a node with a wireless uplink is
+asked - for the root an empty row is the correct answer rather than a gap to
+fill - and only once per holdoff, so a node that genuinely has nothing to say
+costs one CMDU every two minutes instead of one on every tick.
+
+The existing stale-config test moves into a named predicate beside the new
+one, so the call site reads as the two reasons to ask rather than as one
+timestamp comparison with a second case bolted on.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -222,6 +222,11 @@
+ 	 * backhaul uplink -> single element (NULL until a 0xE1 TLV is parsed),
+ 	 * not a list. Mirror of apmld_list's lifecycle. */
+ 	struct wifi_bstamld_element *bstamld;
++
++	/* Controller uptime (s) before which this node is not asked for its
++	 * backhaul STA-MLD again. Zero means "at the next opportunity".
++	 * See cntlr_bstamld_requery_due() for why re-asking is needed. */
++	uint64_t bstamld_requery_at;
+ #endif
+ };
+ 
+--- a/src/cntlr.c
++++ b/src/cntlr.c
+@@ -1871,6 +1871,61 @@
+ }
+ #endif
+ 
++#if (EASYMESH_VERSION >= 6)
++/* A node is asked for its backhaul STA-MLD only when the controller's own
++ * bstamld config changed after that node last acked. A node that misses that
++ * single window - it joined after the change, or its 0xE1 response was lost -
++ * is never asked again, and the bstamld table holds no row for it while the
++ * links are demonstrably up.
++ *
++ * Measured twice on bpi-4g2 (2026-08-08, and again after the cold start of
++ * 2026-08-09): both backhaul links associated on 5 and 6 GHz, the agent's own
++ * status carrying a bsta_mld section, and nothing on record here.
++ */
++#define BSTAMLD_REQUERY_HOLDOFF 120	/* seconds between re-asks, per node */
++
++static bool node_has_wireless_uplink(const struct node *n)
++{
++	int i;
++
++	for (i = 0; i < 6; i++) {
++		if (n->upstream_bssid[i])
++			return true;
++	}
++
++	return false;
++}
++
++static bool cntlr_bstamld_config_stale(struct controller *c, struct node *n)
++{
++	return timestamp_less_than(&n->last_bstamld_ack, &c->cfg.last_bstamld_change) &&
++	       timestamp_greater_than(&n->last_cmdu, &c->cfg.last_bstamld_change);
++}
++
++/* Says yes at most once per holdoff per node, and reserves that slot as it
++ * answers: the caller sends on the strength of the answer, so the bookkeeping
++ * belongs with the decision rather than with the sending.
++ *
++ * A node with no wireless uplink is the root. For the root an empty row is the
++ * right answer rather than a gap to fill, so it is never asked.
++ */
++static bool cntlr_bstamld_requery_due(struct controller *c, struct node *n)
++{
++	if (n->bstamld)
++		return false;
++
++	if (!node_has_wireless_uplink(n))
++		return false;
++
++	if (c->uptime < n->bstamld_requery_at)
++		return false;
++
++	n->bstamld_requery_at = c->uptime + BSTAMLD_REQUERY_HOLDOFF;
++
++	return true;
++}
++#endif
++
+ static void cntlr_renew_nodes_configuration(struct controller *c)
+ {
+ 	trace("%s: --->\n", __func__);
+@@ -1887,6 +1942,28 @@
+ 	/* When at least one running node was configured with older config, */
+ 	/* send autoconfig renew */
+ 	list_for_each_entry(node, &c->agentlist, list) {
++#if (EASYMESH_VERSION >= 6)
++		/* Deliberately not an arm of the chain below.
++		 *
++		 * The AP-MLD arm holds for a node until that node acks, and the
++		 * first arm leaves the loop outright, so a node can sit behind
++		 * either of them indefinitely. Asking from inside the chain
++		 * would reproduce the very gap this is here to close: a node
++		 * that is never reached is exactly the node whose row is
++		 * missing.
++		 *
++		 * info() rather than dbg() on purpose. This fires only while a
++		 * row is genuinely absent, which is either a node still coming
++		 * up or a bug worth seeing, and dbg is below the default level.
++		 */
++		if (cntlr_bstamld_requery_due(c, node)) {
++			info("%s: no backhaul STA-MLD on record for " MACFMT " - asking again\n",
++			     __func__, MAC2STR(node->almacaddr));
++
++			cntlr_send_bsta_mld_configuration_request(c, node);
++		}
++#endif
++
+ 		if (!timestamp_invalid(&node->last_config) &&
+ 		    timestamp_less_than(&node->last_config, &c->cfg.last_change) &&
+ 		    timestamp_greater_than(&node->last_cmdu, &c->cfg.last_change)) {
+@@ -1916,8 +1993,7 @@
+ 			dbg("Found possibly unconfigured AP MLD node: "MACFMT"\n", MAC2STR(node->almacaddr));
+ 
+ 			cntlr_send_ap_mld_configuration_request(c, node);
+-		} else if (timestamp_less_than(&node->last_bstamld_ack, &c->cfg.last_bstamld_change) &&
+-			   timestamp_greater_than(&node->last_cmdu, &c->cfg.last_bstamld_change)) {
++		} else if (cntlr_bstamld_config_stale(c, node)) {
+ 
+ 			dbg("Found possibly unconfigured BSTA MLD node: "MACFMT"\n", MAC2STR(node->almacaddr));
+ 

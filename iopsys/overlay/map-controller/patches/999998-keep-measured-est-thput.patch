@@ -1,0 +1,63 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 999998: do not let an unmeasured link erase a measured throughput estimate
+
+The exact twin of 99993 (keep measured rcpi), two lines above it: an MLO
+client is reported once per affiliated link, an idle link has nothing to
+estimate and honestly reports 0, all reports land on the single sta row
+the MLD has, and both writers of dl_est_thput/ul_est_thput are
+unconditional - so the measured estimate is routinely erased by an
+unmeasured one, in the same callback whose rcpi we already guard.
+
+The blind review of 2026-08-04 flagged this as finding 1.5 and the series
+pattern it belongs to ("fixed one site out of N"). Both writer sites get
+the same guard as rcpi:
+
+  - the associated-STA link metrics path (next to the guarded rcpi), and
+  - the per-BSS link-metrics-response path (next to the guarded ul_rcpi).
+
+Zero-as-no-reading is the correct interpretation on both: the TLV carries
+an estimate the AP computed, and an AP that measured nothing sends 0, not
+an estimate of 0 - a link with a real estimate of zero throughput would be
+a dead link, which association state reports separately.
+
+Cost, as with rcpi: a client that leaves keeps its last estimate until the
+row is released. Association state says whether the client is there; the
+estimate says what the link could do while it was.
+
+Verify on hardware: MLO client with one active link, watch
+est_mac_rate_dl/ul in the sta table - with this patch they hold the
+measured value instead of flapping to 0 with every idle-link report.
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -2518,8 +2518,14 @@
+ 
+ 		s = cntlr_find_sta(c->sta_table, p->macaddr);
+ 		if (s) {
+-			s->de_sta->dl_est_thput = dl_est_thput;
+-			s->de_sta->ul_est_thput = ul_est_thput;
++			/* Same single-row-per-MLD clobber as rcpi below: an idle
++			 * affiliated link estimates nothing and honestly reports 0,
++			 * and the last writer wins. A zero estimate never overwrites
++			 * a measured one - steering decisions divide by these. */
++			if (dl_est_thput)
++				s->de_sta->dl_est_thput = dl_est_thput;
++			if (ul_est_thput)
++				s->de_sta->ul_est_thput = ul_est_thput;
+ 			/* An MLO client is reported once per affiliated link, and a link
+ 			 * the client is not transmitting on has nothing to measure, so it
+ 			 * honestly sends rcpi 0. All those reports land on the one row this
+@@ -3180,8 +3186,12 @@
+ 				continue;
+ 			}
+ 
+-			s->de_sta->dl_est_thput = BUF_GET_BE32(b->dl_thput);
+-			s->de_sta->ul_est_thput = BUF_GET_BE32(b->ul_thput);
++			/* Zero means the link measured nothing - same clobber and same
++			 * trade as ul_rcpi below, so the same guard. */
++			if (BUF_GET_BE32(b->dl_thput))
++				s->de_sta->dl_est_thput = BUF_GET_BE32(b->dl_thput);
++			if (BUF_GET_BE32(b->ul_thput))
++				s->de_sta->ul_est_thput = BUF_GET_BE32(b->ul_thput);
+ 			s->de_sta->time_delta = BUF_GET_BE32(b->time_delta);
+ 			/* record link-metrics-response receive time */
+ 			time(&s->de_sta->tsp);

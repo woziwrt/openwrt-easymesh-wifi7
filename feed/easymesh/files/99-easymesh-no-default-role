@@ -1,0 +1,33 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# A box nobody has set up has no role.
+#
+# Both map daemons ship factory defaults that say otherwise: map-controller
+# arrives with enabled='1' and mapagent's stock controller_select carries
+# local='1' - a fresh node greets its owner as the controller of a mesh
+# nobody founded. Roles here are deliberate and explicit: easymesh-role
+# grants them, and nothing else does.
+#
+# Telling a factory default from a decision needs marks the factory cannot
+# leave. easymesh-role agent sets controller_select.local='0' (the factory
+# ships '1'); easymesh-role controller pairs enabled='1' with
+# dhcp.lan.ignore='0' (the factory leaves ignore unset and the dhcp-safe
+# guard sets '1'). A node carrying either mark made its choice - leave it
+# alone. Everything else is the factory talking, and the factory is wrong.
+#
+# Lives in the meta package on purpose: uci-defaults run in dependency
+# order at install time, and the meta package is the one thing guaranteed
+# to install after every daemon whose default it overrides.
+
+[ -n "$(uci -q get mapcontroller.controller)" ] || exit 0
+
+[ "$(uci -q get mapagent.@controller_select[0].local)" = "0" ] && exit 0
+
+[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] &&
+	[ "$(uci -q get dhcp.lan.ignore)" = "0" ] && exit 0
+
+uci set mapcontroller.controller.enabled='0'
+uci commit mapcontroller
+exit 0

@@ -1,0 +1,1345 @@
+#!/bin/sh /etc/rc.common
+
+. /lib/functions.sh
+
+generate_mapagent_config=0
+generate_wireless_sta_config=0
+generate_aps_config=1
+
+network_mode="$(fw_printenv -n netmode 2>/dev/null)" # default layer3
+multiap_mode="$(fw_printenv -n multiap_mode 2>/dev/null)" # default full
+disable_mlo="$(fw_printenv -n disable_mlo 2>/dev/null)"
+
+# Whose credentials are these? It depends on the role of this node, and
+# getting it wrong is how a fresh agent ends up broadcasting a mesh nobody
+# can join.
+#
+# On a controller - and on a node that has not been given a role yet -
+# /etc/config/mapcontroller is the truth: that is where the wizard writes
+# what the mesh will use, and what map-controller hands out over WSC M2.
+#
+# On an agent it is not the truth, it is leftovers. 99-mapcntlr fills that
+# file in at install time from its own fallbacks: fronthaul SSID
+# "$DEVICE_MANUFACTURER-$BASEMAC_ADDR" (which comes out as "OpenWrt-" here,
+# because get_mac_label returns nothing on this board), key "1234567890",
+# and a backhaul key this node generated for itself with openssl. Nothing
+# in that file ever came from the mesh. Writing it onto the air gives the
+# node a fronthaul under the wrong name and a backhaul with a key no other
+# node holds - measured on 2026-08-15 on a from-scratch join, where
+# ap_mld_1 and ap_mld_2 came out wrong on every boot while sta_mld_1 stayed
+# right, that one being the only section this script does not touch without
+# netmode=extender.
+#
+# What the mesh actually delivered arrives over WSC M2 and lands in the
+# mapagent ap sections, so on an agent read it there - the same place
+# easymesh-genconfig, bh-key-adopt and mlo-backhaul-setup already read from.
+# Four writers, one source.
+#
+# $1 = fronthaul|backhaul. Sets cred_ssid/cred_key/cred_enc, left empty when
+# nothing has been delivered yet; every caller must already cope with empty,
+# and empty is the honest answer - better a section left alone than one
+# filled with an invention.
+map_credentials() {
+	local want="$1" sect i t s k e b named_ssid named_enc mld_sect mld_now mld_bands
+
+	cred_ssid=""
+	cred_key=""
+	cred_enc=""
+
+	if [ "$(uci -q get mapcontroller.controller.enabled)" = "1" ]; then
+		for sect in $(uci show mapcontroller | grep "=ap$" | cut -d. -f2 | cut -d= -f1); do
+			t=$(uci -q get mapcontroller.$sect.type)
+			if [ "$want" = "backhaul" ]; then
+				[ "$t" = "backhaul" ] || continue
+			else
+				[ "$t" = "backhaul" ] && continue
+			fi
+			cred_ssid=$(uci -q get mapcontroller.$sect.ssid)
+			cred_key=$(uci -q get mapcontroller.$sect.key)
+			cred_enc=$(uci -q get mapcontroller.$sect.encryption)
+			break
+		done
+		return 0
+	fi
+
+	# Agent: last complete match wins, the same rule easymesh-genconfig uses.
+	# Taking the first one would hand back a half-written section - on
+	# 2026-08-15 an incomplete bhmld_ap_5 sorted ahead of the real entry and
+	# a fronthaul key was adopted as the backhaul one.
+	i=0
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		t=$(uci -q get mapagent.@ap[$i].type)
+		if [ "$want" = "backhaul" ]; then
+			[ "$t" = "backhaul" ] || { i=$((i+1)); continue; }
+		else
+			[ "$t" = "backhaul" ] && { i=$((i+1)); continue; }
+		fi
+		s=$(uci -q get mapagent.@ap[$i].ssid)
+		k=$(uci -q get mapagent.@ap[$i].key)
+		e=$(uci -q get mapagent.@ap[$i].encryption)
+		[ -n "$s" ] && [ -n "$k" ] && {
+			cred_ssid="$s"
+			cred_key="$k"
+			cred_enc="$e"
+		}
+		# A section with a name but no key still knows the name. Kept apart
+		# from the rule above so that rule is untouched: a half-written
+		# section must still never win a complete one.
+		[ -n "$s" ] && { named_ssid="$s"; named_enc="$e"; }
+		i=$((i+1))
+	done
+
+	# The local AP-MLD names the credential when it already carries one of
+	# the delivered ones.
+	#
+	# A controller without an AP MLD Config TLV (EasyMesh R3, measured
+	# 2026-09-17 with a MediaTek controller) sends several fronthaul
+	# credentials per radio. map-agent 99999999a lets the fronthaul AP-MLD
+	# take one of them and leaves the others as BSSes of their own; "last
+	# complete match wins" would then pick a different one here and put it
+	# on the MLD at the next wifi event, next to the BSS that already
+	# advertises it. With a single fronthaul credential - our own
+	# controller - this selects the same network as the loop above.
+	#
+	# Among the sections carrying that network, the one on the MLD's
+	# primary band wins: the lowest band the MLD lists, 6 GHz last. That is
+	# the band map-agent takes the MLD's encryption from, so both writers
+	# agree - the first match was the 2.4 GHz backhaul section, which is
+	# not even a band of the backhaul MLD, and a 6 GHz section says 'sae'
+	# where 2.4/5 GHz say 'sae-mixed'.
+	mld_sect=apmld0
+	[ "$want" = "backhaul" ] && mld_sect=apmld1
+	mld_now=$(uci -q get mapagent.$mld_sect.ssid)
+	mld_bands=" $(uci -q get mapagent.$mld_sect.band) "
+	[ -n "$mld_now" ] && for b in 2 5 6 any; do
+		[ "$b" = "any" ] || case "$mld_bands" in
+			*" $b "*) ;;
+			*) continue ;;
+		esac
+		i=0
+		while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+			sect=$i
+			i=$((i+1))
+			t=$(uci -q get mapagent.@ap[$sect].type)
+			if [ "$want" = "backhaul" ]; then
+				[ "$t" = "backhaul" ] || continue
+			else
+				[ "$t" = "backhaul" ] && continue
+			fi
+			[ "$b" = "any" ] || [ "$(uci -q get mapagent.@ap[$sect].band)" = "$b" ] || continue
+			s=$(uci -q get mapagent.@ap[$sect].ssid)
+			k=$(uci -q get mapagent.@ap[$sect].key)
+			[ "$s" = "$mld_now" ] && [ -n "$k" ] || continue
+			cred_ssid="$s"
+			cred_key="$k"
+			cred_enc=$(uci -q get mapagent.@ap[$sect].encryption)
+			return 0
+		done
+	done
+
+	# Nothing complete found, but a name was there all along.
+	#
+	# The caller falls back to a compiled-in "OpenWrt-MLD" when this returns
+	# an empty ssid, and on 2026-08-19 a trace of the boot chain caught what
+	# that costs. easymesh-role deletes every mapagent.@ap key during
+	# onboarding - deliberately, so a joining box cannot broadcast its baked
+	# credentials next to the real mesh - and the radios come back a boot
+	# later. The ieee80211 hotplug fires the moment they do, lands here while
+	# the keys are still gone, and the test above rejects a section whose ssid
+	# says 'Drak' because its key is empty. Measured at up=189.59 s: both
+	# wireless.ap_mld_1.ssid and mapagent.apmld0.ssid went from the real name
+	# to OpenWrt-MLD, and it took nine minutes and an extra reboot for
+	# easymesh-genconfig and bh-key-adopt to undo it.
+	#
+	# A known name with no key beats a made-up name with no key. The key stays
+	# empty on purpose - bh-key-adopt fills it in when the mesh delivers one,
+	# and until then there is nothing to put on the air anyway.
+	[ -n "$cred_ssid" ] || {
+		cred_ssid="$named_ssid"
+		[ -n "$cred_enc" ] || cred_enc="$named_enc"
+	}
+}
+
+# map_mld_encryption - reconcile the AP-MLD security across nodes.
+#
+# Every node must end up with the SAME value here. Until 2026-08-18 it was
+# "whichever credential the loop above happened to stop on", and the two ends
+# stopped on different ones:
+#
+#     controller   map_credentials breaks on the FIRST match   -> sae-mixed
+#     agent        "last complete match wins"                  -> sae
+#
+# Same SSID, same key, two different security configurations. A Mac associated
+# over WPA2 on the controller, roamed to the agent, and was told the network's
+# security had changed and asked for a password that had not changed.
+#
+# The fix for that was "strictest wins": one WPA3-only credential made the whole
+# MLD WPA3-only. It did make the nodes agree - and it locked every pre-WPA3
+# client out of the fronthaul, because the 6 GHz credential is always sae and it
+# dragged the 2.4 and 5 GHz links along with it.
+#
+# The premise behind that was wrong. It assumed an AP-MLD can carry only one
+# security configuration, so the 6 GHz link must decide for all of them.
+# Measured 2026-08-27 on a node running the stock OpenWrt MLD config, whose
+# ap_mld_1 spans the same three radios we use:
+#
+#     hostapd-phy0.0.conf (2.4 GHz)   wpa_key_mgmt=WPA-PSK WPA-PSK-SHA256 SAE
+#     hostapd-phy0.2.conf (6 GHz)     wpa_key_mgmt=SAE
+#
+# A single encryption='sae-mixed' on the MLD section, and wifi-scripts derived
+# the per-link key_mgmt themselves - WPA2 offered where it is permitted, SAE
+# only on 6 GHz where it is not. An iPhone 6s, which has no SAE at all, was
+# associated on that MLD with the 6 GHz link up.
+#
+# The rule therefore stays derived - a computed value cannot come out
+# differently on two nodes - but the fronthaul resolves the other way: the
+# LEAST strict credential wins and the 6 GHz link protects itself. The backhaul
+# keeps strictest-wins; it carries no clients and has no reason to offer WPA2.
+#
+# $1 = fronthaul|backhaul. Prints the value the MLD must take, or nothing when
+# there is no reason to override the credential as read.
+map_mld_encryption() {
+	local want="$1" sect i t e
+
+	if [ "$(uci -q get mapcontroller.controller.enabled)" = "1" ]; then
+		for sect in $(uci show mapcontroller | grep "=ap$" | cut -d. -f2 | cut -d= -f1); do
+			t=$(uci -q get mapcontroller.$sect.type)
+			if [ "$want" = "backhaul" ]; then
+				[ "$t" = "backhaul" ] || continue
+			else
+				[ "$t" = "backhaul" ] && continue
+			fi
+			e=$(uci -q get mapcontroller.$sect.encryption)
+			if [ "$want" = "backhaul" ]; then
+				[ "$e" = "sae" ] && { echo sae; return 0; }
+			else
+				[ "$e" = "sae-mixed" ] && { echo sae-mixed; return 0; }
+			fi
+		done
+		return 0
+	fi
+
+	i=0
+	while uci -q get mapagent.@ap[$i] >/dev/null 2>&1; do
+		t=$(uci -q get mapagent.@ap[$i].type)
+		if [ "$want" = "backhaul" ]; then
+			[ "$t" = "backhaul" ] || { i=$((i+1)); continue; }
+		else
+			[ "$t" = "backhaul" ] && { i=$((i+1)); continue; }
+		fi
+		e=$(uci -q get mapagent.@ap[$i].encryption)
+		[ -n "$(uci -q get mapagent.@ap[$i].ssid)" ] && {
+			if [ "$want" = "backhaul" ]; then
+				[ "$e" = "sae" ] && { echo sae; return 0; }
+			else
+				[ "$e" = "sae-mixed" ] && { echo sae-mixed; return 0; }
+			fi
+		}
+		i=$((i+1))
+	done
+	return 0
+}
+
+
+is_logan() {
+	[ -d /sys/module/mt_wifi ] && return 0
+	return 1
+}
+
+is_airoha() {
+	[ -f /proc/device-tree/compatible ] || return
+	strings /proc/device-tree/compatible | grep -qE '^(econet,|airoha,)'; return
+}
+
+is_broadcom() {
+	[ -e /dev/bcm ] && return 0
+	return 1
+}
+
+is_qualcomm() {
+	[ -d /sys/module/ath12k ] && return 0
+	return 1
+}
+
+# Upstream mt76 (MediaTek MT7996 and friends) driving mac80211 directly, as
+# opposed to the proprietary mt_wifi stack that is_logan() detects. Checked
+# after is_airoha(), which also runs mt76 but keeps its own interface naming.
+is_mt76() {
+	[ -d /sys/module/mt76 ] && return 0
+	return 1
+}
+
+enc_to_ieee80211w() {
+	case "$1" in
+		sae-mixed) echo "1" ;;
+		sae)       echo "2" ;;
+		*)         echo "0" ;;
+	esac
+}
+
+# Stamp the backhaul MLD bookkeeping sections as ours, and strip anything a
+# WSC M2 may have written into one.
+#
+# bhmld_ap_<band> is not a BSS. It exists so that apmld_refresh_data_cb() runs
+# apmld_parse() for ap-mld-2, and it names an interface that is deliberately not
+# a netdev (see the long note in the mt76 branch below). The controller has
+# never heard of it, so map-agent's autoconfiguration sweep - which marks every
+# 'ap' section on a radio and only un-marks what the M2 sent back - deleted it
+# on every WSC M2, and before deleting it, wifi_get_first_available_ifname()
+# handed it the backhaul credentials as if it were a free BSS slot.
+#
+# Measured on the controller 2026-09-04, where exactly that had happened:
+#
+#   mapagent.bhmld_ap_5.ssid='MAP--BH'  key=...  encryption='sae'
+#   mapagent.bhmld_ap_5.bss_index='1'   hidden='1'
+#
+# and radio1 had no wlan1-1 section left at all. With an ssid on it the
+# placeholder answers agent_config_get_ap_by_ssid_on_band(), so it is reused as
+# the 5 GHz affiliated AP of the backhaul MLD and the real link never is.
+#
+# map-agent 9999998 reads 'option placeholder' and leaves such a section alone;
+# this is the producer's half of that. The scrub is the repair half: a node
+# upgraded over a configuration that was already claimed heals on the first boot
+# instead of carrying the stolen credentials forward. Idempotent, so it is safe
+# to run on every pass, and it only ever touches options a placeholder must not
+# carry - type, device, ifname, band, enabled and mld_id are left untouched.
+bhmld_own_placeholder() {
+	local sec="$1" opt
+
+	uci set mapagent.${sec}.placeholder="1"
+
+	for opt in ssid key encryption bss_index hidden vendor_ie disallow_bsta_profile; do
+		uci -q delete mapagent.${sec}.$opt
+	done
+}
+
+generate_multiap_config() {
+	devidx=0
+
+	generate_config() {
+		dev="$1"
+
+		[ -n "$dev" ] || return
+
+		config_get band $dev band
+
+		mode_band=""
+		priority=
+		dpp_chan=
+		channels=
+
+		case "$band" in
+			2g)
+				mode_band=2
+				priority=2
+				channels="1 6 11"
+			;;
+			5g)
+				mode_band=5
+				priority=1
+				channels="36-64 100-112"
+			;;
+			6g)
+				mode_band=6
+				priority=0
+			;;
+		esac
+
+		[ -n "$mode_band" ] || return
+
+		devidx=$(echo ${dev} |tr -dc '0-9')
+
+		device="$dev"
+
+		ifprefix_radio=""
+		if is_logan; then
+			uci set mapagent.agent.mld_ap_prefix="bss"
+			uci set mapagent.agent.mld_sta_prefix="sta"
+			ifname_sta=""
+			case "$band" in
+				2g)
+					ifprefix="ra%"
+					ifname="ra0"
+					ifname_bh="ra1"
+					ifname_sta="apcli0"
+				;;
+				5g)
+					ifprefix="rai%"
+					ifname="rai0"
+					ifname_bh="rai1"
+					ifname_sta="apclii0"
+				;;
+				6g)
+					ifprefix="rax%"
+					ifname="rax0"
+					ifname_bh="rax1"
+					ifname_sta="apclix0"
+				;;
+			esac
+			ifprefix_radio="${ifprefix}"
+			if [ "${network_mode}" == "extender" ]; then
+				ifname="${ifname_sta}"
+			fi
+
+			[ "$disable_mlo" == "1" ] || {
+				uci set wireless.$dev.mlo="1"
+				uci set wireless.$dev.mlo_capable="1"
+				uci set mapagent.agent.physical_mld="0"
+			}
+		elif is_airoha; then
+			if [ -d "/sys/module/mt76" ]; then
+				ifprefix="wlan%_%"
+				ifname="wlan${devidx}_0"
+				ifname_bh="wlan${devidx}_1"
+			fi
+			uci set wireless.$dev.channels="$channels"
+			uci commit wireless
+		elif is_broadcom; then
+			ifprefix="wl%."
+			ifname="wl${devidx}"
+			ifname_bh="$ifname.1"
+			device="wl${devidx}"
+			brcm_setup="1"
+		elif is_qualcomm; then
+			ifprefix="wlan0%-"
+			ifname="wlan${devidx}"
+			ifname_bh="wlan${devidx}-1"
+			ap_follow_sta_dfs="1"
+
+			[ "$disable_mlo" == "1" ] || {
+				uci set wireless.$dev.mlo="1"
+				uci set wireless.$dev.mlo_capable="1"
+				uci commit wireless
+
+				# Disable for MLD/MLO
+				uci set mapagent.agent.island_prevention="0"
+				uci commit mapagent
+
+				# wait ap-autoconfiguration
+				generate_aps_config=0
+			}
+		elif is_mt76; then
+			ifprefix="wlan%-"
+			ifname="wlan$devidx"
+			ifname_bh="$ifname-1"
+
+			# build_mld_ifname() composes an MLD netdev name as
+			# prefix + id (config.c:1522). The default prefix is
+			# "wlan" (config.c:2549/2555), which on mt76 collides
+			# head-on with the real wlanN radios - an MLD would be
+			# asked to take the name of an existing interface. The
+			# logan branch sets its own pair for the same reason;
+			# match the ap-mld-N naming already used for the
+			# fronthaul MLD below.
+			uci set mapagent.agent.mld_ap_prefix="ap-mld-"
+			# The name must contain a token from wifi_driver.name, because
+			# libwifi get_wifi_driver() (wifiops.c) matches with
+			#   strstr(ifname, token) && strspn(ifname, token) && next char digit/NUL
+			# -- strstr means the token has to be a literal substring. "sta-mld-3"
+			# contains none of wlan/phy/bsta/ap-mld/bsta-mld, so get_wifi_driver()
+			# returned NULL, every libwifi call came back -ENOTSUP and
+			# wifi.bstamld.<if> status answered "Unknown error" -- which is exactly
+			# what map-agent needs to learn the uplink is up. Naming it bsta-mld-N
+			# matches the token patch 935 already added. Verified on hardware
+			# 2026-07-27: after the rename the status call returns full per-link data
+			# for the first time. Note the token list cannot simply be extended --
+			# the matcher copies it into char drv[32].
+			uci set mapagent.agent.mld_sta_prefix="bsta-mld-"
+
+			# Upstream mac80211 does not consume wireless.$dev.mlo the way
+			# the vendor stacks do. An AP-MLD is expressed as a wifi-mld
+			# section plus one wifi-iface spanning every participating
+			# radio, so collect the radios here and build both afterwards.
+			[ "$disable_mlo" == "1" ] || {
+				mt76_mlo_devices="${mt76_mlo_devices}${mt76_mlo_devices:+ }${dev}"
+
+				# The backhaul MLD spans 5 and 6 GHz only. Adding 2.4 GHz
+				# would extend reach but cap the link, and the 5+6 pair was
+				# measured carrying traffic on both links at once.
+				[ "$mode_band" != "2" ] && \
+					mt76_bh_devices="${mt76_bh_devices}${mt76_bh_devices:+ }${dev}"
+
+				# netifd ignores these two on mt76, but the agent does not:
+				# it ANDs mlo with mlo_capable off the wifi-device section
+				# (config.c:3758 loads the wireless package, not mapagent)
+				# to decide whether to report EMLSR/EMLMR/STR/NSTR. Without
+				# them the Wi-Fi 7 Agent Capabilities TLV goes out with
+				# ap_mlo=0x00 and every wifi7_* column in mapc.db stays 0.
+				# The logan and qualcomm branches above set the same pair.
+				uci set wireless.$dev.mlo="1"
+				uci set wireless.$dev.mlo_capable="1"
+			}
+		else
+			ifprefix="wlan%-"
+			ifname="wlan$devidx"
+			ifname_bh="$ifname-1"
+		fi
+
+		if [ $generate_mapagent_config -eq 1 ]; then
+			local ridx=0
+			while uci -q get "mapagent.@radio[$ridx]" >/dev/null 2>&1; do
+				[ "$(uci -q get mapagent.@radio[$ridx].device)" = "$device" ] && return
+				ridx=$((ridx + 1))
+			done
+			if [ -z "${ifprefix_radio}" ]; then
+				uci set mapagent.agent.ifprefix="$ifprefix"
+			fi
+			uci set mapagent.agent.brcm_setup="$brcm_setup"
+			uci set mapagent.agent.ap_follow_sta_dfs="$ap_follow_sta_dfs"
+			uci add mapagent radio
+			uci set mapagent.@radio[-1].device="$device"
+			uci set mapagent.@radio[-1].band="$mode_band"
+			if [ -n "${ifprefix_radio}" ]; then
+				uci set mapagent.@radio[-1].ifprefix="${ifprefix}"
+			fi
+
+			if [ "$network_mode" == "extender" ]; then
+				map_profile="$(uci -q get mapagent.agent.profile)"
+
+				uci add mapagent bsta
+				uci set mapagent.@bsta[-1].device="$device"
+				uci set mapagent.@bsta[-1].ifname="$ifname"
+				uci set mapagent.@bsta[-1].band="$mode_band"
+				uci set mapagent.@bsta[-1].priority="$priority"
+
+				if [ -f /usr/lib/libdpp.so ]; then
+					# add dpp_chirp section for 2.4GHz bSTA
+					if [ $mode_band -eq 2 ]; then
+						uci add mapagent dpp_chirp
+						uci set mapagent.@dpp_chirp[-1].type="qrcode"
+						uci set mapagent.@dpp_chirp[-1].device="$device"
+						uci set mapagent.@dpp_chirp[-1].ifname="$ifname"
+						uci set mapagent.@dpp_chirp[-1].band="$mode_band"
+						for channel in $channels; do
+							uci add_list mapagent.@dpp_chirp[-1].channel="$channel"
+						done
+					fi
+				fi
+
+				if [ $generate_wireless_sta_config -eq 1 ]; then
+					secname="default_sta_${device}"
+					uci set wireless.$secname=wifi-iface
+					uci set wireless.$secname.device="$device"
+					uci set wireless.$secname.mode="sta"
+					uci set wireless.$secname.ifname="$ifname"
+					uci set wireless.$secname.disabled="0"
+					uci set wireless.$secname.default_disabled="1"
+					uci set wireless.$secname.multi_ap="1"
+					uci set wireless.$secname.multi_ap_profile="$map_profile"
+					uci commit wireless
+				else
+					for secname in $(uci show wireless | grep "=wifi-iface" | cut -d'.' -f2 | cut -d'=' -f1); do
+						[ "$(uci -q get wireless.$secname.mode)" = "sta" ] || continue
+						[ "$(uci -q get wireless.$secname.ifname)" = "$ifname" ] || continue
+						[ "$(uci -q get wireless.$secname.device)" = "$device" ] || continue
+						uci set wireless.$secname.multi_ap="1"
+						uci set wireless.$secname.multi_ap_profile="$map_profile"
+						break
+					done
+					uci commit wireless
+				fi
+			else
+				if [ $generate_aps_config -eq 1 ]; then
+					al_bridge=$(uci -q get mapagent.agent.al_bridge)
+					bridge="${al_bridge#br-}"
+					map_profile="$(uci -q get mapagent.agent.profile)"
+
+					if [ -z "$wps_uuid" ]; then
+						wps_uuid=$(uci show wireless | grep "\.uuid=" | head -1 | cut -d= -f2 | tr -d "'")
+						if [ -z "$wps_uuid" ]; then
+							basemac=$(/lib/wifi/multiap db_get device.deviceinfo.BaseMACAddress 2>/dev/null | tr -d ':' | tr '[:lower:]' '[:upper:]')
+							wps_uuid="$(uuidgen -s -r 2>/dev/null | cut -c 1-24)${basemac}"
+						fi
+					fi
+
+					if { [ -z "$multiap_mode" ] || [ "$multiap_mode" = "full" ]; } && [ -x /usr/sbin/mapcontroller ]; then
+						# Collect ap sections for this band from mapcontroller, in config order
+						all_mc_aps=
+						for mc_ap in $(uci show mapcontroller | grep "=ap$" | cut -d. -f2 | cut -d= -f1); do
+							[ "$(uci -q get mapcontroller.$mc_ap.band)" = "$mode_band" ] || continue
+							all_mc_aps="${all_mc_aps}${all_mc_aps:+ }${mc_ap}"
+						done
+
+						# Pre-read backhaul credentials; needed for multi_ap_backhaul_ssid on FH ifaces
+						mc_ssid_bh= mc_key_bh= mc_enc_bh= mc_hidden_bh=
+						for mc_ap in $all_mc_aps; do
+							[ "$(uci -q get mapcontroller.$mc_ap.type)" = "backhaul" ] || continue
+							mc_ssid_bh=$(uci -q get mapcontroller.$mc_ap.ssid)
+							mc_key_bh=$(uci -q get mapcontroller.$mc_ap.key)
+							mc_enc_bh=$(uci -q get mapcontroller.$mc_ap.encryption)
+							mc_hidden_bh=$(uci -q get mapcontroller.$mc_ap.hidden)
+							break
+						done
+
+						bh_hidden="${mc_hidden_bh}"
+						[ -z "$bh_hidden" ] && bh_hidden="$(uci -q get mapagent.agent.hide_backhaul_bss)"
+						[ -z "$bh_hidden" ] && bh_hidden="1"
+
+						# Assign interface names sequentially in mapcontroller config order
+						# ifprefix ending with % means the trailing digit of ifname is the BSS index (sequential).
+						# Otherwise the chars after the last % are the separator
+						case "$ifprefix" in
+							*%)  sep="" ;;
+							*%*) sep="${ifprefix##*%}" ;;
+							*)   sep="" ;;
+						esac
+						ap_idx=0
+						for mc_ap in $all_mc_aps; do
+							cur_type=$(uci -q get mapcontroller.$mc_ap.type)
+							[ -n "$cur_type" -a "$cur_type" != "fronthaul" -a "$cur_type" != "backhaul" ] && continue
+							cur_ssid=$(uci -q get mapcontroller.$mc_ap.ssid)
+							cur_key=$(uci -q get mapcontroller.$mc_ap.key)
+							cur_enc=$(uci -q get mapcontroller.$mc_ap.encryption)
+							cur_hidden=$(uci -q get mapcontroller.$mc_ap.hidden)
+							[ "$cur_type" = "backhaul" ] && cur_hidden="$bh_hidden"
+							if [ -z "$sep" ]; then
+								cur_ifname="${ifname%[0-9]*}${ap_idx}"
+							elif [ "$ap_idx" -eq 0 ]; then
+								cur_ifname="$ifname"
+							else
+								cur_ifname="${ifname}${sep}${ap_idx}"
+							fi
+							sec_name="${cur_ifname}_ap"
+							sec_name="${sec_name//./_}"
+							sec_name="${sec_name//-/_}"
+
+							uci add mapagent ap
+							uci set mapagent.@ap[-1].type="$cur_type"
+							uci set mapagent.@ap[-1].device="$device"
+							uci set mapagent.@ap[-1].ifname="$cur_ifname"
+							uci set mapagent.@ap[-1].band="$mode_band"
+							uci set mapagent.@ap[-1].enabled="1"
+							uci set mapagent.@ap[-1].bss_index="$ap_idx"
+							[ -n "$cur_ssid" ] && {
+								uci set mapagent.@ap[-1].ssid="$cur_ssid"
+								uci set mapagent.@ap[-1].key="$cur_key"
+								uci set mapagent.@ap[-1].encryption="$cur_enc"
+							}
+							[ "$cur_hidden" = "1" ] && uci set mapagent.@ap[-1].hidden="1"
+
+							# The AP-MLD is the fronthaul. Its links are ordinary BSSes, so a
+							# client that knows nothing about Multi-Link simply associates to
+							# one of them - verified on hardware 2026-07-17 with an iPhone 6s
+							# (802.11ac, 2015): it joined the AP-MLD and carried full traffic
+							# including internet. A per-radio AP with the same SSID therefore
+							# adds nothing and advertises the fronthaul twice on every radio.
+							#
+							# The mapagent section above is still created: the mesh layer needs
+							# it for mld_id and the AP-MLD Config TLV. Only the wireless section
+							# is skipped. ap_idx must still advance, or the backhaul that follows
+							# would be named wlan0 instead of wlan0-1.
+							[ -z "$cur_type" -o "$cur_type" = "fronthaul" ] && [ "$disable_mlo" != "1" ] && {
+								# Drop one that an earlier configuration left behind. This handler
+								# only ever added sections, and the wipe-and-regenerate path in
+								# map_genconf (netmode=extender with no mode=sta section) is
+								# unreachable on a provisioned agent, so a per-radio fronthaul
+								# created before netmode was set survived every boot.
+								#
+								# Measured 2026-07-25: bpi-x8 still carried wlan0-1 and wlan2-1 with
+								# ssid OpenWrt-, while bpi-8g - same image, cleaned by hand on 22.7.
+								# - had none. Two agents, identical build, config permanently
+								# different, and nothing would ever have reconciled them.
+								#
+								# Commit only when something was really removed, so on a healthy
+								# node this costs nothing in a handler that runs on every wifi event.
+								uci -q delete "wireless.${sec_name}" && uci -q commit wireless
+								ap_idx=$((ap_idx + 1))
+								continue
+							}
+
+							# Same reasoning as the fronthaul above, for the backhaul.
+							# The backhaul AP-MLD (ap-mld-2) already spans every participating
+							# radio, so a per-radio backhaul BSS advertises the same backhaul a
+							# second time and takes a BSS slot the MLD needs for its affiliated
+							# APs.
+							#
+							# Measured 2026-07-28: the node that came up with four active legacy
+							# BSSes reported num_ap=0 for both its MLDs, while nodes with one
+							# reported 2 and 3. Deleting them by hand and rebooting brought all
+							# three nodes to non-zero num_ap for the first time that day. The
+							# defect looked like it moved between nodes, because which node got
+							# the most legacy BSSes varied from boot to boot.
+							#
+							# Opt-in via mld_backhaul, so a mesh that still needs a legacy
+							# backhaul for non-MLO agents is unaffected. The mapagent section is
+							# kept and ap_idx still advances, exactly as for the fronthaul.
+							[ "$cur_type" = "backhaul" ] &&
+							[ "$(uci -q get mapagent.agent.mld_backhaul)" = "1" ] && {
+								uci -q delete "wireless.${sec_name}" && uci -q commit wireless
+								ap_idx=$((ap_idx + 1))
+								continue
+							}
+
+							uci set wireless.${sec_name}=wifi-iface
+							uci set wireless.${sec_name}.device="$device"
+							uci set wireless.${sec_name}.ifname="$cur_ifname"
+							uci set wireless.${sec_name}.mode="ap"
+							uci set wireless.${sec_name}.disabled="0"
+							uci set wireless.${sec_name}.ieee80211k="1"
+							uci set wireless.${sec_name}.ieee80211v="1"
+							uci set wireless.${sec_name}.bss_transition="1"
+							[ -n "$bridge" ] && uci set wireless.${sec_name}.network="$bridge"
+							[ -n "$cur_ssid" ] && {
+								uci set wireless.${sec_name}.ssid="$cur_ssid"
+								uci set wireless.${sec_name}.key="$cur_key"
+								uci set wireless.${sec_name}.encryption="$cur_enc"
+								ieee80211w=$(enc_to_ieee80211w "$cur_enc")
+								uci set wireless.${sec_name}.ieee80211w="$ieee80211w"
+								uci set wireless.${sec_name}.mbo="$([ "$ieee80211w" != "0" ] && echo 1 || echo 0)"
+							}
+							[ -n "$map_profile" ] && uci set wireless.${sec_name}.multi_ap_profile="$map_profile"
+							[ "$cur_hidden" = "1" ] && uci set wireless.${sec_name}.hidden="1"
+							[ -n "$wps_uuid" ] && uci set wireless.${sec_name}.uuid="$wps_uuid"
+							uci set wireless.${sec_name}.isolate="0"
+							if [ -z "$cur_type" -o "$cur_type" = "fronthaul" ]; then
+								uci set wireless.${sec_name}.multi_ap="2"
+								uci set wireless.${sec_name}.multicast_to_unicast_all="1"
+								[ "$mode_band" != "6" ] && {
+									uci set wireless.${sec_name}.wps_pushbutton="1"
+									uci set wireless.${sec_name}.wps_cred_add_sae="1"
+								}
+								[ -n "$mc_ssid_bh" ] && uci set wireless.${sec_name}.multi_ap_backhaul_ssid="$mc_ssid_bh"
+								[ -n "$mc_key_bh" ] && uci set wireless.${sec_name}.multi_ap_backhaul_key="$mc_key_bh"
+							elif [ "$cur_type" = "backhaul" ]; then
+								uci set wireless.${sec_name}.multi_ap="1"
+								uci set wireless.${sec_name}.max_inactivity="10"
+								uci set wireless.${sec_name}.multicast_to_unicast_all="0"
+								uci set wireless.${sec_name}.wds_sta="1"
+							fi
+
+							ap_idx=$((ap_idx + 1))
+						done
+					else
+						bh_hidden="$(uci -q get mapagent.agent.hide_backhaul_bss)"
+						[ -z "$bh_hidden" ] && bh_hidden="1"
+
+						uci add mapagent ap
+						uci set mapagent.@ap[-1].type="fronthaul"
+						uci set mapagent.@ap[-1].device="$device"
+						uci set mapagent.@ap[-1].ifname="$ifname"
+						uci set mapagent.@ap[-1].band="$mode_band"
+						uci set mapagent.@ap[-1].enabled="1"
+
+						uci add mapagent ap
+						uci set mapagent.@ap[-1].type="backhaul"
+						uci set mapagent.@ap[-1].device="$device"
+						uci set mapagent.@ap[-1].ifname="$ifname_bh"
+						uci set mapagent.@ap[-1].band="$mode_band"
+						uci set mapagent.@ap[-1].enabled="1"
+						[ "$bh_hidden" = "1" ] && uci set mapagent.@ap[-1].hidden="1"
+
+					fi
+				fi
+			fi
+		fi
+	}
+
+	config_load wireless
+
+	config_foreach generate_config wifi-device
+}
+
+map_genconf () {
+	# dont run before wireless config is available
+	uci show wireless | grep -q '=wifi-device' || return
+
+	# ...and not before a radio actually exists.
+	#
+	# The check above asks the configuration, which is static and present from
+	# boot, so it says nothing about whether the driver is up. The MLD sections
+	# are written only inside the mt76 branch of generate_config(), entered on
+	# [ -d /sys/module/mt76 ]. On a cold boot this handler can run before that -
+	# mt76 shows up around 12 s in - and the branch is then skipped in silence:
+	# the ap sections get rebuilt without a single mld section, the node
+	# advertises an AP-MLD with no affiliated links, and the controller stores
+	# num_ap=0 for both of its MLDs.
+	#
+	# Measured repeatedly on the colocated controller 2026-07-29. mld-report-check
+	# recovers it about a minute later, which is a net rather than a fix - the
+	# repairs counter in the census exists to keep that visible.
+	#
+	# A phy appears only once a driver has probed, so this is both stronger than
+	# asking for a module and independent of which driver it is: generating a
+	# wireless configuration before any radio exists is guesswork on every
+	# platform.
+	[ -n "$(ls /sys/class/ieee80211/ 2>/dev/null)" ] || return
+
+	if [ -f /etc/config/mapagent ]; then
+		radio_count=$(uci show mapagent | grep -c '=radio')
+		wifi_count=$(uci show wireless | grep -c '=wifi-device')
+		[ "$radio_count" -lt "$wifi_count" ] && generate_mapagent_config=1
+	fi
+
+	if [ "$network_mode" == "extender" ]; then
+		if ! uci show wireless | grep -q "mode=.*sta"; then
+			# With an MLO backhaul the uplink is bsta-mld-3, spanning several
+			# radios; the per-radio legacy bSTAs are generated disabled and only
+			# ever accumulate across keep-config upgrades.
+			[ "$(uci -q get mapagent.agent.mld_backhaul)" = "1" ] ||
+				generate_wireless_sta_config=1
+
+			for section in $(uci show wireless | grep "mode=.*ap" | cut -d'.' -f2); do
+				uci delete wireless.$section
+			done
+		fi
+	fi
+
+	generate_multiap_config
+
+	# mt76: provision the fronthaul AP-MLD over the radios collected in
+	# generate_config(). Idempotent, because this is a hotplug handler
+	# that runs on every wifi event.
+	[ -n "$mt76_mlo_devices" ] && {
+		mld_ifname="ap-mld-1"
+		mld_ssid=""
+		mld_key=""
+		mld_enc=""
+		mld_net="$(uci -q get mapagent.agent.al_bridge)"
+		mld_net="${mld_net#br-}"
+		# The fronthaul credentials, from whichever config owns them here.
+		map_credentials fronthaul
+		mld_ssid="$cred_ssid"
+		mld_key="$cred_key"
+		mld_enc="$cred_enc"
+		[ -n "$mld_ssid" ] || mld_ssid="OpenWrt-MLD"
+		[ -n "$mld_enc" ] || mld_enc="sae-mixed"
+		# All nodes must agree on this field, so it is derived rather than read
+		# off whichever credential came last. The fronthaul resolves to the
+		# least strict credential, which keeps pre-WPA3 clients able to join;
+		# wifi-scripts still force SAE-only on the 6 GHz link on their own.
+		mld_strict_enc=$(map_mld_encryption fronthaul)
+		[ -n "$mld_strict_enc" ] && mld_enc="$mld_strict_enc"
+		uci set wireless.mld0=wifi-mld
+		uci set wireless.mld0.ifname="$mld_ifname"
+		uci set wireless.mld0.mode="ap"
+		uci set wireless.ap_mld_1=wifi-iface
+		uci -q delete wireless.ap_mld_1.device
+		for mlo_dev in $mt76_mlo_devices; do
+			uci add_list wireless.ap_mld_1.device="$mlo_dev"
+		done
+		uci set wireless.ap_mld_1.ifname="$mld_ifname"
+		uci set wireless.ap_mld_1.mode="ap"
+		uci set wireless.ap_mld_1.mlo="1"
+		# Give the fronthaul MLD an address of its own, the same way the
+		# backhaul MLD gets one below and the STA MLD gets one in
+		# mlo-backhaul-setup. This was the one MLD of the three that
+		# nobody ever assigned.
+		#
+		# Without an explicit macaddr the address comes off the radio,
+		# and on MT7996 that resolves to the factory EEPROM default on
+		# most boards: measured 2026-09-04, four of the five nodes had
+		# ap-mld-1 at 00:0c:43:26:60:10 while their radios carried four
+		# different, correct RUIDs.
+		#
+		# Link addresses stay unique, so traffic works and the fault is
+		# invisible on air. EasyMesh identifies an AP-MLD by its MLD
+		# address, though, and the controller's apmld table is keyed on
+		# it: the colliding nodes overwrote each other's row, so only
+		# one of them had a fronthaul AP-MLD on record at any moment,
+		# which one changed on every sync, and their affiliated links
+		# piled up under a single MLD (12 links from 4 boxes). A node
+		# with no fronthaul row cannot be given a TID-to-Link policy or
+		# an MLO steering decision for its own radios.
+		#
+		# Offset 2, matching mlo-backhaul-setup's note that 1 and 2
+		# belong to the two AP MLDs and 3 to the STA MLD. Derived from
+		# the AL-MAC: the only identifier that is unique per node AND
+		# survives a power cycle (the Pro-8X has no stable hardware MAC,
+		# so phy0 is unusable here - it carries the factory default
+		# itself).
+		fh_mld_al="$(uci -q get ieee1905.ieee1905.macaddress)"
+		# The all-zero placeholder is worse than no address at all: it is
+		# present, so an emptiness test lets it through, and every box that
+		# has it derives the SAME 00:00:00:00:00:02 - which is the very
+		# collision this block exists to end, reintroduced by the fix for it.
+		case "$fh_mld_al" in 00:00:00:00:00:00) fh_mld_al="" ;; esac
+		[ -n "$fh_mld_al" ] && {
+			fh_mld_lo="${fh_mld_al##*:}"
+			fh_mld_hi="${fh_mld_al%:*}"
+			uci set wireless.ap_mld_1.macaddr="$(printf "%s:%02x" \
+				"$fh_mld_hi" $(( (0x${fh_mld_lo} + 2) & 255 )))"
+		}
+		[ -n "$mld_net" ] && uci set wireless.ap_mld_1.network="$mld_net"
+		uci set wireless.ap_mld_1.ssid="$mld_ssid"
+		uci set wireless.ap_mld_1.encryption="$mld_enc"
+		[ -n "$mld_key" ] && uci set wireless.ap_mld_1.key="$mld_key"
+		uci set wireless.ap_mld_1.sae_pwe="2"
+		uci set mapagent.apmld0=mld
+		# MLD ids must line up with build_mld_ifname(), which composes the
+		# netdev name as prefix + (id - 1) (config.c:1522/1551). With id=1 the
+		# agent derives "ap-mld-0" for a link we called ap-mld-1 and creates a
+		# second, competing wifi-mld section for it. Keep the established
+		# interface names and shift the ids instead.
+		uci set mapagent.apmld0.id="2"
+		uci set mapagent.apmld0.ifname="$mld_ifname"
+		uci set mapagent.apmld0.type="fronthaul"
+		uci set mapagent.apmld0.ssid="$mld_ssid"
+		uci set mapagent.apmld0.encryption="$mld_enc"
+		uci -q delete mapagent.apmld0.band
+		for mlo_band in 2 5 6; do
+			uci add_list mapagent.apmld0.band="$mlo_band"
+		done
+		# Affiliate every fronthaul AP. Without mld_id the MLD comes up
+		# and is advertised, but the AP-MLD Config TLV carries no links -
+		# the controller stores a row of zeroes. Verified on hardware
+		# 2026-07-21.
+		#
+		# Only the sections that carry the MLD's network, though. A
+		# controller may deliver more than one fronthaul credential per
+		# radio (map-agent 99999999a); the others are BSSes of their own
+		# and must not be counted as links of this MLD.
+		mlo_idx=0
+		while uci -q get "mapagent.@ap[$mlo_idx]" >/dev/null 2>&1; do
+			[ "$(uci -q get mapagent.@ap[$mlo_idx].type)" = "fronthaul" ] && {
+				mlo_ap_ssid="$(uci -q get mapagent.@ap[$mlo_idx].ssid)"
+				if [ -z "$mlo_ap_ssid" ] || [ "$mlo_ap_ssid" = "$mld_ssid" ]; then
+					uci set mapagent.@ap[$mlo_idx].mld_id="2"
+				elif [ "$(uci -q get mapagent.@ap[$mlo_idx].mld_id)" = "2" ]; then
+					uci -q delete mapagent.@ap[$mlo_idx].mld_id
+					# ... and the wireless side of the same claim, the
+					# way map-agent's teardown drops it. Matched on the
+					# ifname, never on the SSID, which may hold anything.
+					mlo_ap_if="$(uci -q get mapagent.@ap[$mlo_idx].ifname)"
+					case "$mlo_ap_if" in
+					""|*[!A-Za-z0-9_-]*) ;;
+					*)
+						for mlo_ws in $(uci -q show wireless | \
+							sed -n "s/^wireless\.\([^.=]*\)\.ifname='${mlo_ap_if}'\$/\1/p"); do
+							uci -q delete wireless.$mlo_ws.mld
+						done
+						;;
+					esac
+				fi
+			}
+			mlo_idx=$((mlo_idx + 1))
+		done
+
+		# Every band the MLD declares needs a fronthaul ap section, or the link
+		# on that band has no BSSID the agent can attribute a station to - and
+		# the client is then reported one leg short.
+		#
+		# Measured 2026-08-27 on all four nodes: apmld0.band listed 2, 5 and 6,
+		# and the 6 GHz fronthaul section did not exist. The agent's own AP list
+		# carried a 6 GHz entry with an empty SSID and a zero BSSID, wifi.apmld
+		# reported all three links, and the Associated STA MLD Configuration
+		# Report TLV (0xE2) went out 41 times in a row with Num_AffiliatedSTA=2 -
+		# missing the 6 GHz leg, which was the one carrying traffic at 250 ms of
+		# inactivity while the reported 5 GHz leg had been idle for 7.6 minutes.
+		#
+		# These sections are built once, by the block above, and the only thing
+		# that re-triggers it is radio_count < wifi_count. With three radios
+		# against three wifi-devices that is never true again, so whatever was
+		# missing the first time stays missing across reboots and sysupgrades.
+		#
+		# This adds ONLY what is absent. It never deletes and never rewrites an
+		# existing section: the backhaul ones carry the key WPS delivered, and
+		# regenerating those would drop a node out of the mesh.
+		for mlo_band in $(uci -q get mapagent.apmld0.band); do
+			fh_found=0
+			fh_idx=0
+			while uci -q get "mapagent.@ap[$fh_idx]" >/dev/null 2>&1; do
+				[ "$(uci -q get mapagent.@ap[$fh_idx].type)" = "fronthaul" ] &&
+				[ "$(uci -q get mapagent.@ap[$fh_idx].band)" = "$mlo_band" ] &&
+					fh_found=1
+				fh_idx=$((fh_idx + 1))
+			done
+			[ "$fh_found" = "1" ] && continue
+
+			fh_dev=""
+			r_idx=0
+			while uci -q get "mapagent.@radio[$r_idx]" >/dev/null 2>&1; do
+				[ "$(uci -q get mapagent.@radio[$r_idx].band)" = "$mlo_band" ] &&
+					fh_dev="$(uci -q get mapagent.@radio[$r_idx].device)"
+				r_idx=$((r_idx + 1))
+			done
+			[ -n "$fh_dev" ] || continue
+
+			fh_devidx=$(echo "$fh_dev" | tr -dc 0-9)
+			uci add mapagent ap
+			uci set mapagent.@ap[-1].type="fronthaul"
+			uci set mapagent.@ap[-1].device="$fh_dev"
+			uci set mapagent.@ap[-1].ifname="wlan${fh_devidx}"
+			uci set mapagent.@ap[-1].band="$mlo_band"
+			uci set mapagent.@ap[-1].enabled="1"
+			uci set mapagent.@ap[-1].bss_index="0"
+			uci set mapagent.@ap[-1].mld_id="2"
+			[ -n "$mld_ssid" ] && {
+				uci set mapagent.@ap[-1].ssid="$mld_ssid"
+				uci set mapagent.@ap[-1].key="$mld_key"
+				uci set mapagent.@ap[-1].encryption="$mld_enc"
+			}
+			echo "map_genconfig: added missing fronthaul ap for band $mlo_band on $fh_dev" >&2
+		done
+	}
+
+	# mt76: backhaul AP-MLD plus the matching MLD STA, same shape as the
+	# fronthaul MLD above (a wifi-mld section and one wifi-iface spanning
+	# every participating radio). Opt-in: without mld_backhaul=1 nothing
+	# here runs and the node keeps the legacy per-radio backhaul.
+	[ -n "$mt76_bh_devices" ] && \
+	[ "$(uci -q get mapagent.agent.mld_backhaul)" = "1" ] && {
+		bh_ssid=""
+		bh_key=""
+		bh_enc=""
+		bh_net="$(uci -q get mapagent.agent.al_bridge)"
+		bh_net="${bh_net#br-}"
+		[ -n "$bh_net" ] || bh_net="lan"
+		# The backhaul credentials, from whichever config owns them here.
+		map_credentials backhaul
+		bh_ssid="$cred_ssid"
+		bh_key="$cred_key"
+		bh_enc="$cred_enc"
+		[ -n "$bh_ssid" ] && {
+			[ -n "$bh_enc" ] || bh_enc="sae"
+			bh_mld_ifname="ap-mld-2"
+			# bsta-mld-3, not -1: see the id/ifname note above. The bsta- prefix
+			# is required by the libwifi driver lookup, see mld_sta_prefix above.
+			sta_mld_ifname="bsta-mld-3"
+
+			uci set wireless.mld1=wifi-mld
+			uci set wireless.mld1.ifname="$bh_mld_ifname"
+			uci set wireless.mld1.mode="ap"
+			uci set wireless.ap_mld_2=wifi-iface
+			uci -q delete wireless.ap_mld_2.device
+			for bh_dev in $mt76_bh_devices; do
+				uci add_list wireless.ap_mld_2.device="$bh_dev"
+			done
+			uci set wireless.ap_mld_2.ifname="$bh_mld_ifname"
+
+			# Give the backhaul MLD an address of its own. Without an
+			# explicit macaddr the driver falls back to the EEPROM
+			# default, and MediaTek ships that identical on every
+			# MT7996 -- measured 2026-07-28, where 00:0c:43:26:60:10
+			# was held at once by ap-mld-2 on two nodes and ap-mld-1
+			# on a third. Link addresses stay unique, so traffic
+			# works, but EasyMesh identifies an MLD by its MLD
+			# address: the controller then cannot tell whose report
+			# is whose and the apmld rows overwrite each other.
+			#
+			# Derive it from the AL-MAC, which is the only identifier
+			# that is unique per node AND survives power cycles (the
+			# Pro-8X has no stable hardware MAC, so phy0 is unusable
+			# there -- it carries the factory default itself).
+			bh_mld_al="$(uci -q get ieee1905.ieee1905.macaddress)"
+			[ -n "$bh_mld_al" ] && {
+				bh_mld_lo="${bh_mld_al##*:}"
+				bh_mld_hi="${bh_mld_al%:*}"
+				uci set wireless.ap_mld_2.macaddr="$(printf "%s:%02x" \
+					"$bh_mld_hi" $(( (0x${bh_mld_lo} + 1) & 255 )))"
+			}
+			uci set wireless.ap_mld_2.mode="ap"
+			uci set wireless.ap_mld_2.mlo="1"
+			uci set wireless.ap_mld_2.multi_ap="1"
+			uci set wireless.ap_mld_2.multi_ap_profile="3"
+			uci set wireless.ap_mld_2.network="$bh_net"
+			uci set wireless.ap_mld_2.ssid="$bh_ssid"
+			uci set wireless.ap_mld_2.encryption="$bh_enc"
+			[ -n "$bh_key" ] && uci set wireless.ap_mld_2.key="$bh_key"
+			uci set wireless.ap_mld_2.sae_pwe="2"
+			# Without wds_sta the AP never spawns the 4addr peer netdev
+			# (the legacy backhaul BSS gets one as wlanN-1.staM and it is
+			# what actually carries the bridged traffic). The association
+			# completes and authorises, per-link counters stay at the
+			# handshake, and nothing moves. ieee80211w is mandatory on
+			# 6 GHz; isolate would cut the peer off from the bridge.
+			uci set wireless.ap_mld_2.wds_sta="1"
+			uci set wireless.ap_mld_2.ieee80211w="2"
+			uci set wireless.ap_mld_2.isolate="0"
+
+			uci set mapagent.apmld1=mld
+			uci set mapagent.apmld1.id="3"
+			uci set mapagent.apmld1.ifname="$bh_mld_ifname"
+			uci set mapagent.apmld1.type="backhaul"
+
+			# Affiliate the backhaul MLD's links, exactly as the fronthaul
+			# block below does with mld_id="2". Without this apmld_refresh_data_cb()
+			# never runs apmld_parse() for ap-mld-2 -- it only iterates netif_aps
+			# whose cfg->mld_id equals the MLD id (agent.c:3331-3348) -- so the
+			# MLD keeps the macaddr and ssid it got from calloc() and the agent
+			# emits an AP-MLD Config TLV with a zeroed MAC, no SSID and zero
+			# affiliated APs. The controller dutifully stores that row of zeroes.
+			# Measured on hardware 2026-07-27.
+			#
+			# These are bookkeeping placeholders, NOT the live per-radio backhaul
+			# BSSes. Putting mld_id on wlan1-1/wlan2-1 would make agent.c:4574
+			# skip the rest of their init, so bss->enabled is never set and they
+			# drop out of the AP Operational BSS and Associated Clients TLVs,
+			# their bssid/ssid get overwritten with the MLD link's, and their
+			# station list is redirected to wifi.apmld -- measured, and the reason
+			# this is a separate section. The fronthaul does the same thing: its
+			# placeholders name wlanN interfaces that do not exist as netdevs.
+			bhmld_idx=0
+			while uci -q get "mapagent.@radio[$bhmld_idx]" >/dev/null 2>&1; do
+				bhmld_band="$(uci -q get mapagent.@radio[$bhmld_idx].band)"
+				bhmld_dev="$(uci -q get mapagent.@radio[$bhmld_idx].device)"
+				case "$bhmld_band" in
+				5|6)
+					uci set mapagent.bhmld_ap_${bhmld_band}=ap
+					uci set mapagent.bhmld_ap_${bhmld_band}.type="backhaul"
+					uci set mapagent.bhmld_ap_${bhmld_band}.device="$bhmld_dev"
+					uci set mapagent.bhmld_ap_${bhmld_band}.ifname="bhmld${bhmld_band}"
+					uci set mapagent.bhmld_ap_${bhmld_band}.band="$bhmld_band"
+					uci set mapagent.bhmld_ap_${bhmld_band}.enabled="1"
+					uci set mapagent.bhmld_ap_${bhmld_band}.mld_id="3"
+					bhmld_own_placeholder "bhmld_ap_${bhmld_band}"
+					# A placeholder must never go on the air. map-agent used to
+					# turn one into a wireless section whenever the controller's
+					# backhaul M2 landed on it instead of on a legacy backhaul
+					# section (fixed in map-agent 989). One left behind by an
+					# older build survives a keep-config flash, and it takes the
+					# very BSS slot the backhaul MLD needs -- measured 2026-07-28
+					# on x8, which carried bhmld5 and bhmld6 as transmitting BSSes
+					# and reported num_ap=1 instead of 2. Removing them by hand
+					# brought the missing leg back.
+					uci -q delete "wireless.bhmld${bhmld_band}_ap" && uci -q commit wireless
+					;;
+				esac
+				bhmld_idx=$((bhmld_idx + 1))
+			done
+			uci set mapagent.apmld1.ssid="$bh_ssid"
+			uci set mapagent.apmld1.encryption="$bh_enc"
+			uci -q delete mapagent.apmld1.band
+			for bh_band in 5 6; do
+				uci add_list mapagent.apmld1.band="$bh_band"
+			done
+
+			# The uplink side only belongs on a node that has one.
+			[ "$network_mode" == "extender" ] && {
+				uci set wireless.mld2=wifi-mld
+				uci set wireless.mld2.ifname="$sta_mld_ifname"
+				uci set wireless.mld2.mode="sta"
+				uci set wireless.sta_mld_1=wifi-iface
+				uci -q delete wireless.sta_mld_1.device
+				for bh_dev in $mt76_bh_devices; do
+					uci add_list wireless.sta_mld_1.device="$bh_dev"
+				done
+				uci set wireless.sta_mld_1.ifname="$sta_mld_ifname"
+				uci set wireless.sta_mld_1.mode="sta"
+				uci set wireless.sta_mld_1.mlo="1"
+				uci set wireless.sta_mld_1.multi_ap="1"
+				uci set wireless.sta_mld_1.multi_ap_profile="3"
+				# Without this the MLD STA never joins the bridge and moves
+				# zero bytes, while iw, hostapd and the driver all report a
+				# healthy two-link association. Cost a full round to find.
+				uci set wireless.sta_mld_1.network="$bh_net"
+				uci set wireless.sta_mld_1.ssid="$bh_ssid"
+				uci set wireless.sta_mld_1.encryption="$bh_enc"
+				[ -n "$bh_key" ] && uci set wireless.sta_mld_1.key="$bh_key"
+				uci set wireless.sta_mld_1.sae_pwe="2"
+
+				uci set mapagent.stamld0=mld
+				uci set mapagent.stamld0.id="4"
+				uci set mapagent.stamld0.ifname="$sta_mld_ifname"
+				uci set mapagent.stamld0.type="station"
+				uci set mapagent.stamld0.ssid="$bh_ssid"
+				uci set mapagent.stamld0.encryption="$bh_enc"
+				uci -q delete mapagent.stamld0.band
+				for bh_band in 5 6; do
+					uci add_list mapagent.stamld0.band="$bh_band"
+				done
+
+				# The agent only allocates the bSTA MLD container when a bsta
+				# section names an interface that is NOT one of the radios
+				# (agent.c:4553-4564): agent_get_radio_by_name() has to miss,
+				# and is_mld has to be set. That is why the C path writes
+				# device="all" (config.c:1574) - a deliberately unmatchable
+				# name. With device=radioN the section falls through to the
+				# ordinary per-radio branch and no MLD bSTA is ever created,
+				# so nothing tracks the uplink and it never reaches the bridge.
+				# Named section, not "uci add": this runs on every wifi event.
+				uci set mapagent.bstamld0=bsta
+				uci set mapagent.bstamld0.ifname="$sta_mld_ifname"
+				uci set mapagent.bstamld0.device="all"
+				uci set mapagent.bstamld0.is_mld="1"
+				uci set mapagent.bstamld0.mld_id="4"
+				uci set mapagent.bstamld0.enabled="1"
+				uci set mapagent.bstamld0.onboarded="1"
+				uci set mapagent.bstamld0.priority="0"
+				uci set mapagent.bstamld0.ssid="$bh_ssid"
+				uci set mapagent.bstamld0.encryption="$bh_enc"
+				[ -n "$bh_key" ] && uci set mapagent.bstamld0.key="$bh_key"
+				uci -q delete mapagent.bstamld0.band
+				for bh_band in 5 6; do
+					uci add_list mapagent.bstamld0.band="$bh_band"
+				done
+			}
+		}
+	}
+	uci -q commit wireless
+	uci -q commit mapagent
+
+	# Backfill the backhaul ap placeholders, independently of the block above.
+	#
+	# That block hangs on $mt76_bh_devices, which is filled only inside the
+	# mt76 branch of generate_config() (see the note at the top of this
+	# function: mt76 shows up around 12 s into a cold boot, and until then the
+	# branch is skipped in silence). A handler that runs before the module is
+	# loaded therefore writes a mapagent config with no bhmld_ap sections at
+	# all - and nothing ever puts them back, because every later pass takes
+	# the same silent path.
+	#
+	# What that costs, measured 2026-09-03 across a live four-node mesh:
+	# without bhmld_ap_<band> the ap section carries no mld_id, so the agent
+	# asks wifi.ap.<ifname> instead of wifi.apmld.<mld> (agent.c:4784), that
+	# object does not exist for a BSS on an MLD, the call fails and the
+	# backhaul AP object stays empty (enabled=0, bssid all zeroes). The
+	# Associated Clients TLV then skips it on `if (!bss->enabled) continue;`,
+	# so connected backhaul bSTAs are never reported at all. The four nodes
+	# had 2/2/1/0 sections and 2/2/1/0 populated objects - an exact match.
+	#
+	# Same shape and the same idempotence as the fronthaul backfill above:
+	# named sections, keyed on the band, skipped when already present. Gated
+	# on the module being loaded, so it never runs in the very window it is
+	# meant to repair.
+	[ -d /sys/module/mt76 ] && \
+	[ "$(uci -q get mapagent.agent.mld_backhaul)" = "1" ] && {
+		bf_idx=0
+		while uci -q get "mapagent.@radio[$bf_idx]" >/dev/null 2>&1; do
+			bf_band="$(uci -q get mapagent.@radio[$bf_idx].band)"
+			bf_dev="$(uci -q get mapagent.@radio[$bf_idx].device)"
+			bf_idx=$((bf_idx + 1))
+
+			# The backhaul MLD spans 5 and 6 GHz only, as above.
+			case "$bf_band" in
+			5|6) ;;
+			*) continue ;;
+			esac
+
+			# An existing section still has to be stamped and scrubbed, so
+			# this cannot simply skip it: a node upgraded over a claimed
+			# placeholder never reaches the mt76 branch above on a boot
+			# where mt76 came up late, and would keep the stolen
+			# credentials for as long as it stayed on that path.
+			uci -q get "mapagent.bhmld_ap_${bf_band}" >/dev/null 2>&1 && {
+				bhmld_own_placeholder "bhmld_ap_${bf_band}"
+				uci -q commit mapagent
+				continue
+			}
+			[ -n "$bf_dev" ] || continue
+
+			uci set mapagent.bhmld_ap_${bf_band}=ap
+			uci set mapagent.bhmld_ap_${bf_band}.type="backhaul"
+			uci set mapagent.bhmld_ap_${bf_band}.device="$bf_dev"
+			uci set mapagent.bhmld_ap_${bf_band}.ifname="bhmld${bf_band}"
+			uci set mapagent.bhmld_ap_${bf_band}.band="$bf_band"
+			uci set mapagent.bhmld_ap_${bf_band}.enabled="1"
+			uci set mapagent.bhmld_ap_${bf_band}.mld_id="3"
+			bhmld_own_placeholder "bhmld_ap_${bf_band}"
+			uci -q commit mapagent
+			echo "map_genconfig: added missing backhaul ap for band $bf_band on $bf_dev" >&2
+		done
+	}
+
+
+
+	if [ $generate_mapagent_config -eq 1 ]; then
+		uci set mapagent.agent.enabled="1"
+		# Same rule as further down, one variable over: where a role was
+		# decided, this is not the place to decide it again.
+		#
+		# multiap_mode is unset in every image we ship, so the chain below
+		# falls to "default to full" and writes controller_select local=1,
+		# autostart=1 - an agent told to run its own controller. It then has
+		# nobody to ask: no AP-Autoconfig SEARCH, no M1, no M2, no credentials.
+		# It fabricates its own backhaul key from the wireless config instead,
+		# bh-key-adopt accepts it as delivered, and the node reports settled
+		# while sitting in a mesh of one.
+		#
+		# Measured 2026-08-19 on a from-scratch wired join, with the boot chain
+		# traced: easymesh-role wrote local=0/autostart=0 at registration, this
+		# put both back to 1, and wsc stayed 0 for the node's entire life while
+		# 1905 topology worked perfectly and the controller listed the agent.
+		#
+		# The 2026-08-18 fix caught the sibling of this line -
+		# mapcontroller.controller.enabled - and left this one, which is why
+		# the symptom moved rather than went away.
+		if [ -f /etc/mapc/role ]; then
+			:
+		elif [ "$multiap_mode" == "agent" ]; then
+			uci -q set mapagent.@controller_select[0].autostart=0
+			uci -q set mapagent.@controller_select[0].local=0
+		elif [ "$multiap_mode" == "auto" ]; then
+			uci -q set mapagent.@controller_select[0].autostart=1
+			uci -q set mapagent.@controller_select[0].local=0
+		elif [ "$multiap_mode" == "none" ]; then
+			uci set mapagent.agent.enabled="0"
+		else # default to full
+			if [ "$network_mode" != "extender" ]; then
+				uci set mapagent.agent.dynbh="0"
+			fi
+			uci -q set mapagent.@controller_select[0].autostart=1
+			uci -q set mapagent.@controller_select[0].local=1
+		fi
+		uci -q commit wireless
+		uci -q commit mapagent
+
+		# ⚠️ An unset multiap_mode means AGENT, not controller.
+		#
+		# multiap_mode comes from `fw_printenv multiap_mode`, and no image we
+		# ship has ever set it - the variable simply does not exist in U-Boot,
+		# so this reads empty on every node we build. Empty matched neither
+		# "agent" nor "none", so the else branch ran and every node this
+		# function touched declared itself a controller.
+		#
+		# What that costs is not one wrong flag. bh-key-adopt opens its loop
+		# with `[ mapcontroller.controller.enabled = 1 ] && continue`, so an
+		# agent marked this way never looks at the key the mesh delivered:
+		# the radios easymesh-role deliberately darkened stay dark, no bsta
+		# section is built, and the fronthaul name never arrives. The node
+		# joins the controller's table and is deaf from then on.
+		#
+		# Traced on hardware 2026-08-18 on a from-scratch wired join:
+		#
+		#     /etc/mapc/role                    agent
+		#     mapagent.agent.enabled            1
+		#     mapcontroller.controller.enabled  1      <- written here
+		#     radios                            all disabled
+		#     bh-key-adopt                      not one line in the log
+		#
+		# easymesh-role had set it to 0 correctly; this ran afterwards and
+		# put it back. Same family as the netmode=extender workaround: a gate
+		# resting on a U-Boot variable that production never writes.
+		#
+		# 🔑 Agent is the safe default. A controller is the rare, deliberate
+		# node, and the decision is already recorded in
+		# mapcontroller.controller.enabled by whoever made it - genconfig has
+		# no business guessing it from an absent variable.
+		#
+		# ...and where a decision exists, this is not the place to make one.
+		# The note above ends by saying so, and then the code below guessed
+		# anyway - just in the other direction. /etc/mapc/role is written by
+		# easymesh-role before it touches anything else and nothing but a
+		# decision can produce it, so its presence means the value in
+		# mapcontroller.controller.enabled was chosen, not inherited.
+		#
+		# Traced on hardware 2026-08-19, first from-scratch controller built
+		# from a production image:
+		#
+		#     up=  0 s   easymesh-role wrote controller.enabled=1
+		#     up=196 s   this ran and wrote 0
+		#     every boot mapcontroller started, read 0, exited rc=1
+		#
+		# A mesh with no registrar, on a box that answered ping, served DHCP
+		# and looked entirely healthy. The agent-safe default stays for a
+		# factory box that has never been given a role - that is what the
+		# 2026-08-18 fix was for, and it is untouched here.
+		if [ "$multiap_mode" != "full" ] && [ "$multiap_mode" != "controller" ]; then
+			[ -f /etc/mapc/role ] || uci set mapcontroller.controller.enabled="0"
+		else
+			uci set mapcontroller.controller.enabled="1"
+			[ "$disable_mlo" == "1" ] && {
+				mapcontroller_remove_mld() {
+					uci delete mapcontroller.$1
+				}
+				mapcontroller_remove_mld_id() {
+					uci delete mapcontroller.$1.mld_id
+				}
+
+				config_load mapcontroller
+				config_foreach mapcontroller_remove_mld mld
+				config_foreach mapcontroller_remove_mld_id ap
+			}
+		fi
+		uci commit mapcontroller
+	fi
+}

@@ -1,0 +1,130 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: take the BSS entry that belongs to this socket
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Fixes a defect in 922: every station on a backhaul BSS was published against
+the fronthaul.
+
+hostapd's STATUS lists EVERY BSS on the radio, indexed:
+
+  bss[0]=ap-mld-1     bssid[0]=32:fb:2f:94:91:7b   ssid[0]=OpenWrt-
+  bss[1]=ap-mld-2     bssid[1]=32:fb:2f:94:91:7a   ssid[1]=MAP--BH
+
+Index 0 is the first BSS on that radio, not the one whose control socket was
+asked. 922 read bssid[0] unconditionally, which is right for a fronthaul link
+only by luck - it happens to be first - and wrong for every backhaul link.
+
+Measured on bpi-8g, 2026-08-04: x8's backhaul STA 06:0c:43:26:81:10 was stored
+with bssid 3a:fb:2f:94:51:7b, which the controller's own bss table marks
+is_fbss=1, instead of 32:fb:2f:94:91:7a (MAP--BH, is_bbss=1). The same
+mis-attribution was present on bpi-4g for 8g's backhaul STA. A backhaul link
+therefore appeared in the tables as an ordinary client sitting on the
+fronthaul and never leaving - which is what a user noticed and reported as a
+stale client.
+
+mld_addr and mld_link_id were read from index 0 for the same reason and are
+fixed with it.
+
+Look the BSS up by name instead: strip a trailing _linkN from the socket name
+to get the MLD name hostapd lists it under, find its bss[i], and read
+bssid[i] / mld_addr[i] / mld_link_id[i]. A plain single-BSS radio has only
+index 0 and lands on it unchanged.
+
+Applies on top of 923-publish-btm-response.patch.
+
+--- a/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 17:43:30.099596029 +0200
++++ b/libwifi/modules/wpactrl/wpactrl.c	2026-08-04 17:43:30.099679240 +0200
+@@ -711,6 +711,9 @@
+ /* 922: per-socket cache of STA MLD -> affiliated address mappings. */
+ #define HAPDCTRL_STA_MAX	32
+ 
++/* 924: how many BSS entries a STATUS reply may list for one radio. */
++#define HAPDCTRL_BSS_MAX	8
++
+ struct hapdctrl_sock {
+ 	struct wpa_ctrl *ctrl;		/* attached handle (NULL == closed) */
+ 	char ifname[16];		/* this socket's ctrl name */
+@@ -887,11 +890,51 @@
+ 	return -1;
+ }
+ 
++/* Index of the BSS named @name in a STATUS reply, or -1 (924).
++ *
++ * STATUS lists EVERY BSS on the radio, indexed:
++ *
++ *   bss[0]=ap-mld-1        bssid[0]=32:fb:2f:94:91:7b   ssid[0]=OpenWrt-
++ *   bss[1]=ap-mld-2        bssid[1]=32:fb:2f:94:91:7a   ssid[1]=MAP--BH
++ *
++ * Index 0 is the first BSS on that radio, NOT the one whose socket was asked.
++ * Reading bssid[0] off a backhaul link socket therefore returns the FRONTHAUL
++ * address, and every backhaul station gets published against the fronthaul BSS.
++ * Measured on bpi-8g 2026-08-04: x8's backhaul STA 06:0c:43:26:81:10 was stored
++ * with bssid 3a:fb:2f:94:51:7b (is_fbss=1) instead of 32:fb:2f:94:91:7a
++ * (MAP--BH, is_bbss=1), so it showed up as a stale client on the fronthaul.
++ *
++ * The fronthaul was right only by luck - it happens to be index 0.
++ */
++static int hapdctrl_bss_index(const char *buf, const char *name)
++{
++	char want[48];
++	const char *p;
++	size_t wlen;
++	int i;
++
++	for (i = 0; i < HAPDCTRL_BSS_MAX; i++) {
++		snprintf(want, sizeof(want), "bss[%d]=%s", i, name);
++		wlen = strlen(want);
++
++		p = buf;
++		while (p && *p) {
++			if (!strncmp(p, want, wlen) &&
++			    (p[wlen] == '\n' || p[wlen] == '\0'))
++				return i;
++			p = strchr(p, '\n');
++			if (p)
++				p++;
++		}
++	}
++	return -1;
++}
++
+ /* Cache the static identity of @s: link BSSID, AP MLD address and link id. */
+ static int hapdctrl_sock_info(struct hapdctrl_sock *s)
+ {
+-	char buf[4096] = {0};
+-	int link_id;
++	char buf[4096] = {0}, key[24], parent[16];
++	int link_id, idx;
+ 
+ 	if (s->info_valid)
+ 		return 0;
+@@ -900,13 +943,25 @@
+ 			 CONFIG_HOSTAPD_CTRL_IFACE_DIR))
+ 		return -1;
+ 
+-	if (hapdctrl_kv_mac(buf, "bssid[0]", s->bssid))
++	/* The BSS is listed under the MLD name, so strip a trailing _linkN.
++	 * A plain BSS is its own parent and lands on its own entry. */
++	hapdctrl_parent_key(s->ifname, parent, sizeof(parent));
++
++	idx = hapdctrl_bss_index(buf, parent);
++	if (idx < 0)
++		idx = 0;	/* single-BSS radio: index 0 is the only entry */
++
++	snprintf(key, sizeof(key), "bssid[%d]", idx);
++	if (hapdctrl_kv_mac(buf, key, s->bssid))
+ 		return -1;
+ 
+ 	s->link_id = -1;
+-	if (!hapdctrl_kv_mac(buf, "mld_addr[0]", s->mld_addr) &&
+-	    !hapdctrl_kv_int(buf, "mld_link_id[0]", &link_id))
+-		s->link_id = link_id;
++	snprintf(key, sizeof(key), "mld_addr[%d]", idx);
++	if (!hapdctrl_kv_mac(buf, key, s->mld_addr)) {
++		snprintf(key, sizeof(key), "mld_link_id[%d]", idx);
++		if (!hapdctrl_kv_int(buf, key, &link_id))
++			s->link_id = link_id;
++	}
+ 
+ 	s->info_valid = true;
+ 	return 0;

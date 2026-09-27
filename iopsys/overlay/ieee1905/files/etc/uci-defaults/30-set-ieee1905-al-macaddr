@@ -1,0 +1,93 @@
+#!/bin/sh
+. /usr/share/easymesh/trace.sh 2>/dev/null || :   # EASYMESH-TRACE
+
+. /lib/functions/system.sh
+
+# Ask the cheap question first: is the AL-MAC already configured?
+#
+# It used to be asked last, and that was the whole bug. The script called
+# get_mac_label() up front and did `exit 1` when it came back empty, so it never
+# reached this check. get_mac_label IS empty on every board we run (no
+# system.label_macaddr in board.json, no local-mac-address in the device tree),
+# so the script failed every single time. OpenWrt does not delete a uci-defaults
+# script that exits non-zero, so it stayed in /etc/uci-defaults and re-ran
+# uselessly on every boot. Measured 2026-09-01: present on all four mesh nodes,
+# exit=1, while ieee1905.macaddress had long been set.
+mac=$(uci -q get ieee1905.ieee1905.macaddress)
+[ -n "$mac" ] && exit 0
+
+# Node identity must come from the hardware, not from a random number.
+#
+# With no AL-MAC configured, ieee1905d invents one at first start. It survives
+# only in the config, so `sysupgrade -n` hands the node a NEW 1905 identity and
+# leaves the previous one behind as a ghost in the controller and in mapc.db
+# (num_nodes grows). We used to work around that by hardcoding one AL-MAC for
+# one box in 999-x8-identity; this replaces that with something every board has.
+#
+# The source is a 16-byte per-chip value in the SoC efuse at offset 0x140.
+# Burned at manufacture, so it is immune to everything that makes the other
+# candidates useless here:
+#
+#   get_mac_label            empty on both board types
+#   interface MACs           generated at random each boot (locally-administered
+#                            bit set on eth0, br-lan and U-Boot ethaddr alike)
+#   boot medium serial       every box carries BOTH eMMC and NVMe, root is
+#                            /dev/fit0 and fitblk hides the physical device -
+#                            export_bootdevice returns nothing, so "the boot
+#                            medium" cannot be resolved without guessing
+#   board EEPROM (24c02)     programmed on Pro 8X ("R4PRO8X-BAL95852"), blank
+#                            (all 0xFF) on the classic R4
+#
+# Measured 2026-09-01 on four boards, two board types: all four values differ.
+# The offset was found by diffing the full 4096-byte efuse between boards, not
+# read from a datasheet - hence the sanity check below rather than blind trust.
+#
+# The raw value never leaves this script: it may well be a hardware key, so it
+# is hashed, and only the hash is used. md5 is right here precisely because it
+# is not reversible and always gives the same answer for the same chip.
+# Find the efuse by what it IS, not by what it is numbered. nvmem devices are
+# named in registration order and this box already registers several of them
+# (the board EEPROM appears as 2-00573 / 3-00578, UBI as ubi0_0), so nvmem0 is
+# not a name to rely on. Match the provider whose parent device is the efuse.
+EFUSE=""
+for _d in /sys/bus/nvmem/devices/*/; do
+	case "$(readlink -f "$_d")" in
+	*efuse*) [ -r "$_d/nvmem" ] && { EFUSE="$_d/nvmem"; break; } ;;
+	esac
+done
+
+CHIPID=""
+[ -n "$EFUSE" ] && CHIPID=$(dd if="$EFUSE" bs=1 skip=320 count=16 2>/dev/null | \
+	hexdump -v -e '1/1 "%02x"')
+
+# An unprogrammed or unreadable region is all zeroes or all ones. Deriving an
+# address from that would give every such board the SAME identity, which is
+# worse than a random one.
+case "$CHIPID" in
+	"" | 00000000000000000000000000000000 | ffffffffffffffffffffffffffffffff)
+		CHIPID="" ;;
+esac
+
+# Mainline path, kept for boards that do fill it in.
+BMAC=$(get_mac_label)
+if [ -n "$BMAC" ]; then
+	SRC="label MAC"
+	SEED=${BMAC//:/}
+elif [ -n "$CHIPID" ]; then
+	SRC="SoC efuse chip id"
+	SEED=$(printf '%s' "$CHIPID" | md5sum | cut -c1-12)
+else
+	logger -s -t ieee1905-almac "no stable hardware id on this board - leaving the AL-MAC to ieee1905d"
+	exit 1
+fi
+
+# Locally administered, unicast: clear bit 0 of the first octet, set bit 1.
+LMAC=$((0x$SEED & 0xfeffffffffff))
+LMAC=$(($LMAC | 0x020000000000))
+LMAC=$(printf "%12.12X" $LMAC)
+LMAC=$(echo $LMAC | sed -e 's/[0-9A-F]\{2\}/&:/g' -e 's/:$//')
+
+uci set ieee1905.ieee1905.macaddress="$LMAC"
+uci commit ieee1905
+logger -s -t ieee1905-almac "AL-MAC set to $LMAC (derived from $SRC, stable across sysupgrade -n)"
+exit 0

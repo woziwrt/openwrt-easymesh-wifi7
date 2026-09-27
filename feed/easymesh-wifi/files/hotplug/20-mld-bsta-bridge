@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Fast path for the backhaul-STA bridge fix. The guarantee is the polled
+# service /etc/init.d/mld-bsta-bridge - this event was measured not to arrive
+# for bsta-mld-* on this platform, so it must never be the only mechanism.
+
+[ "$ACTION" = "add" ] || exit 0
+
+# Both names are in use here: the MediaTek flowtable hook reads DEVICENAME,
+# our own MT7996 txpower hook reads INTERFACE.
+case "${DEVICENAME:-$INTERFACE}" in
+bsta-mld-*) /usr/sbin/mld-bsta-bridge once ;;
+esac
+
+exit 0

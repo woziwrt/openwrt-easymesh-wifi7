@@ -1,0 +1,81 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: 993 - do not take a zero client count from a HAL that has the clients
+
+The controller was told a node had no clients while two were associated to
+it, and one of them was the machine asking the question.
+
+The count comes straight from the BSS status reply:
+
+	if (tb[8])
+		ap->num_sta = blobmsg_get_u32(tb[8]);
+
+and the HAL answers that field with 0 while its own assoclist, on the very
+same ubus object, returns the clients. Measured 2026-08-26 on an agent
+serving two:
+
+	iw dev ap-mld-1 station dump      2 stations
+	ubus wifi.ap.ap-mld-1 assoclist   both clients returned
+	ubus wifi.ap.ap-mld-1 status      "num_stations": 0
+
+The assignment is unconditional, so it also overwrites what the agent had
+already counted for itself in wifi_add_sta(). From there the damage is quiet
+and complete. The Associated Clients TLV is laid out as
+
+	bssid | num_sta | num_sta * (macaddr | conntime)
+
+so a zeroed num_sta emits an entry with no clients in it, even though
+ap->stalist is holding them - the station list in `map.agent status` shows
+the clients while num_sta beside it reads 0. The controller stores nothing,
+its database reports nobody, and the overview shows zero clients on a mesh
+that is serving them. Restarting the agent does not help: the next status
+reply zeroes it again.
+
+Believe the HAL when it reports clients, and keep our own count when it
+reports none while we are still holding some. A genuine last-client-leaves
+empties stalist as well, so a real zero is still recorded.
+
+This is a workaround at the reader. status and assoclist disagreeing inside
+one HAL object is a libwifi defect and belongs fixed there; until it is, the
+agent should at least not repeat it.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -3709,8 +3709,34 @@
+ 	if (tb[9])
+ 		ap->enabled = blobmsg_get_bool(tb[9]);
+ 
+-	if (tb[8])
+-		ap->num_sta = blobmsg_get_u32(tb[8]);
++	if (tb[8]) {
++		uint32_t hal_num_sta = blobmsg_get_u32(tb[8]);
++
++		/* 993: the HAL reports 0 here while its own assoclist on the
++		 * same object returns the clients (measured 2026-08-26). This
++		 * assignment is what reaches the Associated Clients TLV, whose
++		 * layout is bssid|num_sta|num_sta*(macaddr|conntime) - so a
++		 * zero emits an entry with no clients while ap->stalist holds
++		 * them, and the controller is told the node is empty. Believe
++		 * a non-zero count. When the HAL says none but we are still
++		 * holding stations, count them ourselves - keeping the previous
++		 * value is not enough: it goes stale the moment a second client
++		 * joins, and the TLV then reports one while two are associated
++		 * (measured 2026-08-26 evening, radio 2 / num_sta 1). A real
++		 * last-client-leaves empties stalist too, so a genuine zero
++		 * still lands. */
++		if (hal_num_sta > 0 || list_empty(&ap->stalist)) {
++			ap->num_sta = hal_num_sta;
++		} else {
++			struct sta *s;
++			uint32_t n = 0;
++
++			list_for_each_entry(s, &ap->stalist, list)
++				n++;
++
++			ap->num_sta = n;
++		}
++	}
+ 
+ 
+ 	if (!ap->enabled && agent_may_enable_fhs(ap->agent))

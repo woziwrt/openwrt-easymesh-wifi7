@@ -1,0 +1,54 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: register controller backhaul apvlan 1905
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+multiap/agent: register backhaul AP/VLAN as ieee1905 interface (controller RX)
+
+Symmetric counterpart to 0001 (agent side). On the AP side of a wireless
+backhaul, mac80211 delivers the 4addr backhaul-STA frames (1905 multicast
+Search + unicast CMDUs) on the dynamic AP/VLAN netdev (e.g. wlan1-1.sta1),
+never on the AP master, and ieee1905d installs an ebtables broute rule that
+keeps 0x893a off br-lan. ieee1905d RX is a per-ifindex AF_PACKET socket, so
+without a socket bound to that AP/VLAN the controller never receives the
+agent AP-Autoconfiguration Search and onboarding stalls (num_nodes stays at
+the controller only).
+
+map-agent already handles the hostapd "wds-station-added/removed" events in
+process_sta_wds_station_evt() with the exact AP/VLAN ifname. Hook that point
+to (de)register the AP/VLAN via the ieee1905 add_interface/del_interface ubus
+method, routed through /lib/wifi/multiap register_bh_wds (keeping all 1905
+registration policy in one script, mirroring the agent-side set_uplink hook).
+--- a/src/agent_ubus_events.c
++++ b/src/agent_ubus_events.c
+@@ -880,6 +880,12 @@
+ 		netif_alloc_wds(a, wdsname);
+ 	else
+ 		netif_free_wds_by_ifname(a, wdsname);
++	/* Register the dynamic 4addr AP/VLAN (e.g. wlan1-1.sta1) as a 1905 iface:
++	 * mac80211 delivers the backhaul STA's 1905 frames on this AP/VLAN, never on
++	 * the AP master, and ieee1905d's broute rule keeps them off br-lan, so a
++	 * per-iface AF_PACKET socket here is required to RX the agent's Search.
++	 * Symmetric to the agent-side set_uplink registration of the bSTA. */
++	runCmd("/lib/wifi/multiap register_bh_wds %s %s", add ? "add" : "del", wdsname);
+ 
+ 	list_for_each_entry(re, &a->radiolist, list) {
+ 		struct netif_ap *ap = NULL;
+--- a/src/script/multiap
++++ b/src/script/multiap
+@@ -1756,6 +1756,16 @@
+ 	bsta_to_wireless) bsta_to_wireless $@;;
+ 	sync_mapcontroller_from_wireless) sync_mapcontroller_from_wireless $@;;
+ 	ts) ts_sub $@;;
++	register_bh_wds)
++		# $1=add|del  $2=wdsname — (de)register backhaul AP/VLAN as a 1905 iface
++		[ -n "$2" ] && {
++			if [ "$1" = "add" ]; then
++				ubus -t 5 call ieee1905 add_interface "{\"ifname\":\"$2\"}" >/dev/null 2>&1
++			else
++				ubus -t 5 call ieee1905 del_interface "{\"ifname\":\"$2\"}" >/dev/null 2>&1
++			fi
++		}
++		;;
+ 	dpp) dpp_sub $@;;
+ 	bsta_enable_all) bsta_enable_all $@;;
+ 	bsta_clear_bssid) bsta_clear_bssid $@;;

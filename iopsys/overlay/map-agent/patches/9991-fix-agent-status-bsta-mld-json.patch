@@ -1,0 +1,101 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9991: make `ubus call map.agent status` parse
+
+`ubus call map.agent status` is not valid JSON on any node that has a backhaul
+STA MLD, which is every agent. Measured 2026-08-01 on all three nodes:
+
+  4g (controller)  jsonfilter -e '@.ap_mld[*].ifname'  ->  ap-mld-2 ap-mld-1
+  8g (agent)       jsonfilter                          ->  Failed to parse JSON
+  x8 (agent)       jsonfilter                          ->  Failed to parse JSON
+
+The controller only escapes because it runs no bSTA MLD, so its "bsta_mld"
+comes out as an empty table and happens to be well formed.
+
+"bsta_mld" is opened as a table and then holds an unkeyed table, which libubox
+renders as
+
+	"bsta_mld": {
+		{
+			"ifname": "bsta-mld-3",
+
+There is exactly one backhaul STA MLD per node - agent->bstamld is a single
+pointer - so the object is right and the anonymous wrapper inside it is not.
+Dropping the wrapper keeps the empty case unchanged ("bsta_mld": {}) and makes
+the populated case parse. The closing call is corrected to close_table for the
+same reason.
+
+This is the second site of the defect 982 fixed in the backhaul block; the
+handoff of 2026-07-31 listed it as open item 5.
+
+The same function has a third instance waiting to happen, fixed here too: in
+the mld_stations loop the table is opened before agent_get_sta(), and the !s
+path continues without closing it. It needs a client to disappear between the
+affiliated list being built and the status being rendered, which is why it has
+not been seen yet - it would produce exactly the same unparseable output, but
+only sometimes.
+
+Consumers that had to work around this can stop. mld-report-check counts
+affiliated APs with awk for this reason and says so in a comment; the workaround
+stays until this patch has been on the nodes long enough to trust.
+
+--- a/src/agent.c	2026-08-01 12:19:30.315059325 +0200
++++ b/src/agent.c	2026-08-01 12:19:30.315106741 +0200
+@@ -6180,11 +6180,18 @@
+ 				void *ttttt;
+ 				struct sta *s;
+ 
+-				ttttt = blobmsg_open_table(&bb, "");
++				/* Look up first, open second. The other way round,
++				 * a station that has gone away since the MLD's
++				 * affiliated list was built leaves a table open
++				 * that nothing ever closes - the same unparseable
++				 * output as above, arriving only when a client
++				 * roams at the wrong moment.
++				 */
+ 				s = agent_get_sta(agent, smld->affiliated_sta[i]);
+ 				if (!s)
+ 					continue;
+ 
++				ttttt = blobmsg_open_table(&bb, "");
+ 				blobmsg_add_macaddr(&bb, "macaddr", s->macaddr);
+ 				blobmsg_add_macaddr(&bb, "bssid", s->bssid);
+ 				blobmsg_add_u32(&bb, "linkid", s->mlo_link_id);
+@@ -6204,8 +6211,24 @@
+ 		void *aa;
+ 		int i;
+ 
+-		t = blobmsg_open_table(&bb, "");
+-
++		/* No anonymous table here. A node has one backhaul STA MLD -
++		 * agent->bstamld is a single pointer - so this is an object,
++		 * and an unkeyed object nested inside it is what libubox
++		 * renders as
++		 *
++		 *	"bsta_mld": {
++		 *		{
++		 *			"ifname": "bsta-mld-3",
++		 *
++		 * which is not JSON. jsonfilter rejects the whole document
++		 * with "quoted object property name expected", so every
++		 * consumer of map.agent status loses every field, not just
++		 * this one. Measured 2026-08-01: both agents unparseable,
++		 * the controller parseable only because it has no bsta_mld
++		 * and the empty table is well formed by accident.
++		 *
++		 * Same defect as 982 in the backhaul block, second site.
++		 */
+ 		blobmsg_add_string(&bb, "ifname", agent->bstamld->bk.ifname);
+ 		blobmsg_add_macaddr(&bb, "macaddr", agent->bstamld->bk.macaddr);
+ 		blobmsg_add_macaddr(&bb, "bssid", agent->bstamld->bk.bssid);
+@@ -6236,10 +6259,8 @@
+ 			blobmsg_close_table(&bb, tt);
+ 		}
+ 		blobmsg_close_array(&bb, aa);
+-
+-		blobmsg_close_table(&bb, t);
+ 	}
+-	blobmsg_close_array(&bb, a);
++	blobmsg_close_table(&bb, a);
+ #endif
+ 	ubus_send_reply(ctx, req, bb.head);
+ 	blob_buf_free(&bb);

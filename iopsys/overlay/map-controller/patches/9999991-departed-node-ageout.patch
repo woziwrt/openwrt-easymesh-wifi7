@@ -1,0 +1,112 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: departed nodes age out of the database like departed clients
+
+agent rows were written and refreshed but never deleted (the schema
+comment on last_seen said so verbatim), so a decommissioned node lived
+in the database forever and db_restore() revived it as a ghost on every
+boot, where the live model then spent 65 s aging it out again. The
+2026-08-04 review flagged this as finding 1.13; the reliability plan
+carries it as item 1.5 ("the departed list grows forever, a retired
+node comes back to life on every boot").
+
+Reuse the client policy wholesale: the hourly janitor deletes agents
+whose last_seen is older than MAPC_DB_HISTORY_DAYS (20 days). A node
+that is merely power-cycled or offline for days is untouched - reviving
+such a node is the recovery guarantee this database exists for. Only a
+node gone for weeks is treated as decommissioned.
+
+The schema has no ON DELETE CASCADE, so the janitor deletes children
+first, all keyed off one doomed-agents set: the MLD subgraph (apmld,
+affiliated_ap, ttlm, bstamld, affiliated_bsta), clients whose last
+owner was the doomed node (sta, and sta_mld/affiliated_sta via the
+doomed node\x27s AP-MLDs), the radio subtree (radio_caps,
+operating_class, scan_result, bss, radio), both directions of
+topology_link, neighbor entries, and the 1905 security row. The
+controller\x27s own agent row is excluded by construction.
+
+The client-MLD family also gains the retention it was missing: sta_mld
+has its own last_seen but no janitor rule; it now follows the same
+20-day cutoff (affiliated_sta rows go with their sta_mld).
+
+Verify on hardware: insert a fake agent row with last_seen 21 days old
+plus a radio/bss child, run one janitor cycle (or wait for the hourly
+tick), confirm the whole subtree is gone while all live nodes and the
+controller row survive; then reboot and confirm db_restore no longer
+logs the ghost.
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -1818,6 +1818,63 @@
+ 		stmt_finish(c->db, st);
+ 	}
+ 
++	/* Departed NODES age out the same way departed clients do. agent rows
++	 * were written and refreshed but never deleted, so a decommissioned
++	 * node lived in the database forever and db_restore() revived it as a
++	 * ghost on every boot. A node unseen for MAPC_DB_HISTORY_DAYS is
++	 * gone for good; a power-cycled or briefly-offline node is untouched,
++	 * which is the recovery guarantee this database exists for.
++	 *
++	 * No ON DELETE CASCADE in the schema, so children go first, keyed off
++	 * the same doomed set. The controller's own row is never doomed. */
++#define DOOMED_AGENTS \
++	"(SELECT almac FROM agent WHERE COALESCE(last_seen,0) < ?1 " \
++	"AND almac <> COALESCE((SELECT controller_almac FROM network LIMIT 1),''))"
++#define DOOMED_RADIOS "(SELECT ruid FROM radio WHERE agent_almac IN " DOOMED_AGENTS ")"
++#define DOOMED_APMLDS "(SELECT mld_macaddr FROM apmld WHERE agent_almac IN " DOOMED_AGENTS ")"
++	{
++		static const char * const doom_sql[] = {
++			"DELETE FROM affiliated_sta WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM sta_mld WHERE ap_mld_macaddr IN " DOOMED_APMLDS ")",
++			"DELETE FROM sta_mld WHERE ap_mld_macaddr IN " DOOMED_APMLDS,
++			"DELETE FROM ttlm WHERE mld_macaddr IN " DOOMED_APMLDS,
++			"DELETE FROM affiliated_ap WHERE mld_macaddr IN " DOOMED_APMLDS,
++			"DELETE FROM apmld WHERE agent_almac IN " DOOMED_AGENTS,
++			"DELETE FROM affiliated_bsta WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM bstamld WHERE agent_almac IN " DOOMED_AGENTS ")",
++			"DELETE FROM bstamld WHERE agent_almac IN " DOOMED_AGENTS,
++			"DELETE FROM sta WHERE agent_almac IN " DOOMED_AGENTS,
++			"DELETE FROM radio_caps WHERE ruid IN " DOOMED_RADIOS,
++			"DELETE FROM operating_class WHERE ruid IN " DOOMED_RADIOS,
++			"DELETE FROM scan_result WHERE ruid IN " DOOMED_RADIOS,
++			"DELETE FROM bss WHERE ruid IN " DOOMED_RADIOS,
++			"DELETE FROM radio WHERE agent_almac IN " DOOMED_AGENTS,
++			"DELETE FROM topology_link WHERE child_almac IN " DOOMED_AGENTS
++			" OR parent_almac IN " DOOMED_AGENTS,
++			"DELETE FROM neighbor WHERE neighbor IN " DOOMED_AGENTS
++			" OR next_hop IN " DOOMED_AGENTS,
++			"DELETE FROM ieee1905_security WHERE id IN " DOOMED_AGENTS,
++			"DELETE FROM agent WHERE COALESCE(last_seen,0) < ?1 "
++			"AND almac <> COALESCE((SELECT controller_almac FROM network LIMIT 1),'')",
++			/* client-MLD family has its own last_seen: same retention */
++			"DELETE FROM affiliated_sta WHERE mld_macaddr IN "
++			"(SELECT mld_macaddr FROM sta_mld WHERE COALESCE(last_seen,0) < ?1)",
++			"DELETE FROM sta_mld WHERE COALESCE(last_seen,0) < ?1",
++		};
++		size_t i;
++
++		for (i = 0; i < sizeof(doom_sql)/sizeof(doom_sql[0]); i++) {
++			st = NULL;
++			if (mapdb_prepare(c->db, doom_sql[i], &st) == MAPDB_OK) {
++				mapdb_bind_int(st, 1, cutoff);
++				stmt_finish(c->db, st);
++			}
++		}
++	}
++#undef DOOMED_APMLDS
++#undef DOOMED_RADIOS
++#undef DOOMED_AGENTS
++
+ 	st = NULL;
+ 	if (mapdb_prepare(c->db,
+ 			  "DELETE FROM sta_metrics_hist WHERE rowid NOT IN "
+--- a/src/db/mapdb_schema.h
++++ b/src/db/mapdb_schema.h
+@@ -92,7 +92,7 @@
+ 	"    max_aplink_num       INTEGER,\n"
+ 	"    max_bstalink_num     INTEGER,\n"
+ 	"    tid_link_caps        INTEGER,\n"
+-	"    last_seen            INTEGER             -- last_tsp_seen epoch [cntlr.h:188]; updated, never used to DELETE\n"
++	"    last_seen            INTEGER             -- last_tsp_seen epoch [cntlr.h:188]; drives departed-node ageout\n"
+ 	");\n"
+ 	"\n"
+ 	"-- 4. radios (iopsys wifi_radio_element)\n"

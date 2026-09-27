@@ -1,0 +1,86 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: ieee1905 skip probe backhaul bsta
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+ieee1905: skip the blocking wifi probe for a registered backhaul bSTA
+
+fix#1 (0001-ieee1905-skip-slow-wifi-dm-probes) skips the synchronous libwifi
+mediainfo/WPS probe in i1905_alloc_interface() only for interfaces whose name
+matches ".sta" or "ap-mld". The wireless backhaul STA registered by map-agent's
+set_uplink hook (patch 0001-register-1905-wireless-backhaul-interface) is a
+bare-named 4addr STA (e.g. "wlan1_0") that matches neither, so it falls through
+to platform_wifi_get_mediainfo()/get_wps_status(), whose hostapd control-socket
+round trips block the single ieee1905d uloop thread. (This used to say "a mt76
+GET_STATION dump that never terminates"; that claim was never measured and is
+wrong - see the correction in patch 0001.) While it is
+stalled, the controller's 1 s-bounded ubus_invoke(..., "cmdu", ..., 1000) send
+of the AP-Autoconfiguration Response / WSC M2 fails and the CMDU is dropped, so
+the agent never completes onboarding (num_nodes stays 0) even though the
+backhaul link and 1905 Topology Discovery are fully up.
+
+Let the caller flag the interface: map-agent passes {"wifi_backhaul":true} to
+ieee1905 add_interface; i1905_interface_add sets a transient
+priv->add_iface_wifi_backhaul around the synchronous i1905_setup_interface()
+call, and i1905_alloc_interface takes the same early skip as the ".sta"/"ap-mld"
+cases. Single-threaded uloop makes the transient flag race-free. The AF_PACKET
+socket created afterwards is all that is needed to TX/RX 1905 CMDUs on the
+backhaul. HW-proven root cause 2026-07-15.
+
+--- a/src/i1905.h	2026-07-15 18:21:51.205534420 +0200
++++ b/src/i1905.h	2026-07-15 18:21:51.219544128 +0200
+@@ -45,6 +45,10 @@
+ 
+ 	bool paused;
+ 	int start_apconfig;
++	/* transient: set around i1905_setup_interface() from i1905_interface_add
++	 * to skip the blocking wifi mediainfo/WPS probe for a wireless backhaul
++	 * bSTA (4addr STA), whose probe blocks on the hostapd control socket. */
++	bool add_iface_wifi_backhaul;
+ 
+ 	int cmdsock;
+ 	char *cmdpath;
+--- a/src/i1905.c	2026-07-15 18:21:51.207775770 +0200
++++ b/src/i1905.c	2026-07-15 18:21:51.219782336 +0200
+@@ -364,7 +364,8 @@
+ 		 * even detecting it via platform_wifi_get_4addr_parent() blocks
+ 		 * (hostapd_cli). Detect by name (no syscall); the AF_PACKET socket
+ 		 * created later is all we need to RX their 1905 CMDUs. */
+-		if (strstr(ifname, ".sta") || !strncmp(ifname, "ap-mld", 6)) {
++		if (priv->add_iface_wifi_backhaul ||
++		    strstr(ifname, ".sta") || !strncmp(ifname, "ap-mld", 6)) {
+ 			info("%s: 4addr/MLD affiliated - skip wifi probe\n", ifname);
+ 			n->media = I1905_MEDIA_UNKNOWN;
+ 			n->num_mediainfo = 0;
+--- a/src/i1905_cmdresp.c	2026-07-15 18:21:51.209897334 +0200
++++ b/src/i1905_cmdresp.c	2026-07-15 18:21:51.219698880 +0200
+@@ -1522,11 +1522,13 @@
+ /* add/del interface policy */
+ enum {
+ 	I1905_INTERFACE_IFNAME,		/* interface name */
++	I1905_INTERFACE_WIFI_BACKHAUL,	/* skip blocking wifi probe (backhaul bSTA) */
+ 	NUM_I1905_INTERFACE_POLICY,
+ };
+ 
+ static const struct blobmsg_policy interface_policy[NUM_I1905_INTERFACE_POLICY] = {
+ 	[I1905_INTERFACE_IFNAME] = { .name = "ifname", .type = BLOBMSG_TYPE_STRING },
++	[I1905_INTERFACE_WIFI_BACKHAUL] = { .name = "wifi_backhaul", .type = BLOBMSG_TYPE_BOOL },
+ };
+ 
+ int i1905_interface_add(struct i1905_private *priv, void *args, void *out)
+@@ -1554,7 +1556,16 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* Skip the blocking wifi mediainfo/WPS probe in i1905_alloc_interface for a
++	 * wireless backhaul bSTA (4addr STA): its GET_STATION dump never returns on
++	 * mt76 and stalls this uloop thread, starving the 1 s-bounded "cmdu" invoke
++	 * the controller uses to send AP-Autoconfig Response / WSC M2 -> onboarding
++	 * stalls forever. Single-threaded uloop makes the transient flag race-free. */
++	if (tb[I1905_INTERFACE_WIFI_BACKHAUL])
++		priv->add_iface_wifi_backhaul =
++			blobmsg_get_bool(tb[I1905_INTERFACE_WIFI_BACKHAUL]);
+ 	iface = i1905_setup_interface(priv, ifname);
++	priv->add_iface_wifi_backhaul = false;
+ 	if (!iface) {
+ 		dbg("%s: %s: error setup interface\n", __func__, ifname);
+ 		ret = 1;

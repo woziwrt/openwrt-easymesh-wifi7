@@ -1,0 +1,86 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# Fix LAN bridge ports for BPI-R4 Pro 8X (MxL862xx DSA)
+#
+# This runs on EVERY first boot -- including the first boot after a keep-config
+# sysupgrade, where /etc/config/network is the RESTORED config, not a freshly
+# generated one. So it must never take a port back that the running config has
+# already handed to another interface.
+#
+# That is exactly what bit us on a BPI-R4 Pro 8X (2026-07-24): node-config.sh carves the
+# management port (mxl_lan0) out of br-lan into its own `lan_3` interface on
+# 192.168.1.x, while br-lan carries the mesh (10.10.10.x). The old unconditional
+# "delete ports, add all six back" put mxl_lan0 into the bridge again on the
+# first boot after every upgrade -> management address collided with the mesh
+# bridge and 192.168.1.2 went dead. Before the compat_version fix this stayed
+# hidden, because Pro-8X could only ever be flashed with -n (config wiped).
+#
+# Rule: seed the bridge with the board's LAN ports MINUS whatever some other
+# network interface already owns. Fresh config -> nothing is claimed -> the full
+# board default, as before. Kept config -> the operator's split survives.
+
+# All LAN-side ports of this board, in display order.
+LAN_PORTS="mxl_lan0 mxl_lan1 mxl_lan2 mxl_lan3 eth3 mxl_lan5"
+
+# Devices bound to a plain (non-bridge) network interface: wan/wan6 on eth1, and
+# after node-config.sh also the management port on lan_3.
+claimed=" $(uci show network 2>/dev/null \
+	| sed -n "s/^network\.[^.]*\.device='\(.*\)'\$/\1/p" \
+	| grep -vx 'br-lan' | tr '\n' ' ')"
+
+bridge_ports=
+for _p in $LAN_PORTS; do
+	case "$claimed" in
+		*" $_p "*) continue ;;
+	esac
+	bridge_ports="$bridge_ports $_p"
+done
+
+# Address the bridge by name, not by a hardcoded @device[0] index.
+_dev=$(uci show network 2>/dev/null \
+	| sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-lan'\$/\1/p" | head -1)
+[ -n "$_dev" ] || _dev='@device[0]'
+
+uci -q delete "network.$_dev.ports"
+for _p in $bridge_ports; do
+	uci add_list "network.$_dev.ports=$_p"
+done
+
+# WAN on eth1 (Aeonsemi AS21xxx COMBO port). Board truth, not a policy choice:
+# on a kept config this is already eth1, so it is a no-op there.
+uci set network.wan.device='eth1'
+uci set network.wan6.device='eth1'
+
+uci commit network
+
+# Fix /etc/board.json so the LuCI status page monitors each LAN port
+# individually instead of falling back to the generic "default" device.
+# board.json is NOT part of the keep-config backup -- it is regenerated from the
+# new image on every upgrade -- so this half must run every time.
+#
+# NB: we can't use board_config_update / ucidef_set_interface_* here. Those go
+# through jshn (json_load), which fails with "Failed to parse message data" on
+# this board because the MT7996 Wi-Fi 7 "wlan" section of board.json contains
+# nested arrays (radios[].freq_ranges = [[lo,hi]]) that jshn cannot parse. The
+# call returns rc=0 but writes nothing, so the previous approach was a silent
+# no-op on every boot and board.json stayed at the generic "default" mapping.
+#
+# Rewrite board.json directly via jsonfilter (which parses it fine), replacing
+# only the "network" object and preserving model + wlan. board.json for this
+# board has exactly these three top-level keys. Cosmetic only (LuCI port
+# display); the UCI bridge above is what carries traffic.
+# (GH issue #17 - reported by klamath on real Pro 8X hardware.)
+_bj=/etc/board.json
+if [ -f "$_bj" ]; then
+	_model=$(jsonfilter -i "$_bj" -e '@.model')
+	_wlan=$(jsonfilter -i "$_bj" -e '@.wlan')
+	# Same port set as the bridge above, so LuCI shows what actually carries LAN.
+	_lan_ports=$(for _p in $bridge_ports; do printf '"%s",' "$_p"; done | sed 's/,$//')
+	_net="{\"lan\":{\"ports\":[$_lan_ports],\"protocol\":\"static\"},\"wan\":{\"device\":\"eth1\",\"protocol\":\"dhcp\"}}"
+	if [ -n "$_wlan" ]; then
+		printf '{"model":%s,"network":%s,"wlan":%s}\n' "$_model" "$_net" "$_wlan" > "$_bj"
+	else
+		printf '{"model":%s,"network":%s}\n' "$_model" "$_net" > "$_bj"
+	fi
+fi

@@ -1,0 +1,178 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 977 - persist associated clients to sta table
+
+The sta table existed since Phase 1 but nothing wrote it. Add mapc_sync_sta
+(UPSERT keyed on macaddr, in the mapc_sync_bss style) + mapc_del_sta, driven
+from the Phase-1 dispatcher on Topology Notification and Response. A roam
+agent->agent rewrites the single row (macaddr PK); the row is deleted only on
+a true disconnect (STA_DISCONNECTED branch). Makes clients visible in the DB
+and the mesh-status WebUI, and persisted for recovery.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -22,6 +22,7 @@
+ struct node;
+ struct netif_radio;
+ struct netif_iface;
++struct sta;
+ 
+ /* Upsert the single 'network' identity row (controller AL-MAC). */
+ void mapc_sync_network(struct controller *c);
+@@ -40,6 +41,13 @@
+  * synced). No-op when the radio reports no BSS at all. */
+ void mapc_sync_bss_sweep(struct controller *c, struct netif_radio *r);
+ 
++/* Upsert the 'sta' row for associated client @s (attached to node @n).
++ * Keyed on macaddr; a roam agent->agent rewrites the single row. */
++void mapc_sync_sta(struct controller *c, struct node *n, struct sta *s);
++
++/* Delete the 'sta' row for @s. Call ONLY on a true disconnect. */
++void mapc_del_sta(struct controller *c, struct sta *s);
++
+ /* Rebuild the 'topology_link' edge set from c->topology.dev_list, one txn. */
+ void mapc_sync_topology(struct controller *c);
+ 
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -25,6 +25,7 @@
+ #include <time.h>
+ 
+ #include "cntlr.h"
++#include "sta.h"
+ #include "wifi_opclass.h"
+ #include "db/mapdb.h"
+ #include "db/mapc_sync.h"
+@@ -483,6 +484,91 @@
+ 	stmt_finish(c->db, st);
+ }
+ 
++/* ---- sta (associated client) ------------------------------------------ */
++
++void mapc_sync_sta(struct controller *c, struct node *n, struct sta *s)
++{
++	static const char *sql =
++		"INSERT INTO sta(macaddr, bssid, associated, is_bsta, agent_almac, "
++		"last_ul_rate, last_dl_rate, est_mac_rate_ul, est_mac_rate_dl, "
++		"conn_time, rcpi, util_tx, util_rx, pkts_tx, pkts_rx, bytes_tx, "
++		"bytes_rx, errors_tx, errors_rx, retrans_count, hostname) "
++		"VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
++		"ON CONFLICT(macaddr) DO UPDATE SET "
++		"bssid=excluded.bssid, associated=excluded.associated, "
++		"is_bsta=excluded.is_bsta, agent_almac=excluded.agent_almac, "
++		"last_ul_rate=excluded.last_ul_rate, last_dl_rate=excluded.last_dl_rate, "
++		"est_mac_rate_ul=excluded.est_mac_rate_ul, "
++		"est_mac_rate_dl=excluded.est_mac_rate_dl, conn_time=excluded.conn_time, "
++		"rcpi=excluded.rcpi, util_tx=excluded.util_tx, util_rx=excluded.util_rx, "
++		"pkts_tx=excluded.pkts_tx, pkts_rx=excluded.pkts_rx, "
++		"bytes_tx=excluded.bytes_tx, bytes_rx=excluded.bytes_rx, "
++		"errors_tx=excluded.errors_tx, errors_rx=excluded.errors_rx, "
++		"retrans_count=excluded.retrans_count, hostname=excluded.hostname";
++	struct wifi_sta_element *d = s->de_sta;
++	char mac[18], bssid[18], almac[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	mac2str(s->macaddr, mac);
++	mac2str(s->bssid, bssid);
++	mac2str(n->almacaddr, almac);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: sta prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, mac);
++	mapdb_bind_text(st, 2, bssid);
++	mapdb_bind_int(st, 3, s->state != STA_DISCONNECTED);
++	mapdb_bind_int(st, 4, s->is_bsta);
++	mapdb_bind_text(st, 5, almac);
++	if (d) {
++		mapdb_bind_int(st, 6, d->ul_rate);
++		mapdb_bind_int(st, 7, d->dl_rate);
++		mapdb_bind_int(st, 8, d->ul_est_thput);
++		mapdb_bind_int(st, 9, d->dl_est_thput);
++		mapdb_bind_int(st, 10, d->conn_time);
++		mapdb_bind_int(st, 11, d->rcpi);
++		mapdb_bind_int(st, 12, (long long)d->dl_utilization);
++		mapdb_bind_int(st, 13, (long long)d->ul_utilization);
++		mapdb_bind_int(st, 14, d->tx_pkts);
++		mapdb_bind_int(st, 15, d->rx_pkts);
++		mapdb_bind_int(st, 16, (long long)d->tx_bytes);
++		mapdb_bind_int(st, 17, (long long)d->rx_bytes);
++		mapdb_bind_int(st, 18, d->tx_errors);
++		mapdb_bind_int(st, 19, d->rx_errors);
++		mapdb_bind_int(st, 20, d->rtx_pkts);
++		mapdb_bind_text(st, 21, d->hostname[0] ? d->hostname : NULL);
++	} else {
++		int i;
++		for (i = 6; i <= 21; i++)
++			mapdb_bind_null(st, i);
++	}
++	stmt_finish(c->db, st);
++}
++
++void mapc_del_sta(struct controller *c, struct sta *s)
++{
++	static const char *sql = "DELETE FROM sta WHERE macaddr=?";
++	char mac[18];
++	mapdb_stmt *st = NULL;
++
++	if (!c->db)
++		return;
++
++	mac2str(s->macaddr, mac);
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: sta delete prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++	mapdb_bind_text(st, 1, mac);
++	stmt_finish(c->db, st);
++}
++
+ /* ---- topology_link ---------------------------------------------------- */
+ 
+ void mapc_sync_topology(struct controller *c)
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -287,6 +287,7 @@
+ 						memset(s->bssid, 0, sizeof(s->bssid));
+ 						memset(s->agent_almacaddr, 0, sizeof(s->agent_almacaddr));
+ 						s->state = STA_DISCONNECTED;
++						mapc_del_sta(c, s); /* 977: true disconnect */
+ 					}
+ 				}
+ 			}
+@@ -4841,6 +4842,12 @@
+ 			/* topology_link is synced authoritatively from
+ 			 * topology_build_tree(); don't duplicate it here. */
+ 			mapc_sync_agent(c, n);
++			/* PATCH 977: persist associated clients (node->stalist). */
++			{
++				struct sta *cs;
++				list_for_each_entry(cs, &n->stalist, list)
++					mapc_sync_sta(c, n, cs);
++			}
+ 			list_for_each_entry(r, &n->radiolist, list) {
+ 				mapc_sync_radio(c, n, r);
+ 				list_for_each_entry(bss, &r->iflist, list)
+@@ -4879,6 +4886,16 @@
+ 			}
+ #endif
+ 			break;
++		case CMDU_TYPE_TOPOLOGY_NOTIFICATION:
++			/* PATCH 977: a client (dis)associated / roamed; upsert
++			 * whatever is now attached (macaddr PK => one row). */
++			/* PATCH 977: persist associated clients (node->stalist). */
++			{
++				struct sta *cs;
++				list_for_each_entry(cs, &n->stalist, list)
++					mapc_sync_sta(c, n, cs);
++			}
++			break;
+ #if (EASYMESH_VERSION >= 6)
+ 		case CMDU_AP_MLD_CONFIG_RESPONSE:
+ 			/* handle_ap_mld_config_response() already parsed 0xE0

@@ -1,0 +1,885 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: add mapdb sqlite persistence
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+diff -ruN a/src/db/mapdb_schema.h b/src/db/mapdb_schema.h
+--- /dev/null
++++ b/src/db/mapdb_schema.h
+@@ -0,0 +1,342 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapdb_schema.h - embedded DDL for the map-controller persistence layer.
++ *
++ * GENERATED - do not hand-edit. Canonical source is schema.sql (same directory).
++ * Regenerate after editing schema.sql with the gen-schema-header step documented
++ * in PHASE0-INTEGRATION.md (the string below is schema.sql verbatim, byte-exact:
++ * diff <(gen-schema-header) schema.sql must be empty).
++ *
++ * Embedding avoids shipping a .sql file on the router - the DDL travels inside
++ * the binary and is applied on mapdb_open(). schema.sql stays authoritative.
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#ifndef MAPDB_SCHEMA_H
++#define MAPDB_SCHEMA_H
++
++/* Bump when the DDL below changes; drives the schema_version migration gate. */
++#define MAPDB_SCHEMA_VERSION 1
++
++/* schema.sql, verbatim. CREATE TABLE IF NOT EXISTS throughout -> idempotent. */
++static const char MAPDB_SCHEMA_SQL[] =
++	"-- map-controller DB persistence layer - schema (ADR-0003, design doc s3.2)\n"
++	"--\n"
++	"-- CANONICAL SOURCE OF TRUTH for the DDL. The router build ships the embedded\n"
++	"-- copy in mapdb_schema.h (a C string literal with identical text) so there is\n"
++	"-- no external .sql file to install. When you edit THIS file, regenerate the\n"
++	"-- header - see the generator note at the top of mapdb_schema.h.\n"
++	"--\n"
++	"-- Dialect: sqlite (affinity types chosen to stay MariaDB-portable).\n"
++	"-- 20 tables: schema_version + 11 recovery-graph (written in v1) + 3 UCI-mirror\n"
++	"-- + 5 telemetry (created empty in v1). No table is ever ALTER-shrunk; growth is\n"
++	"-- ADD COLUMN / new CREATE TABLE under the schema_version migration gate (s3.3).\n"
++	"\n"
++	"-- ---------- meta ----------\n"
++	"CREATE TABLE IF NOT EXISTS schema_version (\n"
++	"    version     INTEGER NOT NULL,          -- monotonically increasing\n"
++	"    applied_at  INTEGER NOT NULL           -- epoch seconds\n"
++	");\n"
++	"\n"
++	"-- ========== WRITTEN IN v1 : recovery graph ==========\n"
++	"\n"
++	"-- 1. network identity (single logical mesh)\n"
++	"CREATE TABLE IF NOT EXISTS network (\n"
++	"    id                TEXT PRIMARY KEY,     -- network id\n"
++	"    controller_almac  TEXT,                 -- our 1905 AL-MAC  [cntlr.h:223]\n"
++	"    colocated_agent   TEXT,                 -- co-located agent AL-MAC\n"
++	"    media             INTEGER               -- network media type\n"
++	");\n"
++	"\n"
++	"-- 2. 1905 security params (ieee1905_security_caps)\n"
++	"CREATE TABLE IF NOT EXISTS ieee1905_security (\n"
++	"    id                    TEXT PRIMARY KEY, -- AL-MAC scope\n"
++	"    onboarding_protocol   INTEGER,          -- [wifi_dataelements.h:692]\n"
++	"    integrity_algorithm   INTEGER,          -- [:693]\n"
++	"    encryption_algorithm  INTEGER           -- [:694]\n"
++	");\n"
++	"\n"
++	"-- 3. agents / 1905 devices (iopsys struct node)\n"
++	"CREATE TABLE IF NOT EXISTS agent (\n"
++	"    almac                TEXT PRIMARY KEY,   -- [cntlr.h:152]\n"
++	"    is_agent             INTEGER,            -- [cntlr.h:171]\n"
++	"    node_type            INTEGER,            -- enum nodetype [cntlr.h:153]\n"
++	"    profile              INTEGER,            -- map_profile [cntlr.h:172]\n"
++	"    multiap_caps         TEXT,               -- ap_cap [cntlr.h:170]\n"
++	"    depth                INTEGER,            -- [cntlr.h:154]\n"
++	"    uplink_type          INTEGER,            -- ul_type [cntlr.h:155]\n"
++	"    upstream_bssid       TEXT,               -- [cntlr.h:162]\n"
++	"    backhaul_mac         TEXT,               -- bh bsta_macaddr [wifi_network_device_backhaul:756]\n"
++	"    backhaul_upstream_al TEXT,               -- upstream_device_macaddr [:757]\n"
++	"    backhaul_media       TEXT,               -- linktype [:755]\n"
++	"    backhaul_type        INTEGER,            -- node_policy.type [config.h:111]\n"
++	"    est_thput_ul         INTEGER,            -- [cntlr.h:156]\n"
++	"    est_thput_dl         INTEGER,            -- [cntlr.h:157]\n"
++	"    scan_supported       INTEGER,            -- [cntlr.h:158]\n"
++	"    sta_count            INTEGER,            -- [cntlr.h:173]\n"
++	"    manufacturer         TEXT,               -- device manufacturer\n"
++	"    model                TEXT,               -- device model\n"
++	"    serial_number        TEXT,               -- device serial number\n"
++	"    sw_version           TEXT,               -- device software version\n"
++	"    exec_env             TEXT,               -- execution environment\n"
++	"    country_code         TEXT,               -- radio.country_code [wifi_dataelements.h:645]\n"
++	"    traffic_sep_allowed  INTEGER,            -- traffic separation allowed\n"
++	"    coordinated_cac      INTEGER,            -- node_policy.coordinated_cac [config.h:119]\n"
++	"    -- R6 / MLO agent caps [cntlr.h:176-179]\n"
++	"    max_mld_num          INTEGER,\n"
++	"    max_aplink_num       INTEGER,\n"
++	"    max_bstalink_num     INTEGER,\n"
++	"    tid_link_caps        INTEGER,\n"
++	"    last_seen            INTEGER             -- last_tsp_seen epoch [cntlr.h:188]; updated, never used to DELETE\n"
++	");\n"
++	"\n"
++	"-- 4. radios (iopsys wifi_radio_element)\n"
++	"CREATE TABLE IF NOT EXISTS radio (\n"
++	"    ruid                 TEXT PRIMARY KEY,   -- macaddr [wifi_dataelements.h:623]\n"
++	"    agent_almac          TEXT REFERENCES agent(almac),\n"
++	"    band                 INTEGER,            -- [:621]\n"
++	"    enabled              INTEGER,            -- [:624]\n"
++	"    cur_opclass          INTEGER,            -- cur_opclass [:664]\n"
++	"    channel              INTEGER,            -- cur_opclass channel\n"
++	"    cf1                  INTEGER,            -- centre frequency 1\n"
++	"    cf2                  INTEGER,            -- centre frequency 2\n"
++	"    tx_streams           INTEGER,            -- [:643]\n"
++	"    rx_streams           INTEGER,            -- [:644]\n"
++	"    max_bssnum           INTEGER,            -- [:647]\n"
++	"    num_bss              INTEGER,            -- [:648]\n"
++	"    steer_policy         INTEGER,            -- [:634]\n"
++	"    channel_util_thresh  INTEGER,            -- [:635]\n"
++	"    rcpi_steer_thresh    INTEGER,            -- [:636]\n"
++	"    anpi_noise           INTEGER,            -- [:637]\n"
++	"    total_utilization    INTEGER,            -- [:638]\n"
++	"    ts_combined_fh       INTEGER,            -- [:670]\n"
++	"    ts_combined_bh       INTEGER,            -- [:671]\n"
++	"    chipset_vendor       TEXT                -- [:673]\n"
++	");\n"
++	"\n"
++	"-- 5. radio capabilities (kept SEPARATE from live state = generous)\n"
++	"CREATE TABLE IF NOT EXISTS radio_caps (\n"
++	"    ruid                 TEXT PRIMARY KEY REFERENCES radio(ruid),\n"
++	"    ht_caps              TEXT,               -- wifi_caps_element.ht  [wifi_dataelements.h:204]\n"
++	"    vht_caps             TEXT,               -- .vht[6]               [:205]\n"
++	"    he_caps              TEXT,               -- .he[15]               [:206]\n"
++	"    eht_caps             TEXT,               -- EHT capabilities blob\n"
++	"    -- R6 Wi-Fi 7 caps [wifi_dataelements.h:181-194]\n"
++	"    wifi7_emlmr          INTEGER,\n"
++	"    wifi7_emlsr          INTEGER,\n"
++	"    wifi7_str            INTEGER,\n"
++	"    wifi7_nstr           INTEGER,\n"
++	"    wifi7_tidlinkmap     INTEGER,\n"
++	"    wifi7_nmlo_sta       INTEGER,            -- supports non-MLO STA assoc [:660]\n"
++	"    num_opclass          INTEGER             -- number of operating classes\n"
++	");\n"
++	"\n"
++	"-- 6. BSSes (iopsys wifi_bss_element)\n"
++	"CREATE TABLE IF NOT EXISTS bss (\n"
++	"    bssid                TEXT PRIMARY KEY,   -- [wifi_dataelements.h:364]\n"
++	"    ruid                 TEXT REFERENCES radio(ruid),\n"
++	"    ssid                 TEXT,               -- [:367]\n"
++	"    enabled              INTEGER,            -- [:368]\n"
++	"    is_fbss              INTEGER,            -- [:390]\n"
++	"    is_bbss              INTEGER,            -- [:389]\n"
++	"    fronthaul_use        INTEGER,            -- BSS serves fronthaul\n"
++	"    backhaul_use         INTEGER,            -- BSS serves backhaul\n"
++	"    akms_fronthaul       TEXT,               -- radio.fbss_akmlist [:677]\n"
++	"    akms_backhaul        TEXT,               -- radio.bbss_akmlist [:678]\n"
++	"    p1_bsta_disallowed   INTEGER,            -- [:386]\n"
++	"    p2_bsta_disallowed   INTEGER,            -- [:387]\n"
++	"    assoc_allowed        INTEGER,            -- sta_assoc_allowed [:388]\n"
++	"    r1_disallowed        INTEGER,            -- [:391]\n"
++	"    r2_disallowed        INTEGER,            -- [:392]\n"
++	"    multi_bssid          INTEGER,            -- [:393]\n"
++	"    transmitted_bssid    INTEGER,            -- [:394]\n"
++	"    est_wmm_be           TEXT,               -- est_wmm_be[3] [:380]\n"
++	"    est_wmm_bk           TEXT,               -- [:381]\n"
++	"    est_wmm_vi           TEXT,               -- [:382]\n"
++	"    est_wmm_vo           TEXT,               -- [:383]\n"
++	"    vlan_id              INTEGER             -- traffic separation VLAN\n"
++	");\n"
++	"\n"
++	"-- 7. operating classes - current per radio for recovery\n"
++	"CREATE TABLE IF NOT EXISTS operating_class (\n"
++	"    ruid                 TEXT REFERENCES radio(ruid),\n"
++	"    opclass              INTEGER,            -- wifi_radio_opclass.cur_opclass [:664]\n"
++	"    channel              INTEGER,\n"
++	"    channel_list         TEXT,\n"
++	"    pref_list            TEXT,\n"
++	"    tx_power             INTEGER,\n"
++	"    max_tx_power         INTEGER,\n"
++	"    PRIMARY KEY (ruid, opclass, channel)\n"
++	");\n"
++	"\n"
++	"-- 8. backhaul topology edges (iopsys bh_topology_dev / local_iface / backhaul_info)\n"
++	"CREATE TABLE IF NOT EXISTS topology_link (\n"
++	"    child_almac          TEXT,               -- bh_topology_dev.al_macaddr [topology.h:52]\n"
++	"    parent_almac         TEXT,               -- backhaul_info.parent->al_macaddr [topology.h:42]\n"
++	"    iface_mac            TEXT,               -- own_iface->macaddr [topology.h:27,44]\n"
++	"    parent_iface_mac     TEXT,               -- parent_iface->macaddr [topology.h:43]\n"
++	"    media_type           INTEGER,            -- local_iface.media_type [topology.h:28]\n"
++	"    depth                INTEGER,            -- backhaul_info.depth [topology.h:40]\n"
++	"    wifi_hops            INTEGER,            -- wifi_hops_from_root [topology.h:41]\n"
++	"    PRIMARY KEY (child_almac, parent_almac, iface_mac)\n"
++	");\n"
++	"\n"
++	"-- 9. AP-MLD identity (R6; iopsys wifi_apmld_element)\n"
++	"CREATE TABLE IF NOT EXISTS apmld (\n"
++	"    mld_macaddr          TEXT PRIMARY KEY,   -- [wifi_dataelements.h:508]\n"
++	"    agent_almac          TEXT REFERENCES agent(almac),\n"
++	"    ssid                 TEXT,               -- [:510]\n"
++	"    enabled              INTEGER,            -- [:511]\n"
++	"    emlmr_enabled        INTEGER,            -- [:515]\n"
++	"    emlsr_enabled        INTEGER,            -- [:516]\n"
++	"    str_enabled          INTEGER,            -- [:517]\n"
++	"    nstr_enabled         INTEGER,            -- [:518]\n"
++	"    ttlm_enabled         INTEGER,            -- [:519]\n"
++	"    num_ap               INTEGER             -- num affiliated APs [:521]\n"
++	");\n"
++	"\n"
++	"-- 10. affiliated APs of an AP-MLD (R6; iopsys wifi_affiliated_ap_element)\n"
++	"CREATE TABLE IF NOT EXISTS affiliated_ap (\n"
++	"    bssid                TEXT PRIMARY KEY,   -- [wifi_dataelements.h:405]\n"
++	"    mld_macaddr          TEXT REFERENCES apmld(mld_macaddr),\n"
++	"    ruid                 TEXT REFERENCES radio(ruid),   -- [:404]\n"
++	"    link_id              INTEGER,            -- [:406]\n"
++	"    punct_bitmap         TEXT                -- punct_bitmap[2] [:407]\n"
++	");\n"
++	"\n"
++	"-- 11. TID-to-link mapping (R6; iopsys wifi_ttlm_element) - OUR contribution\n"
++	"CREATE TABLE IF NOT EXISTS ttlm (\n"
++	"    mld_macaddr          TEXT REFERENCES apmld(mld_macaddr),\n"
++	"    tid                  INTEGER,            -- [wifi_dataelements.h:449]\n"
++	"    direction            INTEGER,            -- dir [:450]\n"
++	"    link_id              INTEGER,            -- [:451]\n"
++	"    PRIMARY KEY (mld_macaddr, tid, direction, link_id)\n"
++	");\n"
++	"\n"
++	"-- ========== DEFINED, UCI-AUTHORITATIVE MIRROR (written from UCI, not back) ==========\n"
++	"\n"
++	"-- 12. network-wide SSID config - mirror of UCI 'ap' creds\n"
++	"CREATE TABLE IF NOT EXISTS network_ssid (\n"
++	"    id                   TEXT PRIMARY KEY,\n"
++	"    ssid                 TEXT,\n"
++	"    passphrase           TEXT,               -- see open Q2: store here only if UCI is NOT authority\n"
++	"    band                 TEXT,\n"
++	"    enabled              INTEGER,\n"
++	"    akms_allowed         TEXT,\n"
++	"    suite_selector       TEXT,\n"
++	"    advertisement_enabled INTEGER,\n"
++	"    mfp_config           TEXT,\n"
++	"    mobility_domain      TEXT,\n"
++	"    haul_type            TEXT,\n"
++	"    auth_type            TEXT,\n"
++	"    vlan_id              INTEGER\n"
++	");\n"
++	"\n"
++	"-- 13. steering policy (iopsys node_policy/steer_policy)\n"
++	"CREATE TABLE IF NOT EXISTS policy (\n"
++	"    id                    TEXT PRIMARY KEY,\n"
++	"    policy_type           INTEGER,\n"
++	"    ap_metrics_interval   INTEGER,\n"
++	"    sta_list              TEXT,\n"
++	"    steering_policy_type  INTEGER,           -- node_policy / radio_policy.policy [config.h:139]\n"
++	"    report_interval       INTEGER,\n"
++	"    sta_rcpi_threshold    INTEGER,           -- STA RCPI steering threshold\n"
++	"    sta_rcpi_hysteresis   INTEGER,\n"
++	"    ap_util_threshold     INTEGER,\n"
++	"    include_sta_traffic_stats INTEGER,\n"
++	"    include_sta_link_metrics  INTEGER,\n"
++	"    profile1_disallowed   INTEGER,\n"
++	"    profile2_disallowed   INTEGER,\n"
++	"    primary_vlan_id       INTEGER,\n"
++	"    default_pcp           INTEGER\n"
++	");\n"
++	"\n"
++	"-- 14. SSID->VID mapping - traffic separation\n"
++	"CREATE TABLE IF NOT EXISTS ssid_to_vid (\n"
++	"    id                   TEXT PRIMARY KEY,\n"
++	"    ssid                 TEXT,\n"
++	"    vid                  INTEGER\n"
++	");\n"
++	"\n"
++	"-- ========== DEFINED, EMPTY IN v1 : telemetry (zero writes -> zero wear) ==========\n"
++	"\n"
++	"-- 15. associated clients (iopsys wifi_sta_element)\n"
++	"CREATE TABLE IF NOT EXISTS sta (\n"
++	"    macaddr              TEXT PRIMARY KEY,   -- [wifi_dataelements.h:295]\n"
++	"    bssid                TEXT,               -- [:296]\n"
++	"    ruid                 TEXT,\n"
++	"    associated           INTEGER,\n"
++	"    is_bsta              INTEGER,            -- struct sta.is_bsta [sta.h:51]\n"
++	"    agent_almac          TEXT,               -- [sta.h:62]\n"
++	"    last_ul_rate         INTEGER, last_dl_rate INTEGER,  -- [:300/:299]\n"
++	"    est_mac_rate_ul      INTEGER, est_mac_rate_dl INTEGER,\n"
++	"    conn_time            INTEGER,            -- [:306]\n"
++	"    rcpi                 INTEGER,            -- [:305]\n"
++	"    signal_strength      INTEGER,\n"
++	"    util_tx              INTEGER, util_rx INTEGER,        -- [:302/:301]\n"
++	"    pkts_tx              INTEGER, pkts_rx INTEGER,        -- [:309/:310]\n"
++	"    bytes_tx             INTEGER, bytes_rx INTEGER,       -- [:307/:308]\n"
++	"    errors_tx            INTEGER, errors_rx INTEGER,      -- [:311/:312]\n"
++	"    retrans_count        INTEGER,            -- rtx_pkts [:313]\n"
++	"    hostname             TEXT,               -- [:316]\n"
++	"    ipv4                 TEXT, ipv6 TEXT,    -- [:314/:315]\n"
++	"    assoc_frame          TEXT                -- reassoc_frame hex [:323]\n"
++	");\n"
++	"\n"
++	"-- 16. scan results (iopsys wifi_scanres_element)\n"
++	"CREATE TABLE IF NOT EXISTS scan_result (\n"
++	"    id                   TEXT PRIMARY KEY,\n"
++	"    ruid                 TEXT,\n"
++	"    scan_status          INTEGER,\n"
++	"    timestamp            TEXT,\n"
++	"    bssid                TEXT,\n"
++	"    ssid                 TEXT,\n"
++	"    signal_strength      INTEGER,\n"
++	"    bandwidth            INTEGER,\n"
++	"    bss_color            INTEGER,\n"
++	"    channel_util         INTEGER,\n"
++	"    sta_count            INTEGER,\n"
++	"    utilization          INTEGER,\n"
++	"    noise                INTEGER,\n"
++	"    scan_duration        INTEGER,\n"
++	"    scan_type            INTEGER\n"
++	");\n"
++	"\n"
++	"-- 17. neighbor graph + positions (for the mesh map)\n"
++	"CREATE TABLE IF NOT EXISTS neighbor (\n"
++	"    neighbor             TEXT PRIMARY KEY,\n"
++	"    pos_x                REAL,               -- node map position, x\n"
++	"    pos_y                REAL,\n"
++	"    pos_z                REAL,\n"
++	"    next_hop             TEXT,\n"
++	"    num_hops             INTEGER,\n"
++	"    path_loss            INTEGER\n"
++	");\n"
++	"\n"
++	"-- 18. STA-MLD (R6 telemetry; iopsys wifi_stamld_element)\n"
++	"CREATE TABLE IF NOT EXISTS sta_mld (\n"
++	"    mld_macaddr          TEXT PRIMARY KEY,   -- [wifi_dataelements.h:456]\n"
++	"    is_bsta              INTEGER,            -- [:475]\n"
++	"    emlmr_enabled INTEGER, emlsr_enabled INTEGER, str_enabled INTEGER,\n"
++	"    nstr_enabled INTEGER, ttlm_enabled INTEGER,  -- [:466-470]\n"
++	"    conn_time            INTEGER,            -- [:476]\n"
++	"    bytes_tx INTEGER, bytes_rx INTEGER,      -- [:477/:478]\n"
++	"    hostname             TEXT,               -- [:474]\n"
++	"    ipv4 TEXT, ipv6 TEXT,                    -- [:472/:473]\n"
++	"    num_sta              INTEGER             -- [:485]\n"
++	");\n"
++	"\n"
++	"-- 19. affiliated STA links of a STA-MLD (R6 telemetry; wifi_affiliated_sta_element)\n"
++	"CREATE TABLE IF NOT EXISTS affiliated_sta (\n"
++	"    macaddr              TEXT,               -- [wifi_dataelements.h:428]\n"
++	"    mld_macaddr          TEXT REFERENCES sta_mld(mld_macaddr),\n"
++	"    bssid                TEXT,               -- [:429]\n"
++	"    ruid                 TEXT,               -- [:430]\n"
++	"    rcpi                 INTEGER,            -- [:437]\n"
++	"    dl_rate INTEGER, ul_rate INTEGER,        -- [:438/:439]\n"
++	"    bytes_tx INTEGER, bytes_rx INTEGER,      -- [:431/:432]\n"
++	"    PRIMARY KEY (macaddr, bssid)\n"
++	");\n"
++;
++
++#endif /* MAPDB_SCHEMA_H */
+diff -ruN a/src/db/mapdb_sqlite.c b/src/db/mapdb_sqlite.c
+--- /dev/null
++++ b/src/db/mapdb_sqlite.c
+@@ -0,0 +1,322 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapdb_sqlite.c - SQLite backend for the map-controller persistence layer.
++ *
++ * Phase 0 (ADR-0003): the only file that touches libsqlite3. It implements the
++ * mapdb.h primitives and sets a crash-safe embedded posture on open (WAL +
++ * busy_timeout + foreign_keys + synchronous=NORMAL). No mesh/app logic - just
++ * the storage engine. A MariaDB backend would be a sibling mapdb_mariadb.c
++ * implementing the same header; nothing else changes (design doc s4).
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>	/* strcasecmp */
++#include <stdio.h>
++#include <errno.h>
++#include <sys/stat.h>	/* mkdir */
++
++#include <sqlite3.h>
++
++#include "db/mapdb.h"
++#include "utils/debug.h"
++
++/* Block up to this long on a locked DB before returning SQLITE_BUSY. WAL means
++ * a single writer at a time; the controller is single-writer anyway. */
++#define MAPDB_BUSY_TIMEOUT_MS	5000
++
++struct mapdb {
++	sqlite3 *h;
++	char errmsg[256];
++};
++
++struct mapdb_stmt {
++	sqlite3_stmt *st;
++	mapdb *db;		/* back-ptr for error propagation */
++};
++
++/* Copy sqlite's current error string into the handle's buffer. */
++static void mapdb_set_error(mapdb *db, const char *ctx)
++{
++	const char *msg = db->h ? sqlite3_errmsg(db->h) : "no db handle";
++
++	snprintf(db->errmsg, sizeof(db->errmsg), "%s: %s",
++		 ctx ? ctx : "mapdb", msg ? msg : "unknown");
++}
++
++const char *mapdb_last_error(mapdb *db)
++{
++	if (!db)
++		return "mapdb: NULL handle";
++	return db->errmsg[0] ? db->errmsg : "no error";
++}
++
++/* Best-effort create of the immediate parent directory of @path (single level,
++ * e.g. /etc/mapc for /etc/mapc/mapc.db). sqlite3_open_v2 will not mkdir. */
++static void mapdb_mkdir_parent(const char *path)
++{
++	char dir[256];
++	char *slash;
++
++	snprintf(dir, sizeof(dir), "%s", path);
++	slash = strrchr(dir, '/');
++	if (!slash || slash == dir)	/* no dir component, or root ("/x") */
++		return;
++	*slash = '\0';
++
++	if (mkdir(dir, 0755) != 0 && errno != EEXIST)
++		warn("mapdb: mkdir %s: %s\n", dir, strerror(errno));
++}
++
++/* Engage WAL and confirm it actually took: PRAGMA journal_mode returns the mode
++ * now in effect, and sqlite silently falls back to the rollback journal when the
++ * fs/dir can't host the -wal/-shm files (matters on f2fs/overlay). Don't fail the
++ * open on fallback - rollback-journal is still crash-safe - just surface it. */
++static void mapdb_set_wal(mapdb *db)
++{
++	mapdb_stmt *st = NULL;
++	const char *mode;
++
++	if (mapdb_prepare(db, "PRAGMA journal_mode = WAL;", &st) != MAPDB_OK) {
++		warn("mapdb: could not set journal_mode: %s\n", mapdb_last_error(db));
++		return;
++	}
++	if (mapdb_step(st) == MAPDB_ROW) {
++		mode = mapdb_column_text(st, 0);
++		if (!mode || strcasecmp(mode, "wal") != 0)
++			warn("mapdb: WAL not engaged (journal_mode=%s); "
++			     "using rollback journal\n", mode ? mode : "?");
++		else
++			info("mapdb: journal_mode=wal\n");
++	}
++	mapdb_finalize(st);
++}
++
++/* ---- lifecycle -------------------------------------------------------- */
++
++mapdb *mapdb_open(const char *path)
++{
++	mapdb *db;
++	int rc;
++
++	if (!path)
++		path = mapdb_default_path();
++
++	db = calloc(1, sizeof(*db));
++	if (!db) {
++		err("mapdb: calloc failed\n");
++		return NULL;
++	}
++
++	mapdb_mkdir_parent(path);
++
++	rc = sqlite3_open_v2(path, &db->h,
++			     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
++	if (rc != SQLITE_OK) {
++		mapdb_set_error(db, "open");
++		err("mapdb: cannot open %s: %s\n", path, mapdb_last_error(db));
++		/* sqlite3_open_v2 allocates a handle even on error; free it. */
++		sqlite3_close_v2(db->h);
++		free(db);
++		return NULL;
++	}
++
++	sqlite3_busy_timeout(db->h, MAPDB_BUSY_TIMEOUT_MS);
++
++	/* Crash-safe embedded posture. WAL: readers never block the writer and an
++	 * interrupted write rolls back cleanly (verified, not assumed - see
++	 * mapdb_set_wal). synchronous=NORMAL is the WAL sweet spot (durable across
++	 * app crash / OS crash; only a power loss mid-fsync can lose the very last
++	 * txn - acceptable for a warm-cache graph). */
++	mapdb_set_wal(db);
++	if (mapdb_exec(db, "PRAGMA synchronous = NORMAL;") != MAPDB_OK ||
++	    mapdb_exec(db, "PRAGMA foreign_keys = ON;") != MAPDB_OK) {
++		err("mapdb: pragma setup failed: %s\n", mapdb_last_error(db));
++		mapdb_close(db);
++		return NULL;
++	}
++
++	if (mapdb_apply_schema(db) != MAPDB_OK) {
++		err("mapdb: schema apply failed: %s\n", mapdb_last_error(db));
++		mapdb_close(db);
++		return NULL;
++	}
++
++	info("mapdb: opened %s (WAL, schema applied)\n", path);
++	return db;
++}
++
++void mapdb_close(mapdb *db)
++{
++	if (!db)
++		return;
++	/* close_v2 (not close): defers teardown until any still-open statements are
++	 * finalized and ALWAYS frees the handle, so an unfinalized stmt can never
++	 * leak the connection (close() would return SQLITE_BUSY and keep it alive). */
++	sqlite3_close_v2(db->h);
++	free(db);
++}
++
++/* ---- one-shot exec ---------------------------------------------------- */
++
++int mapdb_exec(mapdb *db, const char *sql)
++{
++	char *emsg = NULL;
++	int rc;
++
++	if (!db || !db->h)
++		return MAPDB_ERR;
++
++	rc = sqlite3_exec(db->h, sql, NULL, NULL, &emsg);
++	if (rc != SQLITE_OK) {
++		snprintf(db->errmsg, sizeof(db->errmsg), "exec: %s",
++			 emsg ? emsg : sqlite3_errmsg(db->h));
++		sqlite3_free(emsg);
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++/* ---- prepared statements ---------------------------------------------- */
++
++int mapdb_prepare(mapdb *db, const char *sql, mapdb_stmt **stmt)
++{
++	mapdb_stmt *s;
++	int rc;
++
++	if (!db || !db->h || !stmt)
++		return MAPDB_ERR;
++
++	s = calloc(1, sizeof(*s));
++	if (!s) {
++		mapdb_set_error(db, "prepare/calloc");
++		return MAPDB_ERR;
++	}
++	s->db = db;
++
++	rc = sqlite3_prepare_v2(db->h, sql, -1, &s->st, NULL);
++	if (rc != SQLITE_OK) {
++		mapdb_set_error(db, "prepare");
++		free(s);
++		return MAPDB_ERR;
++	}
++
++	*stmt = s;
++	return MAPDB_OK;
++}
++
++int mapdb_bind_text(mapdb_stmt *stmt, int idx, const char *val)
++{
++	int rc;
++
++	if (!stmt)
++		return MAPDB_ERR;
++
++	/* NULL value -> SQL NULL. SQLITE_TRANSIENT: sqlite copies the string, so
++	 * the caller's buffer need not outlive the bind. */
++	rc = val ? sqlite3_bind_text(stmt->st, idx, val, -1, SQLITE_TRANSIENT)
++		 : sqlite3_bind_null(stmt->st, idx);
++	if (rc != SQLITE_OK) {
++		mapdb_set_error(stmt->db, "bind_text");
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++int mapdb_bind_int(mapdb_stmt *stmt, int idx, long long val)
++{
++	if (!stmt)
++		return MAPDB_ERR;
++
++	if (sqlite3_bind_int64(stmt->st, idx, (sqlite3_int64)val) != SQLITE_OK) {
++		mapdb_set_error(stmt->db, "bind_int");
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++int mapdb_bind_null(mapdb_stmt *stmt, int idx)
++{
++	if (!stmt)
++		return MAPDB_ERR;
++
++	if (sqlite3_bind_null(stmt->st, idx) != SQLITE_OK) {
++		mapdb_set_error(stmt->db, "bind_null");
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++int mapdb_step(mapdb_stmt *stmt)
++{
++	int rc;
++
++	if (!stmt)
++		return MAPDB_ERR;
++
++	rc = sqlite3_step(stmt->st);
++	switch (rc) {
++	case SQLITE_ROW:
++		return MAPDB_ROW;
++	case SQLITE_DONE:
++		return MAPDB_DONE;
++	default:
++		mapdb_set_error(stmt->db, "step");
++		return MAPDB_ERR;
++	}
++}
++
++const char *mapdb_column_text(mapdb_stmt *stmt, int col)
++{
++	if (!stmt)
++		return NULL;
++	/* Valid until the next step/reset/finalize; caller copies if it needs to
++	 * keep it (Phase 1 marshalling does). */
++	return (const char *)sqlite3_column_text(stmt->st, col);
++}
++
++long long mapdb_column_int(mapdb_stmt *stmt, int col)
++{
++	if (!stmt)
++		return 0;
++	return (long long)sqlite3_column_int64(stmt->st, col);
++}
++
++int mapdb_reset(mapdb_stmt *stmt)
++{
++	if (!stmt)
++		return MAPDB_ERR;
++	/* Clears bindings too, so a re-used statement starts from a clean slate. */
++	sqlite3_clear_bindings(stmt->st);
++	if (sqlite3_reset(stmt->st) != SQLITE_OK) {
++		mapdb_set_error(stmt->db, "reset");
++		return MAPDB_ERR;
++	}
++	return MAPDB_OK;
++}
++
++void mapdb_finalize(mapdb_stmt *stmt)
++{
++	if (!stmt)
++		return;
++	sqlite3_finalize(stmt->st);
++	free(stmt);
++}
++
++/* ---- transactions ----------------------------------------------------- */
++
++int mapdb_begin(mapdb *db)
++{
++	return mapdb_exec(db, "BEGIN;");
++}
++
++int mapdb_commit(mapdb *db)
++{
++	return mapdb_exec(db, "COMMIT;");
++}
++
++int mapdb_rollback(mapdb *db)
++{
++	return mapdb_exec(db, "ROLLBACK;");
++}
+diff -ruN a/src/db/mapdb.c b/src/db/mapdb.c
+--- /dev/null
++++ b/src/db/mapdb.c
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapdb.c - engine-neutral persistence helpers for map-controller.
++ *
++ * Phase 0 (ADR-0003): the parts of the storage layer that do NOT depend on the
++ * backend - the default DB path and the schema bootstrap. Everything here is
++ * built purely on the mapdb.h primitives (mapdb_exec / mapdb_prepare / ...), so
++ * a future mapdb_mariadb.c reuses this file unchanged. The engine-specific code
++ * lives only in mapdb_sqlite.c.
++ *
++ * No mesh/app logic yet - Phase 1 adds the marshalling + write/restore hooks.
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#include <time.h>
++
++#include "db/mapdb.h"
++#include "db/mapdb_schema.h"
++
++#ifndef MAPDB_DEFAULT_PATH
++/* Dedicated subdir on the writable overlay (survives reboot -> powercycle
++ * recovery works), kept in its own subdir so Phase 1 can exclude /etc/mapc/
++ * from the sysupgrade backup: a firmware flash then starts with a fresh DB rather
++ * than carrying a stale graph + schema_version across images (design doc s7 Q7).
++ * mapdb_open() creates the parent dir. Overridable at build time with
++ * -DMAPDB_DEFAULT_PATH=\"...\" or at runtime via mapdb_open(path). */
++#define MAPDB_DEFAULT_PATH "/etc/mapc/mapc.db"
++#endif
++
++const char *mapdb_default_path(void)
++{
++	return MAPDB_DEFAULT_PATH;
++}
++
++/* Seed the single schema_version row on a fresh DB. Idempotent: a no-op once a
++ * row exists (migrations, when we have them, will UPDATE it instead). */
++static int mapdb_seed_version(mapdb *db)
++{
++	mapdb_stmt *st = NULL;
++	int rc;
++
++	if (mapdb_prepare(db, "SELECT version FROM schema_version LIMIT 1", &st) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	rc = mapdb_step(st);
++	mapdb_finalize(st);
++
++	if (rc == MAPDB_ROW)
++		return MAPDB_OK;	/* already seeded */
++	if (rc != MAPDB_DONE)
++		return MAPDB_ERR;
++
++	if (mapdb_prepare(db,
++			  "INSERT INTO schema_version(version, applied_at) VALUES(?, ?)",
++			  &st) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	mapdb_bind_int(st, 1, MAPDB_SCHEMA_VERSION);
++	mapdb_bind_int(st, 2, (long long)time(NULL));
++
++	rc = mapdb_step(st);
++	mapdb_finalize(st);
++
++	return (rc == MAPDB_DONE) ? MAPDB_OK : MAPDB_ERR;
++}
++
++int mapdb_apply_schema(mapdb *db)
++{
++	if (!db)
++		return MAPDB_ERR;
++
++	if (mapdb_begin(db) != MAPDB_OK)
++		return MAPDB_ERR;
++
++	/* One multi-statement exec; every table is CREATE TABLE IF NOT EXISTS. */
++	if (mapdb_exec(db, MAPDB_SCHEMA_SQL) != MAPDB_OK)
++		goto fail;
++
++	if (mapdb_seed_version(db) != MAPDB_OK)
++		goto fail;
++
++	if (mapdb_commit(db) != MAPDB_OK)
++		goto fail;			/* roll back; don't leave the txn open */
++
++	return MAPDB_OK;
++
++fail:
++	mapdb_rollback(db);
++	return MAPDB_ERR;
++}
+diff -ruN a/src/db/mapdb.h b/src/db/mapdb.h
+--- /dev/null
++++ b/src/db/mapdb.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * mapdb.h - engine-agnostic persistence interface for map-controller.
++ *
++ * Phase 0 (ADR-0003): the thin storage seam that the rest of the controller
++ * will call. It knows nothing about mesh state - only rows and transactions.
++ * Two backends implement it: mapdb_sqlite.c (eMMC baseline, default) and, later,
++ * mapdb_mariadb.c (NVMe). Nothing here leaks a backend type, so swapping the
++ * engine is a one-file change (design doc s4).
++ *
++ * Design-doc note: s4 sketches this as "db_client.h" with a callback-style
++ * db_query(); we ship it as mapdb.* with an explicit prepare/step statement API
++ * so binds replace string-concatenated SQL (no SSID injection/escaping bugs).
++ *
++ * Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
++ */
++#ifndef MAPDB_H
++#define MAPDB_H
++
++/* Opaque handles - callers never see sqlite3* / MYSQL*. */
++typedef struct mapdb mapdb;
++typedef struct mapdb_stmt mapdb_stmt;
++
++/* Return / status codes. */
++#define MAPDB_OK	 0	/* success */
++#define MAPDB_ERR	-1	/* failure; see mapdb_last_error() */
++#define MAPDB_ROW	 1	/* mapdb_step(): a row is available */
++#define MAPDB_DONE	 2	/* mapdb_step(): statement finished, no more rows */
++
++/* ---- lifecycle -------------------------------------------------------- */
++
++/* Open (creating if absent) the DB at @path, configure the engine for a
++ * crash-safe embedded posture (WAL, busy_timeout, foreign_keys) and apply the
++ * schema (mapdb_apply_schema()). @path == NULL uses mapdb_default_path().
++ * Returns a handle, or NULL on failure. */
++mapdb *mapdb_open(const char *path);
++
++/* Flush and close. Safe on NULL. */
++void mapdb_close(mapdb *db);
++
++/* Compile-time default DB file location (see MAPDB_DEFAULT_PATH). */
++const char *mapdb_default_path(void);
++
++/* Create every table (CREATE TABLE IF NOT EXISTS ...) from the embedded DDL and
++ * seed the schema_version row on a fresh DB. Idempotent; engine-neutral (built
++ * only on the primitives below), so every backend reuses it. Wrapped in one
++ * transaction. Returns MAPDB_OK / MAPDB_ERR. Called by mapdb_open(). */
++int mapdb_apply_schema(mapdb *db);
++
++/* ---- one-shot statements ---------------------------------------------- */
++
++/* Execute a statement that returns no rows (DDL / INSERT / UPDATE / PRAGMA).
++ * Multiple ';'-separated statements are allowed. Returns MAPDB_OK / MAPDB_ERR. */
++int mapdb_exec(mapdb *db, const char *sql);
++
++/* ---- prepared statements (bind params are 1-based, columns 0-based) --- */
++
++int mapdb_prepare(mapdb *db, const char *sql, mapdb_stmt **stmt);
++int mapdb_bind_text(mapdb_stmt *stmt, int idx, const char *val);	/* NULL -> SQL NULL */
++int mapdb_bind_int(mapdb_stmt *stmt, int idx, long long val);
++int mapdb_bind_null(mapdb_stmt *stmt, int idx);
++
++/* Advance one step: MAPDB_ROW (row ready, read columns), MAPDB_DONE (finished)
++ * or MAPDB_ERR. */
++int mapdb_step(mapdb_stmt *stmt);
++
++/* Column accessors valid only after mapdb_step() == MAPDB_ROW. The returned
++ * text points into engine memory and is valid until the next step/finalize. */
++const char *mapdb_column_text(mapdb_stmt *stmt, int col);
++long long   mapdb_column_int(mapdb_stmt *stmt, int col);
++
++/* Rewind a prepared statement so its binds can be re-set and re-stepped. */
++int mapdb_reset(mapdb_stmt *stmt);
++
++/* Release a prepared statement. Safe on NULL. */
++void mapdb_finalize(mapdb_stmt *stmt);
++
++/* ---- transactions ----------------------------------------------------- */
++
++int mapdb_begin(mapdb *db);
++int mapdb_commit(mapdb *db);
++int mapdb_rollback(mapdb *db);
++
++/* ---- diagnostics ------------------------------------------------------ */
++
++/* Human-readable text for the last failure on @db. Never NULL. */
++const char *mapdb_last_error(mapdb *db);
++
++#endif /* MAPDB_H */
+diff -ruN a/src/Makefile b/src/Makefile
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -39,7 +39,9 @@
+ 	steer.o \
+ 	steer_module.o \
+ 	son.o \
+-	cntlr_plugin.o
++	cntlr_plugin.o \
++	db/mapdb.o \
++	db/mapdb_sqlite.o
+ 
+ 
+ INCDIR=/usr/include/map-controller
+@@ -58,6 +60,7 @@
+ LIBS = -lubus -lubox -ljson-c -lblobmsg_json -luci -pthread
+ LIBS += -rdynamic -ldl
+ LIBS += -leasy -lwifiutils
++LIBS += -lsqlite3
+ LIBS += -lieee1905 -lmaputil
+ ifneq (,$(findstring USE_LIBDPP,$(CFLAGS)))
+ LIBS += -ldpp

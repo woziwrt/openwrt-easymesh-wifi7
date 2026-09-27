@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# Give the radios time to settle before deciding a link is missing rather
+# than merely late. See /usr/sbin/mld-link-check for what this recovers.
+
+START=98
+
+SETTLE=45
+
+boot() {
+	( sleep "$SETTLE"; /usr/sbin/mld-link-check ) >/dev/null 2>&1 &
+}
+
+stop() {
+	return 0
+}
+
+# start() is deliberately not where the work lives. rcS calls every S* script
+# with "boot"; base-files default_postinst calls "start" on every init script a
+# package ships, on install and on upgrade alike. This one only ever means to
+# act while the node is coming up, and the ten-minute boot window it also
+# checks is a guess from uptime that guesses wrong exactly when it matters -
+# installing a few minutes after a flash lands inside it. Asking the init
+# system what it is doing beats inferring it from a clock.
+start() {
+	echo "mld-link-check: boot only - it runs itself on the next restart" >&2
+}

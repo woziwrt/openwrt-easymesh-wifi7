@@ -1,0 +1,81 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: an MLD has every link, not just the first
+
+agent_ap_add_stations() asked about one link and answered for the whole
+client.
+
+mlsta[i].sta is &mlsta[i].sta[0]. Testing that entry's bssid against
+ap->bssid and then adding that entry's macaddr means an affiliated AP only
+ever sees the client when link 0 happens to sit on it - and when it does,
+the address filed is link 0's, whichever link this BSS actually carries.
+
+Measured 2026-09-07 on the lab mesh, three samples of three, deterministic.
+An iPhone with three links on the bedroom node:
+
+  HAL (correct)                          agent model
+  link0 2.4GHz e6:a3:.. bssid ..:98:b0   wlan0 2.4GHz  ea:50:..   <- link1
+  link1 5GHz   ea:50:.. bssid ..:e2:60   wlan1 5GHz    e6:a3:..   <- link0
+  link2 6GHz   82:a7:.. bssid ..:02:60   wlan2 6GHz    82:a7:..   ok
+
+The HAL is not at fault: each link_bssid matches its own AP exactly
+(..:98:b0 = wlan0, ..:e2:60 = wlan1, ..:02:60 = wlan2). The 2.4 GHz leg was
+being heard at -43 dBm and that measurement was filed under the 5 GHz BSS,
+where it reads as a 5 GHz signal. Every per-band number about an MLO client
+therefore described a different band - and per-band numbers are what
+steering, band steering and TID-to-Link mapping decide on.
+
+The same walk already exists, done correctly, in the other creator of the
+same list: apmld_refresh_stations() in mld.c iterates every link and matches
+each link's bssid, with a comment saying why - sta[0] is the right link only
+when the client happened to associate here first. This brings the two
+creators into agreement.
+
+Verify: with an MLO client associated, `ubus call map.agent status` must show
+each leg's address under the BSS whose bssid equals that leg's link_bssid in
+`ubus call wifi.apmld.<mld> stations`, and the per-leg rssi must follow it.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -4585,8 +4585,38 @@
+ 		}
+ 
+ 		for (i = 0; i < num_sta; i++) {
+-			if (!memcmp(mlsta[i].sta->bssid, ap->bssid, 6))
+-				wifi_add_sta(a, ap->ifname, mlsta[i].sta->macaddr);
++			size_t k;
++
++			/* Every link, not sta[0].
++			 *
++			 * mlsta[i].sta is &mlsta[i].sta[0], so this asked about
++			 * one link and answered for the whole client: on an
++			 * affiliated AP that is not the one link 0 sits on the
++			 * client was skipped entirely, and where it did match the
++			 * address added was link 0's - regardless of which link
++			 * this BSS actually carries.
++			 *
++			 * Measured 2026-09-07 on the lab mesh, three samples of
++			 * three, deterministic: an iPhone with three links on the
++			 * bedroom node had its 2.4 GHz leg (-43 dBm) filed under
++			 * the 5 GHz BSS and its 5 GHz leg under the 2.4 GHz one.
++			 * The HAL was right - each link_bssid matched its own AP -
++			 * so every per-band number about that client described a
++			 * different band, which is what steering and TTLM decide
++			 * on.
++			 *
++			 * apmld_refresh_stations() in mld.c already walks every
++			 * link and says why: sta[0] is the right one only when the
++			 * client happened to associate here first. This is the
++			 * same walk, in the other creator of the same list.
++			 */
++			for (k = 0; k < mlsta[i].num_link; k++) {
++				if (memcmp(mlsta[i].sta[k].bssid, ap->bssid, 6))
++					continue;
++
++				wifi_add_sta(a, ap->ifname,
++					     mlsta[i].sta[k].macaddr);
++			}
+ 		}
+ 	} else {
+ #else

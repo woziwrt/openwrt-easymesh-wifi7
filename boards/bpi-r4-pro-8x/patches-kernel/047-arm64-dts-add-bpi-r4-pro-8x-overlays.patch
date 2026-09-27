@@ -1,0 +1,257 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] arm64: dts: mediatek: mt7988a: add BPI-R4 Pro 8X overlays
+
+The eMMC and SD overlays are based on the BPI-R4 overlays by Frank Wunderlich;
+the Wi-Fi overlay on the OpenWrt BPI-R4 MT7996A overlay by Daniel Golle.
+The NVMe overlay is new.
+
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x-emmc.dtso
+--- 
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x-emmc.dtso	2026-05-24 12:54:27.112262471 +0200
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Copyright (C) 2021 MediaTek Inc.
++ * Author: Frank Wunderlich <frank-w@public-files.de>
++ */
++
++/dts-v1/;
++/plugin/;
++
++/ {
++	compatible = "bananapi,bpi-r4-pro-8x", "mediatek,mt7988a";
++
++	fragment@0 {
++		target-path = "/soc/mmc@11230000";
++		__overlay__ {
++			pinctrl-names = "default", "state_uhs";
++			pinctrl-0 = <&mmc0_pins_emmc_51>;
++			pinctrl-1 = <&mmc0_pins_emmc_51>;
++			bus-width = <8>;
++			max-frequency = <200000000>;
++			cap-mmc-highspeed;
++			mmc-hs200-1_8v;
++			mmc-hs400-1_8v;
++			hs400-ds-delay = <0x12814>;
++			non-removable;
++			no-sd;
++			no-sdio;
++			vmmc-supply = <&reg_emmc_vmmc>;
++			vqmmc-supply = <&reg_emmc_vqmmc>;
++			status = "okay";
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			card@0 {
++				compatible = "mmc-card";
++				reg = <0>;
++
++				block {
++					compatible = "block-device";
++					partitions {
++						block-partition-env {
++							partname = "ubootenv";
++							nvmem-layout {
++								compatible = "u-boot,env";
++							};
++						};
++						emmc_rootfs: block-partition-production {
++							partname = "production";
++						};
++					};
++				};
++			};
++		};
++	};
++
++	fragment@2 {
++		target-path = "/chosen";
++		__overlay__ {
++			rootdisk-emmc = <&emmc_rootfs>;
++		};
++	};
++
++	fragment@3 {
++		target-path = "/";
++		__overlay__ {
++			reg_emmc_vmmc: regulator-emmc-vmmc {
++				compatible = "regulator-fixed";
++				regulator-name = "emmc-vmmc";
++				regulator-min-microvolt = <3300000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++			reg_emmc_vqmmc: regulator-emmc-vqmmc {
++				compatible = "regulator-fixed";
++				regulator-name = "emmc-vqmmc";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++		};
++	};
++};
+--- 
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x-sd.dtso	2026-05-24 12:54:27.112386009 +0200
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Copyright (C) 2023 MediaTek Inc.
++ * Author: Frank Wunderlich <frank-w@public-files.de>
++ */
++
++/dts-v1/;
++/plugin/;
++
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	compatible = "bananapi,bpi-r4-pro-8x", "mediatek,mt7988a";
++
++	fragment@1 {
++		target-path = "/soc/mmc@11230000";
++		__overlay__ {
++			pinctrl-names = "default", "state_uhs";
++			pinctrl-0 = <&mmc0_pins_sdcard>;
++			pinctrl-1 = <&mmc0_pins_sdcard>;
++			cd-gpios = <&pio 12 GPIO_ACTIVE_LOW>;
++			bus-width = <4>;
++			max-frequency = <52000000>;
++			cap-sd-highspeed;
++			no-mmc;
++			vmmc-supply = <&reg_3p3v>;
++			vqmmc-supply = <&reg_3p3v>;
++			status = "okay";
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			card@0 {
++				compatible = "mmc-card";
++				reg = <0>;
++
++				partitions {
++					compatible = "gpt-partitions";
++
++					block-partition-env {
++						partname = "ubootenv";
++						nvmem-layout {
++							compatible = "u-boot,env-layout";
++						};
++					};
++
++					sd_rootfs: block-partition-production {
++						partname = "production";
++					};
++				};
++			};
++		};
++	};
++
++	fragment@2 {
++		target-path = "/chosen";
++		__overlay__ {
++			rootdisk-sd = <&sd_rootfs>;
++		};
++	};
++};
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x-nvme-ssd2.dtso
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/dts-v1/;
++/plugin/;
++/ {
++	compatible = "bananapi,bpi-r4-pro-8x", "mediatek,mt7988a";
++};
++
++&{/chosen} {
++	rootdisk-nvme = <&pcie3>;
++};
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x-wifi-mt7996a.dtso
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/dts-v1/;
++/plugin/;
++
++#include <dt-bindings/gpio/gpio.h>
++
++/ {
++	compatible = "bananapi,bpi-r4-pro-8x", "mediatek,mt7988a";
++
++	fragment@0 {
++		target-path = "/";
++		__overlay__ {
++			wifi_12v: regulator-wifi-12v {
++				compatible = "regulator-fixed";
++				regulator-name = "wifi";
++				regulator-min-microvolt = <12000000>;
++				regulator-max-microvolt = <12000000>;
++				gpios = <&pio 4 GPIO_ACTIVE_HIGH>;
++				enable-active-high;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++		};
++	};
++
++	fragment@1 {
++		target = <&imux3_wifi>;
++		__overlay__ {
++			wifi_eeprom_5g: eeprom@51 {
++				compatible = "atmel,24c02";
++				reg = <0x51>;
++				address-bits = <8>;
++				page-size = <8>;
++				size = <256>;
++
++				nvmem-layout {
++					compatible = "fixed-layout";
++					#address-cells = <1>;
++					#size-cells = <1>;
++
++					macaddr_5g: macaddr@0 {
++						reg = <0x0 0x6>;
++					};
++				};
++			};
++
++			wifi_eeprom_6g: eeprom@52 {
++				compatible = "atmel,24c02";
++				reg = <0x52>;
++				address-bits = <8>;
++				page-size = <8>;
++				size = <256>;
++
++				nvmem-layout {
++					compatible = "fixed-layout";
++					#address-cells = <1>;
++					#size-cells = <1>;
++
++					macaddr_6g: macaddr@0 {
++						reg = <0x0 0x6>;
++					};
++				};
++			};
++		};
++	};
++
++	fragment@2 {
++		target = <&pcie0>;
++		__overlay__ {
++			pcie@0,0 {
++				reg = <0x0000 0 0 0 0>;
++
++				wifi@0,0 {
++					compatible = "mediatek,mt76";
++					reg = <0x0000 0 0 0 0>;
++					nvmem-cell-names = "mac-address";
++					nvmem-cells = <&macaddr_5g>;
++				};
++			};
++		};
++	};
++};

@@ -1,0 +1,357 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Make an AP-MLD link that was never told to start beaconing start beaconing.
+#
+# Measured 2026-09-21 across a five-node mesh after a quiet ten-hour night.
+# Every node hanging off a REPEATER had, on its 6 GHz backhaul link:
+#
+#     iw dev bsta-mld-3 station dump   ->   beacon rx: 0
+#
+# Zero, not few - and 50 MB of traffic had crossed that same link. Nodes
+# hanging off the ROOT showed 379000 on the same link of the same radio, from
+# identical boxes at the same distance. The mesh re-arranged itself during the
+# test and the fault moved with the PARENT, both ways: a box sitting at 0 under
+# a repeater read 2771 an hour later under the root, and the box it swapped
+# places with went from 347410 to 0. Signal, hardware and distance were all
+# ruled out by that swap; the only variable left was what the parent is.
+#
+# The children paid for it every two seconds, all night:
+#
+#     mt7996_beacon_mon_work: link 1: detect 20 beacon loss
+#     mt7996_beacon_mon_work: link 1: send nullfunc to AP ..., try 1/2
+#
+# WHY. An AP-MLD BSS deliberately comes up with its beacon switched off:
+#
+#     net/mac80211/cfg.c  ieee80211_start_ap()
+#         link_conf->enable_beacon = !ieee80211_vif_is_mld(&sdata->vif);
+#     net/mac80211/cfg.c  ieee80211_change_beacon()
+#         link_conf->enable_beacon = true;
+#
+# so it is the SECOND beacon set that turns the transmitter on, and MTK meant
+# it that way (mac80211 patches 0055 and 0118). hostapd sends that second one
+# from hostapd_setup_interface_complete_sync() to every other interface that
+# has already started (hostapd patch 0133) - and on a node that also runs a
+# bSTA on the same radio, the 6 GHz link of the backhaul AP is not among them.
+# What is left is a BSS that associates, carries data and forwards traffic,
+# and never once transmits a beacon.
+#
+# That it is this and not the other candidate in the driver - beacons dropped
+# while the radio is off-channel for the bSTA's scan, mt7996_mcu_add_beacon()
+# skipping a phy with mt76->offchannel set - follows from the counter standing
+# at exactly 0 since boot. A beacon that ran and was later killed by a scan
+# leaves a non-zero count behind it. There never was one.
+#
+# THE REPAIR IS ONE COMMAND, and it is the cheapest in this tree: ask hostapd
+# to set the beacon again. Measured on the box, on a live mesh, no reload:
+#
+#     kitchen 6 GHz beacon rx       0  ->  306 (32 s)  ->  995 (103 s)
+#     beacon_mon_work per minute  ~30  ->  0
+#
+# 995 in 103 s is ten a second, the full 100 ms beacon interval. No teardown,
+# no client drop, and - because this never touches the SSID - no rederivation
+# of the PMK, which is exactly what makes `set ssid` unusable for this.
+#
+# WHY A SERVICE AND NOT A ONE-SHOT AT BOOT. map-agent's "wireless reload" is a
+# full radio teardown, so the links can be rebuilt at any time on a running
+# node and the defect comes back with them.
+#
+# AND WHY IT ALSO RUNS ON A TIMER, which the first version of this deliberately
+# did not. Measured 2026-09-21 on the deploy that shipped that first version:
+# every node kicked its five links at boot, every kick answered OK, and the two
+# children hanging off the repeater were back to `beacon rx: 0` an hour later.
+# A kick sent by hand at that moment took them from 0 to 384 and 391 in forty
+# seconds. So the beacon does not merely fail to start - it is switched off
+# again some time after it has been started, and kicking only when the links
+# are rebuilt is not enough.
+#
+# The likely second half of the mechanism is the one the driver makes no secret
+# of: mt7996_mcu_add_beacon() disables the beacon while the phy is off-channel,
+# which on these nodes happens every time the bSTA scans, and the restore path
+# puts back only what mac80211 believes should be enabled. That also corrects
+# the reasoning in the commit that introduced this file: "0 since boot" does
+# NOT rule the off-channel path out, because the first scan can easily come
+# before the first child ever associates.
+#
+# ⚠️ AND THE OTHER LESSON FROM THAT DEPLOY: `OK` FROM UPDATE_BEACON IS NOT
+# PROOF. hostapd answered OK on all five links of a node whose children were
+# receiving nothing. The only honest instrument is `beacon rx` on the child,
+# which is why easymesh-check tests it there. Nothing in this file may be read
+# as evidence that beacons are going out; it says what hostapd accepted, and
+# that is all it can say.
+
+INTERVAL_IDLE=30
+INTERVAL_PENDING=5
+
+# How often to kick links that are up and were already accepted once. This is
+# a workaround for a defect in the layers below, not a design; the real repair
+# belongs in hostapd patch 0133 and in whatever puts the beacon back after an
+# off-channel trip. Two minutes is chosen to be far shorter than the time it
+# took the fault to reappear after boot and still rare enough to matter little:
+# UPDATE_BEACON reprograms the beacon template, it does not tear anything down,
+# and it was measured on a live mesh with clients on it causing no disassoc,
+# no link drop and no beacon_mon_work event.
+INTERVAL_REKICK=120
+
+# Three passes, not one. At boot the links appear before hostapd will accept a
+# beacon for them, so the first answer being FAIL means "not yet", not "no".
+MAX_TRIES=3
+
+# Measurement window for BeaconTxCnt. Three seconds are enough: at 10 beacons/s
+# per BSS that is 30 samples per BSS, plenty to decide "silent / not silent".
+MEASURE_S=3
+
+CTRL=/var/run/hostapd
+
+# The last measurement, for anyone who wants to know what the radio sent
+# (see silent_links). Read this, never mibinfo.
+TXREC=/tmp/easymesh/beacon-tx
+
+# Verdicts outlive a reboot; the per-round polling does not get written at all.
+# Same placement and the same reason as hostapd-watch and node-heartbeat: the
+# record that matters is the one still there when somebody comes looking, and
+# logger goes to rsyslog, which starts empty at every boot.
+VERDICTS=/etc/mapc/beacon-kick.log
+log() {
+	logger -t beacon-kick "$1"
+	mkdir -p /etc/mapc 2>/dev/null
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$VERDICTS" 2>/dev/null
+}
+
+# What "the links were rebuilt" means, concretely. hostapd recreates its control
+# sockets when it restarts and when a radio is torn down and brought back, so a
+# new inode under a known name is the event we are after. The pid is in here
+# too, for the case where every socket keeps its inode across a restart.
+signature() {
+	pidof hostapd 2>/dev/null
+	ls -li "$CTRL" 2>/dev/null | grep '_link' | awk '{print $1, $NF}' | sort
+}
+
+links() {
+	ls "$CTRL" 2>/dev/null | grep '^ap-mld-.*_link' | sort
+}
+
+# Which band a link sits on. `status` answers phy=phy0.N and that N is the
+# directory name under mt76/, so nothing has to be guessed from the frequency.
+band_of() {
+	hostapd_cli -p "$CTRL" -i "$1" status 2>/dev/null |
+		sed -n 's/^phy=phy[0-9]*\.\([0-9]*\)$/\1/p' | head -1
+}
+
+# Beacons the RADIO actually put on the air, per band.
+#
+# This is the whole point of the rewrite. Until 22. 9. 2026 this script asked
+# hostapd whether it had accepted the command and called that success. It is
+# not: measured that day, every link reported "accepted" while two children
+# sat on a 6 GHz leg that had not seen a beacon for eight minutes.
+#
+# BeaconTxCnt is a hardware MIB counter (BN0_WF_MIB_TOP_TSCR18), so it sits
+# BELOW the firmware and below mac80211's enable_beacon - it counts what RF
+# sent. Reading it zeroes the accumulator, so the value is the delta since the
+# last read and the window belongs to whoever read last.
+#
+# ⚠️ Granularity is the BAND, not the link: on 5 and 6 GHz two BSS share a
+# radio (fronthaul + backhaul). We learn THAT one went quiet, not WHICH - and
+# that is enough, because the repair is sent to both.
+beacons_on_band() {
+	_f=/sys/kernel/debug/ieee80211/phy0/mt76/band$1/mibinfo
+	[ -r "$_f" ] || { echo ""; return 1; }
+	# ⚠️ Every read CONSUMES the window - the value is the delta since the last
+	# read. Nothing else in the tree fills bcn_total_cnt, so the window is all
+	# ours; but a manual `cat` of this file takes it from us and costs one
+	# needless kick.
+	_h=$(sed -n 's/.*BeaconTxCnt=0x\([0-9a-fA-F]*\).*/\1/p' "$_f" | head -1)
+	[ -n "$_h" ] || { echo ""; return 1; }
+	printf '%d' "0x$_h"
+}
+
+# Bands that carry at least one ENABLED link, and how many.
+bands_in_use() {
+	for _i in $(links); do
+		hostapd_cli -p "$CTRL" -i "$_i" status 2>/dev/null |
+			grep -q '^state=ENABLED' || continue
+		band_of "$_i"
+	done | sort | uniq -c | awk '{ print $2, $1 }'
+}
+
+# The links on bands the radio is NOT beaconing on.
+#
+# This replaces "kick every link every couple of minutes". Blind kicking was
+# not merely wasteful, it was the defect: see bsta_settled() above - a kick
+# that lands off channel switches the beacon off. Now nothing is kicked unless
+# the hardware says that band went quiet.
+silent_links() {
+	_bands=$(bands_in_use)
+	[ -n "$_bands" ] || { echo ""; return 0; }
+
+	# Read once to open the window, wait, read again to close it.
+	echo "$_bands" | while read -r _b _n; do beacons_on_band "$_b" >/dev/null; done
+	sleep "$MEASURE_S"
+
+	_quiet=""
+	# This is the ONLY reader of mibinfo on the box. Every read empties the
+	# window, so a second reader steals it: 2026-09-25 a check script read
+	# the same counters while this was measuring and saw 6/12/10 beacons in
+	# 3 s instead of 30/60/60 - a false "radio is silent" on a radio that
+	# was fine. So what is measured here is also published for everyone
+	# else in $TXREC, and nothing else reads the counters.
+	mkdir -p "${TXREC%/*}" 2>/dev/null
+	: > "$TXREC.new"
+	echo "$_bands" | while read -r _b _n; do
+		_got=$(beacons_on_band "$_b")
+		[ -n "$_got" ] || continue
+		echo "$_b $_got $_n" >> "$TXREC.new"
+		# 10 beacons/s per BSS. The threshold is a floor, not equality: an
+		# off-channel scan legitimately eats part of the window.
+		_want=$(( 10 * _n * MEASURE_S * 40 / 100 ))
+		[ "$_got" -lt "$_want" ] && echo "$_b"
+	done > /tmp/.bk-quiet 2>/dev/null
+	_quiet=$(cat /tmp/.bk-quiet 2>/dev/null)
+	rm -f /tmp/.bk-quiet
+	{
+		echo "# $(date +%s) window ${MEASURE_S}s - band beacons bss (10/s per BSS is full rate)"
+		cat "$TXREC.new"
+	} > "$TXREC.tmp" 2>/dev/null && mv "$TXREC.tmp" "$TXREC"
+	rm -f "$TXREC.new"
+
+	[ -n "$_quiet" ] || { echo ""; return 0; }
+	for _i in $(links); do
+		_lb=$(band_of "$_i")
+		for _q in $_quiet; do
+			[ "$_lb" = "$_q" ] && { echo "$_i"; break; }
+		done
+	done
+}
+
+# Do NOT kick while our own backhaul station is moving.
+#
+# This is the other half of the 22. 9. finding, and the more important one:
+# a kick that lands while the radio is off channel does not get thrown away,
+# it turns the beacon OFF -
+#
+#     mt76/patches/0109-...-disable-beacons-when-going-offchannel.patch
+#     mt7996/mcu.c  mt7996_mcu_add_beacon()
+#         if (link->phy && link->phy->mt76->offchannel)
+#                 enabled = false;
+#         rskb = __mt7996_mcu_alloc_bss_req(...);   <- carries on, sends it
+#
+# and the restore path only runs for a link whose phy comes back on channel
+# (mt7996_set_channel -> offchan_bcn_stopped). A link that had its chanctx
+# removed entirely has no phy at all and is skipped by
+# mt7996_update_vif_beacon(). Measured on hall: the bSTA reassociated, both
+# 6 GHz AP links lost their chanctx for 49 seconds, and the beacon never came
+# back - while this script kept kicking into the hole every few seconds.
+bsta_settled() {
+	for _b in $(ls /sys/class/net 2>/dev/null | grep '^bsta-mld-'); do
+		wpa_cli -p /var/run/wpa_supplicant -i "$_b" status 2>/dev/null |
+			grep -q '^wpa_state=COMPLETED' || return 1
+	done
+	return 0
+}
+
+last_sig=""
+pending=""
+t0=$(date +%s)
+tries=0
+kicked=0
+since=0
+laststate=""
+
+while :; do
+	sig=$(signature)
+	rearm=0
+
+	if [ "$sig" != "$last_sig" ]; then
+		# The links were rebuilt under us - boot, or a wireless reload.
+		last_sig="$sig"
+		rearm=1
+	elif [ "$since" -ge "$INTERVAL_REKICK" ]; then
+		# Nothing changed, but the beacon does not stay on by itself.
+		rearm=1
+	fi
+
+	# Do not kick while our own backhaul station is moving. A kick into that
+	# window switches the beacon OFF (see bsta_settled), so a blind kick is worse
+	# than none. Measuring makes no sense at that moment either: a band without
+	# a chanctx is legitimately silent and would look like a fault.
+	if ! bsta_settled; then
+		pending=""
+		sleep "$INTERVAL_IDLE"
+		now=$(date +%s); since=$((now - t0)); continue
+	fi
+
+	if [ "$rearm" = 1 ]; then
+		# Ask the HARDWARE which band is silent - not hostapd whether it accepted the command.
+		pending=$(silent_links)
+		tries=0
+		kicked=0
+		t0=$(date +%s)
+		since=0
+	fi
+
+	if [ -n "$pending" ] && [ "$tries" -lt "$MAX_TRIES" ]; then
+		tries=$((tries + 1))
+		still=""
+		accepted=""
+		for i in $pending; do
+			if hostapd_cli -p "$CTRL" -i "$i" raw UPDATE_BEACON 2>/dev/null |
+			   grep -q '^OK'; then
+				accepted="$accepted $i"
+				kicked=$((kicked + 1))
+			else
+				still="$still $i"
+			fi
+		done
+
+		# ⛔ A second kick "one second later" lived here until 22. 9. 2026 as a
+		# safeguard against the off-channel window. But it is a shot in the dark,
+		# and measurement showed it does harm:
+		#
+		#     mt76/patches/0109-...-disable-beacons-when-going-offchannel
+		#     mt7996/mcu.c  mt7996_mcu_add_beacon()
+		#         if (link->phy && link->phy->mt76->offchannel)
+		#                 enabled = false;
+		#         rskb = __mt7996_mcu_alloc_bss_req(...);   <- carries on
+		#
+		# It does not return - it SENDS a message saying "beacon off". So the second
+		# kick is not a second attempt, it is a second chance to switch the beacon
+		# off. What protects against that window is bsta_settled() above, not
+		# repetition.
+
+		pending=$(echo $still)
+
+		# Say it only when the answer CHANGES. This runs every couple of
+		# minutes now, and a verdict file that scrolls is one nobody reads -
+		# the whole reason it is written outside /tmp is to still be legible
+		# after a bad night.
+		state=""
+		if [ -z "$pending" ]; then
+			[ "$kicked" -gt 0 ] && state="accepted"
+		elif [ "$tries" -ge "$MAX_TRIES" ]; then
+			state="refused:$pending"
+		fi
+
+		if [ -n "$state" ] && [ "$state" != "$laststate" ]; then
+			case "$state" in
+			accepted)
+				log "$kicked link(s) accepted the beacon - whether one reaches the air only the child's beacon rx can say" ;;
+			*)
+				log "refused after $MAX_TRIES passes:$pending - those links are not beaconing and their children will report beacon loss"
+				[ "$kicked" -gt 0 ] && log "$kicked other link(s) did accept it" ;;
+			esac
+			laststate="$state"
+		fi
+	fi
+
+	# Time from the clock, not from summing sleeps. When a round takes longer than
+	# its sleep - and measuring now adds MEASURE_S, and hostapd can freeze for
+	# minutes - the sum of constants claims less time has passed than really has.
+	if [ -n "$pending" ] && [ "$tries" -lt "$MAX_TRIES" ]; then
+		sleep "$INTERVAL_PENDING"
+	else
+		sleep "$INTERVAL_IDLE"
+	fi
+	now=$(date +%s)
+	since=$((now - t0))
+done

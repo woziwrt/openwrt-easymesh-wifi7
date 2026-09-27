@@ -1,0 +1,14 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] net: phylink: check for a NULL PCS before restarting autonegotiation
+
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -1143,7 +1143,8 @@
+ 	if (pl->pcs && linkmode_test_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+ 					 pl->link_config.advertising) &&
+ 	    phy_interface_mode_is_8023z(pl->link_config.interface) &&
+-	    phylink_autoneg_inband(pl->act_link_an_mode))
++	    phylink_autoneg_inband(pl->act_link_an_mode) &&
++	    pl->pcs->ops->pcs_an_restart)
+ 		pl->pcs->ops->pcs_an_restart(pl->pcs);
+ }

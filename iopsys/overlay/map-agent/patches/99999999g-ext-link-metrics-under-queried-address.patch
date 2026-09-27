@@ -1,0 +1,85 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: extended link metrics answer under the queried address
+
+An Associated STA Link Metrics Response carries two TLVs about one
+station: Associated STA Link Metrics (0x96) and Associated STA Extended
+Link Metrics (0xC8), the latter with the last downlink and uplink data
+rate. For an MLO station the network asks about the MLD address, and
+agent_gen_assoc_sta_link_metrics_as() already answers under that address.
+agent_gen_assoc_sta_ext_link_metric() did not: it wrote the address of the
+link the metrics were read from.
+
+Captured 2026-09-24 on the controller, one response for a backhaul bSTA:
+  0x96  sta a6:47:ae:e6:87:23 (MLD, as asked)   rcpi 124
+  0xC8  sta a6:47:ae:e6:88:23 (5 GHz link)      last_dl_rate 972000,
+                                                last_ul_rate 1080000 kbit/s
+The controller keeps the station under its MLD address, so the rates went
+to a station it does not track and it showed dl_rate/ul_rate 0 for every
+backhaul bSTA while the agent was measuring them.
+
+Split the generator the way the link metrics one was split and answer the
+query under the address that was asked about. Callers that report a
+station under its own address are unchanged.
+
+--- a/src/agent_tlv.h	2026-09-24 17:46:56.714955655 +0200
++++ b/src/agent_tlv.h	2026-09-24 17:46:56.930789403 +0200
+@@ -118,6 +118,9 @@
+ 		uint8_t *reported_mac);
+ int agent_gen_assoc_sta_ext_link_metric(struct agent *a,
+ 		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid);
++int agent_gen_assoc_sta_ext_link_metric_as(struct agent *a,
++		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid,
++		uint8_t *reported_mac);
+ int agent_gen_ap_radio_identifier(struct agent *a,
+ 		struct cmdu_buff *frm, uint8_t *radio_id);
+ int agent_gen_ap_metric_query(struct agent *a, struct cmdu_buff *frm,
+--- a/src/agent_tlv.c	2026-09-24 17:46:56.714909289 +0200
++++ b/src/agent_tlv.c	2026-09-24 17:46:56.930727489 +0200
+@@ -2046,6 +2046,23 @@
+ int agent_gen_assoc_sta_ext_link_metric(struct agent *a,
+ 		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid)
+ {
++	return agent_gen_assoc_sta_ext_link_metric_as(a, frm, s, bssid,
++						      s->macaddr);
++}
++
++/* Report @s's extended metrics under @reported_mac - the same rule as
++ * agent_gen_assoc_sta_link_metrics_as(), and for the same reason. The two
++ * TLVs travel in one response; when the link metrics named the MLD that was
++ * asked about and these named the link, the controller filed the rates under
++ * a station it does not track. Measured 2026-09-24 on the controller: the
++ * Associated STA Extended Link Metrics of a backhaul bSTA carried
++ * last_dl_rate 972000 / last_ul_rate 1080000 kbit/s under its 5 GHz link
++ * address a6:47:ae:e6:88:23, while the controller showed that bSTA
++ * (MLD a6:47:ae:e6:87:23) at dl_rate 0 / ul_rate 0. */
++int agent_gen_assoc_sta_ext_link_metric_as(struct agent *a,
++		struct cmdu_buff *frm, struct sta *s, uint8_t *bssid,
++		uint8_t *reported_mac)
++{
+ 	int ret, i;
+ 	int offset = 0;
+ 	struct tlv *t;
+@@ -2057,7 +2074,7 @@
+ 
+ 	t->type = MAP_TLV_ASSOCIATED_STA_EXT_LINK_METRICS;
+ 	data = (struct tlv_sta_ext_link_metric *) t->data;
+-	memcpy(data->macaddr, s->macaddr, 6);
++	memcpy(data->macaddr, reported_mac, 6);
+ 	data->num_bss = 1;
+ 	offset = sizeof(*data);
+ 
+--- a/src/agent_cmdu.c	2026-09-24 17:46:56.714985570 +0200
++++ b/src/agent_cmdu.c	2026-09-24 17:46:56.930843438 +0200
+@@ -517,8 +517,10 @@
+ 		if (ret)
+ 			goto error;
+ 
+-		/* Associated STA Extended Link Metrics TLV */
+-		ret = agent_gen_assoc_sta_ext_link_metric(a, frm, s, s->bssid);
++		/* Associated STA Extended Link Metrics TLV, under the same
++		 * address as the link metrics above */
++		ret = agent_gen_assoc_sta_ext_link_metric_as(a, frm, s, s->bssid,
++							     query->macaddr);
+ 		if (ret)
+ 			goto error;
+ 	} else {

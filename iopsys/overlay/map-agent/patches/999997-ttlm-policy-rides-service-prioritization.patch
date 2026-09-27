@@ -1,0 +1,65 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: take the TTLM policy from the Service Prioritization Request
+
+--- a/src/agent_map.c	2026-08-31 17:41:24.736658775 +0200
++++ b/src/agent_map.c	2026-08-31 17:41:24.737735918 +0200
+@@ -6661,11 +6661,19 @@
+ 	return 0;
+ }
+ 
++#if (EASYMESH_VERSION > 5)
++static void agent_process_tid_to_link_policy(struct agent *a, uint8_t *data,
++					     uint16_t len);
++#endif
++
+ int handle_service_prioritization_request(void *agent, struct cmdu_buff *cmdu,
+                                           struct node *n)
+ {
+ 	struct tlv_dscp_pcp *dscp_pcp;
+ 	struct tlv_spr *spr;
++#if (EASYMESH_VERSION > 5)
++	bool ttlm_seen = false;
++#endif
+ 	struct tlv *tv[SERVICE_PRIORITIZATION_REQUEST_NUM_OF_TLV_TYPES][TLV_MAXNUM] = {0};
+ 
+ 	agnt_trace(LOG_QOS, "%s:--->\n", __func__);
+@@ -6678,10 +6686,39 @@
+ 		return -1;
+ 	}
+ 
++#if (EASYMESH_VERSION > 5)
++	/* TID-to-Link Mapping Policy rides the Service Prioritization Request
++	 * (EasyMesh 6.1 section 17.1.47), which is where the specification puts
++	 * it - not the AP MLD Config Request we used to abuse for it.
++	 *
++	 * Three things follow from moving it here, and all three were problems
++	 * measured on hardware 2026-08-31: the request is unicast to the one
++	 * agent the policy names, it does not re-apply the whole MLD config (so
++	 * the backhaul BSSs are not torn down and the mesh does not scatter),
++	 * and it needs no ieee1905 policy patch of ours - upstream already
++	 * allows the TLV here (r6.c, CMDU_SERVICE_PRIORITIZATION_REQUEST[3]).
++	 *
++	 * It is applied before the QoS rules below and independently of them: a
++	 * TTLM-only request carries no Service Prioritization Rule TLV, and the
++	 * 1905 policy marks that TLV optional, so such a CMDU is valid.
++	 */
++	if (tv[SERVICE_PRIORITIZATION_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0]) {
++		agent_process_tid_to_link_policy((struct agent *)agent,
++			tv[SERVICE_PRIORITIZATION_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0]->data,
++			tlv_length(tv[SERVICE_PRIORITIZATION_REQUEST_TID_TO_LINK_MAPPING_POLICY_IDX][0]));
++		ttlm_seen = true;
++	}
++#endif
++
+ 	if (tv[SERVICE_PRIORITIZATION_REQUEST_SERVICE_PRIORITIZATION_RULE_IDX][0]) {
+ 		spr = (struct tlv_spr *)
+ 			tv[SERVICE_PRIORITIZATION_REQUEST_SERVICE_PRIORITIZATION_RULE_IDX][0]->data;
+ 	} else {
++#if (EASYMESH_VERSION > 5)
++		/* A TTLM-only request is complete without it. */
++		if (ttlm_seen)
++			return 0;
++#endif
+ 		agnt_err(LOG_QOS, "%s: no SPR TLV in SPR CMDU\n", __func__);
+ 		map_error = MAP_STATUS_ERR_TLV_NUM_LESS;
+ 		return -1;

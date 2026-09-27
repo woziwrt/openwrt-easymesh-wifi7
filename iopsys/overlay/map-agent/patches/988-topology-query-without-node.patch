@@ -1,0 +1,101 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 988: answer a Topology Query from two hops away
+
+agent_handle_map_event() looks the sender up by AL-MAC and, when it finds
+nothing, frees the CMDU and returns. Three types are exempt: Topology Discovery,
+Topology Notification and AP-Autoconfig Search. Topology Query is not, so an
+agent whose sender cannot be resolved stops answering the one query the
+controller builds its map from -- and does it without a word in the log.
+
+Whether the sender resolves is not a property of the sender. origin is filled by
+ieee1905d, which starts from the source MAC of the received frame and only
+rewrites it to the sender's AL-MAC if a link is found for that MAC. The
+controller transmits from its AP-MLD address rather than its AL-MAC, so the
+rewrite succeeds for a direct neighbour and silently fails for anyone behind
+another agent.
+
+Measured on hardware 2026-07-30, three-node mesh, 11 h 36 m uptime, no crash and
+no MCU timeout. After x8 re-parented from the controller to the other agent, its
+1905 links no longer carried the controller's AP-MLD 86:f7:56:41:01:d4, so
+origin stayed 86:f7:56:41:01:d4 while the node list held the AL-MAC
+86:f7:56:41:01:d3. Captured on both sides in one window: four Topology Queries
+arrived on bsta-mld-3, no Topology Response left, and on the controller only the
+directly attached agent's responses ever arrived. In the same 16 s at log level
+4 the agent ran handle_map_event 42 times and handle_topology_query none, while
+handling 24 AP-Autoconfig Searches -- the difference between those two numbers
+is this list.
+
+The controller consequently kept that agent's first report for as long as it had
+been up: parent 86:f7:56:41:01:d4 when the node had long since attached to
+ca:8e:1d:ca:bc:af, and one affiliated bSTA when it was running two links. Not
+one check anywhere reported a fault, because the node was associated, bridged
+and forwarding at 2.6 Gbit/s. The database described a star; the mesh was a
+chain.
+
+handle_topology_query() never touches the node -- its only reference to n lives
+inside an #if 0 -- so let a Topology Query through with none, and log the drops
+that remain. A CMDU discarded in silence is how this went unnoticed through five
+reliability cycles.
+
+This treats the symptom at the agent. The deeper question, why ieee1905d cannot
+map a source MAC to an AL-MAC for a device it already knows from its own
+topology database, is left alone for now.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+diff -u -r a/src/agent_map.c b/src/agent_map.c
+--- a/src/agent_map.c	2026-07-30 08:21:25.280752378 +0200
++++ b/src/agent_map.c	2026-07-30 08:21:25.281231196 +0200
+@@ -7101,12 +7101,51 @@
+ 
+ 	n = agent_find_node(a, origin);
+ 	if (!n) {
++		/* A Topology Query has to be answered whether or not we have
++		 * ever heard of the sender, and handle_topology_query() does
++		 * not look at the node at all -- its only use of n sits inside
++		 * an #if 0. Requiring one here is what makes a two-hop agent
++		 * fall out of the controller's map.
++		 *
++		 * origin is filled by ieee1905d, which starts from the source
++		 * MAC of the frame and only rewrites it to the sender's AL-MAC
++		 * when a link is found for that MAC (cmdu_input.c, "override
++		 * with real aladdr of the sender"). The controller sends from
++		 * its AP-MLD address, not its AL-MAC, so the rewrite works for
++		 * a direct neighbour and quietly does not for anyone further
++		 * away.
++		 *
++		 * Measured on hardware 2026-07-30. Once x8 re-parented from the
++		 * controller to the other agent, its 1905 links no longer
++		 * included the controller's AP-MLD 86:f7:56:41:01:d4, so origin
++		 * stayed 86:f7:56:41:01:d4 while the node list held the AL-MAC
++		 * 86:f7:56:41:01:d3. Four Topology Queries were captured
++		 * arriving on bsta-mld-3 and every one was freed here.
++		 * handle_map_event ran 42 times in the same 16 s window and
++		 * handle_topology_query not once, because AP-Autoconfig Search
++		 * is on this list and Topology Query is not.
++		 *
++		 * The controller therefore kept that agent's first report
++		 * forever: parent and affiliated-bSTA count frozen at what they
++		 * were before it moved. Nothing anywhere said so -- the node was
++		 * associated, bridged and forwarding on both links, so every
++		 * health check passed while the database described a star and
++		 * the mesh was a chain.
++		 */
+ 		if (cmdutype != CMDU_TYPE_TOPOLOGY_DISCOVERY &&
+ 		    cmdutype != CMDU_TYPE_TOPOLOGY_NOTIFICATION &&
+-		    cmdutype != CMDU_TYPE_AP_AUTOCONFIGURATION_SEARCH) {
++		    cmdutype != CMDU_TYPE_AP_AUTOCONFIGURATION_SEARCH &&
++		    cmdutype != CMDU_TYPE_TOPOLOGY_QUERY) {
++			/* And say so. This drop was completely silent, which is
++			 * why it took a packet capture on both sides to find. */
++			warn("%s: no node for origin " MACFMT ", dropping cmdu 0x%04x from %s\n",
++			     __func__, MAC2STR(origin), cmdutype, rxif);
+ 			cmdu_free(cmdu);
+ 			return -1;
+ 		}
++
++		dbg("%s: cmdu 0x%04x from unresolved origin " MACFMT " on %s, handling without node\n",
++		    __func__, cmdutype, MAC2STR(origin), rxif);
+ 	}
+ 
+ 	if (f[idx]) {

@@ -1,0 +1,54 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Where this node's own updates come from.
+#
+# Nothing used to ship this line. It was typed by hand on every box, and on
+# 2026-08-14 that showed: the controller still carried the release-asset URL
+# from before the Pages feed existed - the one that mangles the tilde in a
+# version and answers 404 - so `apk add --upgrade` there returned RC=0, said
+# "OK", and changed nothing. A node has no business guessing where its own
+# software lives, and a silent no-op is the worst way to find out it does not
+# know.
+#
+# Written every time rather than only when absent: a wrong address is exactly
+# the case that needs fixing, and this file has no user-owned content to
+# preserve. The bootstrap `apk add` still needs an address from somewhere -
+# the image, or --repository on the command line - because a package cannot
+# deliver the way to reach itself. What this fixes is every update after it.
+FEED=https://woziwrt.github.io/bpi-r4-deploy/easymesh/packages.adb
+LIST=/etc/apk/repositories.d/easymesh.list
+
+# None of the above applies to a production image, and there this line is not
+# merely useless but harmful.
+#
+# The two models are opposites on purpose. A lab image ships nothing and
+# installs the whole stack from this feed, so a node is exactly what its
+# package list says and measurements between boards are comparable. A
+# production image has the stack baked in and gets its updates as a new image
+# through sysupgrade; it has no reason to ever run apk.
+#
+# Leave the feed on such a node and one `apk upgrade` installs the lab build of
+# the same packages on top of the baked one. Which copy the node then runs
+# depends on when it was last flashed and when it was last upgraded - the exact
+# mixture that meant no two boards in the lab were alike until 2026-08-09, and
+# the reason the mesh was taken out of the lab image in the first place. The
+# same command has already replayed firstboot once and taken the controller's
+# role with it.
+#
+# Measured 2026-08-17: the first production image did carry this line, written
+# right here at first boot. The marker is baked by the production builder,
+# because only whoever assembles the image knows which model it is - the node
+# cannot tell a package it was born with from one installed a minute later.
+if [ "$(cat /etc/easymesh-model 2>/dev/null)" = "production" ]; then
+	rm -f "$LIST"
+	exit 0
+fi
+
+mkdir -p /etc/apk/repositories.d
+[ "$(cat "$LIST" 2>/dev/null)" = "$FEED" ] && exit 0
+
+echo "$FEED" > "$LIST"
+logger -t easymesh-config "apk feed set to $FEED"
+exit 0

@@ -1,0 +1,54 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] ieee1905: Steering Policy is nine bytes per radio, and chirp reads inside the TLV
+
+Two validator faults found while mapping the byte layout of every
+operational TLV against captured traffic (2026-07-19, re-verified
+2026-08-10):
+
+1. The Steering Policy TLV (0x89) checker advanced 8 bytes per radio
+   while the spec, our own builder and our own struct all carry 9:
+   radio id (6) + steering policy (1) + channel utilization threshold
+   (1) + RCPI steering threshold (1). The comment said "1 byte for
+   thresholds" - there are two. A well-formed TLV with any radios left
+   num_radio bytes unconsumed and was rejected. Latent today, because
+   the Policy Config Request CMDU is not in the validated list - but
+   the first interop partner whose messages we validate would have
+   been cut off by our own reference code.
+
+2. The DPP Chirp Value (0xD3) checker read data[0], data[1] and
+   data[7] before checking that the TLV was long enough to contain
+   them - an out-of-bounds read on a truncated TLV. The length
+   semantics themselves are correct (1-octet hash length, per spec).
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+--- a/src/extensions/map/tlv_checker.c
++++ b/src/extensions/map/tlv_checker.c
+@@ -472,9 +472,9 @@
+ 	/* Validate each policy -
+ 	 * Each policy is 6 bytes for radio +
+ 	 * 1 byte for steer_policy +
+-	 * 1 byte for thresholds.
++	 * 2 bytes for thresholds: channel utilization and RCPI.
+ 	 */
+-	expected_len = 8;
++	expected_len = 9;
+ 	for (i = 0; i < num_radio; i++) {
+ 		if (remaining_len < expected_len)
+ 			return -1;
+@@ -1381,10 +1381,16 @@
+ 	size_t expected_length;
+ 	uint8_t hashlen;
+ 
+ 	expected_length = sizeof(struct tlv_dpp_chirp);
++	if (datalen < expected_length)
++		return -1;
++
+ 	if (!!(data[0] & DPP_CHIRP_ENROLLEE_MAC_PRESENT)) {
+ 		expected_length += 6;
++		if (datalen < expected_length)
++			return -1;
++
+ 		hashlen = data[7];
+ 	} else {
+ 		hashlen = data[1];
+ 	}

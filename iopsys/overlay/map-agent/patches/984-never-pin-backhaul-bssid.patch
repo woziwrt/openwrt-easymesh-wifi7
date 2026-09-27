@@ -1,0 +1,54 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: never pin the backhaul BSSID in config
+
+wifi_set_iface_bssid() persisted the BSSID the bSTA happened to associate to,
+so the next boot bound it to that exact address. BSSIDs are not stable: each
+BSS address comes from a counter incremented in interface preparation order
+(/usr/share/ucode/wifi/iface.uc), so it moves whenever the interface set
+changes - and, measured on 2026-07-22, even across two reboots with an
+identical config, where the controller's 6 GHz backhaul went
+bc:2f -> bd:2f -> bc:2f.
+
+A pinned bSTA then finds nothing and only scans, taking the node out of the
+mesh. That happened four times in one afternoon.
+
+The in-memory copy is kept, so the agent still knows what it is associated to.
+Only the config is left alone, and an empty value is written so a node
+carrying a stale pin heals itself on the first association.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/config.c
++++ b/src/config.c
+@@ -315,10 +315,28 @@
+ 	if (!section)
+ 		goto out_pkg;
+ 
+-	if (bssid && !hwaddr_is_zero(bssid))
+-		hwaddr_ntoa(bssid, bssid_str);
++	/* PATCH 984: never pin the backhaul BSSID in config.
++	 *
++	 * Persisting the BSSID we happen to be associated to makes the next boot
++	 * bind the bSTA to that exact address. BSSIDs are not stable: without
++	 * `option macaddr` each BSS address comes from a counter incremented in
++	 * interface preparation order (/usr/share/ucode/wifi/iface.uc), so it
++	 * moves whenever the interface set changes - and, measured on 2026-07-22,
++	 * even across two reboots with an identical config (the controller's
++	 * 6 GHz backhaul went bc:2f -> bd:2f -> bc:2f). A pinned bSTA then finds
++	 * nothing and only scans, which takes the whole node out of the mesh. It
++	 * happened four times in one afternoon.
++	 *
++	 * The in-memory copy below is kept - the agent still knows what it is
++	 * associated to. Only the config is left alone, so the bSTA follows the
++	 * SSID and reassociates wherever that SSID currently lives.
++	 *
++	 * An empty value is written rather than nothing at all, so a node that
++	 * already carries a stale pin heals itself on the first association.
++	 */
++	bssid_str[0] = '\0';
+ 
+-	dbg("%s: setting bssid to %s\n", __func__, bssid_str);
++	dbg("%s: clearing persisted bssid (follow SSID instead)\n", __func__);
+ 
+ 	ret = set_value(ctx, pkg, section, "bssid", bssid_str, UCI_TYPE_STRING);
+ 	uci_commit(ctx, &pkg, false);

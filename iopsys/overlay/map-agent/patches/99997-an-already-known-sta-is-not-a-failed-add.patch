@@ -1,0 +1,40 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: an already-known STA is not a failed add
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+wifi_add_sta() returns a struct sta pointer, but the "already in list"
+branch ended with return 0 - a leftover from int semantics. The polled
+refresh paths ignore the return value, so the only caller that noticed
+was the wifi.sta connect-event handler, and it treats NULL as failure
+and returns before stamld_update() and wifi_topology_notification().
+
+A returning client whose previous entry survived in the model was
+therefore never reported again. Measured on bpi-4g 2026-08-05 03:17:46:
+an MLO client re-joined, all three legs answered "STA already in list",
+the handler logged "Failed to add STA" three times, and a 23-minute
+association earlier the same night (02:37-03:00) never produced a
+single row in the controller database, while a legacy client on the
+same node registered in under a second.
+
+Return the entry we found. The event handler then refreshes the MLD
+bookkeeping and sends the join notification exactly as it does for a
+first-time client; duplicate joins are harmless because mld_add_sta()
+already deduplicates and the controller write is an upsert.
+
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1659,7 +1659,13 @@
+ 				timer_del(&sptr->sta_steer_deauth_timer);
+ 
+ 			agent_sta_clean_rssi(sptr);
+-			return 0;
++			/* This function returns a pointer, and 0 here made a healthy
++			 * "STA already known" indistinguishable from failure. The
++			 * connect-event handler bails on NULL, so a returning client
++			 * whose stale entry survived in the model was never reported
++			 * again: no stamld_update(), no Topology Notification.
++			 * Return the entry we found. */
++			return sptr;
+ 		} else {
+ 			struct netif_ap *oldap;
+ 

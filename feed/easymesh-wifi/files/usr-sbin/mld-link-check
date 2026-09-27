@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Recover an AP-MLD that lost a link to the boot race.
+#
+# hostapd can be handed a phy before netifd has created that radio's
+# interfaces; the log shows "Interface wlanX wasn't started" followed by
+# "hostapd.add_iface failed for phy phyN". The affected band is then simply
+# absent from the MLD, and a plain "wifi reload" does not recover it - only a
+# full down/up does. Observed on the 6 GHz radio of the BPI-R4 Pro 8X, 2026-07-21.
+#
+# Runs once per boot from /etc/init.d/mld-link-check. Does nothing at runtime:
+# a wifi restart is far too blunt to trigger on a live mesh. That was the
+# intent from the first version; it is enforced here since 2026-08-09, because
+# a package upgrade turned out to be a second way in. See boot-window.sh.
+
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+in_boot_window || {
+	logger -t mld-link-check "started outside the boot window - skipping; a wifi restart is far too blunt for a live mesh"
+	exit 0
+}
+
+RECHECK=15
+# hostapd needs longer than a recheck to bring every link back after a restart;
+# measuring too early makes the confirmation line under-report.
+SETTLE_AFTER_RESTART=40
+
+ifname="$(uci -q get wireless.mld0.ifname)"
+[ -n "$ifname" ] || exit 0
+
+want="$(uci -q get wireless.ap_mld_1.device | wc -w)"
+[ "$want" -gt 1 ] 2>/dev/null || exit 0
+
+links() {
+	ubus -t 5 call "wifi.apmld.$ifname" status 2>/dev/null | grep -c '"enabled": true'
+}
+
+have="$(links)"
+[ "$have" -lt "$want" ] 2>/dev/null || exit 0
+
+# Confirm it is not merely slow before reaching for the hammer.
+sleep "$RECHECK"
+have="$(links)"
+[ "$have" -lt "$want" ] 2>/dev/null || exit 0
+
+logger -t mld-link-check "AP-MLD $ifname has $have of $want links - restarting wifi once"
+wifi down
+sleep 5
+wifi up
+
+sleep "$SETTLE_AFTER_RESTART"
+logger -t mld-link-check "AP-MLD $ifname now has $(links) of $want links"

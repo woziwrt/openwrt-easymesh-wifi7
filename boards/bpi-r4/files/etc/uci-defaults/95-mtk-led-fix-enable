@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# Enable and run the BPI-R4 port-LED register fix at boot.
+[ -x /etc/init.d/mtk-led-fix ] || exit 0
+/etc/init.d/mtk-led-fix enable
+/etc/init.d/mtk-led-fix start
+exit 0

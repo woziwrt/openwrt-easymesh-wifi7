@@ -1,0 +1,1014 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+# mesh-gwd - the internet gateway follows the cable.
+#
+# Plug the ISP cable into ANY node and the whole mesh goes online; move it
+# to another node and it goes online again, without touching a single
+# client. The mesh is one L2 domain, so this is the classic VRRP setup a
+# wired LAN would use - keepalived would be the standard answer, but it
+# needs kmod-macvlan and kernel modules from the OpenWrt repo do not match
+# our MTK-feed kernel. Our case is also narrower than VRRP: the node that
+# owns the cable owns the address, and nothing else competes for it.
+#
+# The clients' gateway is a virtual address (VIP) that lives on whichever
+# node currently has a working uplink:
+#
+#   have uplink  -> claim VIP, enable NAT, announce with gratuitous ARP
+#   lost uplink  -> release VIP, disable NAT, let another node take over
+#
+# Measured 2026-08-05: moving the VIP between two nodes cost zero pings
+# (75 probes at 0.1 s, no gap) - the announce is what makes it seamless.
+#
+# Deliberately NOT done here: nothing touches wifi, the backhaul or the
+# mesh itself. The worst failure mode is "no internet", never "no mesh".
+# VIP is defined below, once mesh_lan() exists - it is derived from the
+# network the mesh actually runs on rather than assumed.
+# The bridge the mesh lives on, asked rather than assumed. On the nodes this
+# grew up with, the mesh is br-lan and this still answers br-lan. A node that
+# keeps the mesh on a bridge of its own must not watch br-lan, or the whole
+# arbitration below happens in the wrong network: the check for "is somebody
+# already the gateway" asks on a wire the other nodes cannot hear, nobody
+# answers, and every such node makes itself the gateway. Seen on hardware
+# 2026-08-09 with two nodes holding the VIP at once.
+mesh_lan() {
+	local d
+	d=$(uci -q get network.easymesh.device)
+	[ -n "$d" ] || d=$(uci -q get network.lan.device)
+	echo "${d:-br-lan}"
+}
+LAN=${LAN:-$(mesh_lan)}
+
+# The mesh network, asked rather than assumed - the same lesson mesh_lan()
+# above already learned, and it had to be learned twice.
+#
+# These three addresses used to be hardcoded into 10.10.10.x. That held for as
+# long as every mesh was founded on the default subnet. On 2026-08-22 one was
+# founded at 172.16.10.1 through the web wizard, and the result was a mesh with
+# working internet that no client would use: dnsmasq correctly handed out
+# 172.16.10.254 as gateway and resolver, while this daemon sat on
+# 10.10.10.254 - an address in a network that did not exist here. Clients
+# associated, took a lease, found nobody answering for their gateway and
+# dropped the network as "no internet". easymesh-check called it exactly right:
+# "DHCP advertises gateway X and nobody answers for it".
+mesh_net_prefix() {
+	local a
+	# Skip the addresses this daemon adds itself, or a restart would derive
+	# the network from its own leftovers instead of from the real one.
+	a=$(ip -4 -o addr show "$LAN" 2>/dev/null | awk '{print $4}' |
+		cut -d/ -f1 | grep -vE '\.(253|254)$' | head -1)
+	[ -n "$a" ] && echo "${a%.*}"
+}
+MESH_PREFIX=${MESH_PREFIX:-$(mesh_net_prefix)}
+MESH_PREFIX=${MESH_PREFIX:-10.10.10}
+VIP=${VIP:-${MESH_PREFIX}.254}
+WAN_IF=${WAN_IF:-wan}
+PROBE=${PROBE:-1.1.1.1}
+# Legacy static gateway to clear on takeover (pre-VIP deployments).
+GW_FALLBACK=${GW_FALLBACK:-${MESH_PREFIX}.1}
+# Uplink towards the rest of the mesh (absent on the root node).
+BSTA=${BSTA:-bsta-mld-3}
+PERIOD=${PERIOD:-3}
+
+# --- uplink classes: the cable outranks the modem -------------------------
+#
+# A node may carry more than one way out. Which one it uses is a local
+# question - take the best one that works. Which NODE gets to be the mesh's
+# gateway is not, and ARP has nowhere to carry a priority, which is why this
+# was open for so long.
+#
+# The trick is to stop trying to put a priority into the arbitration and to
+# publish the fact instead. A node whose ACTIVE uplink is primary also holds
+# a second address, PRIMARY_MARK. Nothing is ever routed to it; it is a
+# presence beacon, and `arping -D` answers the only question that matters:
+# "is there a node in this mesh with a real cable?" A node that holds the VIP
+# on a backup uplink asks exactly that, and stands down when the answer is
+# yes. Two nodes with cables both hold the mark - that is fine, the question
+# is a boolean and the VIP between them is still decided the old way.
+#
+# The modem can sit in ANY node, the controller included. When the cable and
+# the modem are in the SAME box, failover never moves the VIP at all: the box
+# keeps the address, switches its own uplink underneath, and drops the mark -
+# so a node that still has a cable can take over from it later.
+PRIMARY_MARK=${PRIMARY_MARK:-${MESH_PREFIX}.253}
+# The clients' network, derived from the VIP rather than configured twice.
+MESH_NET=${MESH_NET:-$(echo "$VIP" | sed 's/\.[0-9]*$/.0\/24/')}
+# Which protocols make an interface a backup rather than a primary. Discovered,
+# never configured per node: drop a modem into any box and that box knows.
+BACKUP_PROTOS=${BACKUP_PROTOS:-"qmi mbim ncm"}
+
+# A standby uplink carries no traffic, and an idle PDP context is exactly what
+# an operator reaps. Measured 2026-08-20: the modem held its lease from 21:57,
+# lost it at 23:56 and udhcpc then broadcast discover for five hours without
+# ever getting it back - a dropped bearer cannot be recovered by DHCP, it has
+# to be raised again. `ifup telit` restored it in 30 s. A backup that dies
+# quietly two hours after it was last used is worse than no backup at all, so
+# the standby gets probed and, when it is gone, rebuilt.
+# How many passes between two questions about the mark. Deliberately much
+# shorter than DUP_EVERY: asking is one arping, and this is the delay a user
+# feels as "the cable is back but it is still on the modem". Measured
+# 2026-08-20 with the two sharing DUP_EVERY: 57 s, because a pass costs closer
+# to six seconds than to PERIOD once the probes inside it are counted.
+MARK_EVERY=${MARK_EVERY:-3}
+
+#
+# The numbers are in passes, and a pass is not PERIOD: the probes inside it
+# cost more than the sleep does. Measured 2026-08-20 on the failback, ten
+# passes took 57 s - so about 5.7 s each. 40 passes is therefore a look at the
+# spare roughly every four minutes, and two strikes before touching anything
+# puts the repair at about eight. Long enough not to rebuild an interface over
+# one wobble of a mobile network, short enough that the backup is never dead
+# for half an hour - the bearer this was written for died after two hours of
+# doing nothing, so minutes are the right unit here, not seconds and not
+# hours.
+KEEPALIVE_EVERY=${KEEPALIVE_EVERY:-40}
+KEEPALIVE_FAILS=${KEEPALIVE_FAILS:-2}
+# How many rebuilds before the modem itself is asked to start over.
+KEEPALIVE_IFUPS=${KEEPALIVE_IFUPS:-2}
+# Hysteresis. Handing the gateway over is disruptive and unplugging a cable
+# is rare, so the daemon should be slow to believe the uplink died. Six
+# strikes, because a DHCP renewal takes the WAN interface down and back up
+# - and this ISP renews every five minutes (600 s leases) - which looks
+# exactly like a pulled cable for a few seconds. Only a real unplug keeps
+# failing for half a minute.
+FAILS_TO_DROP=${FAILS_TO_DROP:-6}
+# How many passes between two holders asking again whether they are alone.
+# The claim-time probe answers that question once and never revisits it, which
+# is not enough: a node can take the address on an island and be carried onto
+# the mesh afterwards, next to a node that already holds it. Ten passes is
+# about half a minute - slow enough not to fill the air with ARP, quick enough
+# that a collision does not outlive a coffee.
+DUP_EVERY=${DUP_EVERY:-10}
+
+# procd forwards this daemon's output to the log too, so anything printed
+# here would arrive twice. The log is the only copy that matters.
+log() { logger -t mesh-gwd "$1"; }
+
+# Standing by is the normal state of every node that is not the gateway,
+# and it is checked every few seconds - saying so each time buries the one
+# line that matters under thousands that do not. Only changes are worth
+# reading, so a repeat of the last message is dropped.
+LAST_STATE=
+log_change() {
+	[ "$1" = "$LAST_STATE" ] && return 0
+	LAST_STATE="$1"
+	log "$1"
+}
+
+have_vip() { ip -4 addr show dev "$LAN" | grep -q "inet $VIP/"; }
+
+# A gateway nobody can reach is not a gateway. Holding the cable is only
+# half the job: the node must also be part of the mesh, or the clients
+# send their traffic to an address that answers from an island.
+#
+# Found the hard way (2026-08-05): the middle node of the chain was
+# switched off for a test while the ISP cable sat in the far node. That
+# node kept its uplink, kept the VIP - and the entire mesh lost the
+# internet, because the only way to the gateway went through the node
+# that was off.
+#
+# A node with an uplink port (bsta) must have it associated. The root
+# has no bsta and is by definition in the mesh - but "no bsta interface"
+# alone does not make a node the root: a freshly joined agent has none
+# either, right up until its keys arrive and the backhaul is built. On
+# 2026-08-10 exactly such a node claimed the VIP on an isolated bridge -
+# a second gateway parked on an island, waiting for the backhaul to come
+# up and collide. Only a node configured as controller may treat a
+# missing bsta as being in the mesh.
+in_mesh() {
+	# The controller is the root: it does not attach to anybody, so its own
+	# bSTA reads "Not connected" for as long as it exists. Asking about the
+	# bSTA first and falling back to the role only when the interface is
+	# MISSING therefore worked by accident - it held exactly as long as the
+	# controller failed to build a backhaul MLD at all.
+	#
+	# Measured 2026-08-19, on the first controller whose MLD came up whole:
+	# bsta-mld-3 present, "Not connected", controller.enabled=1, WAN alive
+	# and the ISP gateway answering. mesh-gwd counted 167 consecutive
+	# failures and never claimed the VIP, so every client was handed
+	# 10.10.10.254 as its gateway and its resolver - an address nobody held.
+	# The symptom is precise and misleading: the phone associates, gets a
+	# lease, pings the router, and not one page loads.
+	#
+	# The role is the cheaper and the truer test, so it goes first.
+	[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] && return 0
+	ip link show "$BSTA" >/dev/null 2>&1 || return 1
+	iw dev "$BSTA" link 2>/dev/null | grep -q "^Connected" || return 1
+	return 0
+}
+
+# "Do I have a way out THROUGH MY OWN CABLE?" - three conditions, cheapest
+# first. The probe MUST be sourced from the WAN address: every node reaches
+# the internet through the mesh already, so an unbound ping would answer
+# "yes" on a node whose WAN port holds nothing but a dead switch - and two
+# nodes would then both claim to be the gateway.
+uplink_field() {
+	# The address and the route do not always live in the interface that was
+	# configured. netifd's qmi proto builds telit_4 for IPv4 and telit_6 for
+	# IPv6 on top of "telit"; asking the parent returns an empty address and
+	# the IPv6 nexthop "::" - measured 2026-08-20 on the Telit FN990. Ask the
+	# parent first, fall back to the _4 child.
+	uf=$(ubus -t 5 call network.interface."$1" status 2>/dev/null | \
+	     jsonfilter -e "$2" 2>/dev/null)
+	[ -n "$uf" ] || uf=$(ubus -t 5 call network.interface."${1}_4" status 2>/dev/null | \
+	                     jsonfilter -e "$2" 2>/dev/null)
+	echo "$uf"
+}
+
+# Every resolver this uplink was handed, IPv4 first.
+#
+# Same trap as the nexthop: a qmi parent answers with the IPv6 servers of the
+# half that is up, which is not empty, so "ask the parent, fall back to the
+# child" never reaches the IPv4 ones. Measured 2026-08-20 on the failover: the
+# gateway came up resolving through 2a00:11b4:2110::a while 31.30.90.1 sat
+# unused in telit_4. Both work; the v4 ones are put first because the mesh is
+# v4 and they are the ones certain to be reachable.
+uplink_dns() {
+	ud_all=$(for ud_i in "$1" "${1}_4" "${1}_6"; do
+		ubus -t 5 call network.interface."$ud_i" status 2>/dev/null | \
+			jsonfilter -e '@["dns-server"][*]' 2>/dev/null
+	done | awk 'NF && !seen[$0]++')
+	echo "$ud_all" | grep -v ':' | grep .
+	echo "$ud_all" | grep ':' | grep .
+}
+
+# The first IPv4 nexthop this uplink offers.
+#
+# Not uplink_field: a qmi parent answers route[0].nexthop with the IPv6 "::"
+# of the half that is still up, which is not empty - so a plain "ask the parent,
+# fall back to the child" never reaches the child and then rejects the modem for
+# having a colon in it. Measured 2026-08-20: telit said "::" while telit_4 held
+# 10.2.210.180 and the bearer was perfectly alive. Walk every route on both, and
+# take the first one that is IPv4. An IPv6-only bearer is correctly no way out
+# for an IPv4 mesh.
+uplink_nexthop() {
+	for un_i in "$1" "${1}_4"; do
+		for un_h in $(ubus -t 5 call network.interface."$un_i" status 2>/dev/null | \
+			      jsonfilter -e '@.route[*].nexthop' 2>/dev/null); do
+			case "$un_h" in *:*|"") continue ;; esac
+			echo "$un_h"
+			return 0
+		done
+	done
+	return 1
+}
+
+# Every way out this node has, best first. Discovered rather than configured,
+# because the modem may be in ANY box - including the one that holds the cable
+# - and a per-node config file is one more thing to get wrong on a box nobody
+# is looking at.
+uplink_list() {
+	echo "wan primary"
+	uci -q show network 2>/dev/null | \
+		sed -n "s/^network\.\([^.=]*\)\.proto='\([a-z]*\)'$/\1 \2/p" | \
+	while read -r u_name u_proto; do
+		case " $BACKUP_PROTOS " in
+			*" $u_proto "*) echo "$u_name backup" ;;
+		esac
+	done
+}
+
+# "Do I have a way out THROUGH THIS INTERFACE?" - three conditions, cheapest
+# first. Parameterised, because the old version asked about "wan" and nothing
+# else: a modem could never be an uplink no matter how well it worked.
+#
+# The probe MUST be sourced from the interface being tested. Every node reaches
+# the internet through the mesh already, so an unbound ping answers "yes" for a
+# dead modem and for a WAN port holding nothing but a dead switch - and two
+# nodes would then both claim to be the gateway. (This is exactly where the
+# shipped lite-watchdog would have misled us: its ping carries no -I at all.)
+uplink_probe() {
+	# Ask the system which device carries this interface instead of assuming a
+	# name: it is br-wan on the classic boards, eth1 on the Pro 8X and wwan0
+	# for a modem. Hard-coding "wan" made a Pro 8X with a live cable and an ISP
+	# address sit there insisting it had no uplink (measured 2026-08-05).
+	up_dev=$(ubus -t 5 call network.interface."$1" status 2>/dev/null | \
+		 jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -n "$up_dev" ] || return 1
+
+	ip -br link show "$up_dev" 2>/dev/null | grep -q "LOWER_UP" || return 1
+
+	up_src=$(uplink_field "$1" '@["ipv4-address"][0].address')
+	[ -n "$up_src" ] || return 1
+
+	# Probe the ISP's own gateway, not the open internet. A node that is
+	# not (yet) the mesh gateway routes by default THROUGH the mesh, so a
+	# packet aimed at 1.1.1.1 leaves the wrong way and fails even with a
+	# perfectly good cable - measured on the Pro 8X, 2026-08-05. The ISP
+	# gateway sits on the directly attached WAN subnet, so reaching it
+	# needs no default route at all and answers the only question that
+	# matters: is there a live uplink behind this interface?
+	up_isp=$(uplink_nexthop "$1")
+	[ -n "$up_isp" ] || return 1
+
+	# Two chances, and ARP as a second opinion: ISP routers rate-limit
+	# ICMP, so a single lost echo is not evidence of a dead cable. With
+	# one probe the daemon flapped - claimed, released and re-claimed the
+	# address within a minute, which looked from the mesh like 60% packet
+	# loss on a link that was in fact running at 1152 Mbit/s (2026-08-05).
+	# The ARP fallback is silently useless on a modem (wwan0 is NOARP,
+	# POINTOPOINT) and that is fine - it is a second opinion, not the test.
+	ping -c 2 -W 2 -I "$up_dev" "$up_isp" >/dev/null 2>&1 && return 0
+	arping -c 2 -w 3 -I "$up_dev" "$up_isp" >/dev/null 2>&1 && return 0
+
+	# Third and last: a real host, bound to this device.
+	#
+	# A mobile bearer has no gateway to ask. What netifd calls the nexthop is a
+	# synthetic point-to-point peer, and on every network met so far it answers
+	# nothing at all - measured 2026-08-20: 2/2 lost to 10.2.210.180 while the
+	# bearer was carrying traffic perfectly well. ARP cannot help either, wwan0
+	# being NOARP. So the modem would have failed all three conditions above
+	# forever, and no amount of it working would have made it an uplink.
+	#
+	# This is safe to do here, and the reason is worth stating because the file
+	# warns against it above: the warning is about an UNBOUND probe. "-I <dev>"
+	# binds to the device, so the packet leaves through this uplink and nowhere
+	# else - proven on the same node in the same minute, where 1.1.1.1 answered
+	# over wwan0 in 21 ms while this node's default route pointed at the mesh.
+	# A node whose port is up but whose upstream is dead still fails, which is
+	# the whole point.
+	ping -c 2 -W 2 -I "$up_dev" "$PROBE" >/dev/null 2>&1 && return 0
+	return 1
+}
+
+# The best working uplink this node has, and what class it is. Everything
+# downstream - the route, the resolver, the mark - follows these.
+ACTIVE_IF=
+ACTIVE_DEV=
+ACTIVE_CLASS=
+ACTIVE_NEXTHOP=
+uplink_ok() {
+	ACTIVE_IF=; ACTIVE_DEV=; ACTIVE_CLASS=; ACTIVE_NEXTHOP=
+	set -- $(uplink_list)
+	while [ $# -ge 2 ]; do
+		if uplink_probe "$1"; then
+			ACTIVE_IF=$1
+			ACTIVE_CLASS=$2
+			ACTIVE_DEV=$up_dev
+			ACTIVE_NEXTHOP=$up_isp
+			# Kept in step for every caller that still speaks of "the WAN
+			# interface"; it now names whichever uplink actually won.
+			WAN_IF=$ACTIVE_DEV
+			return 0
+		fi
+		shift 2
+	done
+	return 1
+}
+
+# The presence beacon. Held by any node whose ACTIVE uplink is primary, asked
+# about by any node holding the VIP on a backup. Nothing routes to it.
+have_mark() { ip -4 addr show dev "$LAN" | grep -q "inet $PRIMARY_MARK/"; }
+
+hold_mark() {
+	have_mark && return 0
+	# Ask before taking it. In a mesh with no modem in it nobody ever probes
+	# this address - primary_elsewhere is only ever called by a backup - so a
+	# foreign device sitting on it would go unnoticed for months, and the day a
+	# modem finally arrived the arbitration would read that stranger as "a
+	# primary exists" and the backup would never take over. Another node with a
+	# cable answering here is normal and expected; anything else is worth one
+	# line in the log. The address stays overridable with PRIMARY_MARK=.
+	arping -D -c 2 -w 3 -I "$LAN" "$PRIMARY_MARK" >/tmp/.mgw-mark 2>/dev/null || {
+		hm_peer=$(sed -n 's/.*\[\([0-9A-Fa-f:]*\)\].*/\1/p' /tmp/.mgw-mark | head -1)
+		log_change "$PRIMARY_MARK is already answered by ${hm_peer:-unknown} - another node with a cable, or something that does not belong on this address"
+		# One holder is enough: the mark only answers "is there a cable
+		# somewhere?". Until 2026-09-25 this went on and took the address
+		# anyway, and with two cables plugged in (the BPI-R4 Pro 8X and another node)
+		# both held 172.16.20.253 - two boxes on one IP. Now the second one
+		# waits; it takes the mark on a later pass once the first lets go.
+		rm -f /tmp/.mgw-mark
+		return 1
+	}
+	rm -f /tmp/.mgw-mark
+	ip addr add "$PRIMARY_MARK/24" dev "$LAN" 2>/dev/null || return 1
+	log "holding $PRIMARY_MARK - a primary uplink lives here ($ACTIVE_IF)"
+}
+
+drop_mark() {
+	have_mark || return 0
+	ip addr del "$PRIMARY_MARK/24" dev "$LAN" 2>/dev/null
+	log "dropped $PRIMARY_MARK - no primary uplink here any more"
+}
+
+# Asked only by a node that does NOT hold the mark, so any answer is somebody
+# else's. `arping -D` sends with sender 0.0.0.0 and cannot poison a cache. The
+# one frame that can come back is our own, carried around the mesh; it names
+# our own MAC and is ignored.
+primary_elsewhere() {
+	answer=$(arping -D -c 2 -w 3 -I "$LAN" "$PRIMARY_MARK" 2>/dev/null) && return 1
+	peer=$(echo "$answer" | sed -n 's/.*\[\([0-9A-Fa-f:]*\)\].*/\1/p' | head -1 | tr 'A-F' 'a-f')
+	my=$(cat "/sys/class/net/$LAN/address" 2>/dev/null | tr 'A-F' 'a-f')
+	[ -n "$peer" ] && [ "$peer" = "$my" ] && return 1
+	return 0
+}
+
+# Tell the clock to try again, now that there is a way out.
+#
+# sysntpd starts 27 seconds into the boot. A mesh agent has no uplink then -
+# the backhaul is still being built - so busybox ntpd resolves its four pool
+# names against nothing, ends up with no peers and stays that way. Nothing
+# kicks it afterwards: there is no ntp handler in /etc/hotplug.d/iface.
+#
+# Measured on the agent 2026-08-18: the node had been up 2 h 20 min with a
+# working route, working DNS and ntpd running, and its clock was 15.7 hours
+# behind. A single `ntpd -q` by hand corrected it instantly, which is what
+# rules out the network and leaves only the daemon that gave up at boot.
+#
+# The cost is not cosmetic. Two nodes with unrelated clocks cannot have their
+# logs laid side by side, so a fault that crosses the mesh - an agent that
+# reboots at 03:50 and a controller that stops accepting clients some time
+# that night - cannot be put in order even when both logs survive.
+#
+# Uptime is the clock used here on purpose: the wall clock is the very thing
+# under suspicion, and a rate limit measured with it would be nonsense.
+# ⚠️ A single kick on the route change is not enough, and the reason is worth
+# keeping: what blocks ntpd is not how often it is asked but whether anything
+# answers when it asks. Restarting it in the middle of follow_vip - before
+# dns_reload - points it at the dnsmasq that still holds the servers from the
+# uplink that just died, so it fails exactly as it failed at 27 s. And the kick
+# is only reachable when the default route CHANGES: an agent that boots, settles
+# and then runs for a day never comes past it again, so the clock stays wrong.
+# The gateway is worse still - netifd installs its route at boot, so keep_route
+# never enters that branch until the first DHCP renewal.
+#
+# So: ask on every pass, rate-limited, and stop asking once it worked. Whether
+# it worked is answered by sysntpd itself through /etc/hotplug.d/ntp - the flag
+# is in /var/run, so a reboot with a wrong clock starts the cycle again.
+#
+# Uptime is the clock used for the rate limit on purpose: the wall clock is the
+# very thing under suspicion.
+NTP_KICK_MIN=${NTP_KICK_MIN:-600}
+NTP_SYNCED=${NTP_SYNCED:-/var/run/easymesh-clock-synced}
+ntp_kick_last=0
+kick_clock() {
+	[ -f "$NTP_SYNCED" ] && return 0
+	[ -x /etc/init.d/sysntpd ] || return 0
+	# No way out yet means nothing to resolve through, and a restart now only
+	# burns the next ten minutes of the rate limit.
+	ip route show default 2>/dev/null | grep -q . || return 0
+	now=$(cut -d. -f1 /proc/uptime 2>/dev/null) || return 0
+	[ "$ntp_kick_last" = 0 ] || [ $(( now - ntp_kick_last )) -ge "$NTP_KICK_MIN" ] || return 0
+	ntp_kick_last=$now
+	/etc/init.d/sysntpd restart >/dev/null 2>&1
+	log "clock still unset $(( now / 60 )) min into this boot - asked sysntpd to resolve its peers again"
+}
+
+# Keep the way out installed while we are the gateway. netifd tears the
+# WAN interface down and back up on every DHCP renewal - and an ISP that
+# hands out 600-second leases does that every five minutes - which drops
+# the default route each time. Re-installing it on every pass is cheap
+# (ip route replace is a no-op when it already matches) and it is what
+# keeps the gateway usable between renewals (measured 2026-08-05).
+#
+# It follows the ACTIVE uplink, which is not always the cable: when the cable
+# dies under a node that also carries a modem, the same node stays the gateway
+# and this is what swings its own way out over to the modem.
+keep_route() {
+	[ -n "$ACTIVE_NEXTHOP" ] || return 0
+	ip route show default | grep -q "via $ACTIVE_NEXTHOP" && return 0
+	ip route replace default via "$ACTIVE_NEXTHOP" dev "$ACTIVE_DEV" 2>/dev/null || return 0
+	log "way out now via $ACTIVE_NEXTHOP on $ACTIVE_IF ($ACTIVE_CLASS)"
+}
+
+# Holding the address is not proof of being alone with it.
+#
+# The probe in claim() runs once, at takeover, and a node that already holds
+# the VIP used to never ask again. On 2026-08-14 a joining agent claimed it on
+# its own isolated bridge, easymesh-role then moved that bridge onto the mesh,
+# and the address arrived next to the controller that already had it. Nothing
+# noticed. Routing kept working because ARP picked one of them - by chance,
+# and differently for each client.
+#
+# So the holder asks again, every DUP_EVERY passes. `arping -D` sends with
+# sender 0.0.0.0, so it cannot poison anyone's cache, and our own stack does
+# not hear our own broadcast - any reply comes from somebody else. The one
+# exception is a frame that finds its way back around the mesh; that answer
+# carries our own MAC and is ignored below.
+#
+# The tie-break is the lower MAC address, which is what VRRP falls back to.
+# It matters far more that the rule is deterministic than which way it points:
+# both nodes compute the same comparison from the same two addresses, so
+# exactly one of them stands down. A rule like "newest claimer wins" would let
+# them hand the address back and forth forever.
+#
+# This is NOT priority. Priority - "the cable outranks the LTE modem" - cannot
+# be decided here, because ARP carries no way to tell the other node what our
+# priority is. That needs a real election and is still open; without it, an
+# uplink meant as backup becomes the primary simply by booting first.
+dup_tick=0
+recheck_duplicate() {
+	dup_tick=$((dup_tick + 1))
+	[ "$dup_tick" -ge "$DUP_EVERY" ] || return 0
+	dup_tick=0
+
+	# Success means nobody answered, which is the ordinary case.
+	answer=$(arping -D -c 2 -w 3 -I "$LAN" "$VIP" 2>/dev/null) && return 0
+
+	peer=$(echo "$answer" | sed -n 's/.*\[\([0-9A-Fa-f:]*\)\].*/\1/p' | head -1 | tr 'A-F' 'a-f')
+	my=$(cat "/sys/class/net/$LAN/address" 2>/dev/null | tr 'A-F' 'a-f')
+	# Without both names there is nothing to compare, and standing down on a
+	# guess would cost the mesh its gateway for no reason.
+	[ -n "$peer" ] && [ -n "$my" ] || return 0
+	[ "$peer" = "$my" ] && return 0
+
+	# `sort` rather than `[ a \< b ]`: string comparison is an extension that
+	# not every shell on these boxes has, and a silent syntax error here would
+	# read as "no collision".
+	if [ "$(printf '%s\n%s\n' "$my" "$peer" | sort | head -1)" = "$my" ]; then
+		log "$VIP answered by $peer as well - keeping it, $my is lower; re-announcing"
+		arping -c 3 -A -I "$LAN" "$VIP" >/dev/null 2>&1
+		return 0
+	fi
+
+	log "$VIP answered by $peer as well - standing down, $my is higher"
+	release
+	follow_vip
+	return 1
+}
+
+# Class beats seniority. This closes the hole this file has been describing
+# since 2026-08-14: "an uplink meant as backup becomes the primary simply by
+# booting first". A node holding the VIP on a backup gives it up as soon as a
+# node with a real cable answers for the mark. Nothing has to learn who that
+# node is - the question is a boolean, and ARP can answer a boolean.
+#
+# On its own cadence rather than DUP_EVERY's: this is the delay a user feels
+# as "the cable is back and it is still on the modem", and it costs one arping.
+mark_tick=0
+backup_must_stand_down() {
+	[ "$ACTIVE_CLASS" = "backup" ] || return 1
+	mark_tick=$((mark_tick + 1))
+	[ "$mark_tick" -ge "$MARK_EVERY" ] || return 1
+	mark_tick=0
+	primary_elsewhere
+}
+
+claim() {
+	# The mark is maintained on every pass, not only at takeover. A node whose
+	# cable dies while its own modem takes over underneath keeps the VIP - and
+	# must stop claiming to be primary the same second, or no cabled node could
+	# ever take the gateway back from it.
+	if [ "$ACTIVE_CLASS" = "primary" ]; then hold_mark; else drop_mark; fi
+
+	# resolver_local on every pass, not only at takeover. When the cable dies
+	# under a node that also carries a modem, this node KEEPS the VIP and
+	# keep_route swings its way out over to the modem - but the resolver would
+	# still be pointing at the servers of the uplink that just died, which is
+	# the failure that reads as "route works, nothing loads". resolver_write
+	# compares before writing, so the steady state costs one read.
+	if have_vip; then
+		if backup_must_stand_down; then
+			log "holding $VIP on a backup uplink and a primary answered $PRIMARY_MARK - standing down"
+			release
+			follow_vip
+			return 0
+		fi
+		keep_route
+		resolver_local
+		uplink_changed
+		recheck_duplicate
+		return 0
+	fi
+
+	# Two cables plugged in at once: whoever holds the address keeps it, and
+	# everyone else stands by. First claimer wins; there is no priority and
+	# no preemption. Without the probe below both nodes would answer for the
+	# VIP and the ARP cache would decide at random.
+	#
+	# An earlier version of this comment promised a tie-break on the lower LAN
+	# address, "the same job VRRP does with priorities". There is no such
+	# comparison in the code - $my is read for the log line and nothing else -
+	# and the claim was believed for a while on 2026-08-14 before anyone
+	# looked. Two things followed:
+	#
+	#   - the check ran once, at claim time, so a node that changed L2 while
+	#     holding the VIP never asked again. CLOSED 2026-08-17: the holder now
+	#     re-probes every DUP_EVERY passes and the lower MAC keeps the address
+	#     - see recheck_duplicate() above.
+	#
+	#   - without priority, an uplink meant as failover becomes the primary
+	#     simply by booting first. STILL OPEN, and it is what stands between us
+	#     and using an LTE modem as the mesh's backup route: ARP has nowhere to
+	#     carry a priority, so choosing by anything but "who got here first"
+	#     needs an election the nodes do not have yet.
+	answer=$(arping -D -c 2 -w 3 -I "$LAN" "$VIP" 2>/dev/null)
+	if [ $? -eq 0 ]; then
+		: # nobody answered, the address is free
+	else
+		my=$(ip -4 -br addr show dev "$LAN" | awk '{print $3}' | cut -d/ -f1)
+		# Whoever replied is named in the reply itself. The neighbour table
+		# is not filled in by this probe, so asking it only ever produced an
+		# empty name in a message whose whole point is to say who won.
+		peer=$(echo "$answer" | sed -n 's/.*\[\([0-9A-Fa-f:]*\)\].*/\1/p' | head -1)
+		log_change "VIP already held (by ${peer:-unknown}); standing by on a ${ACTIVE_CLASS:-no} uplink ($my)"
+		return 1
+	fi
+
+	# The address is free - but "free" is not the same as "nobody better is
+	# coming". A node whose only uplink is a backup must not take the gateway
+	# while a cable answers for the mark: that node is a few passes behind,
+	# not absent. Without this the backup grabs the VIP at every boot and only
+	# hands it back a DUP_EVERY later, so every restart of the mesh would cost
+	# half a minute of everybody's traffic going out over a metered link.
+	if [ "$ACTIVE_CLASS" = "backup" ] && primary_elsewhere; then
+		log_change "standing by: only a backup uplink here, and a primary holds $PRIMARY_MARK"
+		return 1
+	fi
+
+	ip addr add "$VIP/24" dev "$LAN" 2>/dev/null || return 1
+	# Tell everyone the address moved; this is what makes it seamless.
+	#
+	# Three frames in one burst is enough on a wire and not enough over the
+	# air. A phone that was dozing through the handover keeps the old MAC for
+	# the VIP and goes on sending to a node that no longer answers for it -
+	# measured 2026-08-20 on the first failback, where the only flows the
+	# phone had left were DNS queries to the VIP carrying zero packets, while
+	# dnsmasq was listening and answering everybody else. To the user that is
+	# not "the gateway moved", it is "the internet is gone", and it lasts
+	# until the client happens to ask again.
+	#
+	# So announce in the background over the next half minute as well. It is
+	# a handful of broadcast frames on an event that happens when a cable is
+	# pulled, and it costs nothing to be believed by a sleeping client.
+	arping -c 3 -A -I "$LAN" "$VIP" >/dev/null 2>&1
+	setsid /bin/sh -c '
+		for gap in 2 3 5 10 15; do
+			sleep $gap
+			arping -c 2 -A -I "'"$LAN"'" "'"$VIP"'" >/dev/null 2>&1
+		done
+	' >/dev/null 2>&1 &
+
+	# Stop routing out through the mesh - we ARE the way out now. The
+	# static default over br-lan is what every node uses to reach the
+	# gateway; on the gateway itself it would compete with the route the
+	# ISP's DHCP just installed, and which of the two wins is a coin toss.
+	ip route del default via "$VIP" dev "$LAN" 2>/dev/null
+	ip route del default via "$GW_FALLBACK" dev "$LAN" 2>/dev/null
+
+	# ...and install the way out ourselves. netifd will not always do it:
+	# with a static lan gateway already in the table the DHCP route can be
+	# skipped, and the node then holds the VIP with no route at all - the
+	# whole mesh points at a gateway that cannot forward (2026-08-05).
+	[ -n "$ACTIVE_NEXTHOP" ] && \
+		ip route replace default via "$ACTIVE_NEXTHOP" dev "$ACTIVE_DEV" 2>/dev/null
+
+	resolver_local
+	log "claimed $VIP (out through $ACTIVE_IF/$ACTIVE_DEV via $ACTIVE_NEXTHOP, $ACTIVE_CLASS)"
+	flush_flows
+}
+
+# A moved gateway leaves every client holding a flow built for the old way out.
+#
+# On this hardware those flows are offloaded: the packets leave through the PPE
+# on a binding made for the path that is gone, bypass the nftables NAT hook
+# entirely and go out with a private source that nothing on the internet
+# answers. The client is not slow, it has no internet at all, and it stays that
+# way until the entries expire. Measured 2026-08-20 on the first failback: 117
+# connections in SYN_SENT, 195 of 198 UNREPLIED, conntrack showing packets=0
+# because software never saw them - and a phone still reporting 82 ms of LTE
+# latency nine minutes after the cable was back.
+#
+# MTK's own fix for this shape (mtk_ppe roaming handler, feed 4e825214) does
+# NOT cover it: that one hooks ROAMING, and here the client never moved - the
+# way out moved underneath it. So the teardown has to happen where the decision
+# is made, which is here.
+#
+# Without conntrack-tools this is one line in the log and nothing else. The
+# flows still age out on their own, exactly as they do today; the package only
+# buys the seconds back.
+flush_flows() {
+	command -v conntrack >/dev/null 2>&1 || {
+		log_change "the way out changed and conntrack-tools is not installed - clients keep the flows built for the old one until those expire"
+		return 0
+	}
+	conntrack -D -s "$MESH_NET" >/dev/null 2>&1
+	log "tore down the flows of $MESH_NET - the way out changed under them"
+}
+
+# The way out changed under a node that kept the address.
+#
+# Measured 2026-08-20 with the cable and the modem in the SAME box - the case
+# this whole design is proudest of, because the VIP never moves and no client
+# should notice. It works, and that is exactly why the flush never fired:
+# release() is not called, claim() is not reached, and netifd had already
+# installed the modem's route with its metric, so keep_route found nothing to
+# change and said nothing. The gateway swapped its uplink in silence and every
+# client kept a flow pinned to a cable that had been unplugged.
+#
+# So hang it on the event that actually happened - the active uplink is not
+# the one it was - rather than on any of the commands that usually accompany
+# it. On the first pass ACTIVE_IF goes from empty to a name, which is a start,
+# not a change, and is not worth a flush.
+last_uplink=
+uplink_changed() {
+	[ "$ACTIVE_IF" = "$last_uplink" ] && return 0
+	if [ -n "$last_uplink" ]; then
+		log "way out swapped from $last_uplink to $ACTIVE_IF ($ACTIVE_CLASS) without moving $VIP"
+		flush_flows
+	fi
+	last_uplink=$ACTIVE_IF
+}
+
+release() {
+	drop_mark
+	have_vip || return 0
+	ip addr del "$VIP/24" dev "$LAN" 2>/dev/null
+	log "released $VIP (no uplink)"
+	flush_flows
+}
+
+# Names have to follow the uplink the same way the route does. dnsmasq
+# forwards to whatever the resolv file lists, and that file is filled from the
+# WAN lease - so a node whose cable is gone keeps a resolver pointing nowhere
+# while routing perfectly through the new gateway. Measured 2026-08-12: the
+# VIP moved in 7 s, every ping worked, and nothing resolved. Clients read that
+# as the internet being down.
+#
+# The file belongs to netifd, which rewrites it whenever an interface changes,
+# so the line is re-added on the next pass rather than defended - the daemon
+# wakes every few seconds anyway, and self-healing beats locking.
+RESOLV=${RESOLV:-/tmp/resolv.conf.d/resolv.conf.auto}
+RESOLV_MARK="# mesh-gwd: names follow the uplink"
+
+# SIGHUP is not enough. dnsmasq runs inside a ujail and netifd replaces the
+# resolv file rather than rewriting it, so the jailed process keeps the file it
+# was started with; on HUP it re-reads that one and ends up with no usable
+# server at all. Measured 2026-08-12 on an agent that had just lost its uplink:
+# the file held the VIP, an explicit query to the VIP answered, and the box's
+# own lookups came back REFUSED - dnsmasq had not logged a "using nameserver"
+# line since before the failover. A restart fixed it in one go.
+#
+# A few seconds without dnsmasq costs nothing here: leases are already handed
+# out and this only runs when the gateway actually changes hands.
+dns_reload() {
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+# One author, one file.
+#
+# This used to APPEND a line to a file netifd owns, and defend nothing. That
+# works exactly until netifd rewrites the file, which it does on every
+# interface change - and then the node has a resolver pointing at an uplink
+# that is gone, or at nothing at all. Measured 2026-08-20, on two nodes on the
+# same image and the same SD card:
+#
+#   .2  resolv.conf.auto EMPTY since boot; dnsmasq answered REFUSED for nine
+#       hours and the clock sat 25 days behind, because ntpd could not resolve
+#       its own pool. It had never once been written.
+#   .3  had the line only by accident: it appeared at 23:56:51, the exact
+#       second the modem's lease dropped and netifd tore the LTE default route
+#       out, leaving the one gap in which the old guard below did not fire.
+#       Restarting the modem took it away again.
+#
+# So mesh-gwd writes the whole file from the role it is in, every pass, and
+# compares before writing so the common case costs one read. Self-healing
+# beats locking, and a single author beats both.
+resolver_write() {
+	rw_want="$RESOLV_MARK
+$1"
+	rw_have=$(cat "$RESOLV" 2>/dev/null)
+	[ "$rw_have" = "$rw_want" ] && return 0
+	mkdir -p "${RESOLV%/*}" 2>/dev/null
+	printf '%s\n' "$rw_want" > "$RESOLV" 2>/dev/null || return 0
+	# Same servers, only our mark missing: netifd rewrote the file on a lease
+	# renewal. Measured 2026-09-24 on the controller: the WAN lease renews
+	# every 5 min, netifd puts back the very same two servers without the
+	# mark, and every pass restarted dnsmasq - 99 times in 8 h, each one
+	# reloading a 332 000 entry blocklist. dnsmasq re-reads the file by itself
+	# when it changes (it logged "reading ... resolv.conf.auto" each time) and
+	# the servers are the ones it already uses, so there is nothing to restart.
+	[ "$(echo "$rw_have" | grep '^nameserver')" = "$1" ] && return 0
+	dns_reload
+	log "resolver rewritten: $(echo "$1" | tr '\n' ' ')"
+}
+
+resolver_via_vip() {
+	resolver_write "nameserver $VIP"
+}
+
+# The gateway must not ask itself: pointing dnsmasq at an address it holds is
+# a forwarding loop, not a resolver.
+# The gateway forwards to whatever its ACTIVE uplink handed it - which on a
+# failover is the modem's servers, not the cable's. Pointing dnsmasq at an
+# address this node holds would be a forwarding loop, not a resolver, so the
+# VIP never appears here.
+resolver_local() {
+	rl_srv=$(uplink_dns "$ACTIVE_IF")
+	# A bearer that handed over no servers still gives us its own gateway, and
+	# on every mobile network met so far that address answers DNS. It is a
+	# fallback, not a preference.
+	[ -n "$rl_srv" ] || rl_srv=$ACTIVE_NEXTHOP
+	rl_want=""
+	for s in $rl_srv; do
+		rl_want="${rl_want:+$rl_want
+}nameserver $s"
+	done
+	[ -n "$rl_want" ] || return 0
+	resolver_write "$rl_want"
+}
+
+# Every node that is not the gateway reaches the internet through the VIP.
+# Kept as a separate step from release() because a node that never had the
+# cable needs it too - it is simply the normal state of a mesh node.
+follow_vip() {
+	have_vip && return 0
+	# Only if our own PRIMARY uplink is the way out; then leave the ISP route
+	# alone (this is the gateway node between two probes, or a standby with a
+	# cable of its own - its own upstreams resolve better than a detour across
+	# the mesh). A node standing on a BACKUP does come through here on purpose:
+	# a metered link must not carry this node's traffic while somebody else has
+	# a cable.
+	#
+	# The old guard read `grep -q "dev $WAN_IF\|dev br-wan"` and WAN_IF is
+	# filled from ubus, so it is EMPTY on a node whose wan interface never came
+	# up. The pattern then collapsed to "dev \|dev br-wan", and the bare "dev "
+	# matches ANY default route - including the mesh one this function is trying
+	# to install. So it returned early on exactly the cable-less agents that
+	# need the resolver and the VIP route most, and did so forever. That is the
+	# whole of the .2 outage above: nine hours, no DNS, clock 25 days behind.
+	# Measured 2026-08-20 on .2 and .3: both reported l3_device = "".
+	[ "$ACTIVE_CLASS" = "primary" ] && [ -n "$ACTIVE_DEV" ] && \
+		ip route show default | grep -q "dev $ACTIVE_DEV" && return 0
+	# Checked on every pass, not only when the route is installed: netifd
+	# rewrites the resolv file behind us and the line has to come back.
+	resolver_via_vip
+	ip route show default | grep -q "via $VIP" && return 0
+	ip route replace default via "$VIP" dev "$LAN" 2>/dev/null || return 0
+	log "routing out through $VIP"
+	# Reload here too, not only when resolver_via_vip edits the file. On the
+	# failover that exposed this, netifd had already written the VIP into the
+	# resolv file from the interface config, so resolver_via_vip found the line
+	# in place and returned without touching dnsmasq - which still held the
+	# servers from the uplink that had just died. The change of role is the
+	# reliable trigger; whether the file needed editing is not.
+	dns_reload
+	# After dns_reload, never before it: ntpd resolves the moment it is
+	# restarted, and until dnsmasq has been told about the new upstreams it
+	# would resolve against the servers of the uplink that just died.
+	kick_clock
+}
+
+# Hand the address back on the way out. Without this a stopped daemon would
+# leave the VIP behind on a node that no longer watches it, and the next
+# node to take over would find the address "already held" - by a ghost.
+# Keep the spare wheel inflated.
+#
+# A standby uplink carries nothing, and an idle bearer is what an operator
+# reaps: measured 2026-08-20, the modem held its lease from 21:57, lost it at
+# 23:56 and udhcpc then broadcast discover for five hours without ever getting
+# it back. DHCP cannot recover a dropped bearer - the context has to be raised
+# again, and `ifup` did it in 30 s. A backup that dies two hours after it was
+# last used is worse than no backup, because nobody finds out until the day the
+# cable fails.
+#
+# Only ever the standby: the active uplink is carrying traffic and proves
+# itself on every pass, so poking it would risk the very thing it is doing.
+# The probe is uplink_probe, which is bound to the interface with -I. This is
+# where the lite-watchdog we already ship would have lied to us - its ping has
+# no -I at all, so on a node whose default route is the mesh it reports a dead
+# modem as healthy. Its good idea, the AT reset, is kept as the last rung.
+keepalive_tick=0
+keepalive_fails=0
+keepalive_ifups=0
+keepalive() {
+	keepalive_tick=$((keepalive_tick + 1))
+	[ "$keepalive_tick" -ge "$KEEPALIVE_EVERY" ] || return 0
+	keepalive_tick=0
+
+	set -- $(uplink_list)
+	while [ $# -ge 2 ]; do
+		ka_if=$1
+		ka_class=$2
+		shift 2
+		[ "$ka_class" = "backup" ] || continue
+		[ "$ka_if" = "$ACTIVE_IF" ] && continue
+
+		if uplink_probe "$ka_if"; then
+			[ "$keepalive_fails" = 0 ] || log "standby uplink $ka_if is back"
+			keepalive_fails=0
+			keepalive_ifups=0
+			continue
+		fi
+
+		keepalive_fails=$((keepalive_fails + 1))
+		[ "$keepalive_fails" -ge "$KEEPALIVE_FAILS" ] || continue
+		keepalive_fails=0
+
+		if [ "$keepalive_ifups" -lt "$KEEPALIVE_IFUPS" ]; then
+			keepalive_ifups=$((keepalive_ifups + 1))
+			log "standby uplink $ka_if is not answering - raising it again ($keepalive_ifups)"
+			ifup "$ka_if" >/dev/null 2>&1 &
+			continue
+		fi
+
+		# Last rung: the interface has been rebuilt twice and the bearer is
+		# still gone, so the modem itself is asked to start over. Opt-in,
+		# because it needs an AT port and the command is modem-specific -
+		# the settings are the ones lite-watchdog already has.
+		ka_port=$(uci -q get watchdog.@watchdog[0].set_port)
+		ka_cmd=$(uci -q get watchdog.@watchdog[0].restartcmd)
+		if [ -n "$ka_port" ] && [ -n "$ka_cmd" ] && command -v sms_tool >/dev/null 2>&1; then
+			keepalive_ifups=0
+			log "standby uplink $ka_if still dead after $KEEPALIVE_IFUPS rebuilds - resetting the modem on $ka_port"
+			sms_tool -d "$ka_port" at "$ka_cmd" >/dev/null 2>&1 &
+		else
+			log "standby uplink $ka_if still dead after $KEEPALIVE_IFUPS rebuilds - no AT reset configured"
+		fi
+	done
+}
+
+# A way out that is not masqueraded is not a way out.
+#
+# Measured 2026-08-20, on the first real failover: the VIP moved to the backup
+# node in 25 s and did exactly what it was designed to do - and not one packet
+# reached the internet, because "telit" was in no firewall zone at all. The
+# mesh had a gateway with a route and no NAT, which from a client looks exactly
+# like a mesh with no gateway. It cost 46 of the 71 seconds that outage lasted.
+#
+# The whole point of discovering uplinks rather than configuring them is that a
+# modem can be dropped into ANY box, so "remember to add it to the wan zone" is
+# not a step that may exist. Done once at startup, idempotent, and only ever
+# adding - a zone this daemon did not create is never taken apart.
+ensure_uplink_zone() {
+	euz_z=$(uci show firewall 2>/dev/null | \
+		sed -n "s/^firewall\.@zone\[\([0-9]*\)\]\.name='wan'$/\1/p" | head -1)
+	[ -n "$euz_z" ] || return 0
+	euz_changed=0
+	set -- $(uplink_list)
+	while [ $# -ge 2 ]; do
+		euz_if=$1
+		euz_class=$2
+		shift 2
+		[ "$euz_class" = "backup" ] || continue
+		# Only a uplink this box actually has configured. A leftover section
+		# with no hardware behind it (one was found on .2 the same day) is
+		# harmless everywhere else and should stay harmless here too.
+		uci -q get network."$euz_if" >/dev/null 2>&1 || continue
+		uci -q get firewall.@zone["$euz_z"].network 2>/dev/null | grep -qw "$euz_if" && continue
+		uci add_list firewall.@zone["$euz_z"].network="$euz_if" 2>/dev/null || continue
+		euz_changed=1
+		log "put $euz_if into the wan firewall zone - a backup uplink is masqueraded like any other way out"
+	done
+	[ "$euz_changed" = "1" ] || return 0
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1 &
+}
+
+cleanup() { release; exit 0; }
+trap cleanup INT TERM
+
+fails=0
+HELD_DEV=
+log "started: VIP=$VIP lan=$LAN mark=$PRIMARY_MARK uplinks=[$(uplink_list | tr '\n' ' ')]"
+ensure_uplink_zone
+
+while :; do
+	if uplink_ok && in_mesh; then
+		fails=0
+		HELD_DEV=$ACTIVE_DEV
+		# claim() answers "no" when somebody else already holds the address.
+		# A node standing by still needs a way out and a resolver, and this is
+		# where a working BACKUP differs from a working cable: the cable node
+		# keeps its own upstreams (follow_vip returns early for class primary),
+		# while a node whose only uplink is metered must route and resolve
+		# through the mesh until the day it is actually needed.
+		#
+		# Without this the standby kept whatever netifd last wrote - measured
+		# 2026-08-20 on .3, which stood by correctly and resolved through the
+		# modem's own servers the whole time.
+		claim || follow_vip
+	elif have_vip && ! in_mesh; then
+		# Cut off from the mesh: give the address up at once, without
+		# the usual grace period. Every second we hold it is a second
+		# the whole network has no gateway at all.
+		log "cut off from the mesh - releasing $VIP"
+		release
+	else
+		# A pulled cable is not a DHCP renewal. FAILS_TO_DROP exists because
+		# a renewal takes the WAN interface down and up for a few seconds and
+		# looks like a dead uplink - but it never takes the LINK down. When
+		# the device that carried our way out has no carrier at all, there is
+		# nothing to wait for. Measured 2026-09-25: the controller answered
+		# "Destination Net Unreachable" 1 s after the cable left, and the mesh
+		# still waited 22 s more before the gateway moved.
+		if have_vip && [ -n "$HELD_DEV" ] && [ -e "/sys/class/net/$HELD_DEV" ] &&
+		   ! ip -br link show "$HELD_DEV" 2>/dev/null | grep -q LOWER_UP; then
+			[ "$fails" -lt "$FAILS_TO_DROP" ] &&
+				log "no carrier on $HELD_DEV - releasing $VIP now instead of after $FAILS_TO_DROP passes"
+			fails=$FAILS_TO_DROP
+		fi
+		fails=$((fails + 1))
+		if [ "$fails" -ge "$FAILS_TO_DROP" ]; then
+			release
+			follow_vip
+		fi
+	fi
+	# Asked here as well as in follow_vip, because most nodes reach a steady
+	# state and never change route again - and a node whose clock never got
+	# set is exactly the node that has been steady all along. kick_clock is
+	# rate-limited and returns at once once the clock is set.
+	kick_clock
+	keepalive
+	sleep "$PERIOD"
+done

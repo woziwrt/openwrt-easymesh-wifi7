@@ -1,0 +1,84 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 99991: steer from the BSS the caller named, not the one we remember
+
+The steer method accepts src_bssid, documents it, and then builds the Client
+Steering Request from s->bssid instead - the location this controller has on
+record for that client. When that record is stale the request names a BSS the
+target agent does not serve, and the agent rejects it.
+
+Measured on hardware 2026-08-03. Client on x8, steered towards 4g:
+
+	ubus call map.controller steer '{... "src_bssid":"00:0c:43:26:60:10" ...}'
+	-> {"status":"ok"}
+
+	agent x8: agent_process_steer_request_tlv:
+	          Error BSSID 7e:04:1c:81:7c:2e not present
+
+7e:04:1c:81:7c:2e is 4g, where the client had been earlier. The controller held
+two contradictory records of the same client at that moment:
+
+	sta      7a:6f:6d:db:82:92 -> 7e:04:1c:81:7c:2e   (4g, stale)
+	sta_mld  7a:6f:6d:db:82:92 -> 00:0c:43:26:60:10   (x8, correct, 33 s old)
+
+so the newer MLD-aware table was right while the legacy one lied, and steering
+read the legacy one. The caller had passed the correct source and it was
+discarded on the way.
+
+An explicit source is an instruction, not a hint: if the caller names the BSS
+the client is on, that is what goes on the wire. Absent one, s->bssid remains
+the fallback, unchanged.
+
+Not fixed here, and the larger half of this: when the controller steers on its
+own initiative there is no caller to ask, and it will still use s->bssid. The
+real repair is for that record to stop going stale - or for this path to prefer
+whichever record carries the fresher timestamp. This patch only stops the
+controller from overriding an answer it was given.
+--- a/src/cntlr_commands_impl.c
++++ b/src/cntlr_commands_impl.c
+@@ -1619,13 +1619,36 @@
+ 	if (!hwaddr_is_zero(target_bssid)) {
+ 		if (!hwaddr_is_zero(sta)) {
+ 			struct sta *s = cntlr_find_sta(c->sta_table, sta);
++			uint8_t explicit_bssid[6] = {0};
++			uint8_t *from_bss;
+ 
+ 			if (!s)
+ 				return -EINVAL;
+ 
++			/* Where the client is *now*. s->bssid is the record
++			 * held by this controller and can be stale: measured
++			 * 2026-08-03 with the client on x8 while sta.bssid
++			 * still named 4g, which made the agent reject the
++			 * request with "BSSID ... not present" - it was asked
++			 * to steer a client off a BSS it does not serve.
++			 * src_bssid is accepted by this method and was then
++			 * thrown away; an explicit source is an instruction,
++			 * not a hint, so it wins. */
++			from_bss = s->bssid;
++			if (tb[STEER_ATTR_FROM_BSSID]) {
++				char from_bssidstr[18] = {0};
++
++				strncpy(from_bssidstr,
++					blobmsg_data(tb[STEER_ATTR_FROM_BSSID]),
++					sizeof(from_bssidstr) - 1);
++				if (hwaddr_aton(from_bssidstr, explicit_bssid) &&
++				    !hwaddr_is_zero(explicit_bssid))
++					from_bss = explicit_bssid;
++			}
++
+ 			/* prepare Client Steer Request */
+ 			cmdu = cntlr_gen_client_steer_request(c, agent,
+-							      s->bssid,
++							      from_bss,
+ 							      steer_op_window,
+ 							      1, (uint8_t (*)[6])sta,
+ 							      1, (uint8_t (*)[6])target_bssid,
+@@ -1640,7 +1663,7 @@
+ 			}
+ 
+ 			// TODO: unify steer handling
+-			cntlr_update_sta_steer_counters(c, s->macaddr, s->bssid,
++			cntlr_update_sta_steer_counters(c, s->macaddr, from_bss,
+ 							target_bssid, STEER_MODE_BTM_REQ,
+ 							STEER_REASON_UNDEFINED,
+ 							255);

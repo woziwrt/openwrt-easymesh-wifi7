@@ -1,0 +1,40 @@
+{
+	"luci-app-easymesh": {
+		"description": "Read the EasyMesh mesh API",
+		"read": {
+			"ubus": {
+				"easymesh": [
+					"*"
+				]
+			}
+		}
+	},
+	"luci-app-easymesh-setup": {
+		"description": "Set this node up as a mesh controller or agent, and change what the network is called",
+		"write": {
+			"ubus": {
+				"easymesh": [
+					"setup_controller",
+					"setup_agent",
+					"wps_open",
+					"wps_join",
+					"wps_status",
+					"suggest_address",
+					"forget_node",
+					"rename",
+					"set_credentials"
+				]
+			}
+		}
+	},
+	"unauthenticated": {
+		"description": "Watch the join progress without a login - the session died with the reboot the wizard itself asked for",
+		"read": {
+			"ubus": {
+				"easymesh": [
+					"setup_state"
+				]
+			}
+		}
+	}
+}

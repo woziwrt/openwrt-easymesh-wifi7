@@ -1,0 +1,175 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] libwifi: a 4-address STA-MLD gets its identity, not an all-zero station
+
+"stations" on a backhaul AP-MLD reported one all-zero station -
+macaddr 00:00:00:00:00:00, link id 255 - for the 4-address WDS child
+carrying the whole mesh, while hostapd listed the client and the
+kernel answered station get on both the MLD master and the AP/VLAN
+(review 2026-08-04 finding 1.10; instrumented on hardware 2026-08-06).
+
+The call lands in iface_get_mlsta_4addr_info(), the dedicated path
+taken when nl80211 refuses the station on the MLD netdev. That path
+reads the client per band and counts the links (two, correctly), but
+never fills the MLD addresses or the link id, and on mt76
+iface_get_sta_info_band() returns those fields as zero - so a
+successful read was published as an empty station.
+
+Everything it needs is already in hand: the caller asked about this
+MLD address, each iteration knows which link it just read, and the
+interface knows its own address. Fill only what the driver left empty,
+so a driver that does report per-link identity keeps it, and mark the
+station 4addr.
+
+Two adjacent defects found while tracing this and fixed here:
+- the per-link enrichment in iface_get_mlsta_info() promised in a
+  comment to "keep the nl80211 data" when the per-band hostapd read
+  fails, but the failed read had already overwritten the entry; the
+  identity is now saved (including the MLD addresses, which the save
+  set dropped even on the success path) and restored before bailing.
+- nlwifi_get_mlsta_info_cb() published a matched station with no
+  NL80211_ATTR_MLO_LINKS as a zeroed skeleton; it now reports it under
+  its real addresses with an invalid link id.
+
+Verify on hardware: ubus call wifi.apmld.<backhaul-mld> stations on a
+node with a child - real MAC and BSSID, real stats, link ids present.
+--- a/libwifi/modules/nl80211/nlwifi.c
++++ b/libwifi/modules/nl80211/nlwifi.c
+@@ -3530,6 +3530,40 @@
+ 		mlsta->num_link = num_link;
+ 	}
+ 
++	if (mlsta->num_link == 0) {
++		/* A 4-address (WDS) STA-MLD: the kernel station dump carries no
++		 * NL80211_ATTR_MLO_LINKS for it, so the identity loop above
++		 * never ran and the reply used to go out as a zeroed skeleton -
++		 * macaddr 00:00:00:00:00:00, link_id invalid - for a child that
++		 * was carrying the whole mesh (measured 2026-08-06 on a
++		 * backhaul AP-MLD, while hostapd listed the client with
++		 * max_simul_links=2). Report the station under its real
++		 * addresses; per-link decomposition stays honestly absent
++		 * until the kernel exposes links for 4addr stations. */
++		struct wifi_sta *sta = &mlsta->sta[0];
++
++		if (resp->ifmode == WIFI_MODE_AP) {
++			memcpy(sta->mld_macaddr, mac, 6);
++			memcpy(sta->macaddr, mac, 6);
++			if_gethwaddr(ifname, sta->mld_bssid);
++			if_gethwaddr(ifname, sta->bssid);
++		} else if (resp->ifmode == WIFI_MODE_STA) {
++			memcpy(sta->mld_bssid, mac, 6);
++			memcpy(sta->bssid, mac, 6);
++			if_gethwaddr(ifname, sta->mld_macaddr);
++			if_gethwaddr(ifname, sta->macaddr);
++			memcpy(mlsta->bssid, mac, 6);
++		}
++		/* An invalid link id, NOT zero: the caller's enrichment loop
++		 * matches entries against real AP link ids, and link 0 exists -
++		 * a zero here gets false-matched, the 4addr client then fails
++		 * the per-band hostapd read, and the loop breaks after the
++		 * failed read has already wiped the identity this block just
++		 * filled (measured: real addresses in, zeros out). */
++		sta->mlo_link_id = WIFI_MLO_INVALID_LINK_ID;
++		mlsta->num_link = 1;
++	}
++
+ 	if (s[NL80211_STA_INFO_INACTIVE_TIME])
+ 		mlsta->sta[0].idle_time = nla_get_u32(s[NL80211_STA_INFO_INACTIVE_TIME]) / 1000;
+ 
+--- a/libwifi/modules/default/wifi.c
++++ b/libwifi/modules/default/wifi.c
+@@ -1898,6 +1898,9 @@
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
++	if (hwaddr_is_zero(mlsta->bssid))
++		if_gethwaddr(ifname, mlsta->bssid);
++
+ 	mlsta->num_link = 0;
+ 	for (i = 0; i < num_aplinks; i++) {
+ 		struct wifi_sta *sta;
+@@ -1912,6 +1915,34 @@
+ 
+ 		memcpy(mlsta->macaddr, macaddr, 6);
+ 
++		/* Identity for a 4-address (WDS) STA-MLD.
++		 *
++		 * This path runs because nl80211 refused the station on the MLD
++		 * netdev, so nothing here has filled the MLD addresses or the
++		 * link id, and iface_get_sta_info_band() reads them back as zero
++		 * on mt76. The reply therefore went out as an all-zero station
++		 * with link id 255 for a child that was carrying the whole mesh
++		 * (measured 2026-08-06 on a backhaul AP-MLD, while hostapd
++		 * listed the client and the kernel answered station get on both
++		 * the master and the AP/VLAN).
++		 *
++		 * Everything needed is already in hand: the caller asked about
++		 * this MLD address, this iteration knows which link it just
++		 * read, and the interface knows its own address. Fill only what
++		 * the driver left empty, so a driver that does report per-link
++		 * identity keeps it. */
++		if (hwaddr_is_zero(sta->macaddr))
++			memcpy(sta->macaddr, macaddr, 6);
++		if (hwaddr_is_zero(sta->mld_macaddr))
++			memcpy(sta->mld_macaddr, macaddr, 6);
++		if (hwaddr_is_zero(sta->bssid))
++			memcpy(sta->bssid, aplinks[i].macaddr, 6);
++		if (hwaddr_is_zero(sta->mld_bssid))
++			if_gethwaddr(ifname, sta->mld_bssid);
++		sta->mlo_link_id = aplinks[i].id;
++		sta->band = aplinks[i].band;
++		mlsta->is4addr = 1;
++
+ 		if (!hwaddr_is_zero(sta->mld_macaddr) &&
+ 		    memcmp(sta->mld_macaddr, sta->macaddr, 6))
+ 			mlsta->mlo_capable = 1;
+@@ -1947,6 +1978,8 @@
+ 				struct wifi_sta *sta;
+ 				uint8_t link_macaddr[6];
+ 				uint8_t link_bssid[6];
++				uint8_t link_mld_macaddr[6];
++				uint8_t link_mld_bssid[6];
+ 				uint8_t link_id;
+ 				int8_t link_rssi[WIFI_NUM_ANTENNA];
+ 				int8_t link_rssi_avg;
+@@ -1970,21 +2003,38 @@
+ 				memcpy(link_bssid, sta->bssid, 6);
+ 				memcpy(link_rssi, sta->rssi, sizeof(link_rssi));
+ 				link_rssi_avg = sta->rssi_avg;
++				memcpy(link_mld_macaddr, sta->mld_macaddr, 6);
++				memcpy(link_mld_bssid, sta->mld_bssid, 6);
+ 
+ 				ret = iface_get_sta_info_band(ifname, aplinks[j].band, macaddr, sta);
+ 				if (ret) {
+ 					/* Hostapd band enrichment can fail for a link the
+-					 * client is not readable on; keep the nl80211 data
+-					 * for this link instead of discarding the whole
+-					 * multi-link reply. */
++					 * client is not readable on - a 4-address WDS
++					 * child is the everyday case. The failed read has
++					 * ALREADY wrecked the entry by now, so "keep the
++					 * nl80211 data" must be an action, not a comment:
++					 * restore the saved identity before bailing.
++					 * (Measured 2026-08-06: without this, a backhaul
++					 * AP-MLD reported its child as an all-zero station
++					 * with link_id 255.) */
+ 					libwifi_dbg("[%s] %s: band %d enrich failed, keeping nl80211 link data\n",
+ 						ifname, __func__, aplinks[j].band);
++					sta->mlo_link_id = link_id;
++					memcpy(sta->macaddr, link_macaddr, 6);
++					memcpy(sta->bssid, link_bssid, 6);
++					memcpy(sta->rssi, link_rssi, sizeof(link_rssi));
++					sta->rssi_avg = link_rssi_avg;
++					memcpy(sta->mld_macaddr, link_mld_macaddr, 6);
++					memcpy(sta->mld_bssid, link_mld_bssid, 6);
++					sta->mlo_capable = true;
+ 					break;
+ 				}
+ 
+ 				sta->mlo_link_id = link_id;
+ 				memcpy(sta->macaddr, link_macaddr, 6);
+ 				memcpy(sta->bssid, link_bssid, 6);
++				memcpy(sta->mld_macaddr, link_mld_macaddr, 6);
++				memcpy(sta->mld_bssid, link_mld_bssid, 6);
+ 				/* Same reason as the identity above: the band enrichment
+ 				 * is handed the MLD netdev and answers with MLD-level
+ 				 * numbers, which on mt76 are zero. Keep what nl80211

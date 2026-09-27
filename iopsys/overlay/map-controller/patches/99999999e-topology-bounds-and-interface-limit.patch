@@ -1,0 +1,310 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] topology: bound every TLV walk, keep 32 interfaces, keep
+ the parent bBSS in the child
+
+A MediaTek R3 agent announces more than 16 interfaces in its Device
+Information TLV. The controller kept 16, then compared that 16 with the
+TLV count on every Topology Response, saw a change each time and logged
+"Currently max 16 interfaces supported!" every two seconds.
+
+Reading the same code for bounds turned up:
+- number_of_neighbors was set to the full neighbor count of a 1905
+  Neighbor Device TLV while only NEIGHBORS_MAX_NUM entries are stored,
+  so every later loop over it read past neighbors_al_macs[];
+- the neighbor count was computed in uint8_t (wraps) and without checking
+  that the TLV holds at least the local MAC (underflows);
+- the Device Information TLV was walked entry by entry without checking
+  the entries fit in the TLV;
+- the tree builder appended the parent bBSS to the parent's ifaces[]:
+  that made the parent's next Topology Response count as a change, which
+  rewrote ifaces[] under the child's parent_iface, and a parent with a
+  full ifaces[] gave its children no parent_iface at all.
+
+Validate the Device Information TLV against its length before use, keep
+up to 32 interfaces and compare against the count the TLV announced,
+warn once per device about a cut list, clamp the stored neighbor count,
+and keep the parent bBSS in the child (parent_iface_store).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/src/cntlr_map.c b/src/cntlr_map.c
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -503,12 +503,16 @@ int handle_topology_response(void *cntlr
+ 		set_bh_toplogy_response_timestamp(bh_topo_dev);
+ 
+ 		if (new_bh_topo_dev ||
+-			has_interface_info_changed(tlv_dev_info, bh_topo_dev)) {
++			has_interface_info_changed(tlv_dev_info,
++				tlv_length(tv[TOPOLOGY_RESPONSE_DEVICE_INFORMATION_TYPE_IDX][0]),
++				bh_topo_dev)) {
+ 
+ 			dbg("%s: New interface info for bh_topology_device\n", __func__);
+ 
+ 			/* Copy new info and invalidate the model. */
+-			copy_interface_info_from_tlv(&c->topology, tlv_dev_info, bh_topo_dev);
++			copy_interface_info_from_tlv(&c->topology, tlv_dev_info,
++				tlv_length(tv[TOPOLOGY_RESPONSE_DEVICE_INFORMATION_TYPE_IDX][0]),
++				bh_topo_dev);
+ 		}
+ 	}
+ 
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -106,7 +106,6 @@ void topology_build_tree_from_assoc(stru
+ 		progress = false;
+ 		list_for_each_entry(dev, &topology->dev_list, list) {
+ 			struct bh_topology_dev *pdev;
+-			struct local_iface *pif;
+ 			struct node *cn, *pn;
+ 
+ 			if (dev->bh.depth != UNKNOWN_TREE_LEVEL)
+@@ -128,14 +127,22 @@ void topology_build_tree_from_assoc(stru
+ 			dev->bh.wifi_hops_from_root =
+ 				pdev->bh.wifi_hops_from_root + 1;
+ 
+-			/* stub the parent bBSS as a local_iface so mapc_sync_topology
+-			 * emits parent_iface_mac == upstream_bssid */
+-			if (pdev->number_of_interfaces < IFACE_MAX_NUM) {
+-				pif = &pdev->ifaces[pdev->number_of_interfaces++];
+-				memcpy(pif->macaddr, cn->upstream_bssid, 6);
+-				pif->media_type = 0x0100;	/* Wi-Fi */
+-				dev->bh.parent_iface = pif;
+-			}
++			/* Hand mapc_sync_topology the parent bBSS as a local_iface,
++			 * so it emits parent_iface_mac == upstream_bssid.
++			 *
++			 * The copy lives in the child. It used to be appended to
++			 * the parent's ifaces[]: that raised the parent's interface
++			 * count above what its Device Information TLV says, so the
++			 * next Topology Response from the parent counted as a
++			 * change and rewrote ifaces[] under the child's pointer,
++			 * and a parent with a full ifaces[] gave its children no
++			 * parent_iface at all.
++			 */
++			memset(&dev->parent_iface_store, 0,
++			       sizeof(dev->parent_iface_store));
++			memcpy(dev->parent_iface_store.macaddr, cn->upstream_bssid, 6);
++			dev->parent_iface_store.media_type = 0x0100;	/* Wi-Fi */
++			dev->bh.parent_iface = &dev->parent_iface_store;
+ 			progress = true;
+ 		}
+ 	} while (progress);
+@@ -269,14 +276,72 @@ void topology_remove_all_devices(struct
+ 	topology->valid = false;
+ }
+ 
++/* The Device Information TLV is a list of variable length entries that
++ * nothing validates before it gets here (the CMDU checker only looks at
++ * its presence). Walk it once against the TLV length before anything
++ * reads an entry.
++ */
++static bool dev_info_tlv_is_sane(const struct tlv_device_info *tlv_dev_info,
++				 uint16_t tlv_len)
++{
++	const uint8_t *p = (const uint8_t *)tlv_dev_info->interface;
++	size_t remain;
++	int i;
++
++	if (tlv_len < sizeof(struct tlv_device_info))
++		return false;
++
++	remain = tlv_len - sizeof(struct tlv_device_info);
++	for (i = 0; i < tlv_dev_info->num_interface; ++i) {
++		const struct local_interface *interface =
++			(const struct local_interface *)p;
++		size_t entry;
++
++		if (remain < sizeof(struct local_interface))
++			return false;
++		entry = sizeof(struct local_interface) + interface->sizeof_mediainfo;
++		if (remain < entry)
++			return false;
++		remain -= entry;
++		p += entry;
++	}
++
++	return true;
++}
++
++/* Say once per device that its interface list was cut, instead of on
++ * every Topology Response (every 2 s): the device list is rebuilt from
++ * scratch, so the note cannot live in bh_topology_dev.
++ */
++static void warn_iface_truncated(const uint8_t *al_macaddr, uint8_t num)
++{
++	static uint8_t warned[8][6];
++	static unsigned int next;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(warned); i++) {
++		if (hwaddr_equal(warned[i], al_macaddr))
++			return;
++	}
++
++	memcpy(warned[next++ % ARRAY_SIZE(warned)], al_macaddr, 6);
++	warn("%s: " MACFMT " reports %u interfaces, keeping the first %d\n",
++	     __func__, MAC2STR(al_macaddr), num, IFACE_MAX_NUM);
++}
++
+ bool has_interface_info_changed(const struct tlv_device_info *tlv_dev_info,
++				uint16_t tlv_len,
+ 				const struct bh_topology_dev *bh_topo_dev)
+ {
+ 	const uint8_t *tlv_iface_p = (uint8_t *)tlv_dev_info->interface;
+ 	size_t tlv_iface_offset;
+ 	int i;
+ 
+-	if (bh_topo_dev->number_of_interfaces != tlv_dev_info->num_interface)
++	/* a malformed TLV changes nothing - keep what we have */
++	if (!dev_info_tlv_is_sane(tlv_dev_info, tlv_len))
++		return false;
++
++	if (bh_topo_dev->reported_interfaces != tlv_dev_info->num_interface)
+ 		return true;
+ 
+ 	tlv_iface_offset = 0;
+@@ -296,22 +361,31 @@ bool has_interface_info_changed(const st
+ 
+ void copy_interface_info_from_tlv(struct bh_topology_data *topology,
+ 				  const struct tlv_device_info *tlv_dev_info,
++				  uint16_t tlv_len,
+ 				  struct bh_topology_dev *bh_topo_dev)
+ {
+ 	const uint8_t *tlv_iface_p = (uint8_t *)tlv_dev_info->interface;
+ 	size_t tlv_iface_offset;
+ 	int i;
+ 
++	if (!dev_info_tlv_is_sane(tlv_dev_info, tlv_len)) {
++		warn("%s: malformed Device Information TLV from " MACFMT
++		     ", ignored\n", __func__, MAC2STR(bh_topo_dev->al_macaddr));
++		return;
++	}
++
+ 	topology->valid = false;
+ 
+ 	/* Clear device old iface data, including neighbors info */
+ 	memset(bh_topo_dev->ifaces, 0, sizeof(bh_topo_dev->ifaces));
+ 
+ 	bh_topo_dev->num_of_ifaces_with_neighbors = 0;
++	bh_topo_dev->reported_interfaces = tlv_dev_info->num_interface;
+ 	bh_topo_dev->number_of_interfaces = tlv_dev_info->num_interface;
+ 
+ 	if (tlv_dev_info->num_interface > IFACE_MAX_NUM) {
+-		warn("%s: Currently max %d interfaces supported!\n", __func__, IFACE_MAX_NUM);
++		warn_iface_truncated(bh_topo_dev->al_macaddr,
++				     tlv_dev_info->num_interface);
+ 		bh_topo_dev->number_of_interfaces = IFACE_MAX_NUM;
+ 	}
+ 
+@@ -329,13 +403,31 @@ void copy_interface_info_from_tlv(struct
+ 	}
+ }
+ 
++/* Number of neighbor entries a 1905 Neighbor Device TLV holds, and how many
++ * of them fit in local_iface. A TLV shorter than its local MAC holds none;
++ * the count is computed in size_t so a long TLV cannot wrap it.
++ */
++static size_t neighbor_tlv_entries(uint16_t tlv_length)
++{
++	if (tlv_length < sizeof(((struct tlv_1905neighbor *)0)->local_macaddr))
++		return 0;
++
++	return (tlv_length - sizeof(((struct tlv_1905neighbor *)0)->local_macaddr)) /
++		sizeof(struct i1905_neighbor);
++}
++
++static uint8_t neighbors_kept(size_t entries)
++{
++	return entries > NEIGHBORS_MAX_NUM ? NEIGHBORS_MAX_NUM : (uint8_t)entries;
++}
++
+ static bool are_neighbor_lists_the_same(const struct local_iface *iface,
+ 					const struct tlv_1905neighbor *tlv_1905neighbor,
+ 					uint16_t tlv_length)
+ {
++	/* compare what copy_neighbor_info_from_tlvs() would have kept */
+ 	const uint8_t tlv_neighbors_num =
+-		(tlv_length - sizeof(tlv_1905neighbor->local_macaddr)) /
+-		sizeof(struct i1905_neighbor);
++		neighbors_kept(neighbor_tlv_entries(tlv_length));
+ 	uint8_t i, j;
+ 
+ 	if (iface->number_of_neighbors != tlv_neighbors_num)
+@@ -419,9 +511,11 @@ void copy_neighbor_info_from_tlvs(struct
+ 
+ 	for (i = 0; i < tlv_number; ++i) {
+ 		const struct tlv_1905neighbor *neighbor_tlv = neighbor_tlvs[i];
+-		const uint8_t neighbors_num =
+-			(tlv_lengths[i] - sizeof(neighbor_tlv->local_macaddr)) /
+-			sizeof(struct i1905_neighbor);
++		const size_t entries = neighbor_tlv_entries(tlv_lengths[i]);
++		/* number_of_neighbors indexes neighbors_al_macs[] everywhere,
++		 * so it must never exceed what that array holds
++		 */
++		const uint8_t neighbors_num = neighbors_kept(entries);
+ 		struct local_iface *local_iface = NULL;
+ 		uint8_t j;
+ 
+@@ -449,7 +543,12 @@ void copy_neighbor_info_from_tlvs(struct
+ 
+ 			local_iface->number_of_neighbors = neighbors_num;
+ 
+-			for (k = 0; k < neighbors_num && k < NEIGHBORS_MAX_NUM; ++k) {
++			if (entries > NEIGHBORS_MAX_NUM)
++				dbg("%s: " MACFMT " lists %zu neighbors, keeping %d\n",
++				    __func__, MAC2STR(local_iface->macaddr),
++				    entries, NEIGHBORS_MAX_NUM);
++
++			for (k = 0; k < neighbors_num; ++k) {
+ 				dbg("%s:   neighbor[%u].aladdr: " MACFMT "\n",
+ 					__func__, k, MAC2STR(neighbor_tlv->nbr[k].aladdr));
+ 
+--- a/src/topology.h
++++ b/src/topology.h
+@@ -20,7 +20,11 @@ struct tlv_1905neighbor;
+ struct tlv_device_info;
+ struct controller;
+ 
+-#define IFACE_MAX_NUM 16
++/* A MediaTek R3 agent reports more than 16 interfaces in its Device
++ * Information TLV (seen 2026-09-17). Interfaces past this bound are not
++ * kept; see copy_interface_info_from_tlv().
++ */
++#define IFACE_MAX_NUM 32
+ #define NEIGHBORS_MAX_NUM 16
+ 
+ struct local_iface {
+@@ -53,6 +57,16 @@ struct bh_topology_dev {
+ 	uint8_t number_of_interfaces;
+ 	uint8_t num_of_ifaces_with_neighbors;
+ 	struct local_iface ifaces[IFACE_MAX_NUM];
++	/* number of interfaces the last Device Information TLV announced;
++	 * can exceed number_of_interfaces when the TLV had more than
++	 * IFACE_MAX_NUM of them
++	 */
++	uint8_t reported_interfaces;
++	/* the parent's bBSS as seen from this device - bh.parent_iface points
++	 * here rather than into the parent's ifaces[], which a Topology
++	 * Response from the parent rewrites
++	 */
++	struct local_iface parent_iface_store;
+ 	struct backhaul_info bh;
+ 	uint8_t prev_parent_aladdr[6];
+ 	uint8_t prev_iface_mac[6];
+@@ -101,6 +115,7 @@ void topology_remove_all_devices(struct
+  * the same way. Also only number of interfaces and their MAC addresses are compared.
+  */
+ bool has_interface_info_changed(const struct tlv_device_info *tlv_dev_info,
++				uint16_t tlv_len,
+ 				const struct bh_topology_dev *bh_topo_dev);
+ /**
+  * Copies interface details from tlv_device_info into bh_topology_dev.
+@@ -108,6 +123,7 @@ bool has_interface_info_changed(const st
+  */
+ void copy_interface_info_from_tlv(struct bh_topology_data *topology,
+ 				  const struct tlv_device_info *tlv_dev_info,
++				  uint16_t tlv_len,
+ 				  struct bh_topology_dev *bh_topo_dev);
+ 
+ /**

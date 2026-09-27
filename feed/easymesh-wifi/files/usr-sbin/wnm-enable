@@ -1,0 +1,87 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Make hostapd actually PROCESS the BTM responses our steering asks for.
+#
+# Measured on a BPI-R4 (4 GB), 2026-08-04, with `hostapd_cli log_level DEBUG`:
+#
+#   WNM: Send BSS Transition Management Request to 7a:6f:6d:db:82:92 ... dialog_token=11
+#   Ignore BSS Transition Management Response from 7a:6f:6d:db:82:92
+#         since BSS Transition Management is disabled
+#
+# The request goes out, the client answers, and hostapd throws the answer away.
+# That is the whole reason btm_success stays 0 while steering demonstrably
+# works: what was missing was the accounting, not the redirect.
+#
+# /lib/netifd/hostapd.sh does `set_default bss_transition 0`, so the option only
+# reaches the hostapd config when a wifi-iface carries `option bss_transition 1`.
+# map-agent knows to set it (config.c sets ieee80211k and bss_transition
+# together), but only on the branch that CREATES a wireless section - and an
+# AP-MLD link returns before that, because it deliberately gets no BSS section
+# of its own. So on an MLD node nobody ever writes it.
+#
+# Not folded into wifimgr-defaults: that is a first-boot service with an
+# `applied` sentinel that disables itself, so a later regeneration of
+# /etc/config/wireless would silently drop the option and the symptom would come
+# back looking like a brand new bug.
+#
+# Runs EARLY (S19, before netifd brings wifi up at S20) so the option is in the
+# config before hostapd is configured from it. That is deliberate: it means this
+# never has to call `wifi reload`, which on MT7996 is the single most disruptive
+# thing to do while the mesh is forming. If the wireless config does not exist
+# yet - the very first boot after a flash, where config_generate may still be
+# running - this simply exits; the file persists, so the next boot sets it
+# before wifi comes up. Correct from then on, with no reload, ever.
+
+# Boot only, enforced. base-files default_postinst runs "start" on every
+# init script a package ships, on upgrade exactly as on install, so an
+# apk upgrade would run this against a node that is carrying traffic.
+# Measured on a BPI-R4 (4 GB) node, 2026-08-09. See boot-window.sh.
+. /usr/share/easymesh/boot-window.sh
+
+# Nothing here belongs on a router nobody has made into a mesh node. See
+# is_mesh_node() in boot-window.sh for what this cost on 2026-08-17.
+is_mesh_node || exit 0
+
+in_boot_window || {
+	logger -t wnm-enable "started outside the boot window - skipping; this rewrites configuration a running node depends on"
+	exit 0
+}
+
+WAIT_MAX=10
+
+i=0
+while ! uci -q show wireless 2>/dev/null | grep -q '=wifi-iface'; do
+	i=$((i + 1))
+	[ "$i" -ge "$WAIT_MAX" ] && break
+	sleep 1
+done
+
+if ! uci -q show wireless 2>/dev/null | grep -q '=wifi-iface'; then
+	logger -t wnm-enable "no wifi-iface after ${WAIT_MAX}s; leaving it for the next boot"
+	exit 0
+fi
+
+# bss_transition  - hostapd processes BTM responses at all (the defect above)
+# ieee80211k      - neighbour reports, which is what a client uses to pick the
+#                   target it then reports back in that response
+changed=0
+
+for s in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+	[ "$(uci -q get "wireless.$s.mode")" = 'ap' ] || continue
+
+	for kv in bss_transition=1 ieee80211k=1; do
+		opt="${kv%%=*}"
+		val="${kv#*=}"
+		[ "$(uci -q get "wireless.$s.$opt")" = "$val" ] && continue
+		uci set "wireless.$s.$opt=$val"
+		changed=$((changed + 1))
+		logger -t wnm-enable "wireless.$s.$opt was unset, forcing $val"
+	done
+done
+
+[ "$changed" -eq 0 ] && exit 0
+
+uci commit wireless
+logger -t wnm-enable "set $changed option(s) before wifi came up"

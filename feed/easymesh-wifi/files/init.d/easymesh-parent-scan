@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# Which parents this node can hear. See /usr/sbin/easymesh-parent-scan.
+#
+# START=99: it scans from a bSTA that does not exist until the radios are up,
+# and it waits FIRST seconds itself before the first scan.
+
+START=99
+USE_PROCD=1
+
+if [ -r /usr/share/easymesh/boot-window.sh ]; then
+	. /usr/share/easymesh/boot-window.sh
+else
+	logger -t easymesh-parent-scan "cannot read /usr/share/easymesh/boot-window.sh - refusing to start"
+	is_mesh_node() { return 1; }
+fi
+
+start_service() {
+	# A router nobody has made into a mesh node has no backhaul to place.
+	is_mesh_node || return 0
+	# The controller is the root and has no bSTA. The daemon would exit 0 at
+	# once and procd would respawn it into a crash loop (2026-09-23 19:55,
+	# both this and its sibling on the controller).
+	[ -n "$(uci -q get wireless.sta_mld_1.ifname)" ] || return 0
+	procd_open_instance
+	procd_set_param command /usr/sbin/easymesh-parent-scan 600
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_close_instance
+}

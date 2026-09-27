@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# Runs after mld-link-check (S98). That one may spend up to ~105 s deciding a
+# link is missing and restarting wifi; re-reading the agent's report before it
+# is finished would only capture the deficit it is still repairing.
+
+START=99
+
+SETTLE=150
+
+start() {
+	( sleep "$SETTLE"; /usr/sbin/mld-report-check ) >/dev/null 2>&1 &
+}
+
+stop() {
+	return 0
+}

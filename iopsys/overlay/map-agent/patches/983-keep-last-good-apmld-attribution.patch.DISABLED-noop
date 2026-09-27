@@ -1,0 +1,134 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent: never replace a known AP-MLD attribution with nothing
+
+agent_init_interfaces() tears the AP-MLD's affiliated-AP attribution down
+unconditionally:
+
+	list_for_each_entry(ap, &re->aplist, list) {
+		ap->torndown = true;
+		ap->enabled = false;
+		if (ap->is_affiliated_ap)
+			mld_del_ap(a, ap);
+
+apmld_parse() then rebuilds it, but every link has to pass a band gate first,
+and the empty case re-arms the teardown:
+
+	if (mld->num_affiliated_ap == 0) {
+		agnt_info(LOG_MLO, "%s: no affiliated APs found in MLD, schedule reload\n", ...);
+		timer_set(&a->init_ifaces_scheduler, IFACE_TIMEOUT * 1000);
+	}
+
+Unconditional teardown, gated refill, and a failure path that schedules another
+teardown. Once the gate starts failing the set can only stay at zero, and the
+node keeps reporting an AP-MLD with no affiliated APs while it is demonstrably
+running three links - iw dev ap-mld-1 info shows ch1 + ch36 + ch37 and
+/var/run/hostapd/ holds ap-mld-1_link0..2 the whole time.
+
+Measured on bpi-4g, 2026-07-22, sampling what the agent reports right after a
+map-agent restart:
+
+	t=0    0      (before the restart)
+	t=15   3      populated
+	t=60   3
+	t=90   0      emptied by itself
+	t=150  0      and never comes back
+
+The controller stores what it is told, so mapc.db ends up with an apmld row
+carrying num_ap=0 and affiliated_ap / ttlm holding only the nodes whose
+attribution has not been re-run yet. Every affiliated_ap=6 / ttlm=48 reading so
+far was taken inside that ~60 s window after something restarted map-agent, not
+in steady state.
+
+Keep the last attribution that produced links, and fall back to it when a
+rebuild comes out empty. A later rebuild that produces anything at all replaces
+it wholesale, so genuine removals still land; the only transition that stops
+being representable is the one that is never legitimate - a running MLD
+reporting nothing. The kept_prev_ap flag keeps this to one log line per
+transition in each direction, because the path runs on every init pass while
+the gate stays shut.
+
+This is the discipline 961-radio-reconcile-sweep already applies to radios, and
+the one the bss table still needs.
+
+Not 971 (patches/unmerged/): that one restructures attribution into a periodic
+async refresh, and was abandoned because the blocking round-trip it existed for
+was solved a layer down in libwifi under ADR 0009. This is 12 lines in the
+existing synchronous path and touches no async machinery.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/mld.h
++++ b/src/mld.h
+@@ -45,6 +45,15 @@
+ #define MAX_AFFILIATED_AP_LINKS_NUM 14
+         uint8_t affiliated_ap[MAX_AFFILIATED_AP_LINKS_NUM][6];
+ 
++	/* PATCH 983: the last attribution that produced links, and whether we
++	 * are currently running on it. agent_init_interfaces() tears the
++	 * affiliated set down unconditionally while the refill below is gated
++	 * on band, so without a fallback a single failed gate empties the set
++	 * for the lifetime of the process. */
++	int num_last_good_ap;
++	uint8_t last_good_ap[MAX_AFFILIATED_AP_LINKS_NUM][6];
++	bool kept_prev_ap;
++
+ 	struct list_head list;
+ };
+ 
+--- a/src/mld.c
++++ b/src/mld.c
+@@ -463,7 +463,53 @@
+ 			break;
+ 		}
+ 
+-		if (mld->num_affiliated_ap == 0) {
++		/* PATCH 983: never replace a known set with nothing.
++		 *
++		 * The teardown above is unconditional, this refill is gated on band,
++		 * and the empty case re-arms the teardown by scheduling another init
++		 * pass. Once the gate starts failing the set can therefore only stay
++		 * at zero, and a node keeps reporting an AP-MLD with no affiliated
++		 * APs while it is demonstrably running three links. Measured on
++		 * bpi-4g 2026-07-22: populated for ~60 s after a map-agent restart,
++		 * then zero for good.
++		 *
++		 * Keep the last attribution that produced links instead. A later
++		 * attribution that produces anything at all replaces it wholesale, so
++		 * genuine removals still land; only the transition that is never
++		 * legitimate - a running MLD reporting nothing - stops existing.
++		 */
++		if (mld->num_affiliated_ap > 0) {
++			mld->num_last_good_ap = mld->num_affiliated_ap;
++			memcpy(mld->last_good_ap, mld->affiliated_ap,
++			       sizeof(mld->last_good_ap));
++			if (mld->kept_prev_ap) {
++				agnt_warn(LOG_MLO, "%s: %s: attribution recovered, %d affiliated APs\n",
++					  __func__, mld->ifname, mld->num_affiliated_ap);
++				mld->kept_prev_ap = false;
++			}
++		} else if (mld->num_last_good_ap > 0) {
++			int k;
++
++			memcpy(mld->affiliated_ap, mld->last_good_ap,
++			       sizeof(mld->affiliated_ap));
++			mld->num_affiliated_ap = mld->num_last_good_ap;
++			for (k = 0; k < mld->num_affiliated_ap; k++) {
++				struct netif_ap *prev;
++
++				prev = agent_get_ap(a, mld->affiliated_ap[k]);
++				if (prev)
++					prev->is_affiliated_ap = true;
++			}
++			/* Logged once per transition: this path runs on every init pass
++			 * while the gate stays shut, and a line per pass would bury the
++			 * ring buffer it is meant to be visible in. */
++			if (!mld->kept_prev_ap) {
++				agnt_warn(LOG_MLO, "%s: %s: attribution came out empty, keeping the previous %d affiliated APs\n",
++					  __func__, mld->ifname, mld->num_affiliated_ap);
++				mld->kept_prev_ap = true;
++			}
++			timer_set(&a->init_ifaces_scheduler, IFACE_TIMEOUT * 1000);
++		} else {
+ 			agnt_info(LOG_MLO, "%s: no affiliated APs found in MLD, schedule reload\n", __func__);
+ 			timer_set(&a->init_ifaces_scheduler, IFACE_TIMEOUT * 1000);
+ 		}

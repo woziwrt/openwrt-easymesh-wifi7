@@ -1,0 +1,319 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: read the BSS Configuration Report bits the way each node writes them
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+The two top bits of the BSS Configuration Report TLV (0xB7) swapped meaning
+between EasyMesh v4.0 (Table 92: set = "not in use") and v6.1 (Table 98:
+set = "Backhaul BSS" / "Fronthaul BSS"). Our agents write v6.1; the MediaTek
+R3 stack writes v4.0 - on 2026-09-17 it reported its backhaul MAP--BH as 0x40
+and its fronthaul as 0x80, so the controller took one for the other and
+steer_backhaul by agent and band aimed at the fronthaul.
+
+Learn the reading per node from the SSIDs this controller configured: a BSS
+whose SSID was handed out only as backhaul or only as fronthaul, reported with
+exactly one of the two bits set, decides it (0x00 and 0xC0 are the same both
+ways round). Until a node has shown it, and for our own agents, the v6.1
+reading stays. mapcontroller.controller.bss_config_bits = auto|v6|v4 forces
+one reading for every node.
+
+The SSID field needs care as well: that stack pads it and declares 33
+bytes, one more than the specification allows, and the parse loop rejected
+the whole Topology Response over it - losing every BSS role of the node.
+Take what stands in front of the first NUL, at most 32 bytes.
+
+The decision lives at the end of struct node and the option in a global,
+not in struct controller_config: the prebuilt steering plugins index into
+both structs and must not see any member move.
+--- a/src/cntlr.h
++++ b/src/cntlr.h
+@@ -233,6 +233,11 @@
+ 	 * node, 0 while it is placed (topology.c). APPEND ONLY - see the
+ 	 * note above. */
+ 	time_t unplaced_since;
++
++	/* How this node sets the Backhaul/Fronthaul bits of its BSS
++	 * Configuration Report (0xB7): 0 while unknown, else BSS_CFG_BITS_V6
++	 * or BSS_CFG_BITS_V4 (config.h). APPEND ONLY - see the note above. */
++	uint8_t bss_cfg_bits;
+ };
+ 
+ static inline bool node_is_agent(const struct node *n)
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -414,6 +414,156 @@
+ static void cntlr_parse_bsta_mld_config_tlv(struct node *n, const uint8_t *data,
+ 					    uint16_t len);
+ 
++/* BSS Configuration Report TLV (0xB7): the meaning of its two top bits changed
++ * between versions of the specification.
++ *
++ *   EasyMesh v4.0, Table 92: bit 7 = 1 "Backhaul BSS not in use",
++ *                            bit 6 = 1 "Fronthaul BSS not in use"
++ *   EasyMesh v6.1, Table 98: bit 7 = 1 "Backhaul BSS",
++ *                            bit 6 = 1 "Fronthaul BSS"
++ *
++ * Our agents write the v6.1 meaning. The MediaTek R3 stack writes the v4.0
++ * one: measured 2026-09-17, its backhaul (MAP--BH) came as 0x40 and its
++ * fronthaul as 0x80. Read the v6.1 way, backhaul and fronthaul swap, and
++ * steer_backhaul by agent and band then aims at the fronthaul.
++ *
++ * The Multi-AP profile does not tell the two apart (that MediaTek node is
++ * Profile-3, like ours). The SSIDs do: this controller handed out every
++ * credential a node reports. A BSS whose SSID we configured only as backhaul,
++ * or only as fronthaul, reported with exactly one of the two bits set, shows
++ * which meaning the node uses. 0x00 and 0xC0 read the same both ways round,
++ * so they say nothing. The first such BSS decides for the node; the
++ * mapcontroller.controller.bss_config_bits option can force either reading.
++ */
++enum bss_cfg_class {
++	BSS_CFG_CLASS_NONE,
++	BSS_CFG_CLASS_BH,
++	BSS_CFG_CLASS_FH,
++};
++
++/* SSID length as reported, trimmed at the first NUL and capped at 32: a
++ * MediaTek R3 agent pads the field and declares 33 (see the 0xB7 loop). */
++static uint8_t cntlr_bss_cfg_ssidlen(const uint8_t *ssid, uint8_t declared)
++{
++	uint8_t max = declared > 32 ? 32 : declared;
++	uint8_t i;
++
++	for (i = 0; i < max; i++) {
++		if (!ssid[i])
++			break;
++	}
++
++	return i;
++}
++
++static enum bss_cfg_class cntlr_bss_cfg_class_of_ssid(struct controller *c,
++						      const uint8_t *ssid,
++						      uint8_t ssidlen)
++{
++	struct iface_credential *ap;
++	uint8_t roles = 0;	/* multi_ap: bit 0 backhaul, bit 1 fronthaul */
++
++	list_for_each_entry(ap, &c->cfg.aplist, list) {
++		if (ap->cred.ssidlen == ssidlen &&
++		    !memcmp(ap->cred.ssid, ssid, ssidlen))
++			roles |= ap->multi_ap;
++	}
++#if (EASYMESH_VERSION >= 6)
++	{
++		struct mld_credential *mld;
++
++		list_for_each_entry(mld, &c->cfg.mldlist, list) {
++			if (mld->cred.ssidlen == ssidlen &&
++			    !memcmp(mld->cred.ssid, ssid, ssidlen))
++				roles |= mld->multi_ap;
++		}
++	}
++#endif
++	if (roles == 0x01)
++		return BSS_CFG_CLASS_BH;
++	if (roles == 0x02)
++		return BSS_CFG_CLASS_FH;
++	return BSS_CFG_CLASS_NONE;	/* unknown SSID, or used in both roles */
++}
++
++static void cntlr_bss_cfg_bits_learn(struct controller *c, struct node *n,
++				     uint8_t report, const uint8_t *ssid,
++				     uint8_t ssidlen)
++{
++	uint8_t bits = report & (BSS_CONFIG_BBSS | BSS_CONFIG_FBSS);
++	enum bss_cfg_class cls;
++	uint8_t vote;
++
++	if (bits != BSS_CONFIG_BBSS && bits != BSS_CONFIG_FBSS)
++		return;
++
++	cls = cntlr_bss_cfg_class_of_ssid(c, ssid, ssidlen);
++	if (cls == BSS_CFG_CLASS_NONE)
++		return;
++
++	/* v6.1: the bit that is set names the role */
++	if ((bits == BSS_CONFIG_BBSS) == (cls == BSS_CFG_CLASS_BH))
++		vote = BSS_CFG_BITS_V6;
++	else
++		vote = BSS_CFG_BITS_V4;
++
++	if (!n->bss_cfg_bits) {
++		n->bss_cfg_bits = vote;
++		info("%s: " MACFMT " writes BSS Configuration Report bits the EasyMesh %s way (0x%02x for a %s SSID)\n",
++		     __func__, MAC2STR(n->almacaddr),
++		     vote == BSS_CFG_BITS_V4 ? "v4.0" : "v6.1", bits,
++		     cls == BSS_CFG_CLASS_BH ? "backhaul" : "fronthaul");
++	} else if (n->bss_cfg_bits != vote) {
++		dbg("%s: " MACFMT " report 0x%02x contradicts its %s reading, kept\n",
++		    __func__, MAC2STR(n->almacaddr), report,
++		    n->bss_cfg_bits == BSS_CFG_BITS_V4 ? "v4.0" : "v6.1");
++	}
++}
++
++/* Walk a 0xB7 TLV only to learn the node's reading, so that the first BSS of
++ * the very report that decides it is already read the right way. */
++static void cntlr_bss_cfg_bits_prescan(struct controller *c, struct node *n,
++				       const uint8_t *d, uint16_t len)
++{
++	uint16_t off = 0;
++	int i, j, num_radio, num_bss;
++
++	if (len < 1)
++		return;
++
++	num_radio = d[off++];
++	for (i = 0; i < num_radio && !n->bss_cfg_bits; i++) {
++		if (off + 7 > len)		/* radio id, num_bss */
++			return;
++		off += 6;
++		num_bss = d[off++];
++		for (j = 0; j < num_bss; j++) {
++			uint8_t report, ssidlen;
++
++			if (off + 9 > len)	/* bssid, report, reserved, ssidlen */
++				return;
++			off += 6;
++			report = d[off];
++			off += 2;
++			ssidlen = d[off++];
++			if (off + ssidlen > len)
++				return;
++			cntlr_bss_cfg_bits_learn(c, n, report, &d[off],
++				cntlr_bss_cfg_ssidlen(&d[off], ssidlen));
++			off += ssidlen;
++		}
++	}
++}
++
++static uint8_t cntlr_bss_cfg_bits_mode(const struct node *n)
++{
++	if (cntlr_bss_config_bits != BSS_CFG_BITS_AUTO)
++		return cntlr_bss_config_bits;
++
++	return n->bss_cfg_bits == BSS_CFG_BITS_V4 ?
++			BSS_CFG_BITS_V4 : BSS_CFG_BITS_V6;
++}
++
+ int handle_topology_response(void *cntlr, struct cmdu_buff *cmdu, struct node *n)
+ {
+ 	trace("%s: from node " MACFMT " --->\n", __func__, MAC2STR(n->almacaddr));
+@@ -636,6 +786,10 @@
+ 
+ 		tv_data = (uint8_t *)tlv;
+ 
++		if (cntlr_bss_config_bits == BSS_CFG_BITS_AUTO && !n->bss_cfg_bits)
++			cntlr_bss_cfg_bits_prescan(c, n, tv_data,
++				tlv_length(tv[TOPOLOGY_RESPONSE_BSS_CONFIGURATION_REPORT_IDX][0]));
++
+ 		offset += 1; /* num_radio */
+ 
+ 		dbg("\tradios_nr: %d\n", tlv->num_radio);
+@@ -682,8 +836,14 @@
+ 				memcpy(&report, &tv_data[offset], 1);
+ 				dbg("\t\t\treport: 0x%02x\n", report);
+ 				dbg("\t\t\treport: %d\n", report);
+-				fh->bss->is_bbss = (report & BSS_CONFIG_BBSS) ? 1 : 0 ;
+-				fh->bss->is_fbss = (report & BSS_CONFIG_FBSS) ? 1 : 0 ;
++				if (cntlr_bss_cfg_bits_mode(n) == BSS_CFG_BITS_V4) {
++					/* EasyMesh v4.0: a set bit means "not in use" */
++					fh->bss->is_bbss = (report & BSS_CONFIG_BBSS) ? 0 : 1;
++					fh->bss->is_fbss = (report & BSS_CONFIG_FBSS) ? 0 : 1;
++				} else {
++					fh->bss->is_bbss = (report & BSS_CONFIG_BBSS) ? 1 : 0 ;
++					fh->bss->is_fbss = (report & BSS_CONFIG_FBSS) ? 1 : 0 ;
++				}
+ 
+ 				/* TODO
+ 				if (fh->bss->is_bbss)
+@@ -703,12 +863,19 @@
+ 				offset += 1; /* reserved byte*/
+ 
+ 				ssidlen = tv_data[offset];
+-				if (ssidlen > 32)
+-					return -1;
+-
+ 				offset += 1; /* ssidlen */
++
++				/* The MediaTek R3 stack writes a fixed 33-byte
++				 * SSID field padded with NULs (measured
++				 * 2026-09-17), so the declared length can be
++				 * larger than the 32 the spec allows. Rejecting
++				 * it dropped the whole Topology Response and
++				 * with it every BSS role of that node. Walk the
++				 * declared length, keep what is in front of the
++				 * first NUL, at most 32 bytes. */
+ 				memset(fh->bss->ssid, 0, sizeof(fh->bss->ssid));
+-				fh->bss->ssidlen = ssidlen;
++				fh->bss->ssidlen = cntlr_bss_cfg_ssidlen(
++						&tv_data[offset], ssidlen);
+ 				memcpy(fh->bss->ssid, &tv_data[offset], fh->bss->ssidlen);
+ 				offset += ssidlen; /* ssid */
+ 
+--- a/src/config.c
++++ b/src/config.c
+@@ -47,6 +47,9 @@
+ 	return 0;
+ }
+ 
++/* config.h: bss_config_bits */
++int cntlr_bss_config_bits = BSS_CFG_BITS_AUTO;
++
+ struct node_policy *cntlr_get_node_policy(struct controller_config *cfg, uint8_t *agent)
+ {
+ 	struct node_policy *a = NULL;
+@@ -842,6 +845,7 @@
+ 		CNTLR_PLUGIN,
+ 		CNTLR_DPP_URI_FILE,
+ 		CNTLR_ASSOC_CTRL_FILE,
++		CNTLR_BSS_CONFIG_BITS,
+ 
+ 		NUM_CNTLR_ATTRS
+ 	};
+@@ -863,6 +867,7 @@
+ 		[CNTLR_PLUGIN] = { .name = "plugin", .type = UCI_TYPE_LIST },
+ 		[CNTLR_DPP_URI_FILE] = { .name = "dpp_uri_file", .type = UCI_TYPE_STRING },
+ 		[CNTLR_ASSOC_CTRL_FILE] = { .name = "assoc_ctrl_file", .type = UCI_TYPE_STRING },
++		[CNTLR_BSS_CONFIG_BITS] = { .name = "bss_config_bits", .type = UCI_TYPE_STRING },
+ 	};
+ 	struct uci_option *tb[NUM_CNTLR_ATTRS];
+ 	char uuidstr[37] = {0};
+@@ -1025,6 +1030,20 @@
+ 		c->enable_ts = !!enbl;
+ 	}
+ 
++	/* reset on every load, so removing the option returns to auto */
++	cntlr_bss_config_bits = BSS_CFG_BITS_AUTO;
++	if (tb[CNTLR_BSS_CONFIG_BITS]) {
++		const char *val = tb[CNTLR_BSS_CONFIG_BITS]->v.string;
++
++		if (!strcmp(val, "v6"))
++			cntlr_bss_config_bits = BSS_CFG_BITS_V6;
++		else if (!strcmp(val, "v4"))
++			cntlr_bss_config_bits = BSS_CFG_BITS_V4;
++		else if (strcmp(val, "auto"))
++			warn("%s: bss_config_bits '%s' is not auto|v6|v4, using auto\n",
++			     __func__, val);
++	}
++
+ 	if (tb[CNTLR_MAX_NODE_BH_HOPS]) {
+ 		const char *val = tb[CNTLR_MAX_NODE_BH_HOPS]->v.string;
+ 		int max_hops;
+--- a/src/config.h
++++ b/src/config.h
+@@ -324,6 +324,16 @@
+ #endif
+ };
+ 
++/* How to read the Backhaul/Fronthaul bits of a BSS Configuration Report TLV
++ * (0xB7): mapcontroller.controller.bss_config_bits = auto | v6 | v4.
++ * Kept outside struct controller_config on purpose: that struct is embedded
++ * in struct controller, and a new member would shift every field after it
++ * under the prebuilt steering plugins. See cntlr_map.c for the why. */
++#define BSS_CFG_BITS_AUTO	0
++#define BSS_CFG_BITS_V6		1
++#define BSS_CFG_BITS_V4		2
++extern int cntlr_bss_config_bits;
++
+ struct node_policy *cntlr_get_node_policy(struct controller_config *cfg, uint8_t *agent);
+ struct radio_policy *cntlr_get_radio_policy(struct controller_config *cfg, uint8_t *radio_mac);
+ 

@@ -1,0 +1,20 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] wifimngr: hal bsta status
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+--- a/wifimngr.c
++++ b/wifimngr.c
+@@ -5159,8 +5159,11 @@
+ 	wifi_get_ifstatus(ifname, &ifs);
+ 
+ 	ret = wifi_sta_info(ifname, &sta);
+-	if (ret)
+-		return UBUS_STATUS_UNKNOWN_ERROR;
++	/* Best-effort: reply even if libwifi could not fully populate the
++	 * station (e.g. mt76 STA-mode NL80211 dump returns nothing), so the
++	 * caller (map-agent, 2s ubus_invoke) never times out. print_sta_info()
++	 * only emits the connection block when bssid is set. */
++	(void)ret;
+ 
+ 	memset(&bb, 0, sizeof(bb));
+ 	blob_buf_init(&bb, 0);

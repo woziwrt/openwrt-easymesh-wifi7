@@ -1,0 +1,82 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller 9992: do not dereference a radio that was never filled
+
+cntlr_send_ap_mld_configuration_request() and its bSTA twin walk n->radiolist
+and read r->radio_el->wifi7caps_* without checking r->radio_el. A node whose
+radios were never populated carries netif_radio entries with radio_el == NULL,
+and the read is a NULL dereference.
+
+Such nodes exist by construction, from two sources measured on hardware
+2026-07-20:
+
+  - db_restore() hydrates the model from mapc.db at t=0, before any agent has
+    reported radios;
+  - a boot-time double-create (nodelist loop plus restore) leaves an orphan
+    node object with radios=0.
+
+The crash path is not exotic - it is the ordinary one. cntlr_check_config_diff()
+walks the entire agentlist on any config change (onboarding, a link flap, a node
+arriving), so a phantom is reached as readily as a real node:
+
+	EXIT=139 (128+11, SIGSEGV), reproduced 2/2 outside procd
+	core pc=0x423a74, x0=0
+	addr2line -> cntlr_check_config_diff, cntlr.c
+	             -> cntlr_send_ap_mld_configuration_request
+
+It was invisible for weeks because procd respawn logs nothing, OpenWrt does not
+write userspace segfaults to dmesg, and procd does not pass ulimit -c to its
+children, so no core was produced until one was forced.
+
+The guard was written on 2026-07-20 and landed in the node-identity series in
+the easymesh-r6 tree; it was never carried into this patch series. Verified
+absent in map-controller 6.5.0.18.
+
+This is a prerequisite for 9993 (node expiry margin). Raising NODE_EXPIRE_TIME
+from 65 s to 180 s triples how long a phantom survives, and the crash needs a
+config change to land inside that window - so widening the window without this
+guard would trade one reliability problem for a worse one.
+
+continue rather than bail: a node may legitimately hold one filled radio and
+one not yet reported, and skipping only the empty entry keeps the Wi-Fi 7 scan
+correct. r is used after the loop, but only when has_wifi7 is true, which
+implies the loop stopped on an entry that passed the guard.
+
+Not fixed here: the same class of unguarded r->radio_el reads exists elsewhere
+in cntlr_map.c (beacon metrics request, channel scan request). Those sit on
+different call paths and are left for a separate change rather than widened
+into this one.
+
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -4747,6 +4747,15 @@
+ 		return -1;
+ 
+ 	list_for_each_entry(r, &n->radiolist, list) {
++		/* A node restored from mapc.db, or one duplicated by a
++		 * boot-time double-create, carries netif_radio entries whose
++		 * radio_el was never filled - radios=0 on the wire. Config
++		 * diff walks the whole agentlist, so such a node reaches this
++		 * loop and dereferences NULL (SIGSEGV, procd respawn, forever).
++		 */
++		if (!r->radio_el)
++			continue;
++
+ 		if (cntlr_radio_support_wifi7(&r->radio_el->wifi7caps_ap)) {
+ 			has_wifi7 = true;
+ 			break;
+@@ -4776,6 +4785,15 @@
+ 		return -1;
+ 
+ 	list_for_each_entry(r, &n->radiolist, list) {
++		/* A node restored from mapc.db, or one duplicated by a
++		 * boot-time double-create, carries netif_radio entries whose
++		 * radio_el was never filled - radios=0 on the wire. Config
++		 * diff walks the whole agentlist, so such a node reaches this
++		 * loop and dereferences NULL (SIGSEGV, procd respawn, forever).
++		 */
++		if (!r->radio_el)
++			continue;
++
+ 		if (cntlr_radio_support_wifi7(&r->radio_el->wifi7caps_bsta)) {
+ 			has_wifi7 = true;
+ 			break;

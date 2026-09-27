@@ -1,0 +1,74 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: 995 - resolve an MLO uplink by AP-MLD address
+
+topology_build_tree_from_assoc() resolves a child s parent by feeding
+node::upstream_bssid to cntlr_find_node_with_bssid(), which walks bss->bssid
+only. That holds for a legacy backhaul, where the bSTA associates to one BSS.
+
+An MLO bSTA associates to an AP-MLD, so upstream_bssid carries the MLD address,
+and an MLD address is deliberately not the BSSID of any affiliated AP. The
+lookup therefore never matches, every child is skipped, and the tree stays flat
+with depth -1 for all nodes below the root.
+
+Measured on the three-node mesh, 2026-07-28, after 990 let the bBSS fallback
+populate upstream_bssid for the first time:
+
+  al     depth  upstream_bssid
+  86:f7    0    00:00:00:00:00:00
+  ca:8e   -1    86:f7:56:41:01:d4   <- controller AP-MLD address
+  e6:a9   -1    00:00:00:00:00:00
+
+while the controller BSSIDs are 76:04:1c:81:bc:2f, 7e:04:1c:81:7c:2e and so on
+- the address simply is not among them.
+
+Fall back to a lookup over each node apmld_list when the BSS lookup misses.
+Same class of defect as the ieee1905 origin bug fixed earlier the same day:
+code written for one address layer being handed an address from another.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/topology.c
++++ b/src/topology.c
+@@ -57,6 +57,33 @@
+  * verified on HW: `ieee1905 info` shows only the controller as 8g's neighbor),
+  * so that walk can never build the 2nd hop. n->upstream_bssid IS populated
+  * 1-hop-reliably from Link Metric Responses, so chain child->parent by it. */
++/* An MLO bSTA associates to an AP-MLD, not to an individual BSS, so
++ * node::upstream_bssid carries the MLD address - which is deliberately not the
++ * BSSID of any affiliated AP. cntlr_find_node_with_bssid() walks bss->bssid
++ * only and therefore never resolves an MLO uplink.
++ *
++ * Measured on the three-node mesh 2026-07-28: 8g reported upstream_bssid
++ * 86:f7:56:41:01:d4, which is the controller AP-MLD address; the controller
++ * BSSIDs are 76:04:1c:81:bc:2f and friends. The lookup missed, the child was
++ * skipped, and depth stayed UNKNOWN for every node below the root.
++ */
++static struct node *find_node_with_mld_macaddr(struct controller *c,
++					       const uint8_t *macaddr)
++{
++	struct node *n = NULL;
++
++	list_for_each_entry(n, &c->agentlist, list) {
++		struct wifi_apmld_element *mld = NULL;
++
++		list_for_each_entry(mld, &n->apmld_list, list) {
++			if (!memcmp(mld->mld_macaddr, macaddr, 6))
++				return n;
++		}
++	}
++
++	return NULL;
++}
++
+ void topology_build_tree_from_assoc(struct controller *c,
+ 				    struct bh_topology_data *topology,
+ 				    const uint8_t *ctrl_al_macaddr)
+@@ -97,6 +124,8 @@
+ 				continue;
+ 			pn = cntlr_find_node_with_bssid(c, cn->upstream_bssid);
+ 			if (!pn)
++				pn = find_node_with_mld_macaddr(c, cn->upstream_bssid);
++			if (!pn)
+ 				continue;
+ 			pdev = topology_find_device(topology, pn->almacaddr);
+ 			if (!pdev || pdev->bh.depth == UNKNOWN_TREE_LEVEL)

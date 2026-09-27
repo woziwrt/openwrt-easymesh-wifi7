@@ -1,0 +1,145 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: reconcile the bss table instead of only growing it
+
+mapc_sync_bss() is an upsert and nothing ever deletes, so the bss table becomes
+the union of every BSSID a radio has ever had.
+
+That would be harmless if BSSIDs were stable. They are not. Without
+`option macaddr`, /usr/share/ucode/wifi/iface.uc derives each BSS address from
+a counter incremented in interface preparation order, so a reboot can renumber
+them. Measured on bpi-8g across a single restart:
+
+	21. 7.   wlan2 = ...92:7b   wlan2-1 = ...91:79   wlan2-2 = ...91:78
+	22. 7.   wlan2 = ...91:7b   wlan2-1 = ...92:79   wlan2-2 = ...92:78
+
+The previous three stay in the table for good. The controller is not even
+unaware of it - it correctly marked two of those rows enabled=0 - it simply had
+no way to remove them. Rows for a BSS that is never mentioned again keep
+whatever enabled value they last had, so the same table holds stale rows in two
+different states and nothing distinguishes them from live ones by construction.
+
+Measured across the lab on 2026-07-22: 26 rows for 21 real BSSes, with 6 rows
+describing BSSes that were not on the air.
+
+This is the discipline sync_operating_class_rows() already states one screen
+above - "recovery wants the current picture, not history" - and the same
+mark-and-sweep that patch 961 gave radios. bss was the last table of that
+family without one.
+
+The sweep runs once per radio, right after that radio's BSSes have been
+upserted from a live Topology Response, and deletes rows for that ruid whose
+BSSID is not in the reported set. Nothing references bss(bssid), so this is
+free of foreign-key fallout.
+
+It deliberately does nothing when the radio reports no BSS at all, and nothing
+when the set is larger than the NOT IN list it is willing to build. An empty
+report is far more often a half-parsed CMDU than a radio that genuinely lost
+every BSS, and deleting a known set on the strength of nothing is how a
+reconcile turns into data loss.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/db/mapc_sync.h
++++ b/src/db/mapc_sync.h
+@@ -35,6 +35,11 @@
+ /* Upsert the 'bss' row for @iface (parent radio must already be synced). */
+ void mapc_sync_bss(struct controller *c, struct netif_iface *iface);
+ 
++/* Delete 'bss' rows of @r that the agent no longer reports (mark-and-sweep
++ * counterpart to the upsert above; call once per radio after its BSSes are
++ * synced). No-op when the radio reports no BSS at all. */
++void mapc_sync_bss_sweep(struct controller *c, struct netif_radio *r);
++
+ /* Rebuild the 'topology_link' edge set from c->topology.dev_list, one txn. */
+ void mapc_sync_topology(struct controller *c);
+ 
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -414,6 +414,75 @@
+ 	stmt_finish(c->db, st);
+ }
+ 
++/* Largest BSS set we will build a NOT IN list for. A radio carries a
++ * handful; anything beyond this is not a radio we understand, and the safe
++ * response to not understanding is to delete nothing. */
++#define MAPC_SWEEP_MAX_BSS	16
++
++/* Delete the bss rows of @r that the agent no longer reports.
++ *
++ * mapc_sync_bss() only ever upserts, so the table grows into the union of
++ * every BSSID the radio has ever had. That matters because BSSIDs move:
++ * without `option macaddr` the address is derived from a counter incremented
++ * in interface preparation order (/usr/share/ucode/wifi/iface.uc), so a
++ * reboot can renumber them. Measured on bpi-8g, wlan2/wlan2-1/wlan2-2 swapped
++ * their 91/92 prefixes across a single restart and the previous three stayed
++ * in the table for good; the controller even marked two of them enabled=0 and
++ * still had no way to remove them.
++ *
++ * This is the discipline sync_operating_class_rows() already states -
++ * "recovery wants the current picture, not history" - and the mark-and-sweep
++ * patch 961 gave radios. bss was the last table of that family without one.
++ *
++ * It deliberately does nothing when the radio reports no BSS at all. An empty
++ * report is far more often a half-parsed CMDU than a radio that genuinely
++ * lost every BSS, and deleting a known set on the strength of nothing is how
++ * a reconcile turns into data loss.
++ */
++void mapc_sync_bss_sweep(struct controller *c, struct netif_radio *r)
++{
++	char bssid[MAPC_SWEEP_MAX_BSS][18];
++	struct netif_iface *iface;
++	char sql[160 + 3 * MAPC_SWEEP_MAX_BSS];
++	mapdb_stmt *st = NULL;
++	char ruid[18];
++	int n = 0, i;
++
++	if (!c->db || !r || !r->radio_el)
++		return;
++
++	list_for_each_entry(iface, &r->iflist, list) {
++		if (!iface->bss)
++			continue;
++		if (n >= MAPC_SWEEP_MAX_BSS)
++			return;		/* more than we can express - delete nothing */
++		mac2str(iface->bss->bssid, bssid[n]);
++		n++;
++	}
++
++	if (n == 0)
++		return;
++
++	mac2str(r->radio_el->macaddr, ruid);
++
++	snprintf(sql, sizeof(sql),
++		 "DELETE FROM bss WHERE ruid=? AND bssid NOT IN (");
++	for (i = 0; i < n; i++)
++		strcat(sql, i ? ",?" : "?");
++	strcat(sql, ")");
++
++	if (mapdb_prepare(c->db, sql, &st) != MAPDB_OK) {
++		warn("mapc_sync: bss sweep prepare: %s\n", mapdb_last_error(c->db));
++		return;
++	}
++
++	mapdb_bind_text(st, 1, ruid);
++	for (i = 0; i < n; i++)
++		mapdb_bind_text(st, i + 2, bssid[i]);
++
++	stmt_finish(c->db, st);
++}
++
+ /* ---- topology_link ---------------------------------------------------- */
+ 
+ void mapc_sync_topology(struct controller *c)
+--- a/src/cntlr_map.c
++++ b/src/cntlr_map.c
+@@ -4734,6 +4734,9 @@
+ 				mapc_sync_radio(c, n, r);
+ 				list_for_each_entry(bss, &r->iflist, list)
+ 					mapc_sync_bss(c, bss);
++				/* PATCH 962: drop rows this radio no longer
++				 * reports; the upsert above cannot. */
++				mapc_sync_bss_sweep(c, r);
+ 			}
+ #if (EASYMESH_VERSION >= 6)
+ 			/* AP-MLD Config TLV (0xE0) rides Topology Response too;

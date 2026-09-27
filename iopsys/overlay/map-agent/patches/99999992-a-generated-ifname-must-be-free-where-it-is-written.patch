@@ -1,0 +1,142 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-agent 9999999: a generated interface name must be free in the registry it is written into
+
+wifi_gen_first_ifname() offers wlan2, wlan2-1, ... and asks
+check_wireless_ifname() whether a candidate is taken. That function looks in one
+place only: wifi-iface sections in /etc/config/wireless.
+
+Since 989 that is the wrong place. A BSS that is a link of an AP-MLD gets no
+wireless section - uci_apply_wps_credentials() writes the mapagent 'ap' section
+and skips the wireless one, on purpose, because the network is already on the
+air as a link of the MLD and an extra BSS would take a slot the MLD needs. On a
+node whose fronthaul and backhaul are both AP-MLDs, /etc/config/wireless
+therefore holds ap_mld_1, ap_mld_2 and sta_mld_1 and not a single wifi-iface.
+check_wireless_ifname() consequently answers "free" for every candidate, its
+max_bss cap never fires either (it counts the same empty set), and every caller
+is handed index 0 - the same name.
+
+Measured on the controller 2026-09-04:
+
+  .1 controller  @ap[4].ifname='wlan2'  @ap[5].ifname='wlan2'   collision
+                 no wlan1-1, no wlan2-1
+  .2 (healthy)   wlan0, wlan0-1, wlan1, wlan1-1, wlan2-1, wlan2
+  .4             same wlan2 collision
+
+Both colliding sections on .1 are anonymous and carry map-agent's own option
+order (ifname, band, device, ssid, key, ...) rather than map_genconfig's
+(device, ifname, mode, disabled, ...), the same fingerprint 989 used - so both
+were generated here, not inherited.
+
+The collision is not caught downstream. config.c logs
+
+  Duplicate 'ap wlan2' config!! ignore
+
+and then keeps going, filling the *same* netif_apcfg with the second section's
+options: one section silently leaves the model. And "multiap clean_stale_ifaces
+wlan2" deletes by ifname, so when either one is torn down both are removed at
+once. Since re->aplist is built exclusively from 'ap' sections (agent.c:4762),
+the section that vanishes takes its AP-MLD link with it - not in the TTLM map
+(agent_tlv.c:4809-4826), assoc_control returning -1 on `if (!ap || !ap->cfg)`
+(agent.c:6198-6200), invisible to steering and to num_sta.
+
+Ask the registry the name is actually written into. cfg->aplist is the in-memory
+image of the mapagent 'ap' sections, and uci_apply_wps_credentials() adds a new
+entry to it through create_fronthaul_iface_config() before it writes UCI, so a
+name handed out earlier in the same M2 loop is already visible - which is
+exactly the case that produced the duplicate. The wireless scan stays: on a
+platform that does have per-BSS wifi-iface sections it is still a real answer,
+and the two tests are a union, never a substitute for each other.
+
+The name test ignores 'device' because these are netdev names and a collision
+across radios is as fatal as one on the same radio - the same rule the wireless
+loop below already follows, which breaks on an ifname match without looking at
+the device. Only the max_bss count is per radio. That count now includes the
+bhmld_ap_<band> bookkeeping placeholders, which occupy no BSS slot; that is
+conservative rather than wrong, it fails towards refusing to generate rather
+than towards handing out a duplicate, and on MT7996 max_bss is 16 against a
+count that reaches 3. A max_bss of 0 - which agent_alloc_radio() never
+produces, but a driver's radio status could - skips the cap rather than
+blocking generation outright.
+
+Left alone deliberately: the "Duplicate 'ap %s' config!! ignore" path in
+config.c, which warns and then merges anyway. It is a poor last line of defence,
+but it is a last line of defence for a state that should not be reachable, and
+changing it to discard a section would delete configuration on the strength of a
+name clash. Fix the generator; revisit that only if a duplicate is ever seen
+again.
+
+How to tell this worked, on hardware: after a sysupgrade,
+
+  uci show mapagent | grep "\.ifname=" | grep wlan | sort
+
+on the controller must list six distinct names - wlan0, wlan0-1, wlan1, wlan1-1,
+wlan2, wlan2-1 - with no value appearing twice, matching what agent .2 already
+had, and "logread | grep Duplicate" must be empty for the boot.
+
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+---
+--- a/src/agent_map.c
++++ b/src/agent_map.c
+@@ -1828,12 +1828,62 @@
+ 	struct uci_package *pkg;
+ 	struct uci_element *e;
+ 	struct wifi_radio_element *re = agent_get_radio_by_name(a, device);
++	struct netif_apcfg *apcfg = NULL;
+ 	bool rv = false;
+ 	int num_ifs = 0;
++	int num_aps = 0;
+ 
+ 	if (!re)
+ 		return -1;
+ 
++	/* Ask the registry the generated name is actually written into.
++	 *
++	 * The uci_foreach below looks for wifi-iface sections in
++	 * /etc/config/wireless, but since 989 map-agent deliberately does not
++	 * create a wireless section for a BSS that is a link of an AP-MLD - it
++	 * writes the mapagent 'ap' section only. On an all-MLD node wireless
++	 * therefore holds ap_mld_1/ap_mld_2/sta_mld_1 and not one wifi-iface,
++	 * so this function answered "free" for every candidate, and
++	 * wifi_gen_first_ifname() handed out index 0 - the same name - to every
++	 * caller.
++	 *
++	 * Measured on the controller 2026-09-04: radio2 carried two anonymous
++	 * 'ap' sections, both ifname='wlan2', both with map-agent's own option
++	 * order (ifname, band, device, ssid, ...), i.e. both generated here.
++	 * config.c then logs "Duplicate 'ap wlan2' config!! ignore" and fills
++	 * the *same* netif_apcfg from the second section, so the backhaul BSS
++	 * silently left the model, and 'clean_stale_ifaces wlan2' would delete
++	 * both sections at once because it deletes by ifname. A healthy node
++	 * has wlan0, wlan0-1, wlan1, wlan1-1, wlan2, wlan2-1.
++	 *
++	 * cfg->aplist is the in-memory image of those 'ap' sections and
++	 * uci_apply_wps_credentials() adds to it before it writes UCI, so a
++	 * name handed out earlier in the same M2 loop is already visible here.
++	 *
++	 * Names are netdev names: a collision across radios is just as fatal as
++	 * one on the same radio, so the name test ignores 'device' - the same
++	 * rule the wireless loop below already follows. Only the max_bss count
++	 * is per radio, and counting a bookkeeping placeholder there fails safe
++	 * (max_bss is 16 on MT7996, the count reaches 3).
++	 *
++	 * The cap is skipped when max_bss is zero. agent_alloc_radio() seeds it
++	 * with WIFI_IFACE_MAX_NUM, but a driver reporting 0 in its radio status
++	 * would overwrite that, and "generate nothing at all" is not what a zero
++	 * should mean here - it did not mean it before this patch either,
++	 * because the wireless loop below only reaches its own copy of this test
++	 * after it has found a wifi-iface section.
++	 */
++	list_for_each_entry(apcfg, &a->cfg.aplist, list) {
++		if (!strncmp(apcfg->name, ifname, IFNAMSIZ))
++			return true;
++
++		if (!strncmp(apcfg->device, device, IFNAMSIZ))
++			num_aps++;
++	}
++
++	if (re->max_bss && num_aps >= re->max_bss)
++		return true;
++
+ 	ctx = uci_alloc_context();
+ 	if (!ctx)
+ 		return -1;

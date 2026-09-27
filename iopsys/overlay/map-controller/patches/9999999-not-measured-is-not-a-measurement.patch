@@ -1,0 +1,61 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] mapc_sync: not-measured is not a measurement
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+Two columns in the agent row carry a sentinel that reads like data.
+
+The root node has no upstream, and its upstream_bssid is all zeros. Written
+out as "00:00:00:00:00:00" it looks like an address, joins like an address,
+and is indistinguishable from one. That is the same class of defect that
+took the controller down on 5. 9., where an all-zero AL-MAC was treated as
+an address and 473 854 log lines later the box was reset by its watchdog.
+The view already turns it into NULL for the UI, which is the tell: the
+value was never wanted, only tolerated.
+
+est_thput_ul / est_thput_dl carry 0xFFFFFFFF when the agent does not know.
+EasyMesh spends the maximum as its unknown marker, so stored as a number it
+becomes the largest throughput in the table - and anything that picks a path
+by throughput picks the node it knows least about. Measured 2026-09-06 on
+five nodes: four agents carried 4294967295 in est_thput_dl and 0 in ul.
+
+Both become NULL. Nothing else changes: the readers already handle NULL,
+and a value that was never measured now says so instead of pretending.
+
+Verify: on a live mesh, `select almac, upstream_bssid, est_thput_dl from
+agent` must show NULL for the root's upstream and for every unknown
+estimate - never 00:00:00:00:00:00 and never 4294967295.
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -152,9 +152,29 @@
+ 	mapdb_bind_text(st, 5, caps);
+ 	mapdb_bind_int(st, 6, depth);
+ 	mapdb_bind_int(st, 7, n->ul_type);
+-	mapdb_bind_text(st, 8, upbssid);
+-	mapdb_bind_int(st, 9, n->est_thput_ul);
+-	mapdb_bind_int(st, 10, n->est_thput_dl);
++	/* A zero upstream BSSID is not an address - it is the root having no
++	 * upstream at all. Written out as "00:00:00:00:00:00" it reads like a
++	 * real value and joins like one, which is the same class of defect that
++	 * took the controller down on 5. 9. (an all-zero AL-MAC treated as an
++	 * address). NULL says "none", and every reader already handles it.
++	 */
++	mapdb_bind_text(st, 8, hwaddr_is_zero(n->upstream_bssid) ? NULL : upbssid);
++
++	/* 0xFFFFFFFF is the agent saying "I do not know" - EasyMesh spends the
++	 * maximum as its unknown marker. Stored as a number it becomes the
++	 * LARGEST throughput in the table, so anything choosing a path by
++	 * throughput chooses the node it knows least about. Measured 2026-09-06:
++	 * four of five agents carried it. Not-measured is not a measurement.
++	 */
++	if (n->est_thput_ul == 0xFFFFFFFFu)
++		mapdb_bind_null(st, 9);
++	else
++		mapdb_bind_int(st, 9, n->est_thput_ul);
++
++	if (n->est_thput_dl == 0xFFFFFFFFu)
++		mapdb_bind_null(st, 10);
++	else
++		mapdb_bind_int(st, 10, n->est_thput_dl);
+ 	mapdb_bind_int(st, 11, n->scan_supported);
+ 	mapdb_bind_int(st, 12, n->sta_count);
+ #if (EASYMESH_VERSION >= 6)

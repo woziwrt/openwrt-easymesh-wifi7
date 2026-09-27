@@ -1,0 +1,96 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] map-controller: a count is derived, not carried
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+
+agent.sta_count multiplied by the number of controller restarts.
+
+n->sta_count is a running counter - ++ in node_add_sta, -- in node_del_sta and
+node_update_stalist - and nothing ever recomputes it from the list it counts.
+Our own recovery then seeds it: restore_agents() reads the stored number back
+into a node whose stalist is empty, because there is no restore_stations() and
+there should not be one. The node comes up claiming N clients with no clients,
+and then counts its real ones on top.
+
+Measured 2026-09-06 after three controller restarts:
+
+    node        real                          sta_count   ratio
+    corridor    4 (1 client + 3 bSTA)            12        x3
+    bedroom     1                                 3        x3
+    kitchen     1                                 1        x1  (stored 0)
+    hall        0                                 0        -
+    controller  2                                 2        x1
+
+Two independent nodes carrying the same multiplier is not drift, it is
+arithmetic: 4 -> 4+4 -> 8+4 = 12, and 1 -> 1+1 -> 2+1 = 3. And the one node
+whose count is right is the controller itself, the only node restore_agents
+skips - "never re-materialize self". The control group came for free.
+
+Sampled over 150 s the numbers do not move, so nothing was going to correct
+them: the value is written to the database on every sync, always wrong, and
+it is what the node list in the web UI shows as the client count.
+
+Two changes, one idea. The number written out is counted from n->stalist every
+time, and the number is no longer restored - which clients are attached is
+what the agents say within seconds of coming up, and it is precisely the part
+of the model that must not be remembered across a restart.
+
+--- a/src/db/mapc_sync.c
++++ b/src/db/mapc_sync.c
+@@ -176,7 +176,39 @@
+ 	else
+ 		mapdb_bind_int(st, 10, n->est_thput_dl);
+ 	mapdb_bind_int(st, 11, n->scan_supported);
+-	mapdb_bind_int(st, 12, n->sta_count);
++
++	/* A count is derived, not carried.
++	 *
++	 * n->sta_count is a running counter: ++ in node_add_sta, -- in
++	 * node_del_sta and node_update_stalist. Nothing ever recomputes it from
++	 * the list it counts, so once the two part company they never meet
++	 * again - and they are made to part company by our own recovery, which
++	 * restores this number from the database while restoring no stations at
++	 * all. The node comes up claiming N clients with an empty list, then
++	 * counts its real clients on top of that.
++	 *
++	 * It multiplies. Measured 2026-09-06, three controller restarts:
++	 *
++	 *   corridor   4 real (1 client + 3 bSTA)   sta_count 12   x3
++	 *   bedroom    1 real                       sta_count  3   x3
++	 *   controller 2 real                       sta_count  2   x1
++	 *
++	 * Two independent nodes, the same multiplier, and the one node that is
++	 * right is the controller itself - the only node restore_agents skips
++	 * ("never re-materialize self"). The experiment came for free.
++	 *
++	 * So the number written here is counted, every time, from the list it
++	 * claims to describe. Walking a handful of entries costs nothing next
++	 * to a value that can only ever be wrong.
++	 */
++	{
++		struct sta *cs = NULL;
++		int nsta = 0;
++
++		list_for_each_entry(cs, &n->stalist, list)
++			nsta++;
++		mapdb_bind_int(st, 12, nsta);
++	}
+ #if (EASYMESH_VERSION >= 6)
+ 	mapdb_bind_int(st, 13, n->max_mld_num);
+ 	mapdb_bind_int(st, 14, n->max_aplink_num);
+@@ -1500,7 +1532,15 @@
+ 		n->est_thput_ul   = (uint32_t)mapdb_column_int(st, 7);
+ 		n->est_thput_dl   = (uint32_t)mapdb_column_int(st, 8);
+ 		n->scan_supported = (bool)mapdb_column_int(st, 9);
+-		n->sta_count      = (uint32_t)mapdb_column_int(st, 10);
++		/* sta_count is NOT restored. It counts n->stalist, and nothing
++		 * here restores a single station into it - there is no
++		 * restore_stations() and there should not be one: which clients
++		 * are attached is what the agents tell us within seconds of
++		 * coming up, and it is the one part of the model that must not
++		 * be remembered from before the restart. Seeding the counter
++		 * without the list is what made it multiply by the number of
++		 * restarts. Left at 0; the first report counts it properly.
++		 */
+ #if (EASYMESH_VERSION >= 6)
+ 		n->max_mld_num      = (int)mapdb_column_int(st, 11);
+ 		n->max_aplink_num   = (int)mapdb_column_int(st, 12);

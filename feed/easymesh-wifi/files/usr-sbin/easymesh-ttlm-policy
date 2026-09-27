@@ -1,0 +1,387 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-ttlm-policy - the producer of /etc/mapc/ttlm-policy.
+#
+# The delivery path has worked end to end since 2026-09-23: a line in that file
+# becomes a Service Prioritization Request (0x8023) to the parent, whose agent
+# negotiates the TID-to-Link map with the backhaul station, and both radios
+# honour it (131 MB with a 6 GHz-only map: 0 B on 5 GHz). What never existed is
+# anything that WRITES the file. This does, from what the controller already
+# knows: bstamld (which station hangs on which parent AP-MLD) and bsta_link
+# (per-leg state, collected every 30 s by easymesh-linkstat-collect). No new
+# instrument on the nodes and no new network path.
+#
+# RULE 1: EVADE A BAD LEG. RULE 2 (dry run of its own, below): ALTERNATE BANDS
+# ACROSS A REPEATER.
+#
+# TTLM is an optimisation that pays only where one leg is plainly bad. On a
+# healthy node, restricting the backhaul to one leg cost 43 % (2026-09-22), and
+# the 6 GHz leg was the faster one on only half the nodes. So this never pins
+# for speed. It pins every TID onto the healthy leg when the other one is bad:
+#
+#   A. sustained - BAD_RUN consecutive bad samples (default 3 = 90 s),
+#   B. recurring - at least BAD_RECUR bad samples within RECUR_WIN seconds
+#      (default 4 in 4 h).
+#
+# A sample is bad only with BOTH halves in the same window:
+#
+#   1. the receive symptom - the leg is "down" or hears fewer than BAD_PCT %
+#      of its beacons, AND
+#   2. evidence in the DATA - at least FAIL_MIN more tx_failed on that leg, or
+#      no rx byte at all on it while the other leg received at least RX_MIN.
+#
+# Beacons alone are not evidence. Measured 2026-09-24 over 25 night-time
+# dropouts of the 6 GHz leg on two nodes: beacons fell to 0-15 % for 30-120 s
+# while data on the same leg carried on unchanged (rx ~2.4 kB/s before and
+# during, tx_failed 0). The missing beacons were a TBTT collision with the
+# node's own beacon, not a lost link. The old rule pinned both nodes onto
+# 5 GHz for good on that - 43 % of throughput for nothing. Nor is "down":
+# easymesh-linkstat says "down" for a window with no beacon at all, which a
+# 120 s dropout produces while the data still flows. Such beacon-only samples
+# are counted and logged once an hour, never pinned on.
+#
+# With no traffic there is no evidence and nothing is pinned - an idle
+# backhaul has nothing to protect.
+#
+# The other leg must be up with at least GOOD_PCT % in the same sample, or
+# there is nowhere to go and nothing is pinned.
+#
+# RELEASE: a pinned station is released when its bad leg has had no bad sample
+# for RELEASE_S (default 4 h). Release is a line mapping every TID to 0, which
+# map-agent turns into a teardown (map-agent 99999999e); the line is dropped
+# one pass later. A removed line on its own is NOT a teardown - agents keep
+# what they were told last.
+#
+# NO FRESH DATA, NO PIN: a station whose legs were last seen more than STALE_S
+# ago gets no new pin. An existing pin is left alone - the parent's fuse
+# (map-agent 99999999e) watches the pinned leg on its own every 30 s.
+#
+# DRY RUN BY DEFAULT: until /etc/mapc/ttlm-policy-live exists, the decision goes
+# to /tmp/easymesh/ttlm-policy/ttlm-policy.dry and the log, and
+# /etc/mapc/ttlm-policy is never touched. Watch it for a day first.
+#
+# Writes the file only when its content changes: map-controller sends on every
+# mtime change, so rewriting identical content would re-negotiate every map.
+#
+# RULE 2: ALTERNATE BANDS ACROSS A REPEATER.
+#
+# A repeater hears its parent and serves its children on the same two radios.
+# With both hops free to use both bands, every frame it forwards takes air
+# time twice on the same radio. Measured 2026-09-25 on controller -> hall ->
+# kitchen (hall with a good card): both hops on 5 GHz 153 Mbit/s, default 172,
+# parent hop on 5 GHz and child hop on 6 GHz 260 Mbit/s (+70 %); hall then
+# received on 5 GHz and transmitted on 6 GHz at the same time, 1.4 s of air
+# per second (STR). It pays only for traffic that CROSSES the repeater:
+# traffic that ends on it loses the second leg (one hop, both legs 292 vs
+# 5 GHz alone 204 Mbit/s). And it needs a card that can transmit on one band
+# while receiving on the other: the kitchen card (one of the noisier ones)
+# collapsed from 368 to 2 Mbit/s on 6 GHz receive while sending on 5 GHz.
+#
+# So a repeater R gets it only when ALL of these hold:
+#   - R is listed in ALT_OK (/etc/mapc/str-ok, one AL-MAC per line): a card
+#     that passed the STR test. There is no automatic card check yet;
+#   - R's 5 GHz leg to its parent and every child's 6 GHz leg to R are good
+#     (not down, >= GOOD_PCT % beacons, fresh);
+#   - no leg involved is pinned by rule 1, which always wins;
+#   - traffic through R's children is >= ALT_BPS bytes/s in ALT_ON samples
+#     in a row.
+# It ends after ALT_OFF_S seconds below ALT_BPS. The orientation is the one
+# that was measured: parent hop on 5 GHz, child hops on 6 GHz.
+#
+# DRY RUN OF ITS OWN: even with the producer live, rule 2 only writes
+# $STATE/alternate.dry and the log until /etc/mapc/ttlm-alternate-live exists.
+
+TICK=${1:-30}
+DB=/etc/mapc/mapc.db
+OUT=/etc/mapc/ttlm-policy
+STATE=/tmp/easymesh/ttlm-policy
+# Live only when /etc/mapc/ttlm-policy-live exists (or DRY=0 is passed).
+DRY=${DRY:-1}
+[ -e /etc/mapc/ttlm-policy-live ] && DRY=0
+BAD_PCT=${BAD_PCT:-50}
+GOOD_PCT=${GOOD_PCT:-80}
+BAD_RUN=${BAD_RUN:-3}
+BAD_RECUR=${BAD_RECUR:-4}
+RECUR_WIN=${RECUR_WIN:-14400}
+RELEASE_S=${RELEASE_S:-14400}
+STALE_S=${STALE_S:-120}
+FAIL_MIN=${FAIL_MIN:-5}
+RX_MIN=${RX_MIN:-10240}
+ALT_OK=${ALT_OK:-/etc/mapc/str-ok}
+ALT_BPS=${ALT_BPS:-625000}          # 5 Mbit/s through the children
+ALT_ON=${ALT_ON:-3}                 # samples in a row above it
+ALT_OFF_S=${ALT_OFF_S:-300}         # seconds below it before ending
+ALT_LIVE=0
+[ -e /etc/mapc/ttlm-alternate-live ] && ALT_LIVE=1
+BAND_5=2 BAND_6=8                   # bsta_link.band
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = "controller" ] || exit 0
+command -v sqlite3 >/dev/null || { logger -t ttlm-policy "no sqlite3 - refusing to start"; exit 1; }
+mkdir -p "$STATE"
+[ "$DRY" = 0 ] || OUT=$STATE/ttlm-policy.dry
+
+log() { logger -t ttlm-policy "$*"; }
+
+# One row per backhaul station that hangs on a known parent:
+#   sta_mld  child_almac  parent_ap_mld  parent_almac
+pairs() {
+	sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+		SELECT b.mld_macaddr, b.agent_almac, b.ap_mld_macaddr, a.agent_almac
+		FROM bstamld b JOIN apmld a ON a.mld_macaddr = b.ap_mld_macaddr
+		WHERE b.ap_mld_macaddr != '' AND a.agent_almac IS NOT NULL;" 2>/dev/null
+}
+
+# The legs of one child:  link_id state beacon_pct last_seen rx_bytes tx_failed
+# (the two counters are absolute; deltas are taken against the previous sample)
+legs() {
+	sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+		SELECT link_id, state, beacon_pct, last_seen, rx_bytes, tx_failed
+		FROM bsta_link WHERE agent_almac = '$1' ORDER BY link_id;" 2>/dev/null
+}
+
+# "degraded" from easymesh-linkstat means any tx_failed in the window, which is
+# most windows on a working leg - so the target leg is judged by beacons and
+# by not being down, never by the word "up".
+bad()  { [ "$1" = down ] || [ "${2:-0}" -lt "$BAD_PCT" ] 2>/dev/null; }
+good() { [ "$1" != down ] && [ "${2:-0}" -ge "$GOOD_PCT" ] 2>/dev/null; }
+
+# Evidence in the data for one leg over the last window:
+#   evidence <dtx_failed of the leg> <drx of the leg> <drx of the other leg>
+# An empty delta (no previous sample, or a counter that went backwards on a
+# reassociation) is no evidence.
+evidence() {
+	[ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 1
+	[ "$1" -ge "$FAIL_MIN" ] && return 0
+	[ "$2" -eq 0 ] && [ "$3" -ge "$RX_MIN" ] && return 0
+	return 1
+}
+
+# delta <new> <old> - empty when there is no old value or it went backwards
+delta() {
+	[ -n "$2" ] || return 0
+	[ "$1" -ge "$2" ] 2>/dev/null && echo $(($1 - $2))
+}
+
+# leg <almac> <band>:  link_id state beacon_pct last_seen rx_bytes tx_bytes
+leg() {
+	sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+		SELECT link_id, state, beacon_pct, last_seen, rx_bytes, tx_bytes
+		FROM bsta_link WHERE agent_almac = '$1' AND band = $2;" 2>/dev/null
+}
+
+# leg_ok <state> <pct> <seen>
+leg_ok() { good "$1" "$2" && [ $((now - ${3:-0})) -le "$STALE_S" ]; }
+
+# Rule 2 over the pairs in $1; appends policy lines to $2.
+alternate() {
+	pf=$1 polout=$2                   # set -- below reuses $1 and $2
+	altout=$STATE/alternate.new
+	: > "$altout"
+	# repeaters: children that are someone's parent
+	awk 'NR==FNR { par[$4] = 1; next } ($2 in par) { print }' "$pf" "$pf" |
+	while read -r rsta r rap rpar; do
+		st=$STATE/alt.$r              # "<on 0|1> <n_above> <below_since> <seen> <bytes>"
+		on=0 nab=0 bsince=0 oseen= obytes=
+		[ -s "$st" ] && read -r on nab bsince oseen obytes < "$st"
+		why=""
+		grep -qix "$r" "$ALT_OK" 2>/dev/null || why="card not in $ALT_OK"
+		set -- $(leg "$r" $BAND_5)
+		rl5=$1
+		[ -z "$why" ] && ! leg_ok "$2" "$3" "$4" && why="own 5 GHz leg not good ($2 $3 %)"
+		[ -z "$why" ] && [ -s "$STATE/pin.$rsta" ] && why="own leg pinned by rule 1"
+		lines="" bytes=0 seen=0 nkids=0
+		for kid in $(awk -v r="$r" '$4 == r { print $1 "/" $2 "/" $3 }' "$pf"); do
+			ksta=${kid%%/*}; rest=${kid#*/}; kal=${rest%%/*}; kap=${rest#*/}
+			nkids=$((nkids + 1))
+			set -- $(leg "$kal" $BAND_6)
+			[ -z "$why" ] && ! leg_ok "$2" "$3" "$4" && why="6 GHz leg of $kal not good ($2 $3 %)"
+			[ -z "$why" ] && [ -s "$STATE/pin.$ksta" ] && why="leg of $kal pinned by rule 1"
+			lines="$lines$r $kap $ksta 2 $(map8 $((1 << ${1:-0})))
+"
+			for b in $BAND_5 $BAND_6; do
+				set -- $(leg "$kal" $b)
+				[ -n "$1" ] || continue
+				bytes=$((bytes + ${5:-0} + ${6:-0}))
+				[ "${4:-0}" -gt "$seen" ] && seen=$4
+			done
+		done
+		# one step per collector refresh
+		if [ -n "$oseen" ] && [ "$seen" != "$oseen" ] && [ "$bytes" -ge "${obytes:-0}" ] && [ "$seen" -gt "$oseen" ]; then
+			rate=$(( (bytes - obytes) / (seen - oseen) ))
+			if [ "$rate" -ge "$ALT_BPS" ]; then
+				nab=$((nab + 1)); bsince=0
+			else
+				nab=0; [ "$bsince" = 0 ] && bsince=$now
+			fi
+			if [ -n "$why" ]; then
+				[ "$on" = 1 ] && log "alternate $r: end - $why"
+				on=0
+			elif [ "$on" = 0 ] && [ "$nab" -ge "$ALT_ON" ]; then
+				on=1
+				log "alternate $r: start - $nkids child(ren), $((rate * 8 / 1000)) kbit/s through them; parent hop 5 GHz, child hops 6 GHz$( [ "$ALT_LIVE" = 1 ] || echo ' (dry run)')"
+			elif [ "$on" = 1 ] && [ "$bsince" != 0 ] && [ $((now - bsince)) -ge "$ALT_OFF_S" ]; then
+				on=0
+				log "alternate $r: end - below $((ALT_BPS * 8 / 1000)) kbit/s for $((now - bsince)) s"
+			fi
+		fi
+		[ "$seen" -gt 0 ] && echo "$on $nab $bsince $seen $bytes" > "$st"
+		# Ending needs an explicit teardown: a line that is merely gone is
+		# not one (see RELEASE above). One pass of all-zero maps, except for
+		# a station rule 1 has pinned meanwhile - its own line stands.
+		tdn=$STATE/altend.$r
+		if [ "$on" = 1 ]; then
+			rm -f "$tdn"
+		elif [ -e "$STATE/alton.$r" ]; then
+			{
+				[ -s "$STATE/pin.$rsta" ] || echo "$rpar $rap $rsta 2 $(map8 0)"
+				for kid in $(awk -v r="$r" '$4 == r { print $1 "/" $3 }' "$pf"); do
+					[ -s "$STATE/pin.${kid%%/*}" ] || echo "$r ${kid#*/} ${kid%%/*} 2 $(map8 0)"
+				done
+			} > "$tdn"
+		fi
+		if [ "$on" = 1 ]; then : > "$STATE/alton.$r"; else rm -f "$STATE/alton.$r"; fi
+		if [ -s "$tdn" ] && [ "$on" = 0 ]; then
+			if [ -e "$tdn.sent" ]; then rm -f "$tdn" "$tdn.sent"; else cat "$tdn" >> "$altout"; : > "$tdn.sent"; fi
+		fi
+		[ "$on" = 1 ] || continue
+		echo "$rpar $rap $rsta 2 $(map8 $((1 << ${rl5:-0})))" >> "$altout"
+		printf '%s' "$lines" >> "$altout"
+	done
+	{
+		echo "# rule 2 (alternate bands across a repeater)$( [ "$ALT_LIVE" = 1 ] || echo ', DRY RUN - not in the policy')"
+		sort "$altout"
+	} > "$altout.f"
+	cmp -s "$altout.f" "$STATE/alternate.dry" 2>/dev/null || mv "$altout.f" "$STATE/alternate.dry"
+	rm -f "$altout.f"
+	[ "$ALT_LIVE" = 1 ] && cat "$altout" >> "$polout"
+	rm -f "$altout"
+}
+
+map8() {
+	# eight TIDs onto one bitmap: "0:m 1:m ... 7:m"
+	echo "0:$1 1:$1 2:$1 3:$1 4:$1 5:$1 6:$1 7:$1"
+}
+
+while :; do
+	now=$(date +%s)
+	new=$STATE/policy.new
+	: > "$new"
+
+	pairs | tee "$STATE/pairs" | while read -r sta child apmld parent; do
+		[ -n "$sta" ] || continue
+		h=$STATE/hist.$sta           # "<ts> <bad_link|->" per sample
+		pin=$STATE/pin.$sta          # "<keep_link> <pinned_since> <last_bad_ts>"
+		rel=$STATE/release.$sta      # present for one pass after a release
+
+		ctr=$STATE/ctr.$sta          # "<seen> <rx0> <tf0> <rx1> <tf1>" of the last sample
+		bon=$STATE/bonly.$sta        # "<since> <n_leg0> <n_leg1>" beacon-only samples
+
+		set -- $(legs "$child" | tr '\n' ' ')
+		# exactly two legs: id st pct seen rx tf, twice
+		if [ $# -ne 12 ]; then
+			continue
+		fi
+		l0=$1 s0=$2 p0=$3 t0=$4 rx0=$5 tf0=$6
+		l1=$7 s1=$8 p1=$9 t1=${10} rx1=${11} tf1=${12}
+		fresh=1
+		[ $((now - t0)) -le "$STALE_S" ] && [ $((now - t1)) -le "$STALE_S" ] || fresh=0
+
+		badleg=-
+		seen=$t0; [ "$t1" -gt "$seen" ] && seen=$t1
+		last=$(tail -1 "$h" 2>/dev/null | cut -d' ' -f1)
+		# one sample per collector refresh, not per tick
+		if [ "$fresh" = 1 ] && [ "$last" != "$seen" ]; then
+			o_seen= o_rx0= o_tf0= o_rx1= o_tf1=
+			[ -s "$ctr" ] && read -r o_seen o_rx0 o_tf0 o_rx1 o_tf1 < "$ctr"
+			echo "$seen $rx0 $tf0 $rx1 $tf1" > "$ctr"
+			drx0=$(delta "$rx0" "$o_rx0"); dtf0=$(delta "$tf0" "$o_tf0")
+			drx1=$(delta "$rx1" "$o_rx1"); dtf1=$(delta "$tf1" "$o_tf1")
+
+			symleg=-
+			if bad "$s0" "$p0" && good "$s1" "$p1"; then
+				symleg=$l0
+				evidence "$dtf0" "$drx0" "$drx1" && badleg=$l0
+			elif bad "$s1" "$p1" && good "$s0" "$p0"; then
+				symleg=$l1
+				evidence "$dtf1" "$drx1" "$drx0" && badleg=$l1
+			fi
+
+			# beacon-only: counted, logged hourly, never pinned on
+			if [ "$symleg" != - ] && [ "$badleg" = - ]; then
+				b_since=$now b_n0=0 b_n1=0
+				[ -s "$bon" ] && read -r b_since b_n0 b_n1 < "$bon"
+				if [ "$symleg" = "$l0" ]; then b_n0=$((b_n0 + 1)); else b_n1=$((b_n1 + 1)); fi
+				echo "$b_since $b_n0 $b_n1" > "$bon"
+			fi
+			if [ -s "$bon" ]; then
+				read -r b_since b_n0 b_n1 < "$bon"
+				if [ $((now - b_since)) -ge 3600 ]; then
+					log "$sta (child $child): beacon-only samples in $(( (now - b_since) / 60 )) min - leg $l0: $b_n0, leg $l1: $b_n1 (data flowed, not pinned)"
+					rm -f "$bon"
+				fi
+			fi
+
+			echo "$seen $badleg" >> "$h"
+			# keep only the recurrence window
+			awk -v lim=$((now - RECUR_WIN)) '$1 >= lim' "$h" > "$h.t" 2>/dev/null && mv "$h.t" "$h"
+		fi
+
+		if [ -s "$pin" ]; then
+			read -r keep since lastbad < "$pin"
+			bl=$l0; [ "$keep" = "$l0" ] && bl=$l1
+			lb=$(awk -v b="$bl" '$2 == b { t = $1 } END { print t + 0 }' "$h" 2>/dev/null)
+			[ "$lb" -gt "${lastbad:-0}" ] && lastbad=$lb && echo "$keep $since $lastbad" > "$pin"
+			if [ $((now - lastbad)) -ge "$RELEASE_S" ]; then
+				log "release $sta (child $child): leg $bl clean for $((now - lastbad)) s"
+				rm -f "$pin"; : > "$rel"
+				echo "$parent $apmld $sta 2 $(map8 0)" >> "$new"
+			else
+				echo "$parent $apmld $sta 2 $(map8 $((1 << keep)))" >> "$new"
+			fi
+			continue
+		fi
+
+		if [ -e "$rel" ]; then
+			rm -f "$rel"          # the teardown line went out last pass
+			continue
+		fi
+
+		[ "$fresh" = 1 ] || continue
+		# A: the last BAD_RUN samples all name the same bad leg
+		runleg=$(tail -n "$BAD_RUN" "$h" | awk -v n="$BAD_RUN" '
+			{ c[$2]++; k = $2 } END { if (NR == n && k != "-" && c[k] == n) print k }')
+		# B: at least BAD_RECUR bad samples of one leg in the window
+		recleg=$(awk -v n="$BAD_RECUR" '$2 != "-" { c[$2]++ }
+			END { for (k in c) if (c[k] >= n) { print k; exit } }' "$h")
+		why=""; bl=""
+		[ -n "$runleg" ] && bl=$runleg && why="sustained ($BAD_RUN samples)"
+		[ -z "$bl" ] && [ -n "$recleg" ] && bl=$recleg && why="recurring (>=$BAD_RECUR in $((RECUR_WIN / 60)) min)"
+		[ -n "$bl" ] || continue
+
+		keep=$l0; [ "$bl" = "$l0" ] && keep=$l1
+		log "pin $sta (child $child, parent $parent) to leg $keep: leg $bl $why"
+		echo "$keep $now $now" > "$pin"
+		echo "$parent $apmld $sta 2 $(map8 $((1 << keep)))" >> "$new"
+	done
+
+	alternate "$STATE/pairs" "$new"
+
+	{
+		echo "# generated by easymesh-ttlm-policy$( [ "$DRY" = 0 ] || echo ' (DRY RUN)'), do not edit by hand"
+		echo "# parent_almac ap_mld sta_mld dir tid:map ..."
+		sort "$new"
+	} > "$new.f"
+	if ! cmp -s "$new.f" "$OUT" 2>/dev/null; then
+		mv "$new.f" "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+		log "policy rewritten ($(grep -vc '^#' "$OUT") line(s))$( [ "$DRY" = 0 ] || echo ', dry run')"
+	fi
+	rm -f "$new" "$new.f"
+	# Heartbeat for easymesh-check. The policy file itself is no proof of
+	# life: it is rewritten only when its content changes, and may stay the
+	# same for hours on a healthy mesh.
+	echo "$now" > "$STATE/alive"
+	[ "${ONESHOT:-0}" = 1 ] && break
+	sleep "$TICK"
+done

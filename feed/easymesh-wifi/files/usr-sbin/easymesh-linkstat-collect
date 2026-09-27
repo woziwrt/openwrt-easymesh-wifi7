@@ -1,0 +1,212 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-linkstat-collect - gather per-leg liveness into the model.
+#
+# Runs on the CONTROLLER only. Each agent computes its own legs
+# (/usr/sbin/easymesh-linkstat) and publishes them on ubus as easymesh
+# link_state; this walks the nodes the controller already knows an address for
+# and writes what they say into mapc.db.
+#
+# Two tables, on purpose:
+#
+#   bsta_link     current state, one row per (agent, leg). Rebuilt wholesale
+#                 per node, the same way mapc_sync_bstamld() rebuilds bstamld.
+#
+#   metric_hist   the hourly series that already exists in the schema, with the
+#                 leg column finally carrying an MLO link id. Every kind
+#                 written today uses leg=-1 (bh_rcpi, sta_rcpi) or a band
+#                 (anpi), so nothing collides.
+#
+# ⚠️ Why HTTP/ubus and not ssh: repeated ssh to these boxes floods dropbear and
+# takes the mesh down for half an hour (incident 2026-05-29). One 3 s HTTP call
+# per node per cycle, five nodes, is nothing.
+#
+# ⚠️ Why not in the render path: overview.js polls every 15 s, and five HTTP
+# calls inside a render block the page. This writes to the DB; the API reads
+# the DB.
+
+# db.sh first (sq1), then names.sh (live_addrs_json) - that order is its
+# documented contract. [ -r ] rather than `if ! . file`: sourcing a missing
+# file ends the script outright in ash.
+for _lib in db names; do
+	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
+		logger -t easymesh-linkstat "cannot read /usr/share/easymesh/$_lib.sh - refusing to start"
+		exit 0
+	}
+	# shellcheck source=/dev/null
+	. "/usr/share/easymesh/$_lib.sh"
+done
+unset _lib
+
+INTERVAL=${1:-30}
+STALE=${STALE:-90}
+
+# Only the controller owns the database.
+[ "$(uci -q get mapcontroller.controller.enabled)" = "1" ] || exit 0
+
+schema() {
+	sq1 "CREATE TABLE IF NOT EXISTS bsta_link (
+		agent_almac TEXT NOT NULL,
+		link_id     INTEGER NOT NULL,
+		band        INTEGER,
+		bssid       TEXT,
+		state       TEXT,
+		beacon_pct  INTEGER,
+		rx_bytes    INTEGER,
+		tx_bytes    INTEGER,
+		tx_failed   INTEGER,
+		last_seen   INTEGER,
+		PRIMARY KEY (agent_almac, link_id));"
+	sq1 "CREATE INDEX IF NOT EXISTS idx_bsta_link_seen ON bsta_link(last_seen);"
+	# Leg quality, added 2026-09-26. ADD COLUMN fails on a table that
+	# already has it, and sq1 swallows that - this is the migration.
+	for _c in rssi tx_mbit rx_mbit chain_spread; do
+		sq1 "ALTER TABLE bsta_link ADD COLUMN $_c INTEGER;"
+	done
+	# Who can hear whom: what each agent's easymesh-parent-scan saw on its
+	# own backhaul channels. The input a backhaul steering decision has
+	# never had (scan_result has always been empty).
+	sq1 "CREATE TABLE IF NOT EXISTS bh_candidate (
+		agent_almac TEXT NOT NULL,
+		bssid       TEXT NOT NULL,
+		freq        INTEGER,
+		signal      INTEGER,
+		parent      TEXT,
+		scan_ts     INTEGER,
+		PRIMARY KEY (agent_almac, bssid));"
+}
+
+session() {
+	curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
+		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
+		"http://$1/ubus" 2>/dev/null |
+		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p'
+}
+
+ask() {
+	_s=$(session "$1")
+	[ -n "$_s" ] || return 1
+	curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$_s\",\"easymesh\",\"${2:-link_state}\",{}]}" \
+		"http://$1/ubus" 2>/dev/null | jsonfilter -e '@.result[1]'
+}
+
+# One node's parent scan, wholesale like bsta_link. Stored only when the scan
+# is newer than what we have, so a node whose scanner died keeps its last
+# scan_ts and ages out of any decision on its own.
+store_cand() {
+	_al=$1; _json=$2
+	_ts=$(echo "$_json" | jsonfilter -e '@.ts' 2>/dev/null)
+	_par=$(echo "$_json" | jsonfilter -e '@.parent' 2>/dev/null)
+	case "$_ts" in ''|*[!0-9]*) return 1 ;; esac
+	_have=$(sq1 "SELECT MAX(scan_ts) FROM bh_candidate WHERE agent_almac='$_al';")
+	[ "${_have:-0}" -lt "$_ts" ] 2>/dev/null || return 0
+	_n=0
+	_sql="BEGIN;DELETE FROM bh_candidate WHERE agent_almac='$_al';"
+	while :; do
+		_b=$(echo "$_json" | jsonfilter -e "@.cand[$_n].bssid" 2>/dev/null)
+		[ -n "$_b" ] || break
+		_f=$(echo "$_json" | jsonfilter -e "@.cand[$_n].freq")
+		_g=$(echo "$_json" | jsonfilter -e "@.cand[$_n].signal")
+		_n=$((_n + 1))
+		case "$_b" in [0-9a-f][0-9a-f]:*) ;; *) continue ;; esac
+		case "$_f" in ''|*[!0-9]*) continue ;; esac
+		case "$_g" in -[0-9]*) ;; *) continue ;; esac
+		_sql="$_sql INSERT INTO bh_candidate VALUES('$_al','$_b',$_f,$_g,'$_par',$_ts);"
+	done
+	_sql="$_sql COMMIT;"
+	[ "$_n" -gt 0 ] || return 1
+	sq1 "$_sql"
+}
+
+# One node, one transaction. Wholesale rebuild: a leg that stopped being
+# reported must disappear, not linger - that is exactly the defect that lets
+# bstamld.num_bsta outlive reality.
+store() {
+	_al=$1; _json=$2; _now=$3
+	_n=0
+	_sql="BEGIN;DELETE FROM bsta_link WHERE agent_almac='$_al';"
+	while :; do
+		_id=$(echo "$_json" | jsonfilter -e "@.links[$_n].id" 2>/dev/null)
+		[ -n "$_id" ] || break
+		_bd=$(echo "$_json" | jsonfilter -e "@.links[$_n].band")
+		_bs=$(echo "$_json" | jsonfilter -e "@.links[$_n].bssid")
+		_st=$(echo "$_json" | jsonfilter -e "@.links[$_n].state")
+		_bp=$(echo "$_json" | jsonfilter -e "@.links[$_n].beacon_pct")
+		_rx=$(echo "$_json" | jsonfilter -e "@.links[$_n].rx_bytes")
+		_tx=$(echo "$_json" | jsonfilter -e "@.links[$_n].tx_bytes")
+		_tf=$(echo "$_json" | jsonfilter -e "@.links[$_n].tx_failed")
+		_rs=$(echo "$_json" | jsonfilter -e "@.links[$_n].rssi")
+		_tr=$(echo "$_json" | jsonfilter -e "@.links[$_n].tx_mbit")
+		_rr=$(echo "$_json" | jsonfilter -e "@.links[$_n].rx_mbit")
+		_cs=$(echo "$_json" | jsonfilter -e "@.links[$_n].chain_spread")
+		# An older linkstat does not send them: NULL, never a made-up 0.
+		for _v in _rs _tr _rr _cs; do
+			eval "case \"\$$_v\" in ''|*[!-0-9]*) $_v=NULL ;; esac"
+		done
+		case "$_st" in up|down|degraded|unknown) ;; *) _st=unknown ;; esac
+		case "$_id$_bd$_bp" in *[!0-9]*) _n=$((_n + 1)); continue ;; esac
+		_sql="$_sql INSERT INTO bsta_link(agent_almac,link_id,band,bssid,state,beacon_pct,rx_bytes,tx_bytes,tx_failed,last_seen,rssi,tx_mbit,rx_mbit,chain_spread)
+			VALUES('$_al',$_id,${_bd:-0},'${_bs:--}','$_st',${_bp:-0},${_rx:-0},${_tx:-0},${_tf:-0},$_now,$_rs,$_tr,$_rr,$_cs);"
+		# History, into the table that already exists for it. Only a real
+		# measurement is folded in: an 'unknown' leg has no delta yet and
+		# averaging it would be the same defect as folding rcpi 255.
+		if [ "$_st" != unknown ]; then
+			_sql="$_sql INSERT INTO metric_hist(subject,kind,leg,ts_hour,min_val,avg_val,max_val,samples)
+				VALUES('$_al','bh_beacon_pct',$_id,($_now/3600)*3600,$_bp,$_bp,$_bp,1)
+				ON CONFLICT(subject,kind,leg,ts_hour) DO UPDATE SET
+				min_val=MIN(metric_hist.min_val,excluded.min_val),
+				max_val=MAX(metric_hist.max_val,excluded.max_val),
+				avg_val=(metric_hist.avg_val*metric_hist.samples+excluded.avg_val)/(metric_hist.samples+1),
+				samples=metric_hist.samples+1;"
+		fi
+		_n=$((_n + 1))
+	done
+	_sql="$_sql COMMIT;"
+	# Nothing parsed - do NOT wipe the node's legs on a malformed answer.
+	# An empty picture is a claim too, and it is the wrong one.
+	[ "$_n" -gt 0 ] || return 1
+	sq1 "$_sql"
+}
+
+schema
+
+pass=0
+while :; do
+	now=$(date +%s)
+	pass=$((pass + 1))
+	# live_addrs_json() from names.sh is the same ledger the API's own
+	# topology call publishes: {"aa:bb:..":"172.16.20.4", ...}. Split it into
+	# almac<TAB>ip without asking anyone a second time.
+	live_addrs_json | tr -d '{}"' | tr ',' '\n' |
+		sed -n 's/^\([0-9a-fA-F:]\{17\}\):\([0-9.]*\)$/\1\t\2/p' |
+		while IFS='	' read -r al ip; do
+			[ -n "$al" ] && [ -n "$ip" ] || continue
+			j=$(ask "$ip") || continue
+			# by field: jsonfilter prints "stale": true with a space, so a
+			# text match never fired (found 2026-09-23)
+			[ "$(echo "$j" | jsonfilter -e '@.stale' 2>/dev/null)" = true ] && continue
+			store "$al" "$j" "$now" ||
+				logger -t easymesh-linkstat "no usable link_state from $al ($ip)"
+			# Parent scans change every 10 min; ask every 10th pass (5 min).
+			# schema again first: sq1 swallows errors, and a CREATE that met
+			# a locked database at start would leave every store failing
+			# quietly until a restart (seen once on 2026-09-23).
+			if [ $((pass % 10)) -eq 1 ]; then
+				schema
+				c=$(ask "$ip" parent_scan) &&
+					[ "$(echo "$c" | jsonfilter -e '@.stale' 2>/dev/null)" != true ] &&
+					store_cand "$al" "$c"
+			fi
+		done
+
+	# A row nobody refreshed stops being a claim. It is not deleted - that
+	# happens with the node, in forget_node and in the janitor - it simply
+	# stops saying 'up'.
+	sq1 "UPDATE bsta_link SET state='unknown'
+	     WHERE state <> 'unknown' AND ($now - last_seen) > $STALE;"
+
+	sleep "$INTERVAL"
+done

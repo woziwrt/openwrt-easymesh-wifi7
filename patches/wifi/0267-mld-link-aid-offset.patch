@@ -1,0 +1,40 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] AP MLD: mark the link AID with the same offset it was allocated with
+
+Two MLD stations were handed the same AID, and the second one lost its
+4-address peer interface as a result. Measured on hardware 2026-07-29:
+
+  hostapd: ap-mld-2: STA 3e:fb:2f:94:72:7b associated (aid 65)
+  hostapd: ap-mld-2: WDS-STA-INTERFACE-ADDED ifname=ap-mld-2.sta1 sta_addr=3e:fb:..
+  hostapd: ap-mld-2: STA 06:0c:43:26:81:10 associated (aid 65)
+  hostapd: nl80211: NL80211_ATTR_STA_VLAN (addr=06:0c:.. ifname=ap-mld-2.sta1)
+           failed: -16 (Resource busy)
+
+The peer interface name is derived from the AID, so an AID collision is an
+interface name collision: the second station is pointed at an interface the
+first one already owns, the bind fails with -EBUSY, and that station stays
+associated with no bridged path - reachable by nothing.
+
+The AID bitmap is indexed consistently everywhere except here. Allocation
+computes aid = i * 32 + j + 65 and sets bit j of word i. Release subtracts the
+same 64 back out. This site does not, so for the first AID handed out - 65 - it
+sets bit 0 of word 2 instead of bit 0 of word 0: a bit belonging to no AID at
+all, while 65 itself is left marked free and is handed out again to the next
+station.
+
+Subtract the offset here as well.
+
+Signed-off-by: WOZIWRT <petr.wozniak@gmail.com>
+---
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5399,7 +5399,8 @@ static int ieee80211_ml_process_link(str
+ 			status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 			goto out;
+ 		}
+-		hapd->sta_aid[(sta->aid - 1) / 32] |= BIT((sta->aid - 1) % 32);
++		hapd->sta_aid[(sta->aid - 1 - 64) / 32] |=
++			BIT((sta->aid - 1 - 64) % 32);
+ 		sta->listen_interval = origin_sta->listen_interval;
+ 		if (update_ht_state(hapd, sta) > 0 && set_beacon)
+ 			*set_beacon = true;
