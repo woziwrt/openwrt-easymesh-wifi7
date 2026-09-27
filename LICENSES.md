@@ -8,6 +8,7 @@
 | `iopsys/overlay/` patch series | as the package they patch (iopsys: BSD-3-Clause) | Petr Wozniak; each patch names its author |
 | `iopsys/overlay/*/Makefile`, init and uci-defaults scripts | as upstream | IOPSYS Software Solutions AB / Genexis, with our changes |
 | `patches/wifi/` | as the component they patch (hostapd: BSD-3-Clause, mt76: ISC, mac80211: GPL-2.0) | each patch names its author |
+| `patches/luci/` | as LuCI (Apache-2.0) | Petr Wozniak |
 | `patches/kernel/`, `patches/mtk-feed/`, `patches/uboot/`, `boards/*/patches-*` | GPL-2.0 (kernel, U-Boot) | each patch names its author |
 | `extras/` - LuCI apps by other authors (CPU/temperature status, scheduled reboot, connection watchdog, modem status, SMS) | each package's own license (see its LICENSE / Makefile) | their authors; included as published |
 | `extras/modemdata-addons/usb/1bc71071` - Telit FN990 support for modemdata | as modemdata | written for this project; added to modemdata at build time |

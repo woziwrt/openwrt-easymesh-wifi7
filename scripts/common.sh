@@ -259,6 +259,12 @@ em_setup_feeds() {
 		[ -d "feeds/$f" ] || em_die "feeds/$f missing - feed clone failed"
 	done
 	em_ok "feeds packages, luci, routing cloned"
+	# Our changes to LuCI itself (e.g. a button to remove the root password,
+	# which stock LuCI cannot do).
+	for f in "$REPO"/patches/luci/*.patch; do
+		[ -f "$f" ] || continue
+		patch -p1 -d feeds/luci < "$f" || em_die "$(basename "$f") does not apply to feeds/luci"
+	done
 	./scripts/feeds install -a
 
 	echo "src-link iopsys $WORK_DIR/iopsys-feed" >> feeds.conf.default
