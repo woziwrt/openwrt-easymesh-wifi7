@@ -48,7 +48,7 @@ ok "full build: $ARCH"
 
 # The SDK and the ImageBuilder are only valid for the revisions they were
 # built from.
-rev() { sed -n "s/^  $1  *\([0-9a-f]\{7,\}\).*/\1/p" "$ARCH/MANIFEST.txt" | head -1; }
+rev() { sed -n "s|^  $1  *\([0-9a-f]\{7,\}\).*|\1|p" "$ARCH/MANIFEST.txt" | head -1; }
 [ "$(rev openwrt)" = "$OPENWRT_COMMIT" ] || die "OpenWrt pin moved since that build ($(rev openwrt) -> $OPENWRT_COMMIT)"
 [ "$(rev mtk-openwrt-feeds)" = "$MTK_COMMIT" ] || die "MTK pin moved since that build ($(rev mtk-openwrt-feeds) -> $MTK_COMMIT)"
 grep -q "tree $IOPSYS_TREE" "$ARCH/MANIFEST.txt" || die "iopsys overlay changed since that build (IOPSYS_TREE) - its binaries need a full build"
