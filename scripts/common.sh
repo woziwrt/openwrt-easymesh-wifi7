@@ -535,7 +535,7 @@ em_archive() {
 		echo "board   : $BOARD"
 		echo "built   : $stamp"
 		echo "repo    : $(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
-		# scripts/release.sh publishes no image with "dirty : yes"
+		# an image with "dirty : yes" is not one to publish
 		echo "dirty   : $([ "${EM_DIRTY:-0}" = 1 ] && echo yes || echo no)"
 		echo ""
 		echo "REVISIONS - the image cannot be rebuilt without these"
