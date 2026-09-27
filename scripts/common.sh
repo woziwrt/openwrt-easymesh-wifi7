@@ -18,7 +18,11 @@
 #   MIRROR_DIR   local git mirrors     (default: $HOME/mirrors, used if present)
 #   OUTPUT_DIR   finished images       (default: $REPO/output)
 #   ALLOW_DIRTY=1  build from a repository with uncommitted changes
+#   LOG_FILE     build log               (default: $OUTPUT_DIR/build-<board>-<time>.log)
+# Any of these can also be set once in $REPO/local.conf (not tracked by git).
 
+# shellcheck source=/dev/null
+[ -f "$REPO/local.conf" ] && . "$REPO/local.conf"
 # shellcheck source=../pins.conf
 . "$REPO/pins.conf"
 
@@ -32,6 +36,14 @@ MTK_KERNEL_PATCHES=mtk-openwrt-feeds/25.12/files/target/linux/mediatek/patches-6
 
 em_die() { echo "ERROR: $*" >&2; exit 1; }
 em_ok()  { echo ">>> $*"; }
+
+# Everything the build prints also goes to a log file, so no `| tee` is needed.
+em_start_log() {
+	mkdir -p "$OUTPUT_DIR"
+	LOG_FILE=${LOG_FILE:-$OUTPUT_DIR/build-$BOARD-$(date +%Y-%m-%d-%H%M).log}
+	exec > >(tee -a "$LOG_FILE") 2>&1
+	em_ok "log: $LOG_FILE"
+}
 
 # --- 0) what is built must be reproducible -----------------------------------
 # An image built from uncommitted files cannot be built again, and nobody can

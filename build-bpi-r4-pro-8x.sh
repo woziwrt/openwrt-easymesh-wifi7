@@ -18,6 +18,7 @@ REPO=$(cd "$(dirname "$0")" && pwd)
 BOARD=bpi-r4-pro-8x
 . "$REPO/scripts/common.sh"
 
+em_start_log
 em_require_clean_repo
 em_fetch_sources
 em_patch_mtk_feed

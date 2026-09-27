@@ -23,8 +23,10 @@ of a box is chosen after the first boot, not at build time.
 ```sh
 git clone https://github.com/woziwrt/openwrt-easymesh-wifi7.git
 cd openwrt-easymesh-wifi7
-./build-bpi-r4.sh 2>&1 | tee build-bpi-r4.log
+./build-bpi-r4.sh
 ```
+
+The build writes its own log to `output/build-<board>-<time>.log`.
 
 The two boards use separate build trees (`build/bpi-r4/`, `build/bpi-r4-pro-8x/`)
 and may be built at the same time. Do not start two builds of the same board at
@@ -58,6 +60,10 @@ once - the script deletes and recreates its own tree.
 | `OUTPUT_DIR` | `output/` | where finished images go |
 | `OPENWRT_COMMIT`, `MTK_COMMIT`, `IOPSYS_BASE`, `IOPSYS_TREE` | `pins.conf` | override a pin for a trial build (the result is then not the tested image) |
 | `ALLOW_DIRTY=1` | off | build from uncommitted changes |
+| `LOG_FILE` | `output/build-<board>-<time>.log` | build log |
+
+Settings for one machine can be kept in `local.conf` in the repository root
+(ignored by git), e.g. `DL_DIR=$HOME/dl-shared`.
 
 ## Repository layout
 
