@@ -4,6 +4,7 @@
 'use strict';
 'require view';
 'require poll';
+'require fs';
 'require wifimgr/layer2 as layer2';
 'require wifimgr/layer3 as layer3';
 'require wifimgr/linkpolicy as linkpolicy';
@@ -68,6 +69,17 @@ var TAB_DEFS = [
     { id: 'diagnostics', label: 'Diagnostics' },
     { id: 'link-policy', label: 'Link Policy' }
 ];
+
+// On an EasyMesh box the mesh controller steers the MLO links, so the Link
+// Policy tab (mlo-steerd, a second steering daemon) is left out entirely:
+// starting it next to the controller knocks clients off their links, and a
+// tab with nothing to do only invites that click.
+function dropLinkPolicyOnEasyMesh() {
+    return fs.exec('/bin/sh', ['-c', 'cat /etc/mapc/role 2>/dev/null || true']).then(function(r) {
+        if (/^(controller|agent)$/.test(((r && r.stdout) || '').trim()))
+            TAB_DEFS = TAB_DEFS.filter(function(t) { return t.id !== 'link-policy'; });
+    }).catch(function() {});
+}
 
 // ── DOM HELPERS ───────────────────────────────────────────────────────────────
 
@@ -2914,7 +2926,8 @@ function loadDiag() {
 
 return view.extend({
     load: function() {
-        return layer3.load_all();
+        return Promise.all([layer3.load_all(), dropLinkPolicyOnEasyMesh()])
+            .then(function(r) { return r[0]; });
     },
 
     render: function(data) {

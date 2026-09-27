@@ -993,19 +993,29 @@ async function hostapd_get_neg_ttlm(ifname, mac) {
     }
 }
 
+// PIDs of the running daemon, matched on its exact command line. `pgrep -f
+// mlo-steerd` matched the very `sh -c` it ran in, so the page always said
+// "running" with a PID that was gone a moment later (found 2026-09-27).
+const STEERD_PIDS = 'for p in /proc/[0-9]*; do case "$(tr "\\0" " " 2>/dev/null < $p/cmdline)" in ' +
+    '"sh /root/mlo-steerd.sh "|"/bin/sh /root/mlo-steerd.sh ") echo ${p#/proc/};; esac; done';
+
 async function steerd_status() {
     try {
-        const [pidRes, logRes, scriptRes] = await Promise.all([
-            fs.exec('/bin/sh', ['-c', 'pgrep -f mlo-steerd | head -1']),
+        const [pidRes, logRes, scriptRes, roleRes] = await Promise.all([
+            fs.exec('/bin/sh', ['-c', STEERD_PIDS + ' | head -1']),
             fs.exec('/bin/sh', ['-c', 'tail -25 /tmp/steerd.log 2>/dev/null || true']),
-            fs.exec('/bin/sh', ['-c', 'test -f /root/mlo-steerd.sh && echo yes || echo no'])
+            fs.exec('/bin/sh', ['-c', 'test -f /root/mlo-steerd.sh && echo yes || echo no']),
+            fs.exec('/bin/sh', ['-c', 'cat /etc/mapc/role 2>/dev/null || true'])
         ]);
         const pid = (pidRes.stdout || '').trim();
         return ok({
             running:         pid !== '',
             pid:             pid ? parseInt(pid) : null,
             log:             (logRes.stdout || '').trim().split('\n').filter(Boolean),
-            script_present:  (scriptRes.stdout || '').trim() === 'yes'
+            script_present:  (scriptRes.stdout || '').trim() === 'yes',
+            // A box in an EasyMesh mesh has its links steered by the mesh
+            // controller; a second steering daemon next to it fights it.
+            easymesh:        /^(controller|agent)$/.test((roleRes.stdout || '').trim())
         });
     } catch(e) {
         return mkErr('exec_failed');
@@ -1014,8 +1024,13 @@ async function steerd_status() {
 
 async function steerd_start() {
     try {
+        // Refused on an EasyMesh box, whatever the page shows: mlo-steerd and
+        // the mesh controller would steer the same links against each other.
+        const role = await fs.exec('/bin/sh', ['-c', 'cat /etc/mapc/role 2>/dev/null || true']);
+        if (/^(controller|agent)$/.test((role.stdout || '').trim()))
+            return mkErr('easymesh_active');
         const res = await fs.exec('/bin/sh', ['-c',
-            '(sh /root/mlo-steerd.sh </dev/null >/tmp/steerd.log 2>&1 &); sleep 1; pgrep -f mlo-steerd >/dev/null'
+            '(sh /root/mlo-steerd.sh </dev/null >/tmp/steerd.log 2>&1 &); sleep 1; [ -n "$(' + STEERD_PIDS + ')" ]'
         ]);
         return res.code === 0 ? ok(null) : mkErr('start_failed');
     } catch(e) {
@@ -1025,7 +1040,7 @@ async function steerd_start() {
 
 async function steerd_stop() {
     try {
-        await fs.exec('/bin/sh', ['-c', 'kill $(pgrep -f mlo-steerd) 2>/dev/null; true']);
+        await fs.exec('/bin/sh', ['-c', 'kill $(' + STEERD_PIDS + ') 2>/dev/null; true']);
         return ok(null);
     } catch(e) {
         return mkErr('exec_failed');

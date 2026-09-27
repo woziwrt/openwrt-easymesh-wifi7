@@ -110,6 +110,18 @@ function renderDaemonRow(sd, onRefresh) {
 
     var running = sd.running;
 
+    // On an EasyMesh box the mesh controller steers the links. No Start
+    // button there - a second steering daemon would fight the controller
+    // and knock clients off their links. Stop stays, should it ever run.
+    if (sd.easymesh && !running) {
+        d.appendChild(el('span', {
+            style: 'display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#444'
+        }));
+        d.appendChild(sp('mlo-steerd: ', 'color:#aaa;font-size:13px'));
+        d.appendChild(sp('off - the EasyMesh controller steers the links on this box', 'color:#888;font-size:13px'));
+        return d;
+    }
+
     // Status dot
     d.appendChild(el('span', {
         style: 'display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;' +
