@@ -83,6 +83,19 @@ em_fetch_sources() {
 	em_clone "$OPENWRT_URL" "$OPENWRT_BRANCH" "$OPENWRT_COMMIT" openwrt openwrt.git
 	em_clone "$MTK_URL" "$MTK_BRANCH" "$MTK_COMMIT" mtk-openwrt-feeds mtk-feeds.git
 
+	# The build date of the image (SOURCE_DATE_EPOCH, file times, and the stamp
+	# LuCI puts on every JS URL) comes from openwrt/version.date, else from the
+	# last OpenWrt commit. With only the OpenWrt date, every image on the same
+	# pin carries the same stamp, and a browser keeps showing the old LuCI pages
+	# after a sysupgrade (found 2026-09-27: new Overview, old view from cache).
+	# Use our own last commit when it is newer - still reproducible per commit.
+	local ow ours
+	ow=$(git -C openwrt log -1 --format=%ct)
+	ours=$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || echo 0)
+	[ "$ours" -gt "$ow" ] && ow=$ours
+	echo "$ow" > openwrt/version.date
+	em_ok "build date $(date -u -d "@$ow" +%F\ %T 2>/dev/null || echo "$ow") (version.date)"
+
 	# Downloads outside the tree, from the first byte: the tree is deleted on
 	# every build, and CONFIG_DOWNLOAD_FOLDER would only take effect after
 	# `autobuild.sh prepare`, which already downloads.
