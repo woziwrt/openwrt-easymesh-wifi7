@@ -133,7 +133,7 @@ lay() {  # lay <package-dir>: htdocs -> /www, root -> /
 for a in luci-app-easymesh luci-app-wifimgr; do
 	lay "$REPO/feed/$a"
 	v=$(sed -n 's/^PKG_VERSION:=//p' "$REPO/feed/$a/Makefile")
-	grep -rl '@@PKG_VERSION@@' "$OV/www" 2>/dev/null | xargs -r sed -i "s/@@PKG_VERSION@@/$v/"
+	{ grep -rl '@@PKG_VERSION@@' "$OV/www" 2>/dev/null || true; } | xargs -r sed -i "s/@@PKG_VERSION@@/$v/"
 done
 ok "overlay: $(find "$OV" -type f | wc -l) files"
 
