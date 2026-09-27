@@ -95,4 +95,4 @@ writer the authoritative value rather than to add a third.
 +			}
  		}
  
- 		err("E2TRACE: ULOZEN sta_mld " MACFMT " pod ap_mld " MACFMT " links=%u\n",
+ 		err("E2TRACE: STORED sta_mld " MACFMT " under ap_mld " MACFMT " links=%u\n",

@@ -36,8 +36,6 @@ zero. That was a symptom treatment and is withdrawn: it would have silenced
 the one message that says the lists are corrupt, and it deleted entries while
 walking a list already known to be broken.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
 
 --- a/src/sta.c
 +++ b/src/sta.c

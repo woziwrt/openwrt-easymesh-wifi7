@@ -14,7 +14,7 @@ the database every ten seconds:
 
 	07:15:53  cntlr_affiliated_sta_metrics: leg 06:52:f0:f8:c9:28
 	                     on 76:04:1c:81:bc:2e  rcpi 130
-	07:16:01  E2TRACE: ULOZEN sta_mld ... links=3      (rebuild + sync)
+	07:16:01  E2TRACE: STORED sta_mld ... links=3      (rebuild + sync)
 	07:16:05  affiliated_sta.rcpi = 0
 
 rcpi 130 is -45 dBm and matches what libwifi reported on that leg. The value was

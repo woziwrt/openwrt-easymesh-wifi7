@@ -47,8 +47,6 @@ INIT_LIST_HEAD for the same reason and is fixed in 99999995.
 sta_dec_ref() does not free at zero; it starts the ageout timer, so the
 station stays valid across the unlink.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
 
 --- a/src/cntlr.c
 +++ b/src/cntlr.c

@@ -4,8 +4,8 @@ Subject: [PATCH] mapc: attribute a STA-MLD to the AP-MLD reporting it
 A client that roams is reported by BOTH the node it left and the node it
 joined. Measured 2026-08-02 with an iPhone moving 4g -> x8:
 
-  E2TRACE: ULOZEN sta_mld 7a:6f:.. pod ap_mld 00:0c:43:26:60:10 links=3
-  E2TRACE: ULOZEN sta_mld 7a:6f:.. pod ap_mld 7e:04:1c:81:7c:2e links=1
+  E2TRACE: STORED sta_mld 7a:6f:.. under ap_mld 00:0c:43:26:60:10 links=3
+  E2TRACE: STORED sta_mld 7a:6f:.. under ap_mld 7e:04:1c:81:7c:2e links=1
   ... alternating, once per Topology Response round
 
 sta_mld is keyed on the client address alone, so the two reports overwrite

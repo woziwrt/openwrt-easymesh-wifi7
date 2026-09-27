@@ -42,8 +42,6 @@ Verified by reading the source on 2026-09-06, not by exploiting it:
 agent_tlv.c ssid[32] on the stack against a one-byte length, and all three
 callers in agent_map.c passing only the pointer.
 
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01SmdHaYcnhtvUuXYfnXZobZ
 
 --- a/src/agent_tlv.c
 +++ b/src/agent_tlv.c
