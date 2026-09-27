@@ -9,6 +9,7 @@
 | `iopsys/overlay/*/Makefile`, init and uci-defaults scripts | as upstream | IOPSYS Software Solutions AB / Genexis, with our changes |
 | `patches/wifi/` | as the component they patch (hostapd: BSD-3-Clause, mt76: ISC, mac80211: GPL-2.0) | each patch names its author |
 | `patches/kernel/`, `patches/mtk-feed/`, `patches/uboot/`, `boards/*/patches-*` | GPL-2.0 (kernel, U-Boot) | each patch names its author |
+| `extras/` - LuCI apps and tools by other authors (CPU/temperature status, scheduled reboot, connection watchdog, modem status, SMS) | each package's own license (see its LICENSE / Makefile) | their authors; included unchanged |
 
 ## Modified copies of upstream files
 
@@ -32,4 +33,4 @@ our own; the upstream copyright inside them applies.
 | `boards/bpi-r4-pro-8x/patches-kernel/046-…` | Sam Shih (MediaTek), via BPI-SINOVOIP | BPI-R4 Pro device tree adapted to the Pro 8X |
 | `boards/bpi-r4-pro-8x/patches-kernel/047-…` | Frank Wunderlich, Daniel Golle | overlays adapted to the Pro 8X |
 | `boards/bpi-r4-pro-8x/patches-kernel/999-eth-00/01/02-…` | Bo-Cun Chen (MediaTek) | ported from Linux 6.6 to 6.12 |
-| `patches/mtk-feed/kernel/999-sfp-10-additional-quirks.patch` | not yet established | SFP module quirks; origin under review |
+| `patches/mtk-feed/kernel/999-sfp-10-additional-quirks.patch` | unknown (community SFP module quirks) | included unchanged, without an author line |

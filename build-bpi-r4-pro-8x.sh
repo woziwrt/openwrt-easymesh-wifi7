@@ -62,6 +62,7 @@ python3 -c 'c=open("package/kernel/linux/modules/netdevices.mk").read(); open("p
 python3 -c 'c=open("target/linux/mediatek/filogic/config-6.12").read(); open("target/linux/mediatek/filogic/config-6.12","w").write(c.replace("CONFIG_AS21XXX_PHY=y","CONFIG_AS21XXX_PHY=m"))'
 chmod +x files/etc/uci-defaults/* files/lib/preinit/* files/usr/sbin/*
 
+em_install_extras
 em_setup_feeds
 
 # The Pro 8X delta is not a full configuration: the production package set

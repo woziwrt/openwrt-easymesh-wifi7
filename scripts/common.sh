@@ -213,6 +213,28 @@ em_install_board_files() {
 	echo production > files/etc/easymesh-model
 }
 
+# --- 3b) third-party extras (run in openwrt/) ---------------------------------
+# Packages by other authors that users of these routers expect: CPU and
+# temperature on the dashboard, scheduled reboot, connection watchdog, LTE
+# modem status and SMS. Copied unchanged from extras/ (each keeps its own
+# license) into the feeds before `feeds install`, or their CONFIG_PACKAGE
+# lines are silently dropped.
+em_install_extras() {
+	local X="$REPO/extras" p
+	cp -r "$X/sms-tool" feeds/packages/utils/sms-tool
+	cp -r "$X/modemdata-main" feeds/packages/utils/modemdata
+	cp -r "$X/luci-app-modemdata-main/luci-app-modemdata" feeds/luci/applications/
+	cp -r "$X/luci-app-sms-tool-js-main/luci-app-sms-tool-js" feeds/luci/applications/
+	for p in luci-app-lite-watchdog luci-app-autoreboot luci-app-cpu-status luci-app-temp-status; do
+		cp -r "$X/$p" feeds/luci/applications/
+	done
+	chmod -R 755 feeds/packages/utils/modemdata/files/usr/share
+	for p in luci-app-modemdata luci-app-sms-tool-js luci-app-autoreboot luci-app-cpu-status luci-app-temp-status; do
+		[ -d "feeds/luci/applications/$p/root" ] && chmod -R 755 "feeds/luci/applications/$p/root"
+	done
+	em_ok "third-party extras copied into the feeds"
+}
+
 # --- 4) feeds: upstream, iopsys, ours (run in openwrt/) ----------------------
 em_setup_feeds() {
 	local f
@@ -412,6 +434,8 @@ em_check_config() {
 	for s in kmod-fs-exfat kmod-fs-ntfs3 ddns-scripts luci-app-ddns \
 	         miniupnpd-nftables luci-app-upnp nlbwmon luci-app-nlbwmon \
 	         luci-app-wol adblock luci-app-adblock luci-proto-wireguard \
+	         luci-app-autoreboot luci-app-cpu-status luci-app-temp-status \
+	         luci-app-lite-watchdog luci-app-modemdata luci-app-sms-tool-js \
 	         kmod-macvlan kmod-usb-storage-uas kmod-usb-net-ipheth usbmuxd \
 	         hd-idle luci-app-hd-idle kmod-usb-printer p910nd luci-app-p910nd \
 	         minidlna luci-app-minidlna tailscale zerotier kmod-vxlan kmod-bonding \

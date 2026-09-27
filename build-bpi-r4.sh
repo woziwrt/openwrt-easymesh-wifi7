@@ -27,6 +27,7 @@ sed -i 's/mt7988a-bananapi-bpi-r4-nvme$/mt7988a-bananapi-bpi-r4-nvme mt7988a-ban
 echo "CONFIG_LED_TRIGGER_PHY=y" >> target/linux/mediatek/filogic/config-6.12
 chmod +x files/etc/init.d/* files/etc/uci-defaults/* files/lib/preinit/*
 
+em_install_extras
 em_setup_feeds
 
 cp "$REPO/configs/bpi-r4.config" .config
