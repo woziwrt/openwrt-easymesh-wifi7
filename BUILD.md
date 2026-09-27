@@ -74,7 +74,7 @@ pins.conf                                 all upstream revisions
 feed/                                     our OpenWrt packages (EasyMesh, LuCI)
 iopsys/overlay/                           our changes to the iopsys Multi-AP stack
 patches/wifi/                             hostapd, mt76 and mac80211 patches
-patches/luci/                             changes to LuCI itself (an empty password can be saved)
+patches/luci/                             changes to LuCI itself (Router Password page)
 patches/mtk-feed/, patches/kernel/, patches/uboot/   patches shared by both boards
 boards/<board>/                           board patches, image layout, first-boot files
 configs/                                  OpenWrt configuration
