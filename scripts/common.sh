@@ -440,17 +440,17 @@ em_archive() {
 	dst="$OUTPUT_DIR/$stamp-$BOARD"
 	mkdir -p "$dst/images" "$dst/packages" "$dst/sdk"
 
-	find "$root/bin/targets" \( -name '*.itb' -o -name '*.img.gz' \) -exec cp -n {} "$dst/images/" \;
+	find "$root/bin/targets" \( -name '*.itb' -o -name '*.img.gz' \) -exec cp {} "$dst/images/" \;
 	# eMMC and NAND images are .bin (~188 MB unpacked); the NVMe image (592 MB)
 	# is installed another way and left out.
 	for f in "$root"/bin/targets/*/*/*emmc-img.bin "$root"/bin/targets/*/*/*snand-img.bin; do
 		[ -f "$f" ] && gzip -c "$f" > "$dst/images/$(basename "$f").gz"
 	done
 	find "$root/bin/packages" -name '*.apk' \( -path '*easymeshr6*' -o -path '*iopsys*' \) \
-		-exec cp -n {} "$dst/packages/" \;
+		-exec cp {} "$dst/packages/" \;
 	for f in "$root"/bin/targets/*/*/openwrt-sdk-*.tar.zst "$root"/bin/targets/*/*/openwrt-imagebuilder-*.tar.zst \
 	         "$root"/bin/targets/*/*/*.manifest; do
-		[ -f "$f" ] && cp -n "$f" "$dst/sdk/"
+		[ -f "$f" ] && cp "$f" "$dst/sdk/"
 	done
 	# The ImageBuilder builds whatever it is told to, silently: the package list
 	# must travel with it or a re-assembled image comes out a fraction of the size.
