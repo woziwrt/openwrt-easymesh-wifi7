@@ -88,6 +88,7 @@ define Package/easymesh-wifi/install
 	$(INSTALL_DATA) ./files/usr-share/boot-window.sh $(1)/usr/share/easymesh/boot-window.sh
 	$(INSTALL_DATA) ./files/usr-share/addr.sh $(1)/usr/share/easymesh/addr.sh
 	$(INSTALL_DATA) ./files/usr-share/join-health.sh $(1)/usr/share/easymesh/join-health.sh
+	$(INSTALL_DATA) ./files/usr-share/parent-plan.awk $(1)/usr/share/easymesh/parent-plan.awk
 
 	$(INSTALL_BIN) ./files/hotplug/20-mld-bsta-bridge $(1)/etc/hotplug.d/net/20-mld-bsta-bridge
 

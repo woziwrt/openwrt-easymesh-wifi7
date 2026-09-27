@@ -2432,12 +2432,29 @@ call)
 					if (msg ~ /^no carrier on /) out(ts, "internet", "Cable unplugged on " self)
 					else if (msg ~ /^VIP already held/) out(ts, "internet", self " has a cable too and stands by as a spare")
 				} else if (tag == "easymesh-parent-plan") {
-					# "[would ]NODE: MOVE OLD (depth D, S dBm) -> NEW (depth D, S dBm): why"
+					# "[PREFIX ]NODE: MOVE OLD (depth D, S5/S6 dBm, T Mbit/s) -> NEW (depth D, S5/S6 dBm, T Mbit/s): why"
+					# PREFIX: would (dry run), proposed (live, waits for its
+					# trial), trying (trial started), reverted (the trial did
+					# not pay); none = kept after a trial. Lines logged before
+					# 2026-09-27 carry no Mbit/s, and no prefix but would.
 					wk = split(msg, ww, /[ (),]+/); wm = idx(ww, wk, "MOVE"); wj = idx(ww, wk, "->")
-					if (wm && wj && ww[1] == "would")
-						out(ts, "planner", "The parent planner would move " n(nc(ww[2])) " from " n(ww[wm + 1]) " to " n(ww[wj + 1]) " (" ww[wm + 3] " -> " ww[wj + 3] " hops) - dry run, not done")
-					else if (wm && wj)
-						out(ts, "planner", "The parent planner moved " n(nc(ww[1])) " from " n(ww[wm + 1]) " to " n(ww[wj + 1]))
+					if (wm && wj) {
+						pre = ww[1]
+						who = n(nc((pre == "would" || pre == "proposed" || pre == "trying" || pre == "reverted") ? ww[2] : pre))
+						pfrom = n(ww[wm + 1]); pto = n(ww[wj + 1])
+						est = (ww[wm + 7] == "Mbit/s" && ww[wj + 7] == "Mbit/s") ? ", about " ww[wm + 6] " -> " ww[wj + 6] " Mbit/s to the controller" : ""
+						hops = " (" ww[wm + 3] " -> " ww[wj + 3] " hops" est ")"
+						if (pre == "would")
+							out(ts, "planner", "The parent planner would move " who " from " pfrom " to " pto hops " - dry run, not done")
+						else if (pre == "proposed")
+							out(ts, "planner", "The parent planner proposes moving " who " from " pfrom " to " pto hops " - a measured trial decides")
+						else if (pre == "trying")
+							out(ts, "planner", "The parent planner is trying " who " under " pto " (a measured trial, back under " pfrom " if it does not pay)")
+						else if (pre == "reverted")
+							out(ts, "planner", "The parent planner tried " who " under " pto " - no gain measured, back under " pfrom)
+						else
+							out(ts, "planner", "The parent planner moved " who " from " pfrom " to " pto hops " - kept after a measured trial")
+					}
 				} else if (tag == "ttlm-policy") {
 					# "pin STA (child C, parent P) to leg K: ...", "release STA (child C): ...",
 					# "alternate NODE: start - ..." / "alternate NODE: end - ..."
