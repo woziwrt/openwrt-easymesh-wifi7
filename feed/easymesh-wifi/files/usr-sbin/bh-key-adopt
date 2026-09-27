@@ -490,6 +490,7 @@ adopt() {
 		{ log "apply-ap failed"; return 1; }
 	/usr/sbin/mlo-backhaul-setup --apply-sta --key "$key" --ssid "$BH_SSID" >/dev/null 2>&1 ||
 		{ log "apply-sta failed"; return 1; }
+	[ -r /usr/share/easymesh/rpc.sh ] && { . /usr/share/easymesh/rpc.sh; mesh_rpc_user; }
 
 	[ -x /usr/sbin/drop-legacy-fronthaul ] && /usr/sbin/drop-legacy-fronthaul
 
@@ -589,6 +590,8 @@ while :; do
 		uci commit mapagent
 		: > "$WPS_SPOOL"
 		log "WPS delivered a backhaul credential for '$wssid' - staged into mapagent config"
+		# The boxes log in to each other with a password made from this key.
+		[ -r /usr/share/easymesh/rpc.sh ] && { . /usr/share/easymesh/rpc.sh; mesh_rpc_user; }
 	}
 
 	# The name can have been changed by someone else meanwhile (wps-join).

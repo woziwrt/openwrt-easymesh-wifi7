@@ -520,8 +520,10 @@ return view.extend({
 					var ns = val('em-rssid'), nk = val('em-rkey');
 					if (!ns)
 						return ui.addNotification(null, E('p', _('The network needs a name.')));
-					if (nk.length < 8)
-						return ui.addNotification(null, E('p', _('The WiFi password needs at least 8 characters.')));
+					if (new TextEncoder().encode(ns).length > 32)
+						return ui.addNotification(null, E('p', _('The network name can be at most 32 bytes.')));
+					if (nk.length < 8 || nk.length > 63)
+						return ui.addNotification(null, E('p', _('The WiFi password needs 8 to 63 characters.')));
 					busy(reBtn, true);
 					callSetCreds(ns, nk).then(function(r) {
 						busy(reBtn, false, _('Change it'));
@@ -587,7 +589,8 @@ return view.extend({
 		foundBtn.addEventListener('click', function() {
 			var ssid = val('em-ssid'), key = val('em-key');
 			if (!ssid) return ui.addNotification(null, E('p', _('The network needs a name.')));
-			if (key.length < 8) return ui.addNotification(null, E('p', _('The WiFi password needs at least 8 characters.')));
+			if (new TextEncoder().encode(ssid).length > 32) return ui.addNotification(null, E('p', _('The network name can be at most 32 bytes.')));
+			if (key.length < 8 || key.length > 63) return ui.addNotification(null, E('p', _('The WiFi password needs 8 to 63 characters.')));
 
 			busy(foundBtn, true);
 			callFound(ssid, key, val('em-rootpw'), val('em-addr') || '10.10.10.1', val('em-name') || state.hostname || '', val('em-bhkey')).then(function(r) {

@@ -134,11 +134,9 @@ ask_controller_addr() {
 	local ctrl="$1" almac="$2" sess out
 	[ -n "$ctrl" ] || return 1
 	command -v curl >/dev/null 2>&1 || return 1
-	sess=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
-		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
-		"http://$ctrl/ubus" 2>/dev/null |
-		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p')
-	[ -n "$sess" ] || return 1
+	[ -r /usr/share/easymesh/rpc.sh ] || return 1
+	. /usr/share/easymesh/rpc.sh
+	sess=$(mesh_rpc_session "$ctrl") || return 1
 	out=$(curl -s --max-time 12 -X POST -H 'Content-Type: application/json' \
 		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sess\",\"easymesh\",\"claim_address\",{\"almac\":\"$almac\"}]}" \
 		"http://$ctrl/ubus" 2>/dev/null)

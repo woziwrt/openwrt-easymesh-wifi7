@@ -96,6 +96,11 @@ printf '=== NIGHTWATCH START %s up=%ss interval=%ss ===\n' \
 
 while :; do
 	sleep "$INTERVAL"
+	# One line a minute is ~50 MB a year on flash. Keep the newest 5000 lines
+	# (about three and a half days) once the file passes 1 MB.
+	if [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+		tail -n 5000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+	fi
 
 	csa_now=$(count "STARTED-CHANNEL-SWITCH")
 	mmc_now=$(count "mmc0: Card stuck")

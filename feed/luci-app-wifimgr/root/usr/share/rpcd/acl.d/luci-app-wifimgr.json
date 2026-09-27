@@ -9,22 +9,9 @@
                 "/sys/kernel/debug/ieee80211/phy0/mt76/band1/txpower_info": [ "read" ],
                 "/sys/kernel/debug/ieee80211/phy0/mt76/band2/txpower_info": [ "read" ],
                 "/sys/kernel/debug/ieee80211/phy0/dfs_status":              [ "read" ],
-                "/proc/version":                                            [ "read" ],
-                "/sbin/uci":                 [ "exec" ],
-                "/bin/sh":                   [ "exec" ],
-                "/bin/cat":                  [ "exec" ],
-                "/bin/ubus":                 [ "exec" ],
-                "/usr/sbin/iw":              [ "exec" ],
-                "/usr/sbin/hostapd_cli":     [ "exec" ],
-                "/usr/sbin/wpa_cli":         [ "exec" ],
-                "/sbin/wifi":                [ "exec" ],
-                "/sbin/iw":                  [ "exec" ],
-                "/bin/logread":              [ "exec" ],
-                "/sbin/logread":             [ "exec" ],
-                "/usr/sbin/logread":         [ "exec" ]
+                "/proc/version":                                            [ "read" ]
             },
             "ubus": {
-                "file":                [ "exec" ],
                 "uci":                 [ "get" ],
                 "network.wireless":    [ "status" ],
                 "network.interface.*": [ "status" ],
@@ -35,10 +22,19 @@
         },
         "write": {
             "file": {
-                "/sbin/uci":    [ "exec" ],
-                "/sbin/wifi":   [ "exec" ],
-                "/sbin/reboot": [ "exec" ],
-                "/bin/sh":      [ "exec" ]
+                "/sbin/uci":             [ "exec" ],
+                "/sbin/wifi":            [ "exec" ],
+                "/sbin/reboot":          [ "exec" ],
+                "/bin/sh":               [ "exec" ],
+                "/bin/cat":              [ "exec" ],
+                "/bin/ubus":             [ "exec" ],
+                "/usr/sbin/iw":          [ "exec" ],
+                "/sbin/iw":              [ "exec" ],
+                "/usr/sbin/hostapd_cli": [ "exec" ],
+                "/usr/sbin/wpa_cli":     [ "exec" ],
+                "/bin/logread":          [ "exec" ],
+                "/sbin/logread":         [ "exec" ],
+                "/usr/sbin/logread":     [ "exec" ]
             },
             "ubus": {
                 "file": [ "exec" ],

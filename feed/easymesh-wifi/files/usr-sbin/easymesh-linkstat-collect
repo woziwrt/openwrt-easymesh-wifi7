@@ -30,7 +30,7 @@
 # db.sh first (sq1), then names.sh (live_addrs_json) - that order is its
 # documented contract. [ -r ] rather than `if ! . file`: sourcing a missing
 # file ends the script outright in ash.
-for _lib in db names; do
+for _lib in db names rpc; do
 	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
 		logger -t easymesh-linkstat "cannot read /usr/share/easymesh/$_lib.sh - refusing to start"
 		exit 0
@@ -79,10 +79,7 @@ schema() {
 }
 
 session() {
-	curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
-		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
-		"http://$1/ubus" 2>/dev/null |
-		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p'
+	mesh_rpc_session "$1"
 }
 
 ask() {

@@ -71,6 +71,9 @@ stamp_push() {
 # what puts the new name on the wire.
 apply_name() {
 	local mac="$1" name="$2" ip mine rc
+	# The name goes into a command on another box below: hostname characters
+	# only, whatever the ledger holds.
+	case "$name" in ""|*[!A-Za-z0-9._-]*) log "'$name' is not a hostname; not written"; return 1 ;; esac
 
 	mine=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
 	if [ "$mac" = "$mine" ]; then

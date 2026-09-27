@@ -10,6 +10,8 @@ START=99
 boot() {
 	[ -f /etc/easymesh-wps-pending ] || return 0
 	local gw addr
-	read -r gw addr < /etc/easymesh-wps-pending
+	# The note is "gateway address start-time"; the third field must not end
+	# up in addr.
+	read -r gw addr _ < /etc/easymesh-wps-pending
 	setsid /usr/libexec/easymesh-wps-join --resume "$gw" "$addr" >/dev/null 2>&1 &
 }

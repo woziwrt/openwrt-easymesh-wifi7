@@ -38,7 +38,10 @@ sq1() { sqlite3 -cmd ".timeout 3000" "$DB" "$1" 2>/dev/null; }
 arr() {
 	local out rc err
 	err=$(mktemp 2>/dev/null || echo /tmp/easymesh-sql.err)
-	out=$(sqlite3 -json "$DB" "$1" 2>"$err"); rc=$?
+	# Same busy timeout as sq/sq1: without it a read that meets the
+	# controller's write lock fails at once, and the page shows an empty
+	# topology for one refresh.
+	out=$(sqlite3 -json -cmd ".timeout 3000" "$DB" "$1" 2>"$err"); rc=$?
 	[ "$rc" -ne 0 ] && logger -t easymesh "SQL refused (rc=$rc): $(head -c 300 "$err")"
 	rm -f "$err"
 	[ -n "$out" ] && echo "$out" || echo "[]"

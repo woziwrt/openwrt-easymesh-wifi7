@@ -46,6 +46,11 @@ define Package/easymesh-core/install
 	$(INSTALL_DATA) ./files/usr-share/db.sh $(1)/usr/share/easymesh/db.sh
 	$(INSTALL_DATA) ./files/usr-share/names.sh $(1)/usr/share/easymesh/names.sh
 	$(INSTALL_DATA) ./files/usr-share/sys.sh $(1)/usr/share/easymesh/sys.sh
+	$(INSTALL_DATA) ./files/usr-share/rpc.sh $(1)/usr/share/easymesh/rpc.sh
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/acl.d/easymesh-mesh.json $(1)/usr/share/rpcd/acl.d/easymesh-mesh.json
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/easymesh-rpc.init $(1)/etc/init.d/easymesh-rpc
 endef
 
 $(eval $(call BuildPackage,easymesh-core))

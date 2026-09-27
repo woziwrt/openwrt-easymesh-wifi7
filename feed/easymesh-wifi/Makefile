@@ -15,7 +15,7 @@ define Package/easymesh-wifi
   CATEGORY:=Network
   SUBMENU:=EasyMesh
   TITLE:=EasyMesh WiFi/MLD runtime (event map, MLD keepers, backhaul setup)
-  DEPENDS:=+ubus +uci +wifimngr
+  DEPENDS:=+ubus +uci +wifimngr +easymesh-core
 endef
 
 define Package/easymesh-wifi/description

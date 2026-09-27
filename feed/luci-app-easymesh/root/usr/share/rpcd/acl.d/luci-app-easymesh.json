@@ -4,7 +4,21 @@
 		"read": {
 			"ubus": {
 				"easymesh": [
-					"*"
+					"setup_state",
+					"add_status",
+					"wps_status",
+					"credentials",
+					"node_state",
+					"health",
+					"events",
+					"ttlm_state",
+					"topology",
+					"nodes",
+					"clients",
+					"client_history",
+					"steer_history",
+					"db_stats",
+					"db_table"
 				]
 			}
 		}

@@ -15,7 +15,7 @@
 # shell on the spot, rpcd gets nothing back, and the UI draws an empty page -
 # which is how five of the seven instruments measured on 2026-09-05 lied: they
 # reported nothing and looked like they reported zero.
-for _lib in db names sys; do
+for _lib in db names sys rpc; do
 	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
 		echo "{\"error\":\"easymesh-core missing: /usr/share/easymesh/$_lib.sh\"}"
 		exit 1
@@ -485,11 +485,9 @@ ask_controller_addr() {
 	local ctrl="$1" almac="$2" sess out
 	[ -n "$ctrl" ] || return 1
 	command -v curl >/dev/null 2>&1 || return 1
-	sess=$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
-		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
-		"http://$ctrl/ubus" 2>/dev/null |
-		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p')
-	[ -n "$sess" ] || return 1
+	[ -r /usr/share/easymesh/rpc.sh ] || return 1
+	. /usr/share/easymesh/rpc.sh
+	sess=$(mesh_rpc_session "$ctrl") || return 1
 	out=$(curl -s --max-time 12 -X POST -H 'Content-Type: application/json' \
 		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sess\",\"easymesh\",\"claim_address\",{\"almac\":\"$almac\"}]}" \
 		"http://$ctrl/ubus" 2>/dev/null)
@@ -791,11 +789,7 @@ controller_addr() {
 # The session is short-lived and used once. Failure is silent on purpose: the
 # caller falls back to saying there is no database here, which is true.
 ubus_session() {
-	local gw="$1"
-	curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
-		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
-		"http://$gw/ubus" 2>/dev/null |
-		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p'
+	mesh_rpc_session "$1"
 }
 
 # When the call arrives over HTTP, uhttpd hands the plugin the caller's session
@@ -1048,14 +1042,20 @@ call)
 		wifikey=$(echo "$input" | jsonfilter -e '@.wifi_key' 2>/dev/null)
 		rootpw=$(echo "$input" | jsonfilter -e '@.root_password' 2>/dev/null)
 		addr=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
-		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		# Hostname characters only, as rename does: the name is shown in LuCI
+		# and travels to the other boxes.
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-63)
 		bhkey=$(echo "$input" | jsonfilter -e '@.backhaul_key' 2>/dev/null)
 
 		[ -n "$ssid" ] || { echo '{"error":"ssid is required"}'; exit 0; }
-		[ "${#wifikey}" -ge 8 ] 2>/dev/null || { echo '{"error":"wifi password must be at least 8 characters"}'; exit 0; }
+		# WPA takes 8 to 63 characters and a network name of up to 32 bytes;
+		# anything outside that is refused by every radio in the mesh at once.
+		[ "$(printf %s "$ssid" | wc -c)" -le 32 ] || { echo '{"error":"the network name can be at most 32 bytes"}'; exit 0; }
+		[ "${#wifikey}" -ge 8 ] 2>/dev/null && [ "${#wifikey}" -le 63 ] ||
+			{ echo '{"error":"wifi password must be 8 to 63 characters"}'; exit 0; }
 		[ -n "$addr" ] || addr=10.10.10.1
-		if [ -n "$bhkey" ] && [ "${#bhkey}" -lt 8 ]; then
-			echo '{"error":"backhaul key must be at least 8 characters (or left empty to generate one)"}'
+		if [ -n "$bhkey" ] && { [ "${#bhkey}" -lt 8 ] || [ "${#bhkey}" -gt 63 ]; }; then
+			echo '{"error":"backhaul key must be 8 to 63 characters (or left empty to generate one)"}'
 			exit 0
 		fi
 		# A key of exactly 64 characters takes every radio on the box down.
@@ -1069,7 +1069,7 @@ call)
 		# believes they set.
 		for k in "$wifikey" "$bhkey"; do
 			[ "${#k}" -eq 64 ] || continue
-			echo '{"error":"a key of exactly 64 characters is refused - it hits a bug in OpenWrt that takes all radios down. Use any other length, e.g. 63 or 65."}'
+			echo '{"error":"a key of exactly 64 characters is refused - it hits a bug in OpenWrt that takes all radios down. Use 8 to 63 characters."}'
 			exit 0
 		done
 
@@ -1136,7 +1136,7 @@ call)
 		# wrongly. It receives them over the cable from the controller, the way
 		# the standard intends - proven on hardware 2026-08-09.
 		input=$(cat)
-		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-63)
 		gw=$(echo "$input" | jsonfilter -e '@.gateway' 2>/dev/null)
 		[ -n "$gw" ] || gw=10.10.10.1
 
@@ -1429,7 +1429,7 @@ call)
 		almac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null)
 		newname=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
 		case "$almac" in
-		[0-9a-fA-F][0-9a-fA-F]:*) ;;
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
 		*) echo '{"error":"which node? give an AL-MAC"}'; exit 0 ;;
 		esac
 		# One word, and none of the characters that would let a name become a
@@ -1586,8 +1586,10 @@ call)
 			exit 0
 		fi
 		mac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		# Exactly six octets: the value goes into SQL below, and a looser
+		# pattern (aa:*ff) let anything between the first and last octet in.
 		case "$mac" in
-		[0-9a-f][0-9a-f]:*[0-9a-f][0-9a-f]) ;;
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
 		*) echo '{"error":"almac: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
 		esac
 		/etc/init.d/mapcontroller stop >/dev/null 2>&1
@@ -1774,7 +1776,7 @@ call)
 		almac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
 		want=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
 		case "$almac" in
-		[0-9a-f][0-9a-f]:*[0-9a-f][0-9a-f]) ;;
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
 		*) echo '{"error":"almac: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
 		esac
 
@@ -1870,7 +1872,9 @@ call)
 		ssid=$(echo "$input" | jsonfilter -e '@.ssid' 2>/dev/null)
 		key=$(echo "$input" | jsonfilter -e '@.wifi_key' 2>/dev/null)
 		[ -n "$ssid" ] || { echo '{"error":"the network needs a name"}'; exit 0; }
-		[ "${#key}" -ge 8 ] 2>/dev/null || { echo '{"error":"the wifi password needs at least 8 characters"}'; exit 0; }
+		[ "$(printf %s "$ssid" | wc -c)" -le 32 ] || { echo '{"error":"the network name can be at most 32 bytes"}'; exit 0; }
+		[ "${#key}" -ge 8 ] 2>/dev/null && [ "${#key}" -le 63 ] ||
+			{ echo '{"error":"the wifi password needs 8 to 63 characters"}'; exit 0; }
 		# The 64-character trap, same as founding: ap.uc:140 reads an
 		# undeclared key on that branch and netifd tears down every phy.
 		[ "${#key}" -ne 64 ] || {
@@ -2119,7 +2123,7 @@ call)
 		# kills an exec plugin after two - so this only launches the worker
 		# and returns. Progress lands in /tmp/wps-join.state (wps_status).
 		input=$(cat)
-		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null)
+		name=$(echo "$input" | jsonfilter -e '@.hostname' 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-63)
 		gw=$(echo "$input" | jsonfilter -e '@.gateway' 2>/dev/null)
 		addr=$(echo "$input" | jsonfilter -e '@.address' 2>/dev/null)
 		if [ -n "$addr" ]; then
@@ -2373,6 +2377,11 @@ call)
 		} | awk -v names=/tmp/.ev-names.$$ -v self="$(uci -q get system.@system[0].hostname)" -v since="$since" '
 			BEGIN { while ((getline l < names) > 0) { split(l, f, " "); nm[tolower(f[1])] = f[2] } }
 			function n(a) { a = tolower(a); return (a in nm) ? nm[a] : a }
+			# busybox awk has no match(s, re, array) - it accepts the call and
+			# leaves the array empty. The lines below are split into words
+			# instead: idx() finds a word, nc() drops a trailing colon.
+			function idx(w, n_, key,  i) { for (i = 1; i <= n_; i++) if (w[i] == key) return i; return 0 }
+			function nc(x) { sub(/:$/, "", x); return x }
 			function esc(t) { gsub(/\\/, "\\\\", t); gsub(/"/, "\\\"", t); return t }
 			function out(ts, kind, text) {
 				key = kind "|" text
@@ -2423,19 +2432,24 @@ call)
 					if (msg ~ /^no carrier on /) out(ts, "internet", "Cable unplugged on " self)
 					else if (msg ~ /^VIP already held/) out(ts, "internet", self " has a cable too and stands by as a spare")
 				} else if (tag == "easymesh-parent-plan") {
-					if (match(msg, /^would ([0-9a-f:]+): MOVE ([0-9a-f:]+) \(depth ([0-9]+)[^>]*> ([0-9a-f:]+) \(depth ([0-9]+)/, a))
-						out(ts, "planner", "The parent planner would move " n(a[1]) " from " n(a[2]) " to " n(a[4]) " (" a[3] " -> " a[5] " hops) - dry run, not done")
-					else if (match(msg, /^([0-9a-f:]+): MOVE ([0-9a-f:]+)[^>]*> ([0-9a-f:]+)/, a))
-						out(ts, "planner", "The parent planner moved " n(a[1]) " from " n(a[2]) " to " n(a[3]))
+					# "[would ]NODE: MOVE OLD (depth D, S dBm) -> NEW (depth D, S dBm): why"
+					wk = split(msg, ww, /[ (),]+/); wm = idx(ww, wk, "MOVE"); wj = idx(ww, wk, "->")
+					if (wm && wj && ww[1] == "would")
+						out(ts, "planner", "The parent planner would move " n(nc(ww[2])) " from " n(ww[wm + 1]) " to " n(ww[wj + 1]) " (" ww[wm + 3] " -> " ww[wj + 3] " hops) - dry run, not done")
+					else if (wm && wj)
+						out(ts, "planner", "The parent planner moved " n(nc(ww[1])) " from " n(ww[wm + 1]) " to " n(ww[wj + 1]))
 				} else if (tag == "ttlm-policy") {
-					if (match(msg, /^pin [0-9a-f:]+ \(child ([0-9a-f:]+)[^)]*\) to leg ([0-9]+)/, a))
-						out(ts, "links", n(a[1]) ": all traffic moved to one link (link " a[2] ") - the other keeps losing data")
-					else if (match(msg, /^release [0-9a-f:]+ \(child ([0-9a-f:]+)/, a))
-						out(ts, "links", n(a[1]) ": both links in use again")
-					else if (match(msg, /^alternate ([0-9a-f:]+): start/, a))
-						out(ts, "links", n(a[1]) " started alternating bands as a repeater")
-					else if (match(msg, /^alternate ([0-9a-f:]+): end/, a))
-						out(ts, "links", n(a[1]) " stopped alternating bands")
+					# "pin STA (child C, parent P) to leg K: ...", "release STA (child C): ...",
+					# "alternate NODE: start - ..." / "alternate NODE: end - ..."
+					wk = split(msg, ww, /[ (),]+/); wc = idx(ww, wk, "child")
+					if (ww[1] == "pin" && wc && idx(ww, wk, "leg"))
+						out(ts, "links", n(ww[wc + 1]) ": all traffic moved to one link (link " nc(ww[idx(ww, wk, "leg") + 1]) ") - the other keeps losing data")
+					else if (ww[1] == "release" && wc)
+						out(ts, "links", n(nc(ww[wc + 1])) ": both links in use again")
+					else if (ww[1] == "alternate" && ww[3] == "start")
+						out(ts, "links", n(nc(ww[2])) " started alternating bands as a repeater")
+					else if (ww[1] == "alternate" && ww[3] == "end")
+						out(ts, "links", n(nc(ww[2])) " stopped alternating bands")
 				} else if (tag == "card-check") {
 					if (msg ~ /^suspect radio cards: none/) out(ts, "card", "Radio card check: no suspect card")
 					else if (msg ~ /^suspect radio cards: /) {
@@ -2679,7 +2693,11 @@ call)
 		need_db_or_proxy nodes || exit 0
 		printf '{"nodes":%s,"names":%s,"pending":%s,"addrs":%s}\n' \
 			"$(arr "$GHOST_CTE select a.almac, a.depth, ($now - a.last_seen) as age_s,
-				a.manufacturer, a.model, a.sw_version, a.sta_count,
+				/* Reported by the device itself over 1905 and shown by LuCI as
+				 * HTML: no markup characters get through. */
+				replace(replace(replace(replace(replace(a.manufacturer, '<', ''), '>', ''), '&', ''), '\"', ''), '''', '') as manufacturer,
+				replace(replace(replace(replace(replace(a.model, '<', ''), '>', ''), '&', ''), '\"', ''), '''', '') as model,
+				replace(replace(replace(replace(replace(a.sw_version, '<', ''), '>', ''), '&', ''), '\"', ''), '''', '') as sw_version, a.sta_count,
 				a.max_mld_num, a.tid_link_caps,
 				b.upstream_bssid, b.wifi_hops, b.backhaul_band, b.backhaul_bands,
 				/* The AL address of the parent, so the Backhaul column can name

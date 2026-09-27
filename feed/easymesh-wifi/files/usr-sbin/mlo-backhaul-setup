@@ -50,6 +50,11 @@
 # single-link bSTA keeps its uplink, so a failed experiment costs one leaf rather
 # than the mesh.
 
+# A value for `uci batch`, quoted: a passphrase with a space or an apostrophe
+# otherwise loses the line silently - batch exits 0 and the section is
+# committed without its key.
+uq() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+
 SSID_MLD="MAP--BH"
 # Our mesh calls its backhaul MAP--BH; a controller that is not ours names
 # its own (MediaTek R3: Multi-AP-1). The name the node was actually given is
@@ -342,9 +347,9 @@ emit_ap() {
 	echo "set wireless.$AP_SEC.network=$MESH_NET"
 	echo "set wireless.$AP_SEC.mode=ap"
 	echo "set wireless.$AP_SEC.mlo=1"
-	echo "set wireless.$AP_SEC.ssid=$SSID_MLD"
+	echo "set wireless.$AP_SEC.ssid=$(uq "$SSID_MLD")"
 	echo "set wireless.$AP_SEC.encryption=sae"
-	echo "set wireless.$AP_SEC.key=$KEY"
+	echo "set wireless.$AP_SEC.key=$(uq "$KEY")"
 	echo "set wireless.$AP_SEC.sae_pwe=2"
 	echo "set wireless.$AP_SEC.ieee80211w=2"
 	# Backhaul AP in Multi-AP terms, and 4-address so a bridged bSTA works.
@@ -385,9 +390,9 @@ emit_sta() {
 	echo "set wireless.$STA_SEC.network=$MESH_NET"
 	echo "set wireless.$STA_SEC.mode=sta"
 	echo "set wireless.$STA_SEC.mlo=1"
-	echo "set wireless.$STA_SEC.ssid=$SSID_MLD"
+	echo "set wireless.$STA_SEC.ssid=$(uq "$SSID_MLD")"
 	echo "set wireless.$STA_SEC.encryption=sae"
-	echo "set wireless.$STA_SEC.key=$KEY"
+	echo "set wireless.$STA_SEC.key=$(uq "$KEY")"
 	echo "set wireless.$STA_SEC.multi_ap=1"
 	echo "set wireless.$STA_SEC.multi_ap_profile=3"
 	echo "set wireless.$STA_SEC.sae_pwe=2"

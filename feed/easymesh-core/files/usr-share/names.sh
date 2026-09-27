@@ -117,6 +117,10 @@ live_names_json() {
 		/"ieee1905id"/ { id = $2; gsub(/[",]/, "", id); next }
 		/"name"/ {
 			n = $2; gsub(/[",]/, "", n)
+			# A name arrives over the wire from any box in the mesh and ends
+			# up in LuCI pages and in commands run on other boxes: only a
+			# hostname-shaped one is taken, anything else is not a name.
+			if (n !~ /^[A-Za-z0-9._-]+$/ || length(n) > 63) n = ""
 			if (id != "" && n != "") {
 				printf "%s\"%s\":\"%s\"", sep, id, n
 				sep = ","

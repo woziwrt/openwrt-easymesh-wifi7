@@ -41,7 +41,7 @@ mkdir -p /tmp/easymesh
 # db.sh, then names.sh (live_addrs_json) - the order easymesh-linkstat-collect
 # documents. [ -r ] rather than `if ! . file`: sourcing a missing file ends the
 # script outright in ash.
-for _lib in db names; do
+for _lib in db names rpc; do
 	[ -r "/usr/share/easymesh/$_lib.sh" ] || {
 		logger -t easymesh-parent-plan "cannot read /usr/share/easymesh/$_lib.sh - refusing to start"
 		exit 0
@@ -182,10 +182,7 @@ steer_log() { logger -t easymesh-parent-steer "$*"; }
 
 ask_p() {
 	# ask_p <ip> <method> <json-params>
-	_s=$(curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
-		-d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}' \
-		"http://$1/ubus" 2>/dev/null | sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p')
-	[ -n "$_s" ] || return 1
+	_s=$(mesh_rpc_session "$1") || return 1
 	curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
 		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$_s\",\"easymesh\",\"$2\",$3]}" \
 		"http://$1/ubus" 2>/dev/null | jsonfilter -e '@.result[1]'

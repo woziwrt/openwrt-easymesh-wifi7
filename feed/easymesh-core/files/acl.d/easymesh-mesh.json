@@ -1,0 +1,15 @@
+{
+	"easymesh-mesh": {
+		"description": "One box of the mesh calling the easymesh API of another (rpcd user easymesh)",
+		"read": {
+			"ubus": {
+				"easymesh": [ "*" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"easymesh": [ "*" ]
+			}
+		}
+	}
+}
