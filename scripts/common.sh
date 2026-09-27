@@ -78,10 +78,11 @@ em_clone() {  # url branch commit dir mirror
 em_fetch_sources() {
 	mkdir -p "$WORK_DIR" "$DL_DIR"
 	cd "$WORK_DIR" || em_die "cannot enter $WORK_DIR"
-	rm -rf openwrt mtk-openwrt-feeds iopsys-feed
+	rm -rf openwrt mtk-openwrt-feeds iopsys-feed modemdata
 
 	em_clone "$OPENWRT_URL" "$OPENWRT_BRANCH" "$OPENWRT_COMMIT" openwrt openwrt.git
 	em_clone "$MTK_URL" "$MTK_BRANCH" "$MTK_COMMIT" mtk-openwrt-feeds mtk-feeds.git
+	em_clone "$MODEMDATA_URL" "$MODEMDATA_BRANCH" "$MODEMDATA_COMMIT" modemdata modemdata.git
 
 	# The build date of the image (SOURCE_DATE_EPOCH, file times, and the stamp
 	# LuCI puts on every JS URL) comes from openwrt/version.date, else from the
@@ -220,9 +221,21 @@ em_install_board_files() {
 # license) into the feeds before `feeds install`, or their CONFIG_PACKAGE
 # lines are silently dropped.
 em_install_extras() {
-	local X="$REPO/extras" p
-	cp -r "$X/sms-tool" feeds/packages/utils/sms-tool
-	cp -r "$X/modemdata-main" feeds/packages/utils/modemdata
+	local X="$REPO/extras" p d
+	# Never copy over a package the feed already has: `cp -r` into an existing
+	# directory nests the copy inside it, both Makefiles get indexed, and which
+	# one builds is luck (sms-tool did exactly that until 2026-09-27; the feed's
+	# own, newer sms-tool is now the one used).
+	for d in feeds/packages/utils/modemdata feeds/luci/applications/luci-app-modemdata \
+	         feeds/luci/applications/luci-app-sms-tool-js feeds/luci/applications/luci-app-lite-watchdog \
+	         feeds/luci/applications/luci-app-autoreboot feeds/luci/applications/luci-app-cpu-status \
+	         feeds/luci/applications/luci-app-temp-status; do
+		[ -e "$d" ] && em_die "$d already exists in the feed - decide which copy to build"
+	done
+	[ -d feeds/packages/utils/sms-tool ] || em_die "feeds/packages has no sms-tool - luci-app-sms-tool-js needs it"
+	cp -r "$WORK_DIR/modemdata" feeds/packages/utils/modemdata
+	rm -rf feeds/packages/utils/modemdata/.git
+	cp -r "$X/modemdata-addons/." feeds/packages/utils/modemdata/files/usr/share/modemdata/addon/
 	cp -r "$X/luci-app-modemdata-main/luci-app-modemdata" feeds/luci/applications/
 	cp -r "$X/luci-app-sms-tool-js-main/luci-app-sms-tool-js" feeds/luci/applications/
 	for p in luci-app-lite-watchdog luci-app-autoreboot luci-app-cpu-status luci-app-temp-status; do
@@ -448,9 +461,14 @@ em_check_config() {
 		em_ok "all user add-ons are in the image"
 	fi
 
-	# A build with no device selected reports success and produces no image.
-	v=$(grep -c "^CONFIG_TARGET_DEVICE_.*=y" .config || true)
-	[ "$v" -gt 0 ] || em_die "no device selected - check that filogic.mk defines the board"
+	# Exactly the devices of this board, no more and no fewer. A build with no
+	# device reports success and produces no image; a build with a device of
+	# another board produces an image under that board's name that was never
+	# meant for it (the Pro 8X build once built BPI-R4 images with the Pro 8X
+	# kernel patches, because the BPI-R4 config it starts from selects them).
+	v=$(sed -n 's/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_\(.*\)=y$/\1/p' .config | sort | tr '\n' ' ')
+	[ "$v" = "$(printf '%s\n' $EM_DEVICES | sort | tr '\n' ' ')" ] ||
+		em_die "devices selected: ${v:-none}; expected: $EM_DEVICES"
 	em_ok "devices selected: $v"
 }
 
@@ -465,6 +483,8 @@ em_finish_config() {
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-emmc-comb-4bg=y" >> .config
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-sdmmc-comb-4bg=y" >> .config
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-spim-nand-ubi-comb-4bg=y" >> .config
+	[ "$(grep -c '^CONFIG_PACKAGE_trusted-firmware-a-mt7988-.*-comb-4bg=y$' .config)" -ge 3 ] ||
+		em_die "the comb-4bg boot loader lines did not make it into .config"
 }
 
 em_build() {

@@ -16,6 +16,8 @@
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")" && pwd)
 BOARD=bpi-r4-pro-8x
+# Every image this build makes; em_check_config stops the build on any other.
+EM_DEVICES="bananapi_bpi-r4-pro-8x"
 . "$REPO/scripts/common.sh"
 
 em_start_log
