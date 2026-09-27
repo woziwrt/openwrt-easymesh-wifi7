@@ -106,8 +106,8 @@ HPF=autobuild/unified/filogic/mac80211/25.12/files/package/network/services/host
 for f in wpa_supplicant.uc hostapd.uc; do
 	git -C "$MTK_GIT" show "$MTK_COMMIT:$HPF/$f" > "$T/hostapd/$f"
 done
-for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios \
-         0276-wpa_supplicant-apsta-grace-before-stopping-aps; do
+# 0276 withdrawn (island of siblings, see scripts/common.sh)
+for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios; do
 	patch -s -p1 -d "$T/hostapd" < "$REPO/patches/wifi/$p.patch" || die "$p does not apply"
 done
 mkdir -p "$OV/usr/share/hostap"
@@ -157,7 +157,7 @@ cp "$IB"/bin/targets/*/*/*"$DEVICE"-sdcard.img.gz "$dst/" 2>/dev/null || true
 	echo "repo       : $(git -C "$REPO" rev-parse HEAD)$([ -n "$(git -C "$REPO" status --porcelain)" ] && echo ' (dirty)')"
 	echo "full build : $ARCH"
 	echo "recompiled : $PKGS_FEED"
-	echo "overlay    : hostapd ucode (0270 0271 0276), patches/luci, luci-app-easymesh, luci-app-wifimgr"
+	echo "overlay    : hostapd ucode (0270 0271), patches/luci, luci-app-easymesh, luci-app-wifimgr"
 	echo "NOT A RELEASE IMAGE - releases come from build-*.sh"
 } > "$dst/MANIFEST.txt"
 ok "output: $dst"

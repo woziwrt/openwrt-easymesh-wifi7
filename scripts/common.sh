@@ -174,8 +174,12 @@ em_apply_wifi_patches() {
 
 	# These change MTK's overlay of hostapd/files (ucode scripts), which is
 	# not a patch series, so they are applied directly.
-	for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios \
-	         0276-wpa_supplicant-apsta-grace-before-stopping-aps; do
+	# 0276 (20 s grace before a lost backhaul stops the APs) is NOT applied:
+	# siblings that lose their parent keep their backhaul BSS up and join each
+	# other - an island with no path to the controller (2026-09-27, kitchen +
+	# hall + corridor after a corridor reboot). To be reworked: the backhaul
+	# BSS must go at once, only the fronthaul may wait.
+	for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios; do
 		patch -p1 -N -d "$HP/files" < "$W/$p.patch" || em_die "$p does not apply"
 	done
 
