@@ -280,6 +280,12 @@ var SLOW_MBIT = 200;
  * leg at -82 dBm carried no data frame at all downstream, so it had no rate
  * to be slow with (2026-09-26). */
 var WEAK_DBM = -80;
+/* ...but a rate says something only while the leg carries traffic. An idle
+ * leg sends only keep-alive frames, at 6-72 Mbit/s whatever it can do: on
+ * 2026-09-27 the kitchen 6 GHz leg read 72/144 Mbit/s idle at -62 dBm and
+ * went to 1297 Mbit/s the moment iperf ran over it - and the picture called
+ * it slow the whole time. Idle, only the signal is judged. */
+var BUSY_MBIT = 5;
 function legPhy(g, f) {
 	var num = function(v) { return v === '' || v == null ? null : +v; };
 	g.phyDown = num(f[7]); g.phyUp = num(f[8]); g.rssi = num(f[9]);
@@ -289,7 +295,7 @@ function legPhy(g, f) {
 	if (g.spread != null && g.spread < 0) g.spread = null;
 	var lo = Math.min(g.phyDown != null ? g.phyDown : 1e9, g.phyUp != null ? g.phyUp : 1e9);
 	g.phyMin = lo < 1e9 ? lo : null;
-	g.slow = g.phyMin != null && g.phyMin < SLOW_MBIT;
+	g.slow = g.phyMin != null && g.phyMin < SLOW_MBIT && g.mbps != null && g.mbps >= BUSY_MBIT;
 	g.faint = g.rssi != null && g.rssi <= WEAK_DBM;
 	if (g.faint) g.slow = true;
 	return g;
@@ -518,7 +524,8 @@ function renderTopology(topo, nodesData) {
 				var f = x.split(':');
 				var g = { id: +f[0], state: f[1], band: +f[2],
 					beacon: f[3] === '' || f[3] == null ? null : +f[3],
-					down: null, up: null, mbps: null };
+					down: null, up: null, mbps: null,
+					seen: f[6] === '' || f[6] == null ? null : +f[6] };
 				legRate(almac, g, +f[4], +f[5], +f[6]);
 				return legPhy(g, f);
 			})
@@ -532,7 +539,15 @@ function renderTopology(topo, nodesData) {
 			(g.phyMin != null ? ', link rate down ' + (g.phyDown != null ? g.phyDown : '?') +
 				' / up ' + (g.phyUp != null ? g.phyUp : '?') + ' Mbit/s' + (g.slow ? ' (slow)' : '') : '') +
 			(g.rssi != null ? ', signal ' + g.rssi + ' dBm' : '') +
-			(g.spread != null ? ', antennas differ by ' + g.spread + ' dB' : '');
+			(g.spread != null ? ', antennas differ by ' + g.spread + ' dB' : '') +
+			/* The picture is up to about a minute and a half behind the air:
+			 * each node measures over 30 s, a collection round on the
+			 * controller takes 20-30 s plus a 30 s pause (measured 2026-09-27:
+			 * rows 12-49 s old), and this page asks every 10 s. Saying how old
+			 * the numbers are keeps a user from reading a past state as the
+			 * present one. */
+			(g.seen ? ', collected ' + Math.max(0, Math.round(Date.now() / 1000 - g.seen)) +
+				' s ago (measured over 30 s)' : '');
 	}
 	var out = [];
 
@@ -739,11 +754,38 @@ function renderTopology(topo, nodesData) {
 		}
 	});
 
-	var box = E('div', { 'style': 'overflow-x:auto' });
+	var box = E('div', { 'style': 'overflow-x:auto;position:relative' });
 	box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" ' +
 		'style="max-height:420px;background:#fbfcfd;border:1px solid #e0e4e8;border-radius:8px">' +
 		out.join('') + '</svg>';
+	box.appendChild(topoLegend(LEG_COLOR));
 	return box;
+}
+
+/* A small key in the corner of the picture, so a user can tell what the
+ * colours and lines mean (until 2026-09-27 only the two of us knew). The
+ * samples use the same colours and dashes as the drawing. Text colour comes
+ * from the theme and the background is a translucent grey, so the key fits
+ * both the light and the dark theme. */
+function topoLegend(legColor) {
+	var line = function(col, w, dash) {
+		return '<svg width="22" height="10" style="vertical-align:middle">' +
+			'<line x1="2" y1="5" x2="20" y2="5" stroke="' + col + '" stroke-width="' + w + '"' +
+			(dash ? ' stroke-dasharray="' + dash + '"' : '') + ' stroke-linecap="round"/></svg>';
+	};
+	var rows = [
+		line(legColor[1], 3) + ' 2.4 ' + line(legColor[2], 3) + ' 5 ' + line(legColor[8], 3) + ' 6 GHz',
+		line(legColor[2], 1.5) + line(legColor[2], 5) + ' ' + _('more traffic'),
+		line(legColor[2], 2.5, '7 4') + ' ' + _('slow or weak'),
+		line('#d9822b', 2.5, '4 3') + ' ' + _('losing beacons'),
+		line('#8a939c', 2, '2 5') + ' ' + _('down')
+	];
+	var key = E('div', { 'style': 'position:absolute;top:8px;right:8px;padding:4px 8px;' +
+		'background:rgba(128,128,128,0.14);border:1px solid rgba(128,128,128,0.35);border-radius:6px;' +
+		'font-size:10.5px;line-height:17px;opacity:0.9;pointer-events:none',
+		'title': _('Hover a line for the numbers and their age') });
+	key.innerHTML = rows.map(function(r) { return '<div style="white-space:nowrap">' + r + '</div>'; }).join('');
+	return key;
 }
 
 function renderNodes(data, amController) {
@@ -1025,7 +1067,7 @@ return view.extend({
 				dom.content(healthBox, renderNow(r[3], r[0], r[2]));
 				if (!EDITING) dom.content(nodesBox, renderNodes(r[1], st.role == 'controller'));
 			});
-		}, 15);
+		}, 10);
 
 		return E('div', {}, [
 			E('h2', {}, _('EasyMesh')),

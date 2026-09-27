@@ -23,7 +23,7 @@
 # takes the mesh down for half an hour (incident 2026-05-29). One 3 s HTTP call
 # per node per cycle, five nodes, is nothing.
 #
-# ⚠️ Why not in the render path: overview.js polls every 15 s, and five HTTP
+# ⚠️ Why not in the render path: overview.js polls every 10 s, and five HTTP
 # calls inside a render block the page. This writes to the DB; the API reads
 # the DB.
 
