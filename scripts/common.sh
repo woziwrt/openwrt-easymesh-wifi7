@@ -174,7 +174,8 @@ em_apply_wifi_patches() {
 
 	# These two change MTK's overlay of hostapd/files (ucode scripts), which is
 	# not a patch series, so they are applied directly.
-	for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios; do
+	for p in 0270-wpa_supplicant-apsta-keep-aps-on-mesh-node 0271-hostapd-restart-mld-sibling-radios \
+	         0276-wpa_supplicant-apsta-grace-before-stopping-aps; do
 		patch -p1 -N -d "$HP/files" < "$W/$p.patch" || em_die "$p does not apply"
 	done
 
