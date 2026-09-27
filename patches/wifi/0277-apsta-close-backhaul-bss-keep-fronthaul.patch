@@ -1,0 +1,375 @@
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Subject: [PATCH] apsta: close the backhaul BSS at once, keep the fronthaul 20 s
+
+A mesh backhaul station that lost its parent stopped every AP on its radios
+at once. On a mesh that runs on one channel that costs every backhaul move
+(a steer, a parent reboot) ~26 s without fronthaul (2026-09-27, a leaf
+steered 16:05:28-54). 0276 gave the backhaul 20 s with all APs up and was
+withdrawn: with the backhaul BSS up too, the two children of a rebooting
+parent joined each other within 6 s (kitchen and hall, 17:58:26 -> :32),
+and the parent, back up, joined that island instead of the controller.
+INACTIVE also restarts the backhaul BSS of a node with no parent, with or
+without 0276.
+
+Split the two. A node whose mesh backhaul is not connected has no path to
+the controller, so its backhaul-only BSSes (multi_ap=1) are closed to mesh
+nodes at once, and stay closed until the backhaul is COMPLETED again:
+
+- wpa_supplicant.uc tells hostapd on every state of a mesh backhaul station
+  whether the node has a backhaul. It rides on apsta_state
+  { backhaul_block }, the only hostapd method user network may call
+  (wpad_acl.json; wpad runs under procd-ujail).
+
+- hostapd.uc refuses authentication on those BSSes from the sta_auth hook
+  (status 17). handle_auth() calls it for every Authentication frame, SAE
+  after its queue, on the link it came in on, so every link of the AP MLD
+  and a returning child are covered; the state lives in hostapd.uc, so an
+  AP restart on INACTIVE does not reopen the BSS. Nothing is stopped, so
+  no AP MLD is torn down on a radio it shares with the fronthaul (0271).
+
+- 1 s later the mesh nodes already on those BSSes are deauthenticated.
+  They have no path either and are the likeliest next parent (a loop);
+  dropped, they close their own backhaul BSS in turn, level by level,
+  well within the ~5 s this node's scan takes.
+
+A wired uplink (map-agent's /var/run/multiap/multiap.backhaul type "eth")
+counts as a backhaul: nothing is refused or dropped. A node without a mesh
+backhaul station - the controller, a plain AP - never sends the flag and is
+not affected.
+
+The fronthaul keeps 0276's grace: a backhaul that was connected gets 20 s
+to find a parent with the APs up; only then are the radios stopped, as
+before, so it can follow a parent to another channel. Boot and first join
+are unchanged. The grace timer stops the APs without touching the iface
+object of the notification, which is stale by then (0276).
+
+Not tested on hardware yet.
+
+---
+--- a/wpa_supplicant.uc
++++ b/wpa_supplicant.uc
+@@ -20,6 +20,8 @@
+ wpas.data.iface_ubus = {};
+ wpas.data.macaddr_list = {};
+ wpas.data.sta_state = {};
++wpas.data.bh = {};
++wpas.data.bh_block = null;
+ 
+ function iface_stop(iface)
+ {
+@@ -713,9 +715,143 @@
+ 	return false;
+ }
+ 
++// A mesh node whose backhaul is not connected has no path to the controller,
++// and a mesh node that joins it has none either. When a parent with two
++// children rebooted, the children joined each other's backhaul BSS within
++// 6 s - an island, each the other's parent - and the parent, back up, joined
++// the island instead of the controller (2026-09-27, corridor, kitchen, hall).
++// Stopping every AP at once used to prevent that by accident; the fronthaul
++// grace below no longer does, and INACTIVE restarts the backhaul BSS of a
++// node with no parent anyway.
++//
++// So hostapd is told, on every state of a mesh backhaul station, whether this
++// node has a backhaul. While it has none, its backhaul BSSes refuse mesh nodes
++// at authentication and drop the ones they had (hostapd.uc); the BSSes
++// themselves keep running. A node with a mesh backhaul station connected, or
++// with no mesh backhaul station at all (the controller, a plain AP), is not
++// affected. A wired uplink is left to hostapd, which checks it at the moment
++// a node asks (/var/run/multiap/multiap.backhaul).
++//
++// It rides on apsta_state because that is the one hostapd method the user
++// network may call (wpad_acl.json) - hostapd and wpa_supplicant run as that
++// user under procd-ujail.
++function bh_block_update()
++{
++	let have = false, connected = false;
++
++	for (let name, state in wpas.data.sta_state) {
++		if (!sta_is_mesh_backhaul(name))
++			continue;
++		have = true;
++		if (state == "COMPLETED")
++			connected = true;
++	}
++
++	// nothing to undo on a node that never had a mesh backhaul
++	if (!have && wpas.data.bh_block == null)
++		return;
++
++	let block = have && !connected;
++	if (block != wpas.data.bh_block)
++		wpas.printf(`mesh backhaul ${block ? "not connected - backhaul BSS closed to mesh nodes" : (have ? "connected" : "gone") + " - backhaul BSS open"}`);
++	wpas.data.bh_block = have ? block : null;
++
++	// sent every time, not only on a change: a restarted hostapd starts open
++	wpas.data.ubus.call("hostapd", "apsta_state", { backhaul_block: block });
++}
++
++// A mesh backhaul that loses its parent stops the APs on its radios, so it
++// can follow a parent to another channel (see above). In a mesh that runs on
++// one channel that is needless and costly: every move of the backhaul - a
++// steer, a parent that reboots - took the fronthaul down for ~26 s
++// (2026-09-27, a leaf steered 16:05:28-54), although the new parent was on
++// the same channel and the backhaul can associate with the APs running.
++//
++// So a backhaul that WAS connected gets BH_GRACE_MS to find a parent with
++// the APs still up: the fronthaul serves its clients, the backhaul BSS is
++// closed to mesh nodes meanwhile (bh_block_update). Only if it has not
++// reached COMPLETED by then are the APs stopped, as before - the case of a
++// parent on another channel, which the radio cannot join while its APs hold
++// the old one. A backhaul that has not been connected yet (boot, first join)
++// stops them at once, as before, and APs that were never stopped are not
++// restarted when it reconnects.
++//
++// 0276 did the grace with the backhaul BSS open and was withdrawn for it:
++// that is how the siblings above found each other.
++const BH_GRACE_MS = 20000;
++
++// The "stop" half of iface_hostapd_notify, for the grace timer: the iface
++// object handed to a notification is not valid any more when the timer
++// fires (status() on it failed and nothing was sent, 2026-09-27), and a stop
++// needs no status anyway.
++function bh_stop_aps(ifname)
++{
++	let ubus = wpas.data.ubus;
++	let mld = wpas.data.mld[ifname];
++
++	if (!mld) {
++		let phy = wpas.data.iface_phy[ifname];
++		if (phy && !radio_has_connected_sta(phy, ifname))
++			ubus.call("hostapd", "apsta_state", { phy: phy, up: false });
++		return;
++	}
++
++	let radio_mask = mld.radio_mask;
++	for (let i = 0; radio_mask; i++, radio_mask >>= 1) {
++		if (!(radio_mask & 1) || radio_has_connected_sta(phy_name(mld.phy, i), ifname))
++			continue;
++		ubus.call("hostapd", "apsta_state", { phy: mld.phy, radio: i, up: false });
++	}
++}
++
++// true: the notification is handled here and must not reach hostapd
++function bh_grace(ifname, state, up)
++{
++	if (!wpas.data.bh[ifname])
++		wpas.data.bh[ifname] = { stopped: false, was_up: false, expired: false, timer: null };
++	let bh = wpas.data.bh[ifname];
++
++	if (up) {
++		if (bh.timer)
++			bh.timer.cancel();
++		bh.timer = null;
++		bh.expired = false;
++		if (state == "COMPLETED")
++			bh.was_up = true;
++		if (!bh.stopped) {
++			wpas.printf(`${ifname}: ${state}, APs were never stopped - nothing to restart`);
++			return true;
++		}
++		bh.stopped = false;
++		return false;
++	}
++
++	if (bh.was_up && !bh.expired) {
++		if (!bh.timer) {
++			wpas.printf(`${ifname}: ${state}, backhaul lost its parent - fronthaul keeps running for ${BH_GRACE_MS / 1000} s`);
++			bh.timer = uloop.timer(BH_GRACE_MS, () => {
++				bh.timer = null;
++				let cur = wpas.data.sta_state[ifname];
++				if (cur == null || cur == "COMPLETED")
++					return;
++				bh.expired = true;
++				bh.stopped = true;
++				wpas.printf(`${ifname}: no parent after ${BH_GRACE_MS / 1000} s (${cur}) - stopping the APs`);
++				bh_stop_aps(ifname);
++			});
++		}
++		return true;
++	}
++
++	bh.stopped = true;
++	return false;
++}
++
+ function iface_hostapd_notify(ifname, iface, state)
+ {
+ 	wpas.data.sta_state[ifname] = state;
++	if (sta_is_mesh_backhaul(ifname))
++		bh_block_update();
+ 
+ 	let status = iface.status();
+ 	let ubus = wpas.data.ubus;
+@@ -753,6 +889,9 @@
+ 		return;
+ 	}
+ 
++	if (sta_is_mesh_backhaul(ifname) && bh_grace(ifname, state, msg.up))
++		return;
++
+ 	if (!mld) {
+ 		msg.phy = wpas.data.iface_phy[ifname];
+ 		if (!msg.phy) {
+@@ -922,6 +1061,10 @@
+ 	},
+ 	iface_remove: function(name, obj) {
+ 		delete wpas.data.sta_state[name];
++		if (wpas.data.bh[name]?.timer)
++			wpas.data.bh[name].timer.cancel();
++		delete wpas.data.bh[name];
++		bh_block_update();
+ 		iface_event("remove", name);
+ 		iface_ubus_remove(name);
+ 	},
+--- a/hostapd.uc
++++ b/hostapd.uc
+@@ -1274,6 +1274,123 @@
+ 	hostapd.data.mld_sibling_timer = uloop.timer(3000, mld_sibling_restart_run);
+ }
+ 
++// A mesh node whose backhaul station is not connected has no path to the
++// controller, and neither has a mesh node that joins its backhaul BSS: when a
++// parent with two children rebooted, the children joined each other within
++// 6 s and stayed there, an island (2026-09-27, corridor, kitchen, hall).
++// wpa_supplicant.uc tells us on every state of a mesh backhaul station
++// whether this node has a backhaul (apsta_state { backhaul_block }). While it
++// has none, each backhaul-only BSS (multi_ap=1) of this node:
++//
++// - refuses authentication, in sta_auth below. hostapd calls that for every
++//   Authentication frame, any algorithm, SAE after its queue, on the link the
++//   frame came in on, and fails the exchange with the status it returns
++//   (ieee802_11.c, handle_auth). So it covers every link of an AP MLD and a
++//   former child coming back, and it survives an AP restart (INACTIVE starts
++//   the APs of a node with no parent), because the state is ours and not the
++//   BSS's. The BSS itself keeps running: stopping one AP MLD on radios it
++//   shares with another is what 0271 is about.
++//
++// - drops the mesh nodes it had, BH_DROP_DELAY_MS later. They have no path
++//   either, and they - or anything below them, all still connected - are the
++//   likeliest parent this node finds next: a loop. Dropped, their backhaul
++//   stations disconnect and close their own backhaul BSSes in turn, so the
++//   subtree is closed level by level, well within the ~5 s this node's scan
++//   takes. The drop happens even if the backhaul is back by then: a node that
++//   found a parent that fast may have found one of its own children.
++//
++// A wired uplink is a backhaul: with map-agent's multiap.backhaul saying
++// "eth", nothing is refused or dropped. It is read when needed, since the
++// agent writes it only after it has disconnected the backhaul station.
++const WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA = 17;
++const WLAN_REASON_DEAUTH_LEAVING = 3;
++const BH_DROP_DELAY_MS = 1000;
++const MAP_UPLINK_FILE = "/var/run/multiap/multiap.backhaul";
++
++hostapd.data.bh_block = false;
++
++function bss_is_mesh_backhaul(name)
++{
++	let config = bss_config(name);
++	if (!config)
++		return false;
++
++	for (let line in config[1].data) {
++		let val = split(line, "=", 2);
++		if (val[0] == "multi_ap")
++			return (int(val[1]) & 3) == 1;
++	}
++
++	return false;
++}
++
++function uplink_is_wired()
++{
++	let data = readfile(MAP_UPLINK_FILE);
++	if (!data)
++		return false;
++
++	try {
++		return json(data).type == "eth";
++	} catch (e) {
++		return false;
++	}
++}
++
++function bh_refuses(iface)
++{
++	return hostapd.data.bh_block && bss_is_mesh_backhaul(iface) && !uplink_is_wired();
++}
++
++function bh_drop_children()
++{
++	delete hostapd.data.bh_drop_timer;
++	if (uplink_is_wired())
++		return;
++
++	// STA-FIRST/STA-NEXT list every station of an AP MLD on any of its
++	// links; DEAUTHENTICATE takes the MLD address on any link the station
++	// has (ctrl_iface_ap.c), so a station is tried until one link takes it.
++	let done = {};
++	for (let phy, list in (hostapd.bss ?? {})) {
++		for (let name, bss in list) {
++			if (!bss || !bss_is_mesh_backhaul(name))
++				continue;
++
++			let addrs = [];
++			let res = bss.ctrl("STA-FIRST");
++			while (res && res != "FAIL" && length(addrs) < 64) {
++				let addr = split(res, "\n")[0];
++				if (!addr || index(addrs, addr) >= 0)
++					break;
++				push(addrs, addr);
++				res = bss.ctrl(`STA-NEXT ${addr}`);
++			}
++
++			for (let addr in addrs) {
++				if (done[addr] ||
++				    bss.ctrl(`DEAUTHENTICATE ${addr} reason=${WLAN_REASON_DEAUTH_LEAVING}`) != "OK")
++					continue;
++				done[addr] = true;
++				hostapd.printf(`${name}: dropped mesh node ${addr} - no backhaul`);
++			}
++		}
++	}
++}
++
++function bh_block_set(block)
++{
++	block = !!block;
++	if (block != hostapd.data.bh_block)
++		hostapd.printf(`backhaul ${block ? "lost - backhaul BSS closed to mesh nodes" : "connected - backhaul BSS open"}`);
++	hostapd.data.bh_block = block;
++
++	if (block && !hostapd.data.bh_drop_timer)
++		hostapd.data.bh_drop_timer = uloop.timer(BH_DROP_DELAY_MS, bh_drop_children);
++
++	return 0;
++}
++
+ let main_obj = {
+ 	reload: {
+ 		args: {
+@@ -1303,8 +1420,12 @@
+ 			csa: true,
+ 			csa_count: 0,
+ 			punct_bitmap: 0,
++			backhaul_block: true,
+ 		},
+ 		call: function(req) {
++			if (req.args.backhaul_block != null)
++				return bh_block_set(req.args.backhaul_block);
++
+ 			let phy = phy_name(req.args.phy, req.args.radio);
+ 			if (req.args.up == null || !phy)
+ 				return libubus.STATUS_INVALID_ARGUMENT;
+@@ -1569,6 +1690,11 @@
+ 		bss_event("remove", name);
+ 	},
+ 	sta_auth: function(iface, sta) {
++		if (bh_refuses(iface)) {
++			hostapd.printf(`${iface}: refused ${sta} - no backhaul`);
++			return { status: WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA };
++		}
++
+ 		let msg = { iface, sta };
+ 		let ret = {};
+ 		let data_cb = (type, data) => {
