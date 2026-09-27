@@ -55,6 +55,7 @@ em_require_clean_repo() {
 		git -C "$REPO" status --porcelain | sed 's/^/    /' >&2
 		[ "${ALLOW_DIRTY:-0}" = 1 ] || em_die "uncommitted changes in $REPO - commit them or set ALLOW_DIRTY=1"
 		echo "WARNING: building from uncommitted changes ($rev) - this image is not reproducible" >&2
+		EM_DIRTY=1
 	else
 		em_ok "repository clean at $rev"
 	fi
@@ -528,6 +529,8 @@ em_archive() {
 		echo "board   : $BOARD"
 		echo "built   : $stamp"
 		echo "repo    : $(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+		# scripts/release.sh publishes no image with "dirty : yes"
+		echo "dirty   : $([ "${EM_DIRTY:-0}" = 1 ] && echo yes || echo no)"
 		echo ""
 		echo "REVISIONS - the image cannot be rebuilt without these"
 		printf "  %-18s %s\n" openwrt "$(git -C "$root" rev-parse HEAD)"
