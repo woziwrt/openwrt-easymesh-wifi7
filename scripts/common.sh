@@ -259,7 +259,7 @@ em_setup_feeds() {
 		[ -d "feeds/$f" ] || em_die "feeds/$f missing - feed clone failed"
 	done
 	em_ok "feeds packages, luci, routing cloned"
-	# Our changes to LuCI itself (e.g. a button to remove the root password,
+	# Our changes to LuCI itself (e.g. saving an empty root password removes it,
 	# which stock LuCI cannot do).
 	for f in "$REPO"/patches/luci/*.patch; do
 		[ -f "$f" ] || continue
