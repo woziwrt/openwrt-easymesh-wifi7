@@ -418,11 +418,16 @@ em_check_config() {
 }
 
 em_finish_config() {
+	make defconfig
+	em_check_config
+	# The DDR4 "comb-4bg" boot loaders for the 8 GB boards go in AFTER the last
+	# `make defconfig`: defconfig drops these three symbols (they are not
+	# selectable through the menu), and without them the bpi-r4-poe-8gb eMMC
+	# and SD images fail at the very end on a missing mt7988-*-comb-4bg-bl2.img
+	# (2026-09-27, first build of this repository).
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-emmc-comb-4bg=y" >> .config
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-sdmmc-comb-4bg=y" >> .config
 	echo "CONFIG_PACKAGE_trusted-firmware-a-mt7988-spim-nand-ubi-comb-4bg=y" >> .config
-	make defconfig
-	em_check_config
 }
 
 em_build() {
