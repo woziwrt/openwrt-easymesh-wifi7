@@ -23,7 +23,6 @@ Follow-up to 0274, from an independent review of MTK 0129.
    handle_action_cb "STA not found" were MSG_DEBUG, which is why a map that
    never reached the driver (0274) left nothing in the log. Raise to INFO.
 
-Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 
 --- a/src/ap/ieee802_11_eht.c	2026-09-23 12:20:11.971806210 +0200
 +++ b/src/ap/ieee802_11_eht.c	2026-09-23 12:20:11.980082898 +0200
