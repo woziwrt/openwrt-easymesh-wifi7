@@ -19,8 +19,11 @@
 # backhaul ran at 6 Mbit/s, while under corridor it had 432-720 Mbit/s.
 #
 # 1. One wireless hop, one leg per band, PHY rate in Mbit/s:
-#      measured  - the leg's own median tx/rx data rate (easymesh-linkstat),
-#                  mean of the two directions, for every hop ABOVE the node
+#      measured  - the leg's own median data rate (easymesh-linkstat),
+#                  downstream: the backhaul station's rx, what its parent
+#                  sends it - clients mostly download, and our legs are far
+#                  from symmetric (controller -> hall 126 down, 424 up,
+#                  2026-09-27). For every hop ABOVE the node
 #                  being planned (its candidates' paths up, and its current
 #                  parent's);
 #      estimated - from signal via r5()/r6() below, for the node's OWN first
@@ -127,15 +130,15 @@ function mlo(a, b,   hi, lo) {
 function hopcost(phy) { return (phy > 0) ? 1 / (eff * phy) : INF }
 function tput(c) { return (c >= INF) ? 0 : int(1 / c + 0.5) }
 
-# A measured leg: mean of the directions that carried data frames; an idle
-# leg (0/0) falls back to its own signal. A leg that is not alive is 0.
-function measleg(n, b,   t, r, x) {
+# A measured leg, downstream: the rx rate of the backhaul station; a leg that
+# carried nothing downstream falls back to its tx rate, an idle one (0/0) to
+# its own signal. A leg that is not alive is 0.
+function measleg(n, b,   t, r) {
 	if (!((n, b) in lst)) return 0
 	if (lst[n, b] != "up" && lst[n, b] != "degraded") return 0
 	t = ltx[n, b] + 0; r = lrx[n, b] + 0
-	if (t > 0 && r > 0) return (t + r) / 2
-	x = t + r
-	if (x > 0) return x
+	if (r > 0) return r
+	if (t > 0) return t
 	return rate(b, lrssi[n, b])
 }
 
@@ -193,6 +196,7 @@ BEGIN {
 	if (eff == "") eff = 0.35
 	if (ghostage == "") ghostage = 3600
 	if (mlofrac == "") mlofrac = 0.25
+	if (badpath == "") badpath = 100
 }
 
 $1 == "ROOT"  { root = $2; next }
@@ -302,6 +306,10 @@ END {
 		besttxt = sprintf("%s (depth %d, %s dBm, %d Mbit/s)", best, bdep, sigtxt(n, best), bt)
 		need = (n in kids) ? relaygain : gain
 		pct = (cur > 0) ? int((bt - cur) * 100 / cur) : 999
+		if (cur >= badpath) {
+			printf "%s: keep %s - its path is not bad (>= %d Mbit/s); best other %s is %+d %%%s\n", n, curtxt, badpath, besttxt, pct, notes
+			continue
+		}
 		if (!(bt >= cur * (1 + need / 100) && bt - cur >= mingain)) {
 			printf "%s: keep %s - best other %s is %+d %%, needs +%d %% and +%d Mbit/s%s\n", n, curtxt, besttxt, pct, need, mingain, notes
 			continue

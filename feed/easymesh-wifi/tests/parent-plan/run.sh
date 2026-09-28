@@ -124,8 +124,19 @@ newcase "kitchen under hall" settled.sql "
 	('02:00:00:00:00:04', 0, 2, '02:00:00:00:01:03', 'up', @NOW@ - 20, -45, 648, 516),
 	('02:00:00:00:00:04', 1, 8, '02:00:00:00:06:03', 'up', @NOW@ - 20, -69, 864, 864);"
 plan
-! has "^kitchen: MOVE" && has "^kitchen: keep hall .* needs +30 %"
+! has "^kitchen: MOVE" && has "^kitchen: keep hall .* its path is not bad"
 ok $? "two parents within 30 %: kitchen stays under hall"
+
+# 3b. Only a plainly better parent: kitchen is on the controller (25 Mbit/s,
+#     a bad path), but corridor, heard only at -73 dBm on 5 GHz and not on
+#     6 GHz, would give about 42 - under twice as much. It stays; hall, with
+#     corridor at -42, still goes.
+newcase "not twice" stuck.sql "
+	UPDATE bh_candidate SET signal = -73 WHERE agent_almac = '02:00:00:00:00:04' AND bssid = '02:00:00:00:01:02';
+	DELETE FROM bh_candidate WHERE agent_almac = '02:00:00:00:00:04' AND bssid = '02:00:00:00:06:02';"
+plan
+! has "^kitchen: MOVE" && has "^kitchen: keep controller .* needs +100 % and +50 Mbit/s" && has "^hall: MOVE .* -> corridor"
+ok $? "only a plainly better parent: a bad path and +68 % is not enough, +100 % is"
 
 # 4. No flapping: kitchen under corridor, the scans wobble +-3 dB every run
 #    towards hall and back, eight runs, with the real streak and hold.
@@ -190,8 +201,8 @@ has "^attic: no action - no backhaul association" && has "^bedroom: keep .* no f
 ok $? "no candidate -> no action"
 
 # 7. Never under its own child: corridor is weak on the controller and hears
-#    hall (its child) at -40. bedroom would pay +41 %, but corridor carries
-#    two children and needs +50 %.
+#    hall (its child) at -40. Its path is not bad enough to move, and a
+#    relay with two children would need +200 % anyway.
 newcase "descendant" settled.sql "
 	UPDATE bsta_link SET rssi = -70, tx_mbit = 216, rx_mbit = 144 WHERE agent_almac = '02:00:00:00:00:02' AND link_id = 0;
 	UPDATE bsta_link SET rssi = -85, tx_mbit = 0, rx_mbit = 0, state = 'down' WHERE agent_almac = '02:00:00:00:00:02' AND link_id = 1;
@@ -201,7 +212,7 @@ newcase "descendant" settled.sql "
 	UPDATE bh_candidate SET signal = -55 WHERE agent_almac = '02:00:00:00:00:02' AND bssid = '02:00:00:00:06:03';"
 plan
 ! has "^corridor: MOVE" && has "hall refused: it is below corridor" && has "kitchen refused: it is below corridor"
-ok $? "a node below is never a parent; a relay needs +50 %"
+ok $? "a node below is never a parent; a relay is not moved for a small gain"
 
 # 8. A failed trial denies that parent for 24 h - the next best is judged
 #    on its own (hall, itself on the controller, pays too little).

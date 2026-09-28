@@ -25,9 +25,13 @@
 # a parent that has been up for STABLE_S - so a box that comes back gets its
 # children back once it has proven itself, not while it is still booting.
 #
-# A move is proposed when the path estimate gains >= GAIN_PCT (RELAY_GAIN_PCT
-# for a node with children - its whole subtree goes dark while it moves) and
-# >= MIN_GAIN_MBIT, in STREAK consecutive runs spanning at least HOLD_S, not
+# It only moves a node off a parent that is plainly bad: a path estimate
+# below BAD_PATH_MBIT (the "no box on a leg under ~100 Mbit/s" criterion),
+# and a candidate at least GAIN_PCT better (RELAY_GAIN_PCT for a node with
+# children - its whole subtree goes dark while it moves) and >= MIN_GAIN_MBIT.
+# The signal -> rate table is off by up to 1.7-3x (2026-09-27), so nothing
+# finer than "twice as good" is trusted to it. That must hold in STREAK
+# consecutive runs spanning at least HOLD_S, not
 # within COOLDOWN of the node's last trial, and never onto a parent whose
 # trial for this node failed within DENY_S. Never onto a parent without a
 # path to the controller (an island - 2026-09-27, three boxes holding each
@@ -58,9 +62,10 @@ SETTLE_S=${SETTLE_S:-900}
 MAXAGE=${MAXAGE:-1500}          # a scan older than this is no candidate
 LINK_FRESH=${LINK_FRESH:-120}   # a leg reported within this = node reachable
 AGENT_FRESH=${AGENT_FRESH:-180} # a wired node heard within this = alive
-GAIN_PCT=${GAIN_PCT:-30}
-RELAY_GAIN_PCT=${RELAY_GAIN_PCT:-50}
-MIN_GAIN_MBIT=${MIN_GAIN_MBIT:-20}
+BAD_PATH_MBIT=${BAD_PATH_MBIT:-100}
+GAIN_PCT=${GAIN_PCT:-100}
+RELAY_GAIN_PCT=${RELAY_GAIN_PCT:-200}
+MIN_GAIN_MBIT=${MIN_GAIN_MBIT:-50}
 STREAK=${STREAK:-3}
 HOLD_S=${HOLD_S:-120}
 STABLE_S=${STABLE_S:-300}
@@ -163,7 +168,7 @@ plan_once() {
 	gather "$now" | awk -f "$LIBDIR/parent-plan.awk" \
 		-v statef="$ST/state.new" -v ripef="$ST/ripe.new" \
 		-v maxage="$MAXAGE" -v linkfresh="$LINK_FRESH" -v agentfresh="$AGENT_FRESH" \
-		-v gain="$GAIN_PCT" -v relaygain="$RELAY_GAIN_PCT" -v mingain="$MIN_GAIN_MBIT" \
+		-v gain="$GAIN_PCT" -v relaygain="$RELAY_GAIN_PCT" -v mingain="$MIN_GAIN_MBIT" -v badpath="$BAD_PATH_MBIT" \
 		-v streak="$STREAK" -v hold="$HOLD_S" -v stable="$STABLE_S" -v ghostage="$GHOST_S" \
 		-v cooldown="$COOLDOWN" -v denys="$DENY_S" \
 		-v eff="$EFF" -v mlofrac="$MLO_FRAC" | sort > "$OUT.tmp" || return 1
