@@ -17,8 +17,11 @@
 # The rule, one plain comparison: if the controller has not answered most of
 # the last WINDOW pings (LOSS of them) and a scan (easymesh-parent-scan) heard
 # another parent at least MARGIN dB stronger than the one we are on, move
-# there - with bh-roam-safe, which goes back on its own if the new parent does
-# not carry us to the controller. Never within SETTLE_S of boot or of a parent
+# there - with the parent planner's own mover (easymesh-bh-trial, MOVE_ONLY),
+# which goes back on its own if the new parent does not carry us to the
+# controller. (Not bh-roam-safe: it looks for the target on the backhaul's
+# current frequencies and refused hall's 5 GHz address while the backhaul
+# sat on 6 GHz only, 2026-09-28.) Never within SETTLE_S of boot or of a parent
 # change, never while a parent trial runs, at most once per HOLD_S.
 
 PERIOD=${PERIOD:-10}
@@ -62,7 +65,6 @@ parent() { $W status 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
 state() { $W status 2>/dev/null | sed -n 's/^wpa_state=//p'; }
 mld_of() { $W bss "$1" 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
 busy() {
-	ps w | grep -q "[b]h-roam-safe" && return 0
 	[ -s /tmp/easymesh/bh-trial.pid ] && [ -d "/proc/$(cat /tmp/easymesh/bh-trial.pid)" ] && return 0
 	return 1
 }
@@ -117,7 +119,7 @@ while :; do
 	set -- $c
 	echo "$now" > "$LAST"
 	log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - moving to $1 heard at $2 dBm"
-	CHECK_IP="$ctrl" /usr/sbin/bh-roam-safe "$1" 90 >/dev/null 2>&1
+	MOVE_ONLY=1 /usr/sbin/easymesh-bh-trial "$1" "$ctrl" >/dev/null 2>&1
 	log "move to $1 done: parent now $(parent)"
 	hist=""
 done

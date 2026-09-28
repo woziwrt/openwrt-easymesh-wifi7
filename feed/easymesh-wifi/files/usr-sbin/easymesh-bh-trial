@@ -26,6 +26,11 @@
 #   6. ALWAYS release the pin - a pinned node cannot heal onto another parent
 #      if this one dies (2026-09-23)
 #
+# MOVE_ONLY=1 (easymesh-bh-rescue) skips both measurements: the parent it
+# leaves carries next to nothing, so there is nothing to compare, and the
+# controller runs no iperf3 server for it. Only step 3 decides - the new
+# parent must carry us to the controller, or we go back - and step 6 holds.
+#
 # Result: /tmp/easymesh/bh-trial.json and the log (tag easymesh-bh-trial).
 # Needs an iperf3 server on the controller for the duration (the caller's job).
 
@@ -104,6 +109,16 @@ result() {
 P0=$(parent); NID=$(netid)
 [ -n "$P0" ] && [ -n "$NID" ] || { log "no association or network - nothing to try"; rm -f "$PIDF"; exit 2; }
 [ "$P0" = "$TARGET" ] && { BASE=""; NEW=""; result "already-there"; exit 0; }
+
+if [ "${MOVE_ONLY:-0}" = 1 ]; then
+	BASE=""; NEW=""
+	if ! move_to "$TARGET"; then
+		log "target $TARGET did not carry us to the controller - going back"
+		move_to "$P0" || { release; $W reassociate >/dev/null 2>&1; }
+		release; result "target-unreachable"; exit 1
+	fi
+	release; result "moved"; exit 0
+fi
 
 BASE=$(measure) || { NEW=""; result "no-baseline"; exit 1; }
 log "baseline via $P0: $BASE Mbit/s (up down), trying $TARGET"
