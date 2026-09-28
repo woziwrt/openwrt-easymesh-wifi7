@@ -37,6 +37,11 @@ nodes at once, and stay closed until the backhaul is COMPLETED again:
   dropped, they close their own backhaul BSS in turn, level by level,
   well within the ~5 s this node's scan takes.
 
+A key handshake of the backhaul station leaves the flag as it was: a
+group rekey of a connected backhaul (COMPLETED -> GROUP_HANDSHAKE) must
+not close the BSS and drop the whole subtree, and a 4-way handshake of a
+backhaul still joining must not open it.
+
 A wired uplink (map-agent's /var/run/multiap/multiap.backhaul type "eth")
 counts as a backhaul: nothing is refused or dropped. A node without a mesh
 backhaul station - the controller, a plain AP - never sends the flag and is
@@ -106,7 +111,7 @@ is refused sees status 1 in its log, although sta_auth returns 17.
  			phy = wpas.data.config[phy];
  			if (!phy)
  				return libubus.STATUS_NOT_FOUND;
-@@ -713,9 +740,146 @@
+@@ -713,9 +740,153 @@
  	return false;
  }
  
@@ -139,7 +144,14 @@ is refused sees status 1 in its log, although sta_auth returns 17.
 +		if (!sta_is_mesh_backhaul(name))
 +			continue;
 +		have = true;
-+		if (state == "COMPLETED")
++		// A key handshake leaves it as it was: a group rekey of a
++		// connected backhaul (COMPLETED -> GROUP_HANDSHAKE -> COMPLETED)
++		// must not close the backhaul BSS and drop the children, and a
++		// 4-way handshake of a backhaul that is still joining must not
++		// open it.
++		if (state == "COMPLETED" ||
++		    ((state == "GROUP_HANDSHAKE" || state == "4WAY_HANDSHAKE") &&
++		     wpas.data.bh_block === false))
 +			connected = true;
 +	}
 +
@@ -253,7 +265,7 @@ is refused sees status 1 in its log, although sta_auth returns 17.
  
  	let status = iface.status();
  	let ubus = wpas.data.ubus;
-@@ -753,6 +917,9 @@
+@@ -753,6 +924,9 @@
  		return;
  	}
  
@@ -263,7 +275,7 @@ is refused sees status 1 in its log, although sta_auth returns 17.
  	if (!mld) {
  		msg.phy = wpas.data.iface_phy[ifname];
  		if (!msg.phy) {
-@@ -922,6 +1089,10 @@
+@@ -922,6 +1096,10 @@
  	},
  	iface_remove: function(name, obj) {
  		delete wpas.data.sta_state[name];
