@@ -197,6 +197,8 @@ BEGIN {
 	if (ghostage == "") ghostage = 3600
 	if (mlofrac == "") mlofrac = 0.25
 	if (badpath == "") badpath = 100
+	if (closer == "") closer = 50
+	if (relaycloser == "") relaycloser = 100
 }
 
 $1 == "ROOT"  { root = $2; next }
@@ -306,11 +308,21 @@ END {
 		besttxt = sprintf("%s (depth %d, %s dBm, %d Mbit/s)", best, bdep, sigtxt(n, best), bt)
 		need = (n in kids) ? relaygain : gain
 		pct = (cur > 0) ? int((bt - cur) * 100 / cur) : 999
-		if (cur >= badpath) {
+		# Two rules, each a plain comparison:
+		# A - the path is bad (< badpath) and the best other is `need` better;
+		# B - the best other is CLOSER to the controller (fewer hops) and
+		#     `cneed` better. B is the picture everyone reads as a broken
+		#     mesh: corridor, next to the controller, hanging on hall after a
+		#     reboot (2026-09-28), its path fine but far from what it could be.
+		#     A parent further out never wins by B: kitchen stays behind hall
+		#     even though corridor is one hop closer and +24 %.
+		cneed = (n in kids) ? relaycloser : closer
+		ruleb = (bdep < cd && bt >= cur * (1 + cneed / 100) && bt - cur >= mingain)
+		if (cur >= badpath && !ruleb) {
 			printf "%s: keep %s - its path is not bad (>= %d Mbit/s); best other %s is %+d %%%s\n", n, curtxt, badpath, besttxt, pct, notes
 			continue
 		}
-		if (!(bt >= cur * (1 + need / 100) && bt - cur >= mingain)) {
+		if (!ruleb && !(bt >= cur * (1 + need / 100) && bt - cur >= mingain)) {
 			printf "%s: keep %s - best other %s is %+d %%, needs +%d %% and +%d Mbit/s%s\n", n, curtxt, besttxt, pct, need, mingain, notes
 			continue
 		}
@@ -318,7 +330,7 @@ END {
 		cnt = (n in ocnt) ? ocnt[n] + 1 : 1
 		first = (n in ofirst) ? ofirst[n] : now
 		printf "X streak %s %d %d\n", n, cnt, first > statef
-		why = sprintf("%+d %% path estimate", pct)
+		why = sprintf("%+d %% path estimate%s", pct, ruleb ? ", closer to the controller" : "")
 		if (cnt < streak || now - first < hold) {
 			printf "%s: wait %s -> %s: %s (seen %d/%d runs, %d s)\n", n, curtxt, besttxt, why, cnt, streak, now - first
 			continue

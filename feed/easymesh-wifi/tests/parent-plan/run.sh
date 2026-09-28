@@ -127,6 +127,29 @@ plan
 ! has "^kitchen: MOVE" && has "^kitchen: keep hall .* its path is not bad"
 ok $? "two parents within 30 %: kitchen stays under hall"
 
+# 3a. Rule B, the reversed relay (2026-09-28 07:02): corridor, next to the
+#     controller, came back from a reboot under hall, which hangs on the
+#     controller itself. Its path (~140) is not bad, but the controller,
+#     one hop closer, gives ~300: it moves. kitchen stays behind hall.
+newcase "reversed relay" settled.sql "
+	UPDATE bstamld SET ap_mld_macaddr = '02:00:00:00:01:03' WHERE agent_almac IN ('02:00:00:00:00:02', '02:00:00:00:00:04');
+	UPDATE bstamld SET ap_mld_macaddr = '02:00:00:00:01:01' WHERE agent_almac = '02:00:00:00:00:03';
+	INSERT OR REPLACE INTO bsta_link (agent_almac, link_id, band, bssid, state, last_seen, rssi, tx_mbit, rx_mbit) VALUES
+	('02:00:00:00:00:02', 0, 2, '02:00:00:00:01:03', 'up', @NOW@ - 20, -42, 720, 720),
+	('02:00:00:00:00:02', 1, 8, '02:00:00:00:06:03', 'up', @NOW@ - 20, -60, 1153, 1153),
+	('02:00:00:00:00:03', 0, 2, '02:00:00:00:01:01', 'up', @NOW@ - 20, -60, 648, 576),
+	('02:00:00:00:00:03', 1, 8, '02:00:00:00:06:01', 'up', @NOW@ - 20, -74, 288, 288),
+	('02:00:00:00:00:04', 0, 2, '02:00:00:00:01:03', 'up', @NOW@ - 20, -45, 648, 516),
+	('02:00:00:00:00:04', 1, 8, '02:00:00:00:06:03', 'up', @NOW@ - 20, -69, 864, 864);
+	INSERT OR REPLACE INTO bh_candidate (agent_almac, bssid, freq, signal, scan_ts) VALUES
+	('02:00:00:00:00:02', '02:00:00:00:01:01', 5180, -46, @NOW@ - 120),
+	('02:00:00:00:00:02', '02:00:00:00:06:01', 6135, -67, @NOW@ - 120),
+	('02:00:00:00:00:02', '02:00:00:00:01:03', 5180, -42, @NOW@ - 120),
+	('02:00:00:00:00:02', '02:00:00:00:06:03', 6135, -60, @NOW@ - 120);"
+plan
+has "^corridor: MOVE hall .* -> controller .* closer to the controller" && ! has "^kitchen: MOVE"
+ok $? "rule B: corridor next to the controller does not stay under hall; kitchen stays behind hall"
+
 # 3b. Only a plainly better parent: kitchen is on the controller (25 Mbit/s,
 #     a bad path), but corridor, heard only at -73 dBm on 5 GHz and not on
 #     6 GHz, would give about 42 - under twice as much. It stays; hall, with
