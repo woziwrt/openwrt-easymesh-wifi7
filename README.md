@@ -106,6 +106,18 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
 - ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients, ~11 s outage
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
+- 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules - its path is
+  bad (under ~100 Mbit/s) and another parent is at least twice as good, or another parent one hop closer to the
+  controller is at least 1.5 times as good. Every move is a measured trial on the box itself (throughput before and
+  after, three rounds each) and is kept only if it paid; otherwise the box goes back on its own. One trial in the mesh
+  at a time. In a test after a controller restart, three moves brought a relay from 26/47 to 1044/1143 Mbit/s
+  (up/down). Running every night under test.
+- ✅ **No island when a relay reboots:** a box that has lost its path to the controller stops accepting other boxes on
+  its backhaul at once and drops the ones it had, so two children of a rebooting relay cannot join each other
+- ✅ **Wi-Fi for clients stays up while a backhaul moves:** a backhaul that lost its parent keeps the box's access
+  points running for 20 s, enough to find a new parent on the same channel (a move took ~6 s instead of ~26 s off air)
+- ✅ **Bridges follow a moved box:** when the backhaul tree changes, every box forgets its learned bridge entries at
+  once. Without it, a box that moved behind another relay was unreachable for up to five minutes.
 - ✅ **Backhaul watchdogs:** a backhaul BSS that stopped beaconing is re-armed. A backhaul station that has moved away is
   dropped by its old parent.
 - ✅ **Radio card check:** noisy cards are found and named in the UI
@@ -114,8 +126,8 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 ## Planned for the next releases
 
-- **Choosing the parent:** scan → plan → trial with automatic rollback, and re-evaluation later (today a box keeps its
-  first parent). In LuCI: move a box by hand, and it comes back by itself if the new place is worse.
+- **Moving a box by hand in LuCI:** pick a parent, and the same measured trial decides - a move that does not pay is
+  undone by itself
 - **Topology planned toward the gateway, from measured links:** the controller remembers the measured throughput of
   every backhaul link it has seen, per direction, in its database, together with the 5 GHz and 6 GHz signal at the time.
   A record whose signal no longer matches on either band is dropped, so a box that has been moved loses only its own
@@ -145,7 +157,9 @@ This is a preview. What is not done yet, or not done well:
 - **Band steering of the backhaul is a dry run by default.** The TTLM rules decide and log what they would do; they only
   act when switched on (`/etc/mapc/ttlm-policy-live`, `/etc/mapc/ttlm-alternate-live`). Per-station TTLM from the
   controller works on hardware in both directions. The automatic *policy* on top of it still needs more nights of testing.
-- **A box keeps the parent it joined with.** The mesh does not yet move a box to a better parent on its own.
+- **The parent planner is deliberately simple.** It corrects parents that are plainly wrong and leaves near-ties
+  alone. It estimates a box's own first hop from signal, which can be far off for a noisy card, and it plans toward
+  the controller, not toward whichever box currently holds the internet uplink (see *Planned*).
 - **Some BE14 cards are noisier than others** (7–13 dB on the same channel in our lab). On such a card, the box's own
   5 GHz beacon can briefly deafen its 6 GHz receiver. The mesh detects these cards and shows them in *Nodes*. A mitigation
   is being tested. Such a box does best at the end of a chain.
