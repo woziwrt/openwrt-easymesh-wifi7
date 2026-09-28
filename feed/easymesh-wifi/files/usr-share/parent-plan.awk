@@ -259,9 +259,10 @@ END {
 		if (n == root || (n in wired)) continue
 		cp = (n in par) ? par[n] : "-"
 		if (!(n in alive) || !conn[n]) {
-			# An AL address is drawn fresh on every boot, so the agent
-			# table keeps the old one of every box that rebooted. Silent
-			# after an hour: that is a ghost, not a node in trouble.
+			# The agent table keeps every box that ever joined - one that
+			# was removed, replaced or paired again under another AL
+			# address. Silent after an hour: that is a ghost, not a node
+			# in trouble. (The AL address itself is stable across boots.)
 			if ((n in nage) && nage[n] > ghostage) continue
 			if (!(n in haslegs) && !(n in cpar))
 				printf "%s: no action - no backhaul association; waiting for a box in 5/6 GHz range (it scans by itself)\n", n
