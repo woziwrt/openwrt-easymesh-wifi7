@@ -118,6 +118,9 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
   points running for 20 s, enough to find a new parent on the same channel (a move took ~6 s instead of ~26 s off air)
 - ✅ **Bridges follow a moved box:** when the backhaul tree changes, every box forgets its learned bridge entries at
   once. Without it, a box that moved behind another relay was unreachable for up to five minutes.
+- 🧪 **A box stuck on a parent it cannot use moves by itself:** when most pings to the main box are lost and a much
+  stronger parent is in range, the box moves there, and goes back if the new place does not work. It needs no help from
+  the main box, which cannot reach it in that state anyway.
 - ✅ **Backhaul watchdogs:** a backhaul BSS that stopped beaconing is re-armed. A backhaul station that has moved away is
   dropped by its old parent.
 - ✅ **Radio card check:** noisy cards are found and named in the UI
