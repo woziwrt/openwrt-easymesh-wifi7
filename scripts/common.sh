@@ -109,6 +109,18 @@ em_fetch_sources() {
 	       -e "s|https://git.openwrt.org/project/|https://github.com/openwrt/|g" \
 	       openwrt/feeds.conf.default
 
+	# Each feed at its pin (pins.conf), not at the head of its branch.
+	sed -i -e "s|^\(src-git packages [^;^]*\)[;^].*|\1^$FEED_PACKAGES_COMMIT|" \
+	       -e "s|^\(src-git luci [^;^]*\)[;^].*|\1^$FEED_LUCI_COMMIT|" \
+	       -e "s|^\(src-git routing [^;^]*\)[;^].*|\1^$FEED_ROUTING_COMMIT|" \
+	       -e "s|^\(src-git telephony [^;^]*\)[;^].*|\1^$FEED_TELEPHONY_COMMIT|" \
+	       -e "s|^\(src-git video [^;^]*\)[;^].*|\1^$FEED_VIDEO_COMMIT|" \
+	       openwrt/feeds.conf.default
+	for f in packages luci routing telephony video; do
+		grep -q "^src-git $f .*\^[0-9a-f]\{40\}$" openwrt/feeds.conf.default ||
+			em_die "feed $f is not pinned in feeds.conf.default"
+	done
+
 	em_setup_iopsys_tree
 }
 
@@ -255,6 +267,17 @@ em_install_extras() {
 	em_ok "third-party extras copied into the feeds"
 }
 
+# A feed that is not at its pin is not the tested one.
+em_check_feed_pins() {
+	local f want have
+	for f in packages luci routing telephony video; do
+		eval "want=\$FEED_$(echo "$f" | tr a-z A-Z)_COMMIT"
+		have=$(git -C "feeds/$f" rev-parse HEAD 2>/dev/null)
+		[ "$have" = "$want" ] || em_die "feeds/$f is at ${have:-nothing}, pins.conf says $want"
+	done
+	em_ok "feeds packages, luci, routing, telephony, video at their pins"
+}
+
 # --- 4) feeds: upstream, iopsys, ours (run in openwrt/) ----------------------
 em_setup_feeds() {
 	local f
@@ -264,6 +287,7 @@ em_setup_feeds() {
 	for f in packages luci routing; do
 		[ -d "feeds/$f" ] || em_die "feeds/$f missing - feed clone failed"
 	done
+	em_check_feed_pins
 	em_ok "feeds packages, luci, routing cloned"
 	# Our changes to LuCI itself: the Router Password page asks for the
 	# current password, and an empty new one removes it (stock LuCI cannot).
