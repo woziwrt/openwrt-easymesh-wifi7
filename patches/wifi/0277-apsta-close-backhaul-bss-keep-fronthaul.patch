@@ -48,7 +48,12 @@ before, so it can follow a parent to another channel. Boot and first join
 are unchanged. The grace timer stops the APs without touching the iface
 object of the notification, which is stale by then (0276).
 
-Not tested on hardware yet.
+Tested on a five-node mesh (2026-09-28, all nodes on this patch): a
+parent with two children rebooted - the children refused each other and
+no island formed; the controller rebooted - the tree closed level by
+level and rebuilt from the controller; a leaf lost its parent - it was
+back under another node in 6 s with its APs never stopped. A child that
+is refused sees status 1 in its log, although sta_auth returns 17.
 
 ---
 --- a/wpa_supplicant.uc
