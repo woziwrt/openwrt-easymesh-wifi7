@@ -953,6 +953,7 @@ list)
   "bh_trial": { "target": "str", "controller": "str" },
   "bh_trial_state": {},
   "fdb_flush": { "mesh": false },
+  "parent_plan": {},
   "rename": { "almac": "str", "name": "str" },
   "add_status": {},
   "node_state": {},
@@ -1546,6 +1547,24 @@ call)
 		rm -f /tmp/easymesh/bh-trial.json
 		setsid /usr/sbin/easymesh-bh-trial "$t" "$c" 5203 </dev/null >/dev/null 2>&1 &
 		echo '{"started":true}'
+		;;
+	parent_plan)
+		# What the parent planner thinks of each box now, whether it acts,
+		# and the last trials (easymesh-parent-plan). Controller only; the
+		# names are LuCI's business (it has the name map).
+		pf=/tmp/easymesh/parent-plan.txt
+		printf '{"live":%s,"running":"%s","age_s":%s,"nodes":[' \
+			"$([ -e /etc/mapc/parent-steer-live ] && echo true || echo false)" \
+			"$(cut -d' ' -f1 /tmp/easymesh/parent-steer/running 2>/dev/null | head -1)" \
+			"$([ -e "$pf" ] && echo $(( $(date +%s) - $(date -r "$pf" +%s) )) || echo null)"
+		[ -e "$pf" ] && grep -v '^#' "$pf" | awk '
+			function esc(x) { gsub(/\\/, "\\\\", x); gsub(/"/, "\\\"", x); return x }
+			{ a = $1; sub(/:$/, "", a); rest = $0; sub(/^[^ ]+ /, "", rest)
+			  st = $2; if (st == "no") st = "no action"; if (st == "settling") st = "settling"
+			  printf "%s{\"almac\":\"%s\",\"state\":\"%s\",\"line\":\"%s\"}", (NR > 1 ? "," : ""), esc(a), esc(st), esc(rest) }'
+		printf '],"trials":['
+		[ -s /etc/mapc/parent-steer/trials.jsonl ] && tail -n 5 /etc/mapc/parent-steer/trials.jsonl | awk '{ printf "%s%s", (NR > 1 ? "," : ""), $0 }'
+		printf ']}\n'
 		;;
 	fdb_flush)
 		# Forget this box's learned bridge entries: another box saw the
@@ -2459,6 +2478,8 @@ call)
 						pre = ww[1]
 						who = n(nc((pre == "would" || pre == "proposed" || pre == "trying" || pre == "reverted") ? ww[2] : pre))
 						pfrom = n(ww[wm + 1]); pto = n(ww[wj + 1])
+						wq = idx(ww, wk, "[measured")
+						meas = (wq && ww[wq + 2] == "->") ? " (measured " ww[wq + 1] " -> " ww[wq + 3] " Mbit/s up/down)" : ""
 						est = (ww[wm + 7] == "Mbit/s" && ww[wj + 7] == "Mbit/s") ? ", about " ww[wm + 6] " -> " ww[wj + 6] " Mbit/s to the controller" : ""
 						hops = " (" ww[wm + 3] " -> " ww[wj + 3] " hops" est ")"
 						if (pre == "would")
@@ -2468,9 +2489,9 @@ call)
 						else if (pre == "trying")
 							out(ts, "planner", "The parent planner is trying " who " under " pto " (a measured trial, back under " pfrom " if it does not pay)")
 						else if (pre == "reverted")
-							out(ts, "planner", "The parent planner tried " who " under " pto " - no gain measured, back under " pfrom)
+							out(ts, "planner", "The parent planner tried " who " under " pto " - no gain measured, back under " pfrom meas)
 						else
-							out(ts, "planner", "The parent planner moved " who " from " pfrom " to " pto hops " - kept after a measured trial")
+							out(ts, "planner", "The parent planner moved " who " from " pfrom " to " pto hops " - kept after a measured trial" meas)
 					}
 				} else if (tag == "ttlm-policy") {
 					# "pin STA (child C, parent P) to leg K: ...", "release STA (child C): ...",

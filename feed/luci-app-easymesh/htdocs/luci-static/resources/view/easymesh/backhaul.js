@@ -21,6 +21,7 @@
 var callTopology = rpc.declare({ object: 'easymesh', method: 'topology' });
 var callTtlm = rpc.declare({ object: 'easymesh', method: 'ttlm_state' });
 var callNodes = rpc.declare({ object: 'easymesh', method: 'nodes' });
+var callPlan = rpc.declare({ object: 'easymesh', method: 'parent_plan' });
 
 var BAND = { 1: '2.4 GHz', 2: '5 GHz', 8: '6 GHz' };
 var OK = '#2e8540', WARN = '#b58900', BAD = '#c0392b';
@@ -83,11 +84,11 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
-		return Promise.all([ callTopology(), callTtlm(), callNodes() ]);
+		return Promise.all([ callTopology(), callTtlm(), callNodes(), callPlan() ]);
 	},
 
-	renderAll: function(topo, tt, nodesData) {
-		topo = topo || {}; tt = tt || {};
+	renderAll: function(topo, tt, nodesData, plan) {
+		topo = topo || {}; tt = tt || {}; plan = plan || {};
 		var names = topo.names || {}, byAl = {}, parentOf = {}, kids = {};
 		(topo.nodes || []).forEach(function(n) { byAl[n.almac] = n; });
 		(topo.links || []).forEach(function(l) {
@@ -159,6 +160,53 @@ return view.extend({
 			return E('span', { 'style': 'font-weight:bold;color:' + (live ? OK : WARN) },
 				live ? _('live') : _('dry run'));
 		}
+		/* --- 3. choosing the parent: what the planner thinks of each box --- */
+		function macs(txt) {
+			return String(txt || '').replace(/([0-9a-f]{2}:){5}[0-9a-f]{2}/g, function(m) { return nm(m); });
+		}
+		function planWords(p) {
+			var l = p.line || '', m;
+			if (plan.running && plan.running == p.almac)
+				return _('a measured trial is running now');
+			switch (p.state) {
+			case 'keep':
+				return _('stays - no clearly better parent');
+			case 'wait':
+				m = l.match(/->\s+([0-9a-f:]{17}).*?([+-]\d+) %.*?seen (\d+)\/(\d+)/);
+				return m ? _('would move under %s (%s %%), confirming (%s of %s checks)').format(nm(m[1]), m[2], m[3], m[4]) : macs(l);
+			case 'MOVE':
+				m = l.match(/->\s+([0-9a-f:]{17})/);
+				return m ? _('about to be tried under %s').format(nm(m[1])) : macs(l);
+			case 'hold':
+				return _('resting after a trial');
+			case 'settling':
+				return _('settling after a change of parent');
+			case 'no action':
+				return /not heard/.test(l) ? _('not reachable over the mesh right now - it moves by itself if its link is unusable')
+				                           : _('waiting for a parent in range');
+			}
+			return macs(l);
+		}
+		function planSection() {
+			var items = (plan.nodes || []).map(function(p) {
+				return E('li', {}, [ E('strong', {}, nm(p.almac)), ': ', planWords(p) ]);
+			});
+			var trials = (plan.trials || []).slice().reverse().map(function(t) {
+				var when = new Date(t.ts * 1000);
+				var hm = ('0' + when.getHours()).slice(-2) + ':' + ('0' + when.getMinutes()).slice(-2);
+				var num = (t.base && t.base.length == 2 && t.trial && t.trial.length == 2)
+					? ' - ' + _('%d/%d → %d/%d Mbit/s (up/down)').format(t.base[0], t.base[1], t.trial[0], t.trial[1]) : '';
+				var v = t.verdict == 'kept' ? _('kept') : (t.verdict == 'reverted' ? _('went back, it did not pay') : t.verdict);
+				return E('li', {}, [ hm, ' ', E('strong', {}, nm(t.child)), ' → ', nm(t.parent), ': ', v, num ]);
+			});
+			return E('p', {}, [ E('strong', {}, _('3. Choosing the parent')), ' — ', mode(plan.live), E('br'),
+				_('A box is moved to another parent when its path is bad (under about 100 Mbit/s) and another parent is at least twice as good, or when a parent one hop closer to the main box is at least 1.5 times as good. Every move is a measured trial: throughput before and after, and a move that does not pay is undone.'),
+				items.length ? E('ul', { 'style': 'margin:4px 0 0 18px' }, items)
+				             : E('div', { 'style': 'opacity:.75' }, _('The planner has not reported yet.')),
+				trials.length ? [ E('div', { 'style': 'margin-top:6px' }, _('Last trials:')),
+				                  E('ul', { 'style': 'margin:2px 0 0 18px' }, trials) ] : '' ]);
+		}
+
 		var rules = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, _('What the controller does with the links')),
 			E('p', {}, [ E('strong', {}, _('1. Evade a bad link')), ' — ', mode(tt.rule1_live), E('br'),
@@ -169,9 +217,10 @@ return view.extend({
 				_('A repeater that forwards traffic receives on 5 GHz from its parent and sends on 6 GHz to its children at the same time, instead of sharing one radio both ways. For uploads it is the other way round (receives on 6 GHz, sends on 5 GHz). Measured on 25 Sep for downloads: 153 → 260 Mbit/s through one repeater; the upload direction is not measured yet. Only for cards that passed the STR test.'),
 				reps.length ? E('ul', { 'style': 'margin:4px 0 0 18px' }, reps)
 				            : E('div', { 'style': 'opacity:.75' }, _('No repeater with a verified card.')) ]),
+			planSection(),
 			E('p', { 'style': 'font-size:11px;opacity:.7' },
 				(tt.alive_s != null ? _('Rules last evaluated %d s ago.').format(tt.alive_s) + ' ' : '') +
-				_('A dry run only writes down what it would do; switching a rule live is done on the controller.'))
+				_('A dry run only writes down what it would do; switching a rule or the planner live is done on the controller.'))
 		]);
 
 		return E('div', {}, [
@@ -187,10 +236,10 @@ return view.extend({
 
 	render: function(data) {
 		var self = this;
-		var box = E('div', {}, this.renderAll(data[0], data[1], data[2]));
+		var box = E('div', {}, this.renderAll(data[0], data[1], data[2], data[3]));
 		poll.add(function() {
-			return Promise.all([ callTopology(), callTtlm(), callNodes() ]).then(function(r) {
-				dom.content(box, self.renderAll(r[0], r[1], r[2]));
+			return Promise.all([ callTopology(), callTtlm(), callNodes(), callPlan() ]).then(function(r) {
+				dom.content(box, self.renderAll(r[0], r[1], r[2], r[3]));
 			});
 		}, 15);
 		return E('div', {}, [

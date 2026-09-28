@@ -256,12 +256,21 @@ steer_once() {
 			# Until 2026-09-27 this was written under the target BSSID and
 			# read under the AL address, so a failed trial never denied
 			# anything.
+			# what the trial measured (up/down, Mbit/s), for Events and LuCI
+			m=""
+			_bu=$(echo "$r" | jsonfilter -e '@.base[0]' 2>/dev/null); _bd=$(echo "$r" | jsonfilter -e '@.base[1]' 2>/dev/null)
+			_tu=$(echo "$r" | jsonfilter -e '@.trial[0]' 2>/dev/null); _td=$(echo "$r" | jsonfilter -e '@.trial[1]' 2>/dev/null)
+			[ -n "$_bu" ] && [ -n "$_tu" ] && m=" [measured $_bu/$_bd -> $_tu/$_td Mbit/s up/down]"
 			if [ "$v" = kept ]; then
-				logger -t easymesh-parent-plan "$line - kept after a measured trial"
+				logger -t easymesh-parent-plan "$line - kept after a measured trial$m"
 			else
 				echo "$now" > "$MEM/deny.$child.$parent"
-				logger -t easymesh-parent-plan "reverted $line - the trial did not pay ($v)"
+				logger -t easymesh-parent-plan "reverted $line - the trial did not pay ($v)$m"
 			fi
+			# the last trials, for LuCI (Backhaul & MLO); kept across reboots
+			printf '{"ts":%s,"child":"%s","parent":"%s","verdict":"%s","base":[%s],"trial":[%s]}\n' \
+				"$now" "$child" "$parent" "$v" "${_bu:+$_bu,$_bd}" "${_tu:+$_tu,$_td}" >> "$MEM/trials.jsonl"
+			tail -n 20 "$MEM/trials.jsonl" > "$MEM/trials.jsonl.$$" && mv "$MEM/trials.jsonl.$$" "$MEM/trials.jsonl"
 			echo "$now" > "$MEM/last.$child"
 			rm -f "$ST/running"; iperf_stop
 		elif [ $((now - started)) -gt "$TRIAL_MAX" ]; then
