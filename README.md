@@ -144,6 +144,8 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 - **Mitigation for noisy BE14 cards** (beacon timing), on by default once confirmed
 - **Join from any box:** press the button on the nearest box of the mesh, not only on the main one (EasyMesh push-button event propagation)
 - **Interoperability** with other vendors' EasyMesh controllers and agents, in both roles
+- **Conformance with the specification:** follow the EasyMesh R6 specification closely and check the mesh against the
+  publicly listed EasyMesh test cases, so that a vendor who builds on it could take it to certification
 - **Radar channels (DFS)** as an option, and channel suggestions from scans
 - **Onboarding with DPP (Easy Connect)**
 - **Capacity in the UI:** measured maximum of each link, not only the current traffic
