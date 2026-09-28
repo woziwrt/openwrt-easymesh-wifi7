@@ -1,4 +1,4 @@
-# WOZIWRT EasyMesh — Wi-Fi 7 mesh on open routers
+# EasyMesh Wi-Fi 7 for OpenWrt
 
 **A Wi-Fi 7 mesh built from open-source routers that decides by itself which way the traffic flows.**
 
