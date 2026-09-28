@@ -952,6 +952,7 @@ list)
   "parent_scan": {},
   "bh_trial": { "target": "str", "controller": "str" },
   "bh_trial_state": {},
+  "fdb_flush": { "mesh": false },
   "rename": { "almac": "str", "name": "str" },
   "add_status": {},
   "node_state": {},
@@ -1545,6 +1546,22 @@ call)
 		rm -f /tmp/easymesh/bh-trial.json
 		setsid /usr/sbin/easymesh-bh-trial "$t" "$c" 5203 </dev/null >/dev/null 2>&1 &
 		echo '{"started":true}'
+		;;
+	fdb_flush)
+		# Forget this box's learned bridge entries: another box saw the
+		# backhaul tree change, and a bridge here does not learn again
+		# that a MAC moved (easymesh-fdb-guard). With "mesh" on the
+		# controller, every box is asked in turn; anywhere else it stays
+		# here, so a request can never bounce around the mesh.
+		input=$(cat)
+		m=$(echo "$input" | jsonfilter -e '@.mesh' 2>/dev/null)
+		if [ "$m" = true ] && [ "$(cat /etc/mapc/role 2>/dev/null)" = controller ]; then
+			/usr/sbin/easymesh-fdb-guard mesh >/dev/null 2>&1 </dev/null &
+			echo '{"flushed":"mesh"}'
+		else
+			/usr/sbin/easymesh-fdb-guard flush >/dev/null 2>&1
+			echo '{"flushed":"local"}'
+		fi
 		;;
 	bh_trial_state)
 		p=$(cat /tmp/easymesh/bh-trial.pid 2>/dev/null)

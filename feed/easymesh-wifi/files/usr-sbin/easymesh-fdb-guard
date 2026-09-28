@@ -1,0 +1,139 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-fdb-guard - forget bridge entries when the backhaul tree changes.
+#
+#   easymesh-fdb-guard           run (procd, every box)
+#   easymesh-fdb-guard flush     forget this box's learned entries once
+#   easymesh-fdb-guard mesh      the same on every box that can be reached
+#
+# A bridge on this hardware does not learn again that a MAC address has moved
+# from one backhaul station to another. On 2026-09-28 hall moved from bedroom
+# to corridor, both children of the controller: the Wi-Fi was up at once and
+# corridor learned hall where it now was, but the controller kept hall on
+# bedroom's port ("offload" entry) and sent it everything there. Nothing
+# reached hall from the controller for as long as that entry lived - ~300 s,
+# the bridge ageing time - although hall's own frames were coming in through
+# corridor all the while. Deleting that one entry brought hall back at once.
+# The same hole cut two children of a rebooted relay off for 4-5 min, and
+# made the parent planner's trials fail ("target-unreachable") and deny the
+# right parent for a day.
+#
+# So every box forgets its learned (dynamic) bridge entries as soon as its
+# part of the backhaul changes - a backhaul station comes or goes on its AP,
+# or its own backhaul station changes parent - and asks the controller to do
+# the same on every box. The controller cannot see such a change itself when
+# it happens below it (hall moved between two of its grandchildren), and the
+# topology it learns over 1905 lags by ~1 min (47 and 65 s, 2026-09-28), so
+# the box that sees the change says so. The controller also acts on changes
+# of that topology, for the case where the box that saw the change could not
+# reach it. Forgetting costs a moment of flooding while the entries are
+# learned again; the hole costs minutes.
+
+PERIOD=${PERIOD:-2}
+QUIET=${QUIET:-5}              # never forget more often than this
+TOPO_PERIOD=${TOPO_PERIOD:-5}  # controller: how often to read the topology
+ST=/tmp/easymesh
+mkdir -p "$ST"
+
+log() { logger -t easymesh-fdb-guard "$*"; }
+
+flush_local() {
+	bridge fdb flush dev br-lan dynamic 2>/dev/null
+}
+
+is_controller() { [ "$(cat /etc/mapc/role 2>/dev/null)" = controller ]; }
+
+# The API of another box, as the parent planner calls it (rpc.sh).
+ask() {
+	# ask <ip> <method> <json-params>
+	local s
+	s=$(mesh_rpc_session "$1") || return 1
+	curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$s\",\"easymesh\",\"$2\",$3]}" \
+		"http://$1/ubus" >/dev/null 2>&1
+}
+
+libs() {
+	# db.sh, then names.sh (live_addrs_json), then rpc.sh
+	for l in db names rpc; do
+		[ -r "/usr/share/easymesh/$l.sh" ] || return 1
+		. "/usr/share/easymesh/$l.sh"
+	done
+}
+
+my_addr() { ip -4 -o addr show dev br-lan 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4; exit }'; }
+
+# Every box of the mesh but this one; each is asked in the background, so a
+# box that cannot be reached - the one that moved, possibly - holds nobody up.
+flush_mesh() {
+	flush_local
+	libs || return 0
+	local me ip
+	me=$(my_addr)
+	for ip in $(live_addrs_json | tr -d '{}"' | tr ',' '\n' | sed -n 's/^[0-9a-f:]\{17\}:\([0-9.]*\)$/\1/p' | sort -u); do
+		[ "$ip" = "$me" ] && continue
+		ask "$ip" fdb_flush '{}' &
+	done
+	wait
+}
+
+# An agent asks the controller: the registrar's AL address, then its IP; the
+# gateway address as a last resort (on the controller unless it failed over).
+ask_controller() {
+	libs || return 0
+	local al ip
+	al=$(ubus -t 5 call ieee1905 info 2>/dev/null |
+		sed -n 's/.*"registrar_[0-9]*": *"\([0-9a-f:]\{17\}\)".*/\1/p' | head -1)
+	[ -n "$al" ] && ip=$(live_addrs_json | tr -d '{}"' | tr ',' '\n' | sed -n "s/^$al:\([0-9.]*\)$/\1/p" | head -1)
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.gateway)
+	[ -n "$ip" ] && ask "$ip" fdb_flush '{"mesh":true}'
+}
+
+# What this box's part of the backhaul looks like: the stations on its
+# backhaul AP and the parent of its own backhaul station.
+local_sig() {
+	local k
+	for k in $(iw dev 2>/dev/null | sed -n 's/.*Interface \(ap-mld-2\.sta[0-9]*\).*/\1/p'); do
+		iw dev "$k" station dump 2>/dev/null | awk '/^Station/ { print $2; exit }'
+	done | sort | tr '\n' ' '
+	wpa_cli -i bsta-mld-3 status 2>/dev/null | awk -F= '$1 == "ap_mld_addr" { printf "up=%s", $2 }'
+}
+
+topo_sig() {
+	sqlite3 -cmd ".timeout 1000" /etc/mapc/mapc.db \
+		"SELECT child_almac || '>' || parent_almac FROM topology_link ORDER BY 1;" 2>/dev/null | tr '\n' ' '
+}
+
+case "$1" in
+flush) flush_local; exit 0 ;;
+mesh)  flush_mesh; exit 0 ;;
+esac
+
+last=0; lsig=$(local_sig); tsig=""; tnext=0; why=""
+is_controller && tsig=$(topo_sig)
+while :; do
+	sleep "$PERIOD"
+	now=$(date +%s)
+	s=$(local_sig)
+	[ "$s" != "$lsig" ] && { why="${why:+$why, }backhaul here changed"; lsig=$s; }
+	if is_controller && [ "$now" -ge "$tnext" ]; then
+		tnext=$((now + TOPO_PERIOD))
+		t=$(topo_sig)
+		[ -n "$t" ] && [ "$t" != "$tsig" ] && { why="${why:+$why, }mesh topology changed"; tsig=$t; }
+	fi
+	[ -n "$why" ] || continue
+	# a change within QUIET of the last flush waits for it, it is not lost
+	[ $((now - last)) -ge "$QUIET" ] || continue
+	last=$now
+	if is_controller; then
+		log "$why - forgetting learned bridge entries on every box"
+		flush_mesh
+	else
+		log "$why - forgetting learned bridge entries here, asking the controller for the rest"
+		flush_local
+		ask_controller &
+	fi
+	why=""
+done

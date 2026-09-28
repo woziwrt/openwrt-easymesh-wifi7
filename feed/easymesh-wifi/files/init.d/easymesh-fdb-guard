@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+
+# Forgets learned bridge entries when the backhaul tree changes, on this box
+# and, through the controller, on every box. See /usr/sbin/easymesh-fdb-guard.
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/sbin/easymesh-fdb-guard
+	procd_set_param respawn
+	procd_close_instance
+}
