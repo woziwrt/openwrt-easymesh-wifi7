@@ -116,6 +116,17 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 - **Choosing the parent:** scan → plan → trial with automatic rollback, and re-evaluation later (today a box keeps its
   first parent). In LuCI: move a box by hand, and it comes back by itself if the new place is worse.
+- **Topology planned toward the gateway, from measured links:** the controller remembers the measured throughput of
+  every backhaul link it has seen, per direction, in its database, together with the 5 GHz and 6 GHz signal at the time.
+  A record whose signal no longer matches on either band is dropped, so a box that has been moved loses only its own
+  links. From these links the controller computes the tree with the least airtime from the *active gateway* to every box
+  (downstream, where client traffic goes), rather than toward the controller, and moves boxes one at a time, with
+  hysteresis. If the WAN cable is moved to another box, the mesh rearranges around it. A temporary failover to LTE does
+  not rearrange anything. This is the airtime metric known from 802.11s and mesh routing protocols. What we add is
+  applying it to EasyMesh topology from the controller.
+- **Traffic statistics history:** traffic per box, backhaul link and client, link quality, topology changes, outages and
+  gateway failovers over hours, days and weeks, kept in the controller database with retention, shown as graphs in LuCI
+  and exported through the API
 - **TTLM policy switched on by default,** after enough A/B measurements, with per-direction STR checks and noisy cards
   kept out of relaying
 - **Mitigation for noisy BE14 cards** (beacon timing), on by default once confirmed
