@@ -161,6 +161,16 @@ plan
 ! has "^kitchen: MOVE" && has "^kitchen: keep controller .* needs +100 % and +50 Mbit/s" && has "^hall: MOVE .* -> corridor"
 ok $? "only a plainly better parent: a bad path and +68 % is not enough, +100 % is"
 
+# 3c. Neither the last scan nor kitchen's own legs give a signal for the
+#     parent it is on: there is no estimate for it, not a path of 0 against
+#     which anything is "+999 %".
+newcase "parent unheard" stuck.sql "
+	DELETE FROM bh_candidate WHERE agent_almac = '02:00:00:00:00:04' AND bssid IN ('02:00:00:00:01:01', '02:00:00:00:06:01');
+	UPDATE bsta_link SET rssi = 0 WHERE agent_almac = '02:00:00:00:00:04';"
+plan
+! has "^kitchen: MOVE" && has "^kitchen: keep .* the last scan did not hear the current parent" && has "^hall: MOVE .* -> corridor"
+ok $? "no signal for the current parent (scan nor leg) is no reason to move"
+
 # 4. No flapping: kitchen under corridor, the scans wobble +-3 dB every run
 #    towards hall and back, eight runs, with the real streak and hold.
 newcase "wobbling scans" settled.sql

@@ -34,6 +34,7 @@
 PERIOD=${PERIOD:-2}
 QUIET=${QUIET:-5}              # never forget more often than this
 TOPO_PERIOD=${TOPO_PERIOD:-5}  # controller: how often to read the topology
+MESH_GAP=${MESH_GAP:-3}        # controller: asked for the mesh, not more often
 ST=/tmp/easymesh
 mkdir -p "$ST"
 
@@ -79,6 +80,20 @@ flush_mesh() {
 	wait
 }
 
+# What the API's {"mesh":true} runs. Every box that saw the change asks -
+# the old parent, the new one and the node that moved, within seconds - and
+# the API takes it from any box that knows the mesh secret: one at a time,
+# and not again within MESH_GAP of the last (review, 2026-09-28).
+mesh_once() {
+	local l
+	exec 9>"$ST/fdb-mesh.lock"
+	flock -n 9 || return 0
+	l=$(cat "$ST/fdb-mesh.last" 2>/dev/null)
+	[ -n "$l" ] && [ $(($(date +%s) - l)) -lt "$MESH_GAP" ] && return 0
+	date +%s > "$ST/fdb-mesh.last"
+	flush_mesh
+}
+
 # An agent asks the controller: the registrar's AL address, then its IP; the
 # gateway address as a last resort (on the controller unless it failed over).
 ask_controller() {
@@ -94,11 +109,17 @@ ask_controller() {
 # What this box's part of the backhaul looks like: the stations on its
 # backhaul AP and the parent of its own backhaul station.
 local_sig() {
-	local k
+	local k st=""
+	if [ -S /var/run/wpa_supplicant/bsta-mld-3 ]; then
+		# a wpa_cli that did not answer is not a change of parent - it
+		# was two flushes of the whole mesh (review, 2026-09-28)
+		st=$(wpa_cli -i bsta-mld-3 status 2>/dev/null)
+		[ -n "$st" ] || { echo "?"; return; }
+	fi
 	for k in $(iw dev 2>/dev/null | sed -n 's/.*Interface \(ap-mld-2\.sta[0-9]*\).*/\1/p'); do
 		iw dev "$k" station dump 2>/dev/null | awk '/^Station/ { print $2; exit }'
 	done | sort | tr '\n' ' '
-	wpa_cli -i bsta-mld-3 status 2>/dev/null | awk -F= '$1 == "ap_mld_addr" { printf "up=%s", $2 }'
+	echo "$st" | awk -F= '$1 == "ap_mld_addr" { printf "up=%s", $2 }'
 }
 
 topo_sig() {
@@ -108,7 +129,7 @@ topo_sig() {
 
 case "$1" in
 flush) flush_local; exit 0 ;;
-mesh)  flush_mesh; exit 0 ;;
+mesh)  mesh_once; exit 0 ;;
 esac
 
 last=0; lsig=$(local_sig); tsig=""; tnext=0; why=""
@@ -117,7 +138,7 @@ while :; do
 	sleep "$PERIOD"
 	now=$(date +%s)
 	s=$(local_sig)
-	[ "$s" != "$lsig" ] && { why="${why:+$why, }backhaul here changed"; lsig=$s; }
+	[ "$s" != "?" ] && [ "$s" != "$lsig" ] && { why="${why:+$why, }backhaul here changed"; lsig=$s; }
 	if is_controller && [ "$now" -ge "$tnext" ]; then
 		tnext=$((now + TOPO_PERIOD))
 		t=$(topo_sig)
@@ -129,6 +150,7 @@ while :; do
 	last=$now
 	if is_controller; then
 		log "$why - forgetting learned bridge entries on every box"
+		date +%s > "$ST/fdb-mesh.last"
 		flush_mesh
 	else
 		log "$why - forgetting learned bridge entries here, asking the controller for the rest"

@@ -286,6 +286,12 @@ END {
 			printf "%s: keep %s - no fresh scan (%s)\n", n, curtxt, (n in stale) ? "the last one is older than " maxage " s" : "none received"
 			continue
 		}
+		# A scan that did not hear the parent we are on gives no estimate for
+		# it: cur would be 0 and every candidate "+999 %" (review, 2026-09-28).
+		if (sigof(n, cp, 2) == "" && sigof(n, cp, 8) == "") {
+			printf "%s: keep %s - the last scan did not hear the current parent\n", n, curtxt
+			continue
+		}
 
 		best = ""; bestc = INF; notes = ""
 		k = split(cands[n], cl, " ")
