@@ -82,14 +82,21 @@ measure() {
 	echo "$_su $_sd $_n" | awk '{ printf "%d %d\n", $1 / $3, $2 / $3 }'
 }
 
-# pin <bssid>, wait until it is the parent and the controller answers
+# pin <bssid>, wait until it is the parent and the controller answers.
+# A target the station has not associated with within ASSOC_S is given up at
+# once: waiting the whole 90 s for a parent that never answers, and then up to
+# 90 s more for the way back, left kitchen three minutes without a backhaul
+# (2026-09-28, the controller at -71 dBm never acknowledged its auth).
+ASSOC_S=${ASSOC_S:-30}
 move_to() {
 	$W set_network "$NID" bssid "$1" >/dev/null 2>&1
 	$W reassociate >/dev/null 2>&1
 	_i=0
 	while [ $_i -lt 90 ]; do
-		if [ "$(parent)" = "$1" ] && ping -c 1 -W 2 "$CIP" >/dev/null 2>&1; then
-			return 0
+		if [ "$(parent)" = "$1" ]; then
+			ping -c 1 -W 2 "$CIP" >/dev/null 2>&1 && return 0
+		elif [ $_i -ge "$ASSOC_S" ]; then
+			return 1
 		fi
 		_i=$((_i + 3)); sleep 3
 	done
@@ -109,6 +116,9 @@ result() {
 P0=$(parent); NID=$(netid)
 [ -n "$P0" ] && [ -n "$NID" ] || { log "no association or network - nothing to try"; rm -f "$PIDF"; exit 2; }
 [ "$P0" = "$TARGET" ] && { BASE=""; NEW=""; result "already-there"; exit 0; }
+# stopped half way (procd, a reboot of the service, kill): never leave the
+# station pinned - rule 6
+trap 'release; rm -f "$PIDF"; log "stopped - pin released, parent now $(parent)"; exit 143' TERM INT HUP
 
 if [ "${MOVE_ONLY:-0}" = 1 ]; then
 	BASE=""; NEW=""

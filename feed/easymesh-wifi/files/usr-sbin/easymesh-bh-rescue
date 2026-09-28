@@ -32,8 +32,10 @@ SETTLE_S=${SETTLE_S:-120}
 BOOT_S=${BOOT_S:-300}
 HOLD_S=${HOLD_S:-600}
 SCAN_AGE=${SCAN_AGE:-900}
+BAN_S=${BAN_S:-3600}     # a target we could not stay on is not tried again
 PARENTS=/tmp/easymesh/parents.json
 LAST=/tmp/easymesh/bh-rescue.last
+BAN=/tmp/easymesh/bh-rescue.ban
 W="wpa_cli -i bsta-mld-3"
 
 log() { logger -t easymesh-bh-rescue "$*"; }
@@ -63,7 +65,9 @@ controller_ip() {
 
 parent() { $W status 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
 state() { $W status 2>/dev/null | sed -n 's/^wpa_state=//p'; }
-mld_of() { $W bss "$1" 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
+banned() {
+	[ -s "$BAN" ] && awk -v m="$1" -v now="$(date +%s)" '$1 == m && $2 > now { f = 1 } END { exit !f }' "$BAN"
+}
 busy() {
 	[ -s /tmp/easymesh/bh-trial.pid ] && [ -d "/proc/$(cat /tmp/easymesh/bh-trial.pid)" ] && return 0
 	return 1
@@ -71,7 +75,10 @@ busy() {
 
 # "<mld> <signal> <parent-signal>" of the strongest other parent in the last
 # scan, if it is MARGIN dB stronger than the strongest link of ours; nothing
-# otherwise.
+# otherwise. The AP MLD of each link comes from the scan itself: looked up
+# here, up to 600 s later, a 6 GHz link had none any more, the link address
+# became the target and the move could never be seen to arrive (review,
+# 2026-09-28). A link without one is not a target.
 better_parent() {
 	local p=$1 ts now best bmld bsig psig b f s m
 	[ -s "$PARENTS" ] || return 1
@@ -83,10 +90,10 @@ better_parent() {
 		[ -n "$b" ] || break
 		s=$(jsonfilter -i "$PARENTS" -e "@.cand[$i].signal" 2>/dev/null)
 		[ -n "$s" ] || continue
-		m=$(mld_of "$b"); [ -n "$m" ] || m=$b
-		if [ "$m" = "$p" ]; then
+		m=$(jsonfilter -i "$PARENTS" -e "@.cand[$i].mld" 2>/dev/null)
+		if [ "$m" = "$p" ] || [ "$b" = "$p" ]; then
 			[ "$s" -gt "$psig" ] && psig=$s
-		elif [ "$s" -gt "$bsig" ]; then
+		elif [ -n "$m" ] && [ "$s" -gt "$bsig" ] && ! banned "$m"; then
 			bsig=$s; bmld=$m
 		fi
 	done
@@ -105,7 +112,7 @@ while :; do
 		ctrl=$(controller_ip); cnext=$((now + 300))
 	fi
 	[ -n "$ctrl" ] || continue
-	if ping -c1 -W1 "$ctrl" >/dev/null 2>&1; then r=1; else r=0; fi
+	if ping -c1 -W2 "$ctrl" >/dev/null 2>&1; then r=1; else r=0; fi
 	hist=$(printf "%s%s" "$hist" "$r" | tail -c "$WINDOW")
 	[ ${#hist} -ge "$WINDOW" ] || continue
 	lost=$(echo "$hist" | tr -cd 0 | wc -c)
@@ -120,6 +127,17 @@ while :; do
 	echo "$now" > "$LAST"
 	log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - moving to $1 heard at $2 dBm"
 	MOVE_ONLY=1 /usr/sbin/easymesh-bh-trial "$1" "$ctrl" >/dev/null 2>&1
-	log "move to $1 done: parent now $(parent)"
+	# the station may roam on by itself right after the pin is released
+	# (kitchen hall -> corridor 11 s later, 2026-09-28): report what sticks
+	sleep 15
+	# Not there: the target cannot carry us - or is below us, and 0277 had it
+	# refuse us once our own children were dropped. Either way, not again
+	# for BAN_S; the move and the way back cost the subtree two drops.
+	if [ "$(parent)" = "$1" ]; then
+		log "move to $1 done: parent now $1"
+	else
+		echo "$1 $(( $(date +%s) + BAN_S ))" >> "$BAN"
+		log "move to $1 did not stick: parent now $(parent) - $1 not tried again for $BAN_S s"
+	fi
 	hist=""
 done

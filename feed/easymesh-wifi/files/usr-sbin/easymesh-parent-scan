@@ -21,7 +21,7 @@
 #
 # Writes /tmp/easymesh/parents.json:
 #   {"ts":..,"parent":"<ap-mld>","freqs":"5500,6135",
-#    "cand":[{"bssid":"..","freq":5500,"signal":-55}, ...]}
+#    "cand":[{"bssid":"..","freq":5500,"signal":-55,"mld":"<ap-mld>"}, ...]}
 # Only BSSs carrying our backhaul SSID. tmpfs on purpose.
 
 PERIOD=${1:-600}
@@ -71,11 +71,17 @@ scan_once() {
 			'NR > 1 && index(f, "," $2 ",") { n++ } END { exit !n }' && [ $i -ge 3 ] && break
 	done
 
+	# The AP MLD of each link, asked now: wpa_supplicant forgets a BSS 180 s
+	# after it last heard it and this file lives 600 s, and a 6 GHz link
+	# looked up later had no AP MLD any more - easymesh-bh-rescue took the
+	# link address for a parent and never saw the backhaul arrive there
+	# (review, 2026-09-28). Empty if the BSS is not an AP MLD.
 	$W scan_results 2>/dev/null | awk -F'\t' -v ssid="$ssid" -v f=",$freqs," \
-		-v ts="$(date +%s)" -v par="$parent" -v fq="$freqs" '
-		NR > 1 && $5 == ssid && index(f, "," $2 ",") {
-			c = c (n++ ? "," : "") sprintf("{\"bssid\":\"%s\",\"freq\":%d,\"signal\":%d}", $1, $2, $3)
-		}
+		'NR > 1 && $5 == ssid && index(f, "," $2 ",") { print $1, $2, $3 }' |
+	while read -r b fr sg; do
+		echo "$b $fr $sg $($W bss "$b" 2>/dev/null | sed -n 's/^ap_mld_addr=//p')"
+	done | awk -v ts="$(date +%s)" -v par="$parent" -v fq="$freqs" '
+		{ c = c (n++ ? "," : "") sprintf("{\"bssid\":\"%s\",\"freq\":%d,\"signal\":%d,\"mld\":\"%s\"}", $1, $2, $3, $4) }
 		END { printf "{\"ts\":%s,\"parent\":\"%s\",\"freqs\":\"%s\",\"cand\":[%s]}\n", ts, par, fq, c }' \
 		> "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
 }
