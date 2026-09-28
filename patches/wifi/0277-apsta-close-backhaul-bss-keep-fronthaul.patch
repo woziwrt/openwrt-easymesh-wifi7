@@ -18,7 +18,12 @@ nodes at once, and stay closed until the backhaul is COMPLETED again:
 - wpa_supplicant.uc tells hostapd on every state of a mesh backhaul station
   whether the node has a backhaul. It rides on apsta_state
   { backhaul_block }, the only hostapd method user network may call
-  (wpad_acl.json; wpad runs under procd-ujail).
+  (wpad_acl.json; wpad runs under procd-ujail). While the node has none,
+  the block is repeated every 10 s and whenever hostapd brings up a radio
+  (it asks phy_status before it starts the APs), and hostapd holds it as
+  a 30 s lease: a restarted hostapd, which starts open, is closed again
+  before its APs can take a node, and a wpa_supplicant that dies cannot
+  leave the node closed for good.
 
 - hostapd.uc refuses authentication on those BSSes from the sta_auth hook
   (status 17). handle_auth() calls it for every Authentication frame, SAE
@@ -57,7 +62,46 @@ Not tested on hardware yet.
  
  function iface_stop(iface)
  {
-@@ -713,9 +715,143 @@
+@@ -404,6 +406,27 @@
+ 		iface_status_fill_radio_link(mld, radio, msg, status);
+ }
+ 
++// Tell hostapd whether this node has a mesh backhaul (bh_block_update below).
++// hostapd keeps a block only as a lease and a restarted hostapd starts open,
++// so while the block lasts it is repeated every BH_REFRESH_MS, and at once
++// when hostapd brings up a radio (phy_status): it asks that before it starts
++// the APs, so the block is back before a mesh node can join them.
++const BH_REFRESH_MS = 10000;
++
++function bh_block_send()
++{
++	if (wpas.data.bh_refresh)
++		wpas.data.bh_refresh.cancel();
++	wpas.data.bh_refresh = null;
++
++	if (wpas.data.bh_block == null)
++		return;
++
++	wpas.data.ubus.call("hostapd", "apsta_state", { backhaul_block: wpas.data.bh_block });
++	if (wpas.data.bh_block)
++		wpas.data.bh_refresh = uloop.timer(BH_REFRESH_MS, bh_block_send);
++}
++
+ let main_obj = {
+ 	phy_set_state: {
+ 		args: {
+@@ -471,6 +494,10 @@
+ 			if (!phy)
+ 				return libubus.STATUS_INVALID_ARGUMENT;
+ 
++			// hostapd is about to start the APs of this radio
++			if (wpas.data.bh_block)
++				uloop.timer(1, bh_block_send);
++
+ 			phy = wpas.data.config[phy];
+ 			if (!phy)
+ 				return libubus.STATUS_NOT_FOUND;
+@@ -713,9 +740,146 @@
  	return false;
  }
  
@@ -71,7 +115,8 @@ Not tested on hardware yet.
 +// node with no parent anyway.
 +//
 +// So hostapd is told, on every state of a mesh backhaul station, whether this
-+// node has a backhaul. While it has none, its backhaul BSSes refuse mesh nodes
++// node has a backhaul, and again while it has none (bh_block_send). While it
++// has none, its backhaul BSSes refuse mesh nodes
 +// at authentication and drop the ones they had (hostapd.uc); the BSSes
 +// themselves keep running. A node with a mesh backhaul station connected, or
 +// with no mesh backhaul station at all (the controller, a plain AP), is not
@@ -100,10 +145,12 @@ Not tested on hardware yet.
 +	let block = have && !connected;
 +	if (block != wpas.data.bh_block)
 +		wpas.printf(`mesh backhaul ${block ? "not connected - backhaul BSS closed to mesh nodes" : (have ? "connected" : "gone") + " - backhaul BSS open"}`);
-+	wpas.data.bh_block = have ? block : null;
 +
-+	// sent every time, not only on a change: a restarted hostapd starts open
-+	wpas.data.ubus.call("hostapd", "apsta_state", { backhaul_block: block });
++	// sent every time, not only on a change (bh_block_send)
++	wpas.data.bh_block = block;
++	bh_block_send();
++	if (!have)
++		wpas.data.bh_block = null;
 +}
 +
 +// A mesh backhaul that loses its parent stops the APs on its radios, so it
@@ -201,7 +248,7 @@ Not tested on hardware yet.
  
  	let status = iface.status();
  	let ubus = wpas.data.ubus;
-@@ -753,6 +889,9 @@
+@@ -753,6 +917,9 @@
  		return;
  	}
  
@@ -211,7 +258,7 @@ Not tested on hardware yet.
  	if (!mld) {
  		msg.phy = wpas.data.iface_phy[ifname];
  		if (!msg.phy) {
-@@ -922,6 +1061,10 @@
+@@ -922,6 +1089,10 @@
  	},
  	iface_remove: function(name, obj) {
  		delete wpas.data.sta_state[name];
@@ -224,7 +271,7 @@ Not tested on hardware yet.
  	},
 --- a/hostapd.uc
 +++ b/hostapd.uc
-@@ -1274,6 +1274,123 @@
+@@ -1274,6 +1274,144 @@
  	hostapd.data.mld_sibling_timer = uloop.timer(3000, mld_sibling_restart_run);
  }
  
@@ -256,9 +303,17 @@ Not tested on hardware yet.
 +// A wired uplink is a backhaul: with map-agent's multiap.backhaul saying
 +// "eth", nothing is refused or dropped. It is read when needed, since the
 +// agent writes it only after it has disconnected the backhaul station.
++//
++// The block is a lease: wpa_supplicant.uc repeats it every 10 s while it
++// lasts, and it lapses BH_BLOCK_LEASE_MS after the last word. A hostapd that
++// restarts starts open and is told again when it brings up a radio; a
++// wpa_supplicant that dies, or loses its mesh backhaul station without
++// saying so, leaves the node as it was before this change, not closed for
++// good.
 +const WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA = 17;
 +const WLAN_REASON_DEAUTH_LEAVING = 3;
 +const BH_DROP_DELAY_MS = 1000;
++const BH_BLOCK_LEASE_MS = 30000;
 +const MAP_UPLINK_FILE = "/var/run/multiap/multiap.backhaul";
 +
 +hostapd.data.bh_block = false;
@@ -332,12 +387,25 @@ Not tested on hardware yet.
 +	}
 +}
 +
++function bh_block_lapse()
++{
++	delete hostapd.data.bh_lease;
++	hostapd.printf(`no word on the backhaul for ${BH_BLOCK_LEASE_MS / 1000} s - backhaul BSS open`);
++	hostapd.data.bh_block = false;
++}
++
 +function bh_block_set(block)
 +{
 +	block = !!block;
 +	if (block != hostapd.data.bh_block)
 +		hostapd.printf(`backhaul ${block ? "lost - backhaul BSS closed to mesh nodes" : "connected - backhaul BSS open"}`);
 +	hostapd.data.bh_block = block;
++
++	if (hostapd.data.bh_lease)
++		hostapd.data.bh_lease.cancel();
++	delete hostapd.data.bh_lease;
++	if (block)
++		hostapd.data.bh_lease = uloop.timer(BH_BLOCK_LEASE_MS, bh_block_lapse);
 +
 +	if (block && !hostapd.data.bh_drop_timer)
 +		hostapd.data.bh_drop_timer = uloop.timer(BH_DROP_DELAY_MS, bh_drop_children);
@@ -348,7 +416,7 @@ Not tested on hardware yet.
  let main_obj = {
  	reload: {
  		args: {
-@@ -1303,8 +1420,12 @@
+@@ -1303,8 +1441,12 @@
  			csa: true,
  			csa_count: 0,
  			punct_bitmap: 0,
@@ -361,7 +429,7 @@ Not tested on hardware yet.
  			let phy = phy_name(req.args.phy, req.args.radio);
  			if (req.args.up == null || !phy)
  				return libubus.STATUS_INVALID_ARGUMENT;
-@@ -1569,6 +1690,11 @@
+@@ -1569,6 +1711,11 @@
  		bss_event("remove", name);
  	},
  	sta_auth: function(iface, sta) {
