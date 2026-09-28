@@ -204,6 +204,11 @@ How to check the claim yourself: [docs/TECHNICAL.md → Verifying](docs/TECHNICA
 The exact recipe (OpenWrt, MediaTek feed and iopsys feed pinned to commits) is in [BUILD.md](BUILD.md): one script per
 board, `./build-bpi-r4.sh` and `./build-bpi-r4-pro-8x.sh`.
 
+## Who made it
+
+Petr Wozniak, in collaboration with Claude, an AI assistant by Anthropic. Every change was built, flashed and tested on
+real hardware - a five-box lab running around the clock.
+
 ## License
 
 Our code: BSD-3-Clause (EasyMesh services, LuCI app), GPL-2.0-or-later (kernel and device tree changes). Patches keep the
@@ -211,3 +216,6 @@ license of the code they change. Third-party components keep their own licenses 
 mt76: ISC). See [LICENSE](LICENSE) and [LICENSES.md](LICENSES.md).
 
 Copyright (c) 2026, Petr Wozniak (WOZIWRT project)
+
+This project implements the EasyMesh R6 specification but is not certified by the Wi-Fi Alliance. Wi-Fi EasyMesh is a
+trademark of the Wi-Fi Alliance.
