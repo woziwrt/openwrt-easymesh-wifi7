@@ -1,0 +1,123 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-bh-rescue - leave a parent the backhaul cannot use.
+#
+# A backhaul station keeps whatever parent it associated with for as long as
+# the association holds, however little gets through it. On 2026-09-28 the
+# controller rebooted; bedroom had its backhaul back first, so it was the only
+# parent kitchen could join - at -78 dBm, from the other end of the flat.
+# Kitchen stayed there for 30 minutes at 6 Mbit/s with 70 % of its packets
+# lost, while corridor and hall answered its scans at -49 and -50 dBm. The
+# parent planner could not help: it reads each node over HTTP, and nothing
+# that size got through. The node itself is the only one that can see this
+# and act, so this runs on every agent.
+#
+# The rule, one plain comparison: if the controller has not answered most of
+# the last WINDOW pings (LOSS of them) and a scan (easymesh-parent-scan) heard
+# another parent at least MARGIN dB stronger than the one we are on, move
+# there - with bh-roam-safe, which goes back on its own if the new parent does
+# not carry us to the controller. Never within SETTLE_S of boot or of a parent
+# change, never while a parent trial runs, at most once per HOLD_S.
+
+PERIOD=${PERIOD:-10}
+WINDOW=${WINDOW:-9}      # pings, one per PERIOD
+LOSS=${LOSS:-6}          # of WINDOW lost -> the parent is unusable
+MARGIN=${MARGIN:-10}     # dB stronger than the parent we are on
+SETTLE_S=${SETTLE_S:-120}
+BOOT_S=${BOOT_S:-300}
+HOLD_S=${HOLD_S:-600}
+SCAN_AGE=${SCAN_AGE:-900}
+PARENTS=/tmp/easymesh/parents.json
+LAST=/tmp/easymesh/bh-rescue.last
+W="wpa_cli -i bsta-mld-3"
+
+log() { logger -t easymesh-bh-rescue "$*"; }
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = controller ] && exit 0
+mkdir -p /tmp/easymesh
+
+libs() {
+	for l in db names; do
+		[ -r "/usr/share/easymesh/$l.sh" ] || return 1
+		. "/usr/share/easymesh/$l.sh"
+	done
+}
+
+# The controller's address: the registrar's AL address, then its IP; the
+# lan gateway as a last resort (the same idea as easymesh-fdb-guard).
+controller_ip() {
+	local al ip
+	al=$(ubus -t 5 call ieee1905 info 2>/dev/null |
+		sed -n 's/.*"registrar_[0-9]*": *"\([0-9a-f:]\{17\}\)".*/\1/p' | head -1)
+	if [ -n "$al" ] && libs; then
+		ip=$(live_addrs_json | tr -d '{}"' | tr ',' '\n' | sed -n "s/^$al:\([0-9.]*\)$/\1/p" | head -1)
+	fi
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.gateway)
+	echo "$ip"
+}
+
+parent() { $W status 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
+state() { $W status 2>/dev/null | sed -n 's/^wpa_state=//p'; }
+mld_of() { $W bss "$1" 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
+busy() {
+	ps w | grep -q "[b]h-roam-safe" && return 0
+	[ -s /tmp/easymesh/bh-trial.pid ] && [ -d "/proc/$(cat /tmp/easymesh/bh-trial.pid)" ] && return 0
+	return 1
+}
+
+# "<mld> <signal> <parent-signal>" of the strongest other parent in the last
+# scan, if it is MARGIN dB stronger than the strongest link of ours; nothing
+# otherwise.
+better_parent() {
+	local p=$1 ts now best bmld bsig psig b f s m
+	[ -s "$PARENTS" ] || return 1
+	ts=$(jsonfilter -i "$PARENTS" -e '@.ts' 2>/dev/null); now=$(date +%s)
+	[ -n "$ts" ] && [ $((now - ts)) -le "$SCAN_AGE" ] || return 1
+	psig=-200; bsig=-200; bmld=""
+	for i in $(seq 0 31); do
+		b=$(jsonfilter -i "$PARENTS" -e "@.cand[$i].bssid" 2>/dev/null) || break
+		[ -n "$b" ] || break
+		s=$(jsonfilter -i "$PARENTS" -e "@.cand[$i].signal" 2>/dev/null)
+		[ -n "$s" ] || continue
+		m=$(mld_of "$b"); [ -n "$m" ] || m=$b
+		if [ "$m" = "$p" ]; then
+			[ "$s" -gt "$psig" ] && psig=$s
+		elif [ "$s" -gt "$bsig" ]; then
+			bsig=$s; bmld=$m
+		fi
+	done
+	[ -n "$bmld" ] && [ "$psig" -gt -200 ] && [ "$bsig" -ge $((psig + MARGIN)) ] || return 1
+	echo "$bmld $bsig $psig"
+}
+
+hist=""; par=""; since=$(date +%s); ctrl=""; cnext=0
+while :; do
+	sleep "$PERIOD"
+	now=$(date +%s)
+	p=$(parent)
+	[ "$p" != "$par" ] && { par=$p; since=$now; hist=""; }
+	[ "$(state)" = COMPLETED ] || { hist=""; continue; }
+	if [ "$now" -ge "$cnext" ] || [ -z "$ctrl" ]; then
+		ctrl=$(controller_ip); cnext=$((now + 300))
+	fi
+	[ -n "$ctrl" ] || continue
+	if ping -c1 -W1 "$ctrl" >/dev/null 2>&1; then r=1; else r=0; fi
+	hist=$(printf "%s%s" "$hist" "$r" | tail -c "$WINDOW")
+	[ ${#hist} -ge "$WINDOW" ] || continue
+	lost=$(echo "$hist" | tr -cd 0 | wc -c)
+	[ "$lost" -ge "$LOSS" ] || continue
+	# the parent is unusable - may we act?
+	[ "$(cut -d. -f1 /proc/uptime)" -ge "$BOOT_S" ] || continue
+	[ $((now - since)) -ge "$SETTLE_S" ] || continue
+	[ -s "$LAST" ] && [ $((now - $(cat "$LAST"))) -lt "$HOLD_S" ] && continue
+	busy && continue
+	c=$(better_parent "$p") || { hist=""; continue; }
+	set -- $c
+	echo "$now" > "$LAST"
+	log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - moving to $1 heard at $2 dBm"
+	CHECK_IP="$ctrl" /usr/sbin/bh-roam-safe "$1" 90 >/dev/null 2>&1
+	log "move to $1 done: parent now $(parent)"
+	hist=""
+done

@@ -32,6 +32,8 @@ define Package/easymesh-wifi/description
                        association is discovered by polling minutes later
                        instead of from the event within ~0.1 s.
   evsrc-check        - verifies the event sources actually came up.
+  easymesh-bh-rescue - leaves a parent the backhaul cannot use (most pings to
+                       the controller lost, a much stronger parent heard)
   easymesh-fdb-guard - forgets learned bridge entries when the backhaul tree
                        changes, on every box (a moved MAC is not learned again)
   mld-bsta-relink    - keeps the backhaul MLD on every link it is configured
@@ -103,6 +105,7 @@ define Package/easymesh-wifi/install
 	$(INSTALL_BIN) ./files/usr-sbin/evsrc-check $(1)/usr/sbin/evsrc-check
 	$(INSTALL_BIN) ./files/usr-sbin/mld-bsta-relink $(1)/usr/sbin/mld-bsta-relink
 	$(INSTALL_BIN) ./files/usr-sbin/easymesh-fdb-guard $(1)/usr/sbin/easymesh-fdb-guard
+	$(INSTALL_BIN) ./files/usr-sbin/easymesh-bh-rescue $(1)/usr/sbin/easymesh-bh-rescue
 	$(INSTALL_BIN) ./files/usr-sbin/mld-config-check $(1)/usr/sbin/mld-config-check
 	$(INSTALL_BIN) ./files/usr-sbin/mld-link-check $(1)/usr/sbin/mld-link-check
 	$(INSTALL_BIN) ./files/usr-sbin/mld-report-check $(1)/usr/sbin/mld-report-check
@@ -152,6 +155,7 @@ define Package/easymesh-wifi/install
 	$(INSTALL_BIN) ./files/init.d/evsrc-check $(1)/etc/init.d/evsrc-check
 	$(INSTALL_BIN) ./files/init.d/mld-bsta-relink $(1)/etc/init.d/mld-bsta-relink
 	$(INSTALL_BIN) ./files/init.d/easymesh-fdb-guard $(1)/etc/init.d/easymesh-fdb-guard
+	$(INSTALL_BIN) ./files/init.d/easymesh-bh-rescue $(1)/etc/init.d/easymesh-bh-rescue
 	$(INSTALL_BIN) ./files/init.d/mld-config-check $(1)/etc/init.d/mld-config-check
 	$(INSTALL_BIN) ./files/init.d/mld-link-check $(1)/etc/init.d/mld-link-check
 	$(INSTALL_BIN) ./files/init.d/mld-report-check $(1)/etc/init.d/mld-report-check
