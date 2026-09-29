@@ -843,7 +843,12 @@ return view.extend({
 			bFound,
 			E('h3', { 'style': 'margin-top:1.6em' }, _('Adding it to a mesh you already have?')),
 			E('p', { 'style': 'max-width:560px' },
-				_('Then this screen is not needed. Leave the box plugged in. Press the WPS button on a box that is already in the mesh first, then hold the WPS button on this box for three seconds and let go - that way there are seven minutes to walk between them. Doing it the other way round works too, but leaves only about three. It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
+				/* The main box and no other. An agent refuses the press
+				 * (30-easymesh), and on a BPI-R4 a refused short press
+				 * falls through to the stock reset handler, which restarts
+				 * that box - "a box that is already in the mesh" sent
+				 * people to exactly that. */
+				_('Then this screen is not needed. Leave the box plugged in. Press the WPS button on the main box (the first one you set up) first, then hold the WPS button on this box for three seconds and let go - that way there are seven minutes to walk between them. Doing it the other way round works too, but leaves only about three. It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
 			E('div', { 'style': 'margin-top:2.5em;text-align:right;max-width:560px' }, [ fallbackLink, fallback ])
 		]);
 

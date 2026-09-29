@@ -946,7 +946,9 @@ return view.extend({
 				E('p', {}, _('Make this the first box: it keeps the network name and password, hands them to every box added later, and stays in charge of the mesh.')),
 				E('a', { 'class': 'cbi-button cbi-button-apply', 'href': L.url('admin/network/easymesh/setup') }, _('Set this box up as the first one')),
 				E('h3', { 'style': 'margin-top:1.5em' }, _('Adding this box to a mesh you already have?')),
-				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in, hold its WPS button for three seconds and let go, then press the WPS button on a box that is already in the mesh. It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
+				/* The main box, not any box of the mesh: see the same
+				 * sentence in setup.js for why. */
+				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in, hold its WPS button for three seconds and let go, then press the WPS button on the main box (the first one you set up). It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
 				E('p', { 'style': 'color:#888;font-size:.9em' }, _('A short press keeps its usual meaning here, so pairing an ordinary device is unaffected.'))
 			]);
 
