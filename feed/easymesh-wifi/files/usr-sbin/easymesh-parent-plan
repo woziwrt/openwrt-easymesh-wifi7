@@ -243,6 +243,18 @@ iperf_stop() {
 	rm -f "$IPERF_PIDF"
 }
 
+# The last trials, for LuCI (Backhaul & MLO), kept across reboots. Written
+# whole into a new file and moved over the old one: appended in place, a
+# power cut could leave half a line on the flash, and one broken line made
+# the whole answer invalid JSON (review, 2026-09-29).
+trial_record() {
+	{
+		grep '^{.*}$' "$MEM/trials.jsonl" 2>/dev/null | tail -n 19
+		printf '{"ts":%s,"child":"%s","parent":"%s","verdict":"%s","base":[%s],"trial":[%s]}\n' \
+			"$now" "$child" "$parent" "$1" "$2" "$3"
+	} > "$MEM/trials.jsonl.$$" && mv "$MEM/trials.jsonl.$$" "$MEM/trials.jsonl"
+}
+
 steer_once() {
 	now=$(date +%s)
 	# 1. a trial in flight: wait for it, record it, let go of the server
@@ -267,14 +279,12 @@ steer_once() {
 				echo "$now" > "$MEM/deny.$child.$parent"
 				logger -t easymesh-parent-plan "reverted $line - the trial did not pay ($v)$m"
 			fi
-			# the last trials, for LuCI (Backhaul & MLO); kept across reboots
-			printf '{"ts":%s,"child":"%s","parent":"%s","verdict":"%s","base":[%s],"trial":[%s]}\n' \
-				"$now" "$child" "$parent" "$v" "${_bu:+$_bu,$_bd}" "${_tu:+$_tu,$_td}" >> "$MEM/trials.jsonl"
-			tail -n 20 "$MEM/trials.jsonl" > "$MEM/trials.jsonl.$$" && mv "$MEM/trials.jsonl.$$" "$MEM/trials.jsonl"
+			trial_record "$v" "${_bu:+$_bu,$_bd}" "${_tu:+$_tu,$_td}"
 			echo "$now" > "$MEM/last.$child"
 			rm -f "$ST/running"; iperf_stop
 		elif [ $((now - started)) -gt "$TRIAL_MAX" ]; then
 			steer_log "trial $child -> $parent: no result after ${TRIAL_MAX}s ($r) - giving up"
+			trial_record timeout "" ""
 			echo "$now" > "$MEM/deny.$child.$parent"; echo "$now" > "$MEM/last.$child"
 			rm -f "$ST/running"; iperf_stop
 		fi

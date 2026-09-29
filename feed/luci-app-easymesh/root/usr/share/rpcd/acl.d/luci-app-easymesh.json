@@ -12,6 +12,7 @@
 					"health",
 					"events",
 					"ttlm_state",
+					"parent_plan",
 					"topology",
 					"nodes",
 					"clients",

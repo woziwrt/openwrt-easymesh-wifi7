@@ -773,7 +773,7 @@ resv_claim() {
 # agent saw the whole mesh, clicked the pencil drawn right there, and got
 # "only the controller keeps the names". A control that is visible and refuses
 # is worse than one that is absent.
-CTRL_METHODS="health topology nodes clients client_history steer_history db_stats db_table rename forget_node ttlm_state events"
+CTRL_METHODS="health topology nodes clients client_history steer_history db_stats db_table rename forget_node ttlm_state events parent_plan"
 
 controller_addr() {
 	local a
@@ -1550,8 +1550,11 @@ call)
 		;;
 	parent_plan)
 		# What the parent planner thinks of each box now, whether it acts,
-		# and the last trials (easymesh-parent-plan). Controller only; the
-		# names are LuCI's business (it has the name map).
+		# and the last trials (easymesh-parent-plan). The planner runs on the
+		# controller only; asked on an agent, the question goes there (an
+		# agent answering from its own empty /tmp showed "dry run" next to a
+		# live planner - review, 2026-09-29). The names are LuCI's business.
+		need_db_or_proxy parent_plan || exit 0
 		pf=/tmp/easymesh/parent-plan.txt
 		printf '{"live":%s,"running":"%s","age_s":%s,"nodes":[' \
 			"$([ -e /etc/mapc/parent-steer-live ] && echo true || echo false)" \
@@ -1563,7 +1566,9 @@ call)
 			  st = $2; if (st == "no") st = "no action"; if (st == "settling") st = "settling"
 			  printf "%s{\"almac\":\"%s\",\"state\":\"%s\",\"line\":\"%s\"}", (NR > 1 ? "," : ""), esc(a), esc(st), esc(rest) }'
 		printf '],"trials":['
-		[ -s /etc/mapc/parent-steer/trials.jsonl ] && tail -n 5 /etc/mapc/parent-steer/trials.jsonl | awk '{ printf "%s%s", (NR > 1 ? "," : ""), $0 }'
+		# only whole lines: a power cut can leave half of one on the flash
+		[ -s /etc/mapc/parent-steer/trials.jsonl ] && grep '^{.*}$' /etc/mapc/parent-steer/trials.jsonl |
+			tail -n 5 | awk '{ printf "%s%s", (NR > 1 ? "," : ""), $0 }'
 		printf ']}\n'
 		;;
 	fdb_flush)

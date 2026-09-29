@@ -196,11 +196,19 @@ return view.extend({
 				var hm = ('0' + when.getHours()).slice(-2) + ':' + ('0' + when.getMinutes()).slice(-2);
 				var num = (t.base && t.base.length == 2 && t.trial && t.trial.length == 2)
 					? ' - ' + _('%d/%d → %d/%d Mbit/s (up/down)').format(t.base[0], t.base[1], t.trial[0], t.trial[1]) : '';
-				var v = t.verdict == 'kept' ? _('kept') : (t.verdict == 'reverted' ? _('went back, it did not pay') : t.verdict);
+				var v = { 'kept': _('kept'), 'reverted': _('went back, it did not pay'),
+				          'target-unreachable': _('could not get there, went back'),
+				          'no-baseline': _('could not measure first, not tried'),
+				          'timeout': _('no answer from the box, given up') }[t.verdict] || t.verdict;
 				return E('li', {}, [ hm, ' ', E('strong', {}, nm(t.child)), ' → ', nm(t.parent), ': ', v, num ]);
 			});
+			/* the planner reports every 5 min; a file much older than that is a planner that stopped */
+			var stale = (plan.age_s != null && plan.age_s > 900)
+				? E('div', { 'style': 'font-weight:bold;color:' + WARN },
+				    _('The planner has not reported for %d min - what follows is old.').format(Math.floor(plan.age_s / 60))) : '';
 			return E('p', {}, [ E('strong', {}, _('3. Choosing the parent')), ' — ', mode(plan.live), E('br'),
 				_('A box is moved to another parent when its path is bad (under about 100 Mbit/s) and another parent is at least twice as good, or when a parent one hop closer to the main box is at least 1.5 times as good. Every move is a measured trial: throughput before and after, and a move that does not pay is undone.'),
+				stale,
 				items.length ? E('ul', { 'style': 'margin:4px 0 0 18px' }, items)
 				             : E('div', { 'style': 'opacity:.75' }, _('The planner has not reported yet.')),
 				trials.length ? [ E('div', { 'style': 'margin-top:6px' }, _('Last trials:')),
