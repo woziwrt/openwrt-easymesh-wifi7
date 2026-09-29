@@ -10,8 +10,8 @@
 
 ## What it does
 
-- **One button to add a box.** Press the WPS button on the new box, then on the main box (or *Pair a new box* in the web interface). The new box joins
-  the mesh, gets its settings and a name, and does not need to reboot.
+- **One button to add a box.** Press *Pair a new box* on the main box (or its WPS button), then hold the WPS button on
+  the new box. The new box joins the mesh, gets its settings and a name, and does not need to reboot.
 - **Wi-Fi 7 multi-link backhaul.** Every box talks to its parent over two links at once (5 GHz and 6 GHz, MLO). The main
   box (the EasyMesh *controller*) can tell each backhaul link which band carries which traffic
   (*TID-to-Link Mapping*, TTLM) based on the shape of the whole mesh, not on one radio's view.
@@ -38,31 +38,52 @@
 - a microSD card per box. Running from SD leaves whatever is in the box's own flash untouched: take the card out and the
   box boots its old system.
 
+Any box can be the main box, and it can stand anywhere; a BPI-R4 Pro 8X can just as well be one of the others.
+
 ### 1. Prepare the cards
-Download the image for your board from [Releases](<!-- TODO -->) and write it to one SD card per box
-(`bananapi_bpi-r4-*-sdcard.img.gz` <!-- TODO exact file names -->). Set the boot switch of every box to SD.
+Download the image for your board from [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases), check it
+against `SHA256SUMS`, and write it to one SD card per box:
+
+| Board | Image |
+|---|---|
+| BPI-R4, 4 GB | `openwrt-mediatek-filogic-bananapi_bpi-r4-sdcard.img.gz` |
+| BPI-R4, 8 GB | `openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-sdcard.img.gz` |
+| BPI-R4 Pro 8X | `openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-sdcard.img.gz` |
+
+Set the boot switch of every box to SD. Like stock OpenWrt, every box starts at `http://192.168.1.1` with the user
+`root` and **no password** (just click *Log in*).
+
+The image starts with the Wi-Fi country set to **CZ** (Czech Republic). If you are elsewhere, set yours on each box in
+*Network → WiFi Manager → Change Country* before you build the mesh.
 
 ### 2. The first box becomes the main box (controller)
-Connect a computer to a LAN port of the first box (**not LAN3**, on the Pro 8X **not LAN1** - that one becomes the
-service port), plug the internet cable into its WAN port, and open `http://192.168.1.1`.
-Go to *Network → EasyMesh → Setup* and choose *Start a new mesh*. Enter the Wi-Fi name, the Wi-Fi password and a name for
-the box. That is the only place where you type anything.
-After setup that LAN port is part of the mesh: your computer stays connected and gets its address from the main box.
-The main box keeps one socket as a [service port](#the-service-port-a-way-in-when-the-mesh-is-not) at `192.168.1.1`.
+Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
+Pro 8X) - and open `http://192.168.1.1`.
+Go to *Network → EasyMesh → Setup* and click **This is my first box**. Enter the network name, the Wi-Fi password and a
+name for the box. Leave *Mesh addresses* at `10.10.10.1` unless your home network already uses `10.10.10.x`; it must not
+be `192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
+Click **Create the mesh**, then **Reboot now**. After about 2 minutes (5 on the Pro 8X) the main box answers at
+**`http://10.10.10.1`** (or the address you chose), and the page moves there by itself. That LAN port is now part of the
+mesh: your computer gets a `10.10.10.x` address from the main box.
+
+**The internet cable** goes into the WAN port of **any** box, the main box or another one. The mesh has internet as soon
+as that box has joined. The main box keeps one socket as a [service port](#the-service-port-a-way-in-when-the-mesh-is-not)
+at `192.168.1.1`.
 
 ### 3. Add the other boxes, one at a time
 Put the new box where it is meant to stand. For now it has to be within Wi-Fi reach of the **main box**: pairing is
-opened there. Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X).
+opened there. Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X). Then:
 
-- **With buttons only (no computer):**
-  1. Hold the **WPS button on the new box** for three seconds and let go.
-  2. Within two minutes press the **WPS button on the main box**. <!-- TODO verify the window tonight (clean re-pairing 25 Sep) -->
-- **From the web interface:** do step 1 on the new box, then click *Pair a new box* in the main box's *Overview* instead of
-  pressing its button.
+1. **On the main box,** click *Pair a new box* in its *Overview*, or press its WPS button briefly. It keeps pairing open
+   for about seven minutes, so there is time to walk over.
+2. **On the new box,** hold the WPS button for **4 to 8 seconds** and let go.
 
-The new box joins on its own in about four minutes, without a reboot and with nothing to type in. It takes the Wi-Fi
-settings from the main box and appears in *Overview* and *Nodes*. Then add the next one.
-<!-- TODO: photo of the WPS button on the R4 and the Pro 8X; what the LEDs show while pairing -->
+Only the main box takes a short press: on a BPI-R4 that is not the main box, a short press restarts it. The other order
+(new box first) works too, but leaves only about three minutes.
+
+The new box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if
+something does not come up. It takes the Wi-Fi settings from the main box and appears in *Overview* and *Nodes*. Then
+add the next one.
 
 ### 4. Check that it works
 - *Overview* says **"Mesh is working"**, all boxes are online, every link is healthy.
@@ -202,7 +223,7 @@ How to check the claim yourself: [docs/TECHNICAL.md → Verifying](docs/TECHNICA
   specification and the measurements are in [docs/TECHNICAL.md](docs/TECHNICAL.md); every patch below the EasyMesh layer
   is listed in [docs/PATCHES.md](docs/PATCHES.md). Review of single patches is very welcome.
 - **Testers:** a report with two boxes is already useful. Please attach the output of `easymesh-check` and a screenshot of
-  *Nodes*. <!-- TODO: issue template -->
+  *Nodes*.
 
 ## Building from source
 
