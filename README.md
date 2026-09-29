@@ -71,8 +71,10 @@ settings from the main box and appears in *Overview* and *Nodes*. Then add the n
   so that one bad second does not paint a healthy link red, and asking every box more often would spend the backhaul
   the mesh needs for your traffic. After a change, wait two minutes before judging it. The key in the corner of the
   picture says what the lines mean; hover a line for its numbers and their age.
-- If a box does not appear after five minutes: press both buttons again. If that does not help, see
-  [Troubleshooting](docs/TROUBLESHOOTING.md) <!-- TODO -->.
+- If a box does not appear after five minutes, pair it again: *Pair a new box* on the main box, then hold the new box's
+  button 4 to 8 seconds and let go.
+- To start a box over, hold its button **10 seconds**: that erases its settings (writing its SD card again does the
+  same). There is one main box per mesh; if you made a second one by mistake, start that one over and pair it.
 
 ### The service port: a way in when the mesh is not
 
@@ -196,11 +198,9 @@ How to check the claim yourself: [docs/TECHNICAL.md → Verifying](docs/TECHNICA
 
 ## For reviewers
 
-- **Wi-Fi driver / hostapd people:** our changes below the EasyMesh layer are small and listed patch by patch in
-  [docs/TECHNICAL.md → Patches](docs/TECHNICAL.md#patches-below-easymesh). Most of them fix corner cases we hit with
-  multi-link 4-address backhaul stations. Review of single patches is very welcome.
-- **EasyMesh people:** the architecture, the messages we use and where we deviate from the specification are in
-  [docs/TECHNICAL.md](docs/TECHNICAL.md).
+- **Wi-Fi driver, hostapd and EasyMesh people:** the architecture, the messages we use, where we deviate from the
+  specification and the measurements are in [docs/TECHNICAL.md](docs/TECHNICAL.md); every patch below the EasyMesh layer
+  is listed in [docs/PATCHES.md](docs/PATCHES.md). Review of single patches is very welcome.
 - **Testers:** a report with two boxes is already useful. Please attach the output of `easymesh-check` and a screenshot of
   *Nodes*. <!-- TODO: issue template -->
 

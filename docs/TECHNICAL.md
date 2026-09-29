@@ -3,8 +3,6 @@
 For people who know Wi-Fi 7 MLO or EasyMesh and want to know what exactly happens. The user-facing README is one level
 up.
 
-<!-- TODO before release: every number below links to a measurement log in docs/measurements/ -->
-
 ## Architecture
 
 ```
@@ -44,7 +42,6 @@ decides and delivers:
      (2 hops, downloads): 153 → 260 Mbit/s (+70 %). The upload direction (receive 6, send 5) is not measured yet. Run-to-run variance on our lab is about 30 %, so more A/B runs are pending.
    - Both rules are **dry runs** unless switched on. A dry run logs what it would do.
 2. **Deliver:** map-controller sends the map to the parent agent in a **Service Prioritization Request (CMDU `0x8023`)**.
-   <!-- TODO: exact TLV layout; our patch numbers in map-controller (9995) and map-agent (9993) -->
    Riding on an existing CMDU means we inherit its retry logic, and the map survives a controller restart.
 3. **Apply:** map-agent on the parent hands the map to hostapd. hostapd negotiates it with the station
    (**Negotiated TTLM**, TTLM Request/Response action frames), and the firmware enforces it.
@@ -63,8 +60,6 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
    *TTLM Response* between the parent AP MLD and the station, with the same map.
 3. **In the traffic:** run `iperf3` through the link. Before the map both links carry bytes. After it, only the mapped
    one does. ⚠️ Read **received** bytes at the other end: per-link *transmit* counters on this platform are not reliable.
-
-<!-- TODO: script verify-ttlm.sh that does 1–3 on two boxes and prints PASS/FAIL -->
 
 ## Network layout of a box
 
@@ -93,21 +88,25 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
 
 ## Patches below EasyMesh
 
-<!-- TODO: generate this table from the patch headers (From:, Subject:), one line each, grouped:
-     hostapd/wpa_supplicant · mac80211 · mt76 · iopsys stack (ieee1905, map-agent, map-controller, wifimngr, libwifi).
-     Note for hostapd: three fixes (0273–0275) correct TTLM frame handling in MediaTek's patches. They were reported
-     to MediaTek and confirmed (Sep 2026); MediaTek has equivalent fixes internally, and ours go away once those are published. -->
+Every patch we apply to code we did not write is listed, one line each, in [PATCHES.md](PATCHES.md): 16 on the Wi-Fi
+side (hostapd, wpa_supplicant, mac80211, mt76), 202 on the iopsys EasyMesh stack, and a few for the kernel, U-Boot and
+LuCI. Most of the Wi-Fi ones fix corner cases of multi-link 4-address backhaul stations. Three of them (`0273`–`0275`)
+correct TTLM frame handling in MediaTek's hostapd patches; they were reported to MediaTek and confirmed (September 2026),
+and ours go away once MediaTek publishes its own fixes.
 
 ## Deviations from the EasyMesh specification
 
 - Profile 3 capabilities are reported without DPP and without 1905 message security (both mandatory for certification,
   not for interoperability of the rest).
-- <!-- TODO: list from our patch descriptions (e.g. reporting under the MLD address) -->
 
 ## Measurements
 
-<!-- TODO: link logs. Candidates with dates:
-     2026-09-21 hop cost: 1 hop 418, 2 hops 89–152, 3 hops 29.7 Mbit/s (depth outweighs RSSI)
-     2026-09-23 per-station Neg-TTLM, 20/20, 0 B on the unmapped link both ways
-     2026-09-25 band alternation across a repeater 153 → 260 Mbit/s
-     2026-09-25 gateway failover 24 → 11 s client outage -->
+All on our five-box lab; the raw logs are not published yet.
+
+| Date | What | Result |
+|---|---|---|
+| 2026-09-21 | Throughput by hop count (iperf3 to the controller) | 1 hop 418, 2 hops 89–152, 3 hops 29.7 Mbit/s - depth costs more than signal strength |
+| 2026-09-23 | Negotiated TTLM per backhaul station, "all TIDs on 6 GHz" | 0 bytes on the 5 GHz link in both directions; setup and teardown 20/20 |
+| 2026-09-25 | Band alternation across one repeater (downloads) | 153 → 260 Mbit/s |
+| 2026-09-25 | Gateway failover, client outage | 24 → 11 s |
+| 2026-09-28 | Parent planner, three measured trials in one night (a relay moved from 2 hops to 1) | about 120/250 → 1000/1080 Mbit/s up/down, all three kept |
