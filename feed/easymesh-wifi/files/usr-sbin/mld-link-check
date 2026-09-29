@@ -1,4 +1,3 @@
-#!/bin/sh
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
 #
@@ -30,29 +29,58 @@ RECHECK=15
 # hostapd needs longer than a recheck to bring every link back after a restart;
 # measuring too early makes the confirmation line under-report.
 SETTLE_AFTER_RESTART=40
+# Look again every POLL seconds for as long as the boot window lasts. One look
+# at ~90 s was not enough: on the controller, map-agent restarts the wifi once
+# more ~150 s into the boot, and on 2026-09-29 that second start handed hostapd
+# an empty configuration for the 6 GHz radio - both AP MLDs came up without
+# their 6 GHz link, every child of the controller joined on one leg, and this
+# script had already looked and gone.
+POLL=30
 
-ifname="$(uci -q get wireless.mld0.ifname)"
-[ -n "$ifname" ] || exit 0
-
-want="$(uci -q get wireless.ap_mld_1.device | wc -w)"
-[ "$want" -gt 1 ] 2>/dev/null || exit 0
-
-links() {
-	ubus -t 5 call "wifi.apmld.$ifname" status 2>/dev/null | grep -c '"enabled": true'
+# Every AP MLD, not only the fronthaul: the backhaul one (mld1) lost its
+# 6 GHz link the same way, and that is the one the mesh runs on.
+# "<ifname> <links wanted>" per AP MLD whose wifi-iface lists several radios.
+mlds() {
+	for m in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-mld$/\1/p"); do
+		[ "$(uci -q get wireless.$m.mode)" = ap ] || continue
+		i=$(uci -q get wireless.$m.ifname)
+		[ -n "$i" ] || continue
+		for s in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)\.ifname='$i'$/\1/p"); do
+			[ "$(uci -q get wireless.$s)" = wifi-iface ] || continue
+			w=$(uci -q get wireless.$s.device | wc -w)
+			[ "$w" -gt 1 ] 2>/dev/null && echo "$i $w"
+			break
+		done
+	done
 }
 
-have="$(links)"
-[ "$have" -lt "$want" ] 2>/dev/null || exit 0
+links() {
+	ubus -t 5 call "wifi.apmld.$1" status 2>/dev/null | grep -c '"enabled": true'
+}
 
-# Confirm it is not merely slow before reaching for the hammer.
-sleep "$RECHECK"
-have="$(links)"
-[ "$have" -lt "$want" ] 2>/dev/null || exit 0
+# "<ifname> <have>/<want>" of every AP MLD short of links, nothing if none is
+short() {
+	mlds | while read -r i w; do
+		h=$(links "$i")
+		[ "$h" -lt "$w" ] 2>/dev/null && echo "$i $h/$w"
+	done
+}
 
-logger -t mld-link-check "AP-MLD $ifname has $have of $want links - restarting wifi once"
-wifi down
-sleep 5
-wifi up
-
-sleep "$SETTLE_AFTER_RESTART"
-logger -t mld-link-check "AP-MLD $ifname now has $(links) of $want links"
+while in_boot_window; do
+	s=$(short)
+	if [ -n "$s" ]; then
+		# Confirm it is not merely slow before reaching for the hammer.
+		sleep "$RECHECK"
+		s=$(short)
+		if [ -n "$s" ]; then
+			logger -t mld-link-check "AP-MLD short of links: $(echo $s) - restarting wifi once"
+			wifi down
+			sleep 5
+			wifi up
+			sleep "$SETTLE_AFTER_RESTART"
+			logger -t mld-link-check "after the restart: $(echo $(short)) (nothing listed = every AP MLD complete)"
+			exit 0
+		fi
+	fi
+	sleep "$POLL"
+done
