@@ -92,6 +92,9 @@ add the next one.
   so that one bad second does not paint a healthy link red, and asking every box more often would spend the backhaul
   the mesh needs for your traffic. After a change, wait two minutes before judging it. The key in the corner of the
   picture says what the lines mean; hover a line for its numbers and their age.
+- **A thick line with nothing of yours running is a measurement.** With the parent planner on, it measures the
+  throughput of a box before and after a trial move (about a minute of traffic on that branch); *Events* says which
+  box and why.
 - If a box does not appear after five minutes, pair it again: *Pair a new box* on the main box, then hold the new box's
   button 4 to 8 seconds and let go.
 - To start a box over, hold its button **10 seconds**: that erases its settings (writing its SD card again does the
