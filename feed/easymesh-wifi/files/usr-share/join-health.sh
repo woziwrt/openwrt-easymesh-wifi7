@@ -20,6 +20,23 @@
 # for lacking them - it simply has not got there yet.
 join_health_links() { iw dev "$1" info 2>/dev/null | grep -c "channel "; }
 
+# How many links an MLD should carry: the radios its wifi-iface lists that
+# are not switched off. Until 2026-09-29 this was 3 and 2 written in, so a box
+# with one radio held down failed every look and spent its fallback reboot on
+# a configuration somebody chose (review C9, 2026-09-27). Empty when the
+# config does not say.
+join_health_want() {
+	local s r n=0
+	for s in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.ifname='$1'$/\1/p"); do
+		[ "$(uci -q get wireless.$s)" = wifi-iface ] || continue
+		for r in $(uci -q get wireless.$s.device); do
+			[ "$(uci -q get wireless.$r.disabled)" = 1 ] || n=$((n + 1))
+		done
+		echo "$n"
+		return 0
+	done
+}
+
 # join_health_once [phase1|mid|final]
 #
 #   phase1 - the box is only preparing its radios; it has no credentials yet,
@@ -39,10 +56,12 @@ join_health_once() {
 	# only went to the log - but from today a verdict like that is what the
 	# fallback reboot decides on, so it has to stop lying.
 	if [ "$_when" != phase1 ]; then
-		[ -d /sys/class/net/ap-mld-1 ] && [ "$(join_health_links ap-mld-1)" != 3 ] &&
-			bad="$bad ap-mld-1=$(join_health_links ap-mld-1)/3"
-		[ -d /sys/class/net/ap-mld-2 ] && [ "$(join_health_links ap-mld-2)" != 2 ] &&
-			bad="$bad ap-mld-2=$(join_health_links ap-mld-2)/2"
+		_p=$(join_health_want ap-mld-1)
+		[ -d /sys/class/net/ap-mld-1 ] && [ "$(join_health_links ap-mld-1)" != "${_p:-3}" ] &&
+			bad="$bad ap-mld-1=$(join_health_links ap-mld-1)/${_p:-3}"
+		_p=$(join_health_want ap-mld-2)
+		[ -d /sys/class/net/ap-mld-2 ] && [ "$(join_health_links ap-mld-2)" != "${_p:-2}" ] &&
+			bad="$bad ap-mld-2=$(join_health_links ap-mld-2)/${_p:-2}"
 		[ -d /sys/class/net/bsta-mld-3 ] &&
 			! iw dev bsta-mld-3 link 2>/dev/null | grep -q 'Connected to' &&
 			bad="$bad bsta-not-associated"
