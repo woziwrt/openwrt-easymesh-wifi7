@@ -92,9 +92,9 @@ add the next one.
   so that one bad second does not paint a healthy link red, and asking every box more often would spend the backhaul
   the mesh needs for your traffic. After a change, wait two minutes before judging it. The key in the corner of the
   picture says what the lines mean; hover a line for its numbers and their age.
-- **A thick line with nothing of yours running is a measurement.** With the parent planner on, it measures the
-  throughput of a box before and after a trial move (about a minute of traffic on that branch); *Events* says which
-  box and why.
+- **A thick line with nothing of yours running is a measurement.** A trial move (yours, or the planner's when it is
+  on) measures the throughput of a box before and after, about three minutes of traffic on that branch; *Events* says
+  which box and why.
 - If a box does not appear after five minutes, pair it again: *Pair a new box* on the main box, then hold the new box's
   button 4 to 8 seconds and let go.
 - To start a box over, hold its button **10 seconds**: that erases its settings (writing its SD card again does the
@@ -156,8 +156,6 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 ## Planned for the next releases
 
-- **Moving a box by hand in LuCI:** pick a parent, and the same measured trial decides - a move that does not pay is
-  undone by itself
 - **Topology planned toward the gateway, from measured links:** the controller remembers the measured throughput of
   every backhaul link it has seen, per direction, in its database, together with the 5 GHz and 6 GHz signal at the time.
   A record whose signal no longer matches on either band is dropped, so a box that has been moved loses only its own
@@ -184,26 +182,31 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 ## What the mesh does by itself
 
-What matters most is that your devices stay online, so anything that moves a box is either off by default or acts
-only when a box is already in trouble:
+What matters most is that your devices stay online, so nothing moves a box on its own unless you switch it on:
 
 | Mechanism | By default | What it does | What it costs |
 |---|---|---|---|
 | Finding a new parent after a box or its parent restarts | on | the backhaul joins the best parent it hears, within seconds | the boxes behind a restarting box are offline for 5-30 s |
 | No island ([details](docs/TECHNICAL.md#self-healing-and-optimisation)) | on | a box without a path to the main box stops accepting others at once | nothing |
 | Bridges follow a moved box | on | every box forgets its learned bridge entries when the tree changes | nothing noticeable |
-| Stuck-box rescue | on | a box that loses most pings to the main box moves to a parent at least 10 dB stronger, and goes back if that does not work | a few seconds, only for a box that was not working anyway |
-| Parent planner | **off** (logs only) | moves a box to a clearly better parent, one measured trial at a time | a few seconds for the box and the boxes behind it, plus a minute of measuring traffic |
+| Moving a box by hand | when you ask | *Backhaul & MLO* → *Move…* next to a box: pick a parent it hears; a measured trial keeps the move only if it is faster, otherwise the box goes back by itself | a few seconds for the box and the boxes behind it; one to three minutes if the new parent does not answer; about three minutes of test traffic |
+| Parent planner | **off** (logs only) | moves a box to a clearly better parent, one measured trial at a time | as a move by hand, whenever it decides to |
+| Stuck-box rescue | **off** (logs only) | a box that loses most pings to the main box moves to a parent at least 10 dB stronger, and goes back if that does not work | a few seconds, or one to three minutes if the new place does not answer |
+| Deaf-link guard | **off** (logs only) | a box whose parent's beacons are all gone reconnects | the box and the boxes behind it drop for a moment |
 | TTLM rules (band steering of the backhaul) | **off** (logs only) | moves traffic of a backhaul link to its better band | nothing noticeable |
 
-To switch the planner on, run `touch /etc/mapc/parent-steer-live` on the main box (remove the file to switch it off
-again). Its decisions, and what it would do while off, are in *Backhaul & MLO* and *Events*.
+**The planner is switched in its Danger zone** on *Backhaul & MLO* (or `touch /etc/mapc/parent-steer-live` on the main
+box). The name is meant: once it is on, the mesh may keep rearranging itself for an undetermined time, and switching it
+off again does not undo the moves it made - put a box back with *Move…*. What it decides, and what it would do while
+off, is in *Backhaul & MLO* and *Events*. The rescue and the deaf-link guard are switched on the boxes with
+`touch /etc/mapc/bh-rescue-live` and `touch /etc/mapc/deaf-guard-live`.
 
 **How long things take** (measured in our lab):
 - a new box joins and carries traffic about four minutes after you pair it;
 - after a power cut of the whole mesh, it is working again about three minutes after the boxes have booted;
 - when one box restarts, the boxes behind it find another parent within 5-30 seconds;
-- with the planner on, it waits until a box has been stable for about 15 minutes before it tries a move.
+- a move by hand is decided in about three to four minutes;
+- with the planner on, it waits until a box has been stable for about 7 minutes before it tries a move.
 
 ## Known limitations
 
@@ -221,12 +224,14 @@ This is a preview. What is not done yet, or not done well:
 - **EasyMesh Profile 3 without message security.** DPP onboarding and 1905 encryption are not implemented. Onboarding is
   WPS push-button. The backhaul links themselves are encrypted Wi-Fi (WPA3). <!-- TODO verify SAE on release image -->
 - **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
-- **Automatic moves cost a moment of connectivity.** When the parent planner or the stuck-box rescue moves a box, that
-  box and the boxes behind it are off the mesh for a few seconds, and a planner trial loads the backhaul for about a
-  minute while it measures. That is why the planner is off by default.
+- **Every move costs a moment of connectivity.** When a box is moved - by hand or by the planner - that box and the
+  boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
+  trial loads that branch with test traffic for about three minutes while it measures. That is why nothing moves boxes
+  on its own by default.
 - **After the main box restarts, the tree follows the radio, not the floor plan.** Each box reconnects to the parent it
   hears best at that moment, which can be a box further from the main box than it needs to be. The mesh works, some
-  paths are slower. With the planner off, it stays that way until the next reconnection.
+  paths are slower. With the planner off, it stays that way until the next reconnection, or until you move a box by
+  hand.
 - **A box that lost one of its two backhaul links keeps going on one.** The mesh does not reconnect it to get the
   second link back on purpose: a reconnection takes the box and every box behind it off the mesh for up to a minute.
 - **The controller database lives on the boot medium.** On a slow SD card, a large database write can stall the box for
