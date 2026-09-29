@@ -99,7 +99,7 @@ return view.extend({
 			E('h3', {}, _('Should the mesh change channel?')),
 			E('p', {}, _('Every box of the mesh has to use the same channel in each band - a backhaul link needs both ends on one channel. So a change is always a change for the whole mesh.')),
 			E('p', {}, [ E('strong', {}, _('5 GHz: ')),
-				_('in one test on 23 Sep (each channel measured once, one after the other, so not yet a settled result) channel 100 carried 43 % more than channel 36 over all links, the kitchen uplink 79 \u2192 793 Mbit/s. But channel 100 needs radar detection (DFS): after radar the whole mesh has to leave it, listen for 60 s on the new channel and may not come back for 30 min. These radio cards cannot watch for radar in the background, so there is no ready spare channel. The mesh therefore stays on channel 36, which never has to stop for radar.') ]),
+				_('in one test on 23 Sep (each channel measured once, one after the other, so not yet a settled result) channel 100 carried 43 % more than channel 36 over all links, and one backhaul link went from 79 to 793 Mbit/s. But channel 100 needs radar detection (DFS): after radar the whole mesh has to leave it, listen for 60 s on the new channel and may not come back for 30 min. These radio cards cannot watch for radar in the background, so there is no ready spare channel. The mesh therefore stays on channel 36, which never has to stop for radar.') ]),
 			E('p', { 'style': 'opacity:.75' }, _('Neighbouring networks per channel are not shown yet: the controller does not collect channel scans. A channel suggestion based on them will come once it does.'))
 		]));
 		return out;
