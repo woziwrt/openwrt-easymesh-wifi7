@@ -361,6 +361,15 @@ emit_ap() {
 	# reports nothing at all - it is off by default in OpenWrt.
 	echo "set wireless.$AP_SEC.bss_transition=1"
 	echo "set wireless.$AP_SEC.ieee80211k=1"
+	# No inactivity poll on the backhaul. The poll is ACKed by the child radio
+	# whatever its data path does, so a parent keeps a child that no longer
+	# gets frames through for ever (2026-09-25); and mac80211 judges an MLD
+	# child idle from one link only, so a child that sends on the other link
+	# is polled every 300 s. 98-easymesh-bh-no-inactivity-poll sets it at
+	# first boot, but this section does not exist then - it is built here, at
+	# pairing, and deleted and rebuilt on every run; the option has to be
+	# written here or a freshly paired mesh never has it (2026-09-29).
+	echo "set wireless.$AP_SEC.skip_inactivity_poll=1"
 	# hidden=0 is NOT cosmetic. A hidden backhaul BSS on 6 GHz took down the whole
 	# phy on 2026-07-21 (MBSSID x hidden); the root cause was a template that
 	# shipped hidden=1. Never let this one default.
