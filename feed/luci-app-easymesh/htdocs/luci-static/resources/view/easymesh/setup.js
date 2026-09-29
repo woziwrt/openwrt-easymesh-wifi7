@@ -130,7 +130,11 @@ function rebootOverlay(dest, hintText, waitDown, hosts) {
 		'display:flex;align-items:center;justify-content:center;text-align:center' },
 		E('div', {}, [
 			spinner,
-			E('div', { 'style': 'font-size:17px;color:#24292f' }, _('Router restarting…')),
+			/* waitDown is the join's own wait, and since 2026-09-20 the
+			 * join does not reboot unless its fallback needs to - so it
+			 * must not be headed "restarting". */
+			E('div', { 'style': 'font-size:17px;color:#24292f' },
+				waitDown ? _('Please wait…') : _('Router restarting…')),
 			hint
 		])));
 
@@ -294,7 +298,7 @@ function rebootOverlay(dest, hintText, waitDown, hosts) {
 					sawItLeave = false;
 					stopWaitingForIt = Date.now() + 180000;
 					deadline = Math.min(Date.now() + 300000, hardStop);
-					dom.content(hint, _('Almost there - the box is applying what the mesh told it, and restarts once more on its own.'));
+					dom.content(hint, _('Almost there - the box is applying what the mesh told it. This can take a few more minutes.'));
 					window.setTimeout(probe, 3000);
 					return;
 				}
@@ -381,14 +385,19 @@ function narrate(container, air) {
 						 * constant. The overlay stopped counting restarts for
 						 * the same reason; a sentence that keeps counting
 						 * just moves the wrong promise somewhere the user
-						 * reads it at the end instead of the beginning. */
+						 * reads it at the end instead of the beginning.
+						 *
+						 * Since 2026-09-20 the air join does not reboot at
+						 * all unless its one fallback reboot is needed, so it
+						 * no longer says it did; the cable join still went
+						 * through the Reboot now the user pressed. */
 						air === true
-							? _('In the mesh - joined over the air, no cable was ever involved. The box restarted itself along the way, so LuCI will ask you to sign in again - then see it in ')
-							: _('In the mesh. The cable can stay where it is - the mesh blocks the second path on its own and keeps the wire as a standby - or you can unplug it and the box carries on over the air. The box restarted itself along the way, so LuCI will ask you to sign in again - then see it in '),
+							? _('In the mesh - joined over the air, no cable was ever involved. If LuCI asks you to sign in again, do so - then see it in ')
+							: _('In the mesh. The cable can stay where it is - the mesh blocks the second path on its own and keeps the wire as a standby - or you can unplug it and the box carries on over the air. The box restarted along the way, so LuCI may ask you to sign in again - then see it in '),
 						E('a', { 'href': L.url('admin/network/easymesh/overview') }, _('Overview')),
 						'.'
 					], 'good')
-					: E('p', { 'style': 'color:#69707a;font-size:12px' }, air === 'cable' ? _('This usually takes a few minutes. Leave the cable in.') : _('This usually takes a few minutes - the box restarts itself along the way.')))
+					: E('p', { 'style': 'color:#69707a;font-size:12px' }, air === 'cable' ? _('This usually takes a few minutes. Leave the cable in.') : _('This usually takes a few minutes. The box restarts once by itself only if something does not come up.')))
 		]);
 	}
 	var last = {};
@@ -487,8 +496,11 @@ return view.extend({
 			 * actually happens (the Pair button in Overview) and keep the
 			 * reconfigure form behind a deliberate second click. */
 			if (state.role == 'controller') {
-				/* The button, not this page - and in the order the worker
-			 * actually expects it: the new box first, this one second.
+				/* The button, not this page - and in the order that leaves
+			 * the most time: this box first, the new one second. wps_open
+			 * re-arms the window for about seven minutes, while the new
+			 * box waits only about three (easymesh-wps-join), so this is
+			 * the same order Overview gives.
 			 *
 			 * This used to end with "then run setup on the NEW box", which
 			 * sent people into the LuCI of a box that is not on the network
@@ -497,9 +509,9 @@ return view.extend({
 			 * reader who saw both was told opposite things by the same
 			 * interface. */
 			locked.appendChild(note([
-					_('Adding another box to the mesh? Hold the WPS button on the NEW box for three seconds and let go, then press "Pair a new box" in '),
+					_('Adding another box to the mesh? Press "Pair a new box" in '),
 					E('a', { 'href': L.url('admin/network/easymesh/overview') }, _('Overview')),
-					_(' - or press WPS on this box instead. It joins on its own in about four minutes, with nothing to type in. Nothing on this page needs changing for that.')
+					_(' (or press the WPS button on this box briefly), then hold the WPS button on the new box for 4 to 8 seconds and let go. This box keeps pairing open for about seven minutes. The new box joins on its own in about four minutes, with nothing to type in. Nothing on this page needs changing for that.')
 				], 'good'));
 			}
 			locked.appendChild(note(_('This box is already set up as ') + state.role +
@@ -739,7 +751,7 @@ return view.extend({
 						busy(wpsBtn, false, _('Join over the air'));
 						dom.content(wpsStat, note(_('In the mesh - joined over the air, no cable was ever involved.'), 'good'));
 						handOver(window.location.origin + '/cgi-bin/luci/',
-							_('In the mesh. The box is restarting to finish - then LuCI asks you to sign in, and the new box is in Overview.'), true);
+							_('In the mesh. The box is finishing its setup, which can take a few minutes - it restarts once by itself only if something does not come up. Then the login screen comes back, and the new box is in Overview.'), true);
 						return;
 					} else if (st.indexOf('error') === 0) {
 						busy(wpsBtn, false, _('Join over the air'));
@@ -799,12 +811,12 @@ return view.extend({
 				E('div', {}, _('1. Open the controller’s LuCI in another tab. Next to its "Pair a new box" button it shows the address to copy below.')),
 				E('div', {}, _('2. Press "Join over the air" here and wait for Ready.')),
 				E('div', {}, _('3. Then press "Pair a new box" over there. The mesh hands the keys over by itself.')),
-				/* "Up to twice" counted the join and the finisher and forgot
-				 * the one this box takes first, to get itself a clean radio -
-				 * three in all, measured 2026-08-15. Name the reasons rather
-				 * than the number: the reasons are what makes the waiting
-				 * legible, and they stay true when the count moves. */
-				E('div', { 'style': 'margin-top:6px;color:#8a6d0b' }, _('The box then restarts itself a few times while it settles - to get a clean radio, to join, and once more to raise the network name. Just wait for the login screen.'))
+				/* This listed three restarts (clean radio, join, network
+				 * name), measured 2026-08-15. Since 2026-09-20 each of
+				 * those is a restart of the services, not of the box
+				 * (easymesh-soft-restart), and the box reboots once only
+				 * as the join's fallback. */
+				E('div', { 'style': 'margin-top:6px;color:#8a6d0b' }, _('The box then sets itself up on its own. It does not normally restart - it restarts once by itself only if something does not come up. Just wait until this page says it is in the mesh.'))
 			]), 'warn'),
 			row(_('Mesh address for this box'), _('Copy it exactly from the controller - it shows the number next to its "Pair a new box" button (e.g. 10.10.10.4). The network part must match the mesh.'), input('em-waddr', 'text', '')),
 			wpsBtn,
@@ -889,7 +901,7 @@ return view.extend({
 				 * falls through to the stock reset handler, which restarts
 				 * that box - "a box that is already in the mesh" sent
 				 * people to exactly that. */
-				_('Then this screen is not needed. Leave the box plugged in. Press the WPS button on the main box (the first one you set up) first, then hold the WPS button on this box for three seconds and let go - that way there are seven minutes to walk between them. Doing it the other way round works too, but leaves only about three. It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
+				_('Then this screen is not needed. Leave the box plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or press its WPS button briefly. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if something does not come up. Do not keep holding: ten seconds or more erases the box instead.')),
 			E('div', { 'style': 'margin-top:2.5em;text-align:right;max-width:560px' }, [ fallbackLink, fallback ])
 		]);
 

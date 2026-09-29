@@ -63,8 +63,8 @@ function countClients(c) {
 /* The screen the user is already looking at, because pressing the first button
  * is what brought them here.
  *
- * Adding a box takes about four minutes and three restarts of a box in another
- * room, and for all of that a person who has just pressed two buttons is given
+ * Adding a box takes about four minutes of a box in another room setting
+ * itself up, and for all of that a person who has just pressed two buttons is given
  * nothing at all. That silence is not neutral: it is when people press again,
  * and pressing again restarts a join that was going fine. So the controller says
  * what it knows, every few seconds, in the four states it can actually tell
@@ -79,7 +79,7 @@ function renderAdd(st) {
 	 * question they did not ask, and leaves the one they did ask open. */
 	if (st.state == 'armed') {
 		body = [ E('strong', {}, _('Button registered here.')), ' ',
-			_('Now hold the WPS button on the new box for three seconds. Nothing else - no cable, and nothing to type in. After that it runs on its own for about four minutes and restarts three times; nothing here needs doing until this box says it is done.'),
+			_('Now hold the WPS button on the new box for 4 to 8 seconds and let go. Nothing else - no cable, and nothing to type in. After that it sets itself up on its own in about four minutes, and restarts once by itself only if something does not come up; nothing here needs doing until this box says it is done.'),
 			st.window_left_s != null
 				? E('div', { 'style': 'color:#69707a;font-size:.9em;margin-top:.3em' },
 					_('You have %d s left to do it. If it runs out, nothing is lost - just press here again.').format(st.window_left_s))
@@ -91,7 +91,7 @@ function renderAdd(st) {
 	} else if (st.state == 'paired') {
 		cls += ' info';
 		body = [ E('strong', {}, _('Both buttons registered - the boxes have agreed.')), ' ',
-			_('The new box is setting itself up now and restarts a few times on its own. It takes about four minutes from the second press. Leave both boxes alone; there is nothing more to press.') ];
+			_('The new box is setting itself up now. It takes about four minutes from the second press, and it restarts once by itself only if something does not come up. Leave both boxes alone; there is nothing more to press.') ];
 	} else if (st.state == 'stalled') {
 		cls += ' warning';
 		/* No button of its own. This panel used to carry one, and "Pair a
@@ -108,12 +108,14 @@ function renderAdd(st) {
 					 * saying "done" would be disproved seconds later - the box
 					 * goes away again and its lamp goes dark. Say what is
 					 * happening instead, and keep the green for when it is
-					 * actually true. */
+					 * actually true. Since 2026-09-20 that last step restarts
+					 * the services, not the box (easymesh-soft-restart), so
+					 * the text no longer promises a restart. */
 					cls += ' info';
 					body = [
 						E('strong', {}, _('The new box is here and finishing up.')),
 						' ',
-						_('It has the credentials and restarts once more to put them into service. Its lamp goes dark during that - that is the restart, not a failure. Wait for the green line here.')
+						_('It has the credentials and is putting them into service. Its lamp may go dark for a moment during that - that is not a failure. Wait for the green line here.')
 					];
 				} else if (st.state == 'joined') {
 		cls += ' success';
@@ -123,7 +125,7 @@ function renderAdd(st) {
 		cls += ' warning';
 		body = [ E('strong', {}, _('The other button was never pressed.')),
 			E('div', { 'style': 'margin-top:.3em' },
-				_('Nothing is broken and nothing was changed here. Press "Pair a new box" below, then hold the WPS button on the new box for three seconds - it has to be held, a short press does something else.')) ];
+				_('Nothing is broken and nothing was changed here. Press "Pair a new box" below, then hold the WPS button on the new box for 4 to 8 seconds and let go - it has to be held, a short press does something else.')) ];
 	} else {
 		return E([]);
 	}
@@ -948,7 +950,7 @@ return view.extend({
 				E('h3', { 'style': 'margin-top:1.5em' }, _('Adding this box to a mesh you already have?')),
 				/* The main box, not any box of the mesh: see the same
 				 * sentence in setup.js for why. */
-				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in, hold its WPS button for three seconds and let go, then press the WPS button on the main box (the first one you set up). It restarts itself a few times and joins on its own - about four minutes, with nothing to type in. Do not keep holding: ten seconds or more erases the box instead.')),
+				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or press its WPS button briefly. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if something does not come up. Do not keep holding: ten seconds or more erases the box instead.')),
 				E('p', { 'style': 'color:#888;font-size:.9em' }, _('A short press keeps its usual meaning here, so pairing an ordinary device is unaffected.'))
 			]);
 
@@ -963,14 +965,26 @@ return view.extend({
 		var topoBox = E('div', {}, renderTopology(topo, nodes));
 
 		/* Pairing a new box over the air: the controller half of the WPS
-		 * join (proven 2026-08-11). One press opens a two-minute window;
-		 * the matching press lives on the new box's setup screen. The
-		 * countdown is honest - it mirrors hostapd's own PBC timeout. */
+		 * join (proven 2026-08-11). One press opens hostapd's two-minute
+		 * window (window_s), and wps_open re-arms it three times, 100 s
+		 * apart, so pairing stays open for about seven minutes unless a box
+		 * pairs first - the same 420 s add_status counts. The countdown
+		 * shows that, not the first window: counting 120 s down to "closed"
+		 * told the user to press again while the door was still open.
+		 *
+		 * The button comes back after the first window, as before: a
+		 * second press is how the next box is added straight away, and
+		 * wps_open stops the old re-arm loop before starting a new one. */
 		var pairBox = E('div', {});
 		if (st.role == 'controller') {
+			var PAIR_OPEN_S = 420;
 			var pairBtn = E('button', { 'class': 'cbi-button cbi-button-apply' }, _('Pair a new box'));
 			var pairStat = E('span', { 'style': 'margin-left:10px;color:#69707a' });
 			var pairTimer = null;
+			var pairOpenText = function(s) {
+				return _('Pairing stays open for up to %s more. Now hold the WPS button on the new box for 4 to 8 seconds and let go.')
+					.format(Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2));
+			};
 			pairBtn.addEventListener('click', function() {
 				pairBtn.disabled = true;
 				callWpsOpen().then(function(r) {
@@ -979,18 +993,21 @@ return view.extend({
 						pairStat.textContent = _('Could not open the window: ') + ((r && r.error) || _('unknown error'));
 						return;
 					}
-					var left = r.window_s || 120;
-					pairStat.textContent = _('Window open (%ds) - the new box is exchanging keys now. Watch its setup screen.').format(left);
+					var locked = r.window_s || 120;
+					var left = PAIR_OPEN_S;
+					pairStat.textContent = pairOpenText(left);
 					if (pairTimer) clearInterval(pairTimer);
 					pairTimer = setInterval(function() {
 						left -= 1;
+						locked -= 1;
+						if (locked <= 0) pairBtn.disabled = false;
 						if (left <= 0) {
 							clearInterval(pairTimer);
 							pairBtn.disabled = false;
-							pairStat.textContent = _('Window closed. Press again if the new box was not ready yet.');
+							pairStat.textContent = _('Pairing has closed. If the new box has not joined, press again.');
 							return;
 						}
-						pairStat.textContent = _('Window open (%ds) - the new box is exchanging keys now. Watch its setup screen.').format(left);
+						pairStat.textContent = pairOpenText(left);
 					}, 1000);
 				});
 			});
@@ -1023,7 +1040,7 @@ return view.extend({
 			var addrLine = E('div', { 'style': 'margin-top:8px;font-size:13px' },
 				_('Looking for a free address…'));
 			var stepsLine = E('div', { 'style': 'margin-top:4px;color:#69707a;font-size:12px' },
-				_('Press this first, then walk to the new box and hold its WPS button for three seconds - there are seven minutes to get there. The other order works too, but leaves only about three: the new box listens for a shorter while than this one keeps the door open. It joins on its own in about four minutes, with nothing to type in anywhere.'));
+				_('Press this first, then walk to the new box, hold its WPS button for 4 to 8 seconds and let go. This box keeps pairing open for about seven minutes, so there is time to get there. The other order works too, but leaves only about three: the new box waits for a shorter while than this one keeps the door open. It joins on its own in about four minutes, with nothing to type in anywhere, and restarts once by itself only if something does not come up.'));
 			callSuggest().then(function(r) {
 				if (r && r.address) {
 					dom.content(addrLine, [
