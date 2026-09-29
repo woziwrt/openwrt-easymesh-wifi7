@@ -249,8 +249,6 @@ setup_mesh_network() {
 	# the mesh is a single L2 domain and one address cannot live on all of it.
 	# It carries no gateway and no DNS: it is a way in, never a way out, and a
 	# second default route here would fight the one the mesh just set.
-	# No DHCP either (setup_mesh_dhcp) - a laptop on this port uses a static
-	# address on purpose, so the path keeps working when nothing else does.
 	uci set network.mgmt=interface
 	uci set network.mgmt.device="$MGMT_PORT"
 	uci set network.mgmt.proto=static
@@ -259,13 +257,31 @@ setup_mesh_network() {
 	uci -q delete network.mgmt.gateway
 	uci -q delete network.mgmt.dns
 
-	# Set here rather than in setup_mesh_dhcp, which only the controller
-	# calls: an agent needs its service socket quiet too. Without a dhcp
-	# section dnsmasq would leave it alone anyway, but "quiet by accident"
-	# is the kind of thing a later default flips without anyone noticing.
+	# DHCP on the service socket, on every node (set here rather than in
+	# setup_mesh_dhcp, which only the controller calls). Until 2026-09-29 it
+	# was off, on the idea that a laptop there uses a static address so the
+	# way in works when nothing else does. It left the user who founds a mesh
+	# the way the README says - laptop on this socket, set to automatic like
+	# every laptop is - with no way to get an address after the reboot that
+	# turns the socket into the service port: the lease from the stock image
+	# either survives or the box is gone. A static address still works.
+	# Only an address: an empty option 3 and 6 send no gateway and no DNS,
+	# so a laptop that also has Wi-Fi keeps its internet there. force skips
+	# the start-up probe for another server - on this wire it is either our
+	# laptop or nothing. No IPv6 on it, same as no gateway.
 	uci set dhcp.mgmt=dhcp
 	uci set dhcp.mgmt.interface=mgmt
-	uci set dhcp.mgmt.ignore='1'
+	uci -q delete dhcp.mgmt.ignore
+	uci set dhcp.mgmt.start=100
+	uci set dhcp.mgmt.limit=50
+	uci set dhcp.mgmt.leasetime=1h
+	uci set dhcp.mgmt.force=1
+	uci set dhcp.mgmt.dhcpv4=server
+	uci set dhcp.mgmt.dhcpv6=disabled
+	uci set dhcp.mgmt.ra=disabled
+	uci -q delete dhcp.mgmt.dhcp_option
+	uci add_list dhcp.mgmt.dhcp_option=3
+	uci add_list dhcp.mgmt.dhcp_option=6
 	uci commit dhcp
 
 	# Both networks need to be in a firewall zone, or they are not networks
