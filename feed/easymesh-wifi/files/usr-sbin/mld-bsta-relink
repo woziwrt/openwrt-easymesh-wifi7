@@ -124,30 +124,6 @@ state() {
 	wpa_cli -i "$ifname" status 2>/dev/null | sed -n 's/^wpa_state=//p'
 }
 
-# The parent's AP MLD and the network in use: a reassociation is pinned to the
-# parent we are on. Unpinned, the station picks the strongest BSS with the
-# backhaul SSID, and for a relay that is often its own child - a loop. That
-# took bedroom's subtree off the mesh three times in 20 minutes on 2026-09-29
-# (bedroom one-legged, corridor below it and louder than the controller).
-parent_mld() {
-	wpa_cli -i "$ifname" status 2>/dev/null | sed -n 's/^ap_mld_addr=//p'
-}
-netid() {
-	wpa_cli -i "$ifname" list_networks 2>/dev/null | awk -F'\t' '/\[CURRENT\]/ { print $1; exit }'
-}
-# A parent trial owns the pin while it runs (easymesh-bh-trial).
-trial_runs() {
-	read -r _tp 2>/dev/null < /tmp/easymesh/bh-trial.pid &&
-		grep -q easymesh-bh-trial "/proc/$_tp/cmdline" 2>/dev/null
-}
-pin_nid=""
-release() {
-	[ -n "$pin_nid" ] && wpa_cli -i "$ifname" set_network "$pin_nid" bssid any >/dev/null 2>&1
-	pin_nid=""
-}
-# stopped half way: never leave the station pinned
-trap 'release; exit 143' TERM INT HUP
-
 sleep "$FIRST_CHECK"
 
 tries=0
@@ -188,37 +164,21 @@ while :; do
 		continue
 	fi
 
-	pm="$(parent_mld)"; nid="$(netid)"
-	if [ -z "$pm" ] || [ -z "$nid" ] || trial_runs; then
-		sleep "$INTERVAL"
-		continue
-	fi
-
-	was="$(parent)"
-	tries=$((tries + 1))
-	logger -t mld-bsta-relink \
-		"$ifname has $have/$want links on $was - reassociating to the same parent $pm ($tries/$MAX_TRIES)"
-
-	pin_nid="$nid"
-	wpa_cli -i "$ifname" set_network "$nid" bssid "$pm" >/dev/null 2>&1
-	wpa_cli -i "$ifname" reassociate >/dev/null 2>&1
-	sleep "$SETTLE"
-	release
-
-	now="$(links)"
-	nowp="$(parent)"
-
-	if [ "$nowp" != "$was" ]; then
-		# Worth saying out loud even when the link count improved: the node may
-		# have gained a leg and lost a hop's worth of throughput at the same time.
+	# Report, never act. A reassociation - pinned to the same parent or not -
+	# takes this node off its parent for up to 90 s: the parent answers an
+	# Authentication from a station it still holds with a deauthentication,
+	# the next attempts fail, and every child of this node goes down with it
+	# (0277). On 2026-09-29, with two noisy cards losing their 6 GHz leg every
+	# few minutes, that kept the mesh changing shape all morning. The reason
+	# this script reassociated - 5 GHz sitting out a DFS CAC at boot - is gone
+	# (5 GHz stays on channel 36), and one leg carries traffic. So a missing
+	# leg is logged once per change, and the station is left alone.
+	if [ "$gave_up" -eq 0 ]; then
 		logger -t mld-bsta-relink \
-			"$ifname now has $now/$want links but changed parent: $was -> $nowp"
-	elif [ "$now" -gt "$have" ] 2>/dev/null; then
-		logger -t mld-bsta-relink "$ifname now has $now/$want links on $nowp"
-	else
-		logger -t mld-bsta-relink "$ifname still has $now/$want links after reassociate"
+			"$ifname has $have/$want links on $(parent) - not reassociating (it would take this node and its children off the mesh)"
+		gave_up=1
 	fi
-
+	now="$have"
 	last_have="$now"
 	sleep "$INTERVAL"
 done
