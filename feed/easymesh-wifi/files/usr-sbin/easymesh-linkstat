@@ -342,8 +342,18 @@ deaf_guard() {
 		deaf_log "$_why - would reassociate ($DEAF_OFF present)"
 		return 0
 	fi
-	deaf_log "$_why - reassociating"
-	wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" reassociate >/dev/null 2>&1
+	deaf_log "$_why - reconnecting"
+	# Disconnect first, reconnect a moment later - never a bare reassociate.
+	# A reassociation picks the strongest BSS with the backhaul SSID while
+	# this node's children are still attached and their backhaul BSSes open,
+	# and for a relay that is often its own child: a loop (2026-09-29, from
+	# mld-bsta-relink). Disconnected, the node closes its backhaul BSS and
+	# drops its children (0277) within a second, so they are no longer
+	# candidates by the time the station looks. Not pinned to the parent on
+	# purpose: every leg of it is deaf.
+	wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" disconnect >/dev/null 2>&1
+	sleep 3
+	wpa_cli -p /var/run/wpa_supplicant -i "$BSTA" reconnect >/dev/null 2>&1
 	deaf_check=1
 }
 
