@@ -105,8 +105,15 @@ function note(text, kind) {
  * takes in the middle of its own work is not, and dropping the user at LuCI's
  * front door there loses a story that is still running. So the caller says
  * where the wait ends, and what to promise while it lasts.
+ *
+ * Founding is the exception to "the address that comes back". The README
+ * sends the user to a LAN port, not the service port, and after the reboot
+ * that port is in the mesh: the computer gets an address from the new mesh
+ * and the main box answers at the mesh address it was just given, not at
+ * 192.168.1.1. So founding passes `hosts` - the new address first, the one
+ * the page came from second - and the wait goes to whichever answers.
  */
-function rebootOverlay(dest, hintText, waitDown) {
+function rebootOverlay(dest, hintText, waitDown, hosts) {
 	document.head.appendChild(E('style', {},
 		'@keyframes em-spin { to { transform: rotate(360deg) } }'));
 
@@ -177,6 +184,21 @@ function rebootOverlay(dest, hintText, waitDown) {
 			.then(function() { return done(true); }, function() { return done(false); });
 	}
 
+	/* With several hosts, ask the way LuCI's own reboot page does
+	 * (ui.pingDevice: an image from LuCI's static files). fetch cannot
+	 * look at another origin without CORS headers uhttpd does not send;
+	 * an image can, and only a LuCI has that file. The first host in the
+	 * list wins when more than one answers. */
+	function probeHosts() {
+		return Promise.all(hosts.map(function(h) {
+			return ui.pingDevice('http', h).then(function() { return h; }, function() { return null; });
+		})).then(function(up) {
+			for (var i = 0; i < up.length; i++)
+				if (up[i]) { home = 'http://' + up[i] + '/cgi-bin/luci/'; return true; }
+			return false;
+		});
+	}
+
 	/* "It answers again" is not "it is done".
 	 *
 	 * Measured 2026-08-15 on a from-scratch BPI-R4 Pro 8X join: an over-the-air join
@@ -204,6 +226,10 @@ function rebootOverlay(dest, hintText, waitDown) {
 	catch (e) { ubusUrl = '/ubus'; }
 
 	function askState() {
+		/* Only founding passes hosts, and a founded controller never runs
+		 * the finisher (setup_controller clears adopt-state). A POST to
+		 * the new address would be refused as cross-origin anyway. */
+		if (hosts) return Promise.resolve('');
 		var ctl = ('AbortController' in window) ? new AbortController() : null;
 		var timer = ctl ? window.setTimeout(function() { ctl.abort(); }, 4000) : null;
 		function done(v) { if (timer) window.clearTimeout(timer); return v; }
@@ -227,10 +253,17 @@ function rebootOverlay(dest, hintText, waitDown) {
 		 * is the cable; on a join over the air the cable is not involved at
 		 * all, and the old wording sent people to look at a socket that had
 		 * nothing to do with it - and named LAN3, which is not what the port
-		 * is called on every board. */
+		 * is called on every board.
+		 *
+		 * After founding, the service port is the wrong thing to name: the
+		 * user was sent to a LAN port, and there the box now answers at its
+		 * new address. Name that first, and the old one for the case where
+		 * the cable is in the service port after all. */
 		dom.content(hint, waitDown
 			? _('Still not back. Sign in and open Network - EasyMesh to see where it stopped.')
-			: _('Still not back. Check that the cable is still in the service port, then reload this page.'));
+			: (hosts
+				? _('Still not back. Open http://%s - that is where the main box answers now. If your computer is plugged into the service port and that page does not open, use http://%s instead.').format(hosts[0], hosts[hosts.length - 1])
+				: _('Still not back. Check that the cable is still in the service port, then reload this page.')));
 	}
 
 	function probe() {
@@ -240,7 +273,7 @@ function rebootOverlay(dest, hintText, waitDown) {
 		}
 		/* Any answer means the box is serving again - a login redirect or a
 		 * refused session are both "it is up", which is all we are asking. */
-		probeOnce().then(function(up) {
+		(hosts ? probeHosts() : probeOnce()).then(function(up) {
 			if (!up) { sawItLeave = true; window.setTimeout(probe, 3000); return; }
 			if (!sawItLeave && Date.now() < stopWaitingForIt) {
 				window.setTimeout(probe, 3000);
@@ -272,7 +305,9 @@ function rebootOverlay(dest, hintText, waitDown) {
 	window.setTimeout(probe, waitDown ? 3000 : 20000);
 }
 
-function successWithReboot(text) {
+/* newAddr: the address the box answers at after this reboot, when that is
+ * not the one this page is on - only founding moves it. */
+function successWithReboot(text, newAddr) {
 	var callReboot = rpc.declare({ object: 'system', method: 'reboot' });
 	var btn = E('button', { 'class': 'cbi-button cbi-button-apply', 'style': 'margin-top:8px' }, _('Reboot now'));
 	var box = E('div', {}, [ note(text, 'good'), btn ]);
@@ -281,7 +316,12 @@ function successWithReboot(text) {
 		callReboot().then(function() {
 			dom.content(box, []);
 			narrate(box, 'cable');
-			rebootOverlay();
+			if (newAddr && newAddr != window.location.host)
+				rebootOverlay(null,
+					_('This takes a few minutes. The main box then answers at http://%s, and the login screen opens there on its own.').format(newAddr),
+					false, [ newAddr, window.location.host ]);
+			else
+				rebootOverlay();
 		}, function() {
 			window.location = L.url('admin/system/reboot');
 		});
@@ -593,11 +633,12 @@ return view.extend({
 			if (key.length < 8 || key.length > 63) return ui.addNotification(null, E('p', _('The WiFi password needs 8 to 63 characters.')));
 
 			busy(foundBtn, true);
-			callFound(ssid, key, val('em-rootpw'), val('em-addr') || '10.10.10.1', val('em-name') || state.hostname || '', val('em-bhkey')).then(function(r) {
+			var addr = val('em-addr') || '10.10.10.1';
+			callFound(ssid, key, val('em-rootpw'), addr, val('em-name') || state.hostname || '', val('em-bhkey')).then(function(r) {
 				busy(foundBtn, false, _('Create the mesh'));
 				result.innerHTML = '';
 				result.appendChild(r && r.ok
-					? successWithReboot(_('Mesh created. Press Reboot now to bring it up, then add the other boxes one at a time.'))
+					? successWithReboot(_('Mesh created. Press Reboot now to bring it up, then add the other boxes one at a time.'), r.address || addr)
 					: note(_('Setup failed: ') + ((r && (r.error || r.log)) || _('unknown error')), 'bad'));
 			});
 		});
