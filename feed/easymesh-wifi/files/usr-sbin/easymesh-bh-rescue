@@ -36,6 +36,7 @@ BAN_S=${BAN_S:-3600}     # a target we could not stay on is not tried again
 PARENTS=/tmp/easymesh/parents.json
 LAST=/tmp/easymesh/bh-rescue.last
 BAN=/tmp/easymesh/bh-rescue.ban
+TRIAL=/tmp/easymesh/bh-trial.json
 W="wpa_cli -i bsta-mld-3"
 
 log() { logger -t easymesh-bh-rescue "$*"; }
@@ -50,12 +51,16 @@ libs() {
 	done
 }
 
+controller_al() {
+	ubus -t 5 call ieee1905 info 2>/dev/null |
+		sed -n 's/.*"registrar_[0-9]*": *"\([0-9a-f:]\{17\}\)".*/\1/p' | head -1
+}
+
 # The controller's address: the registrar's AL address, then its IP; the
 # lan gateway as a last resort (the same idea as easymesh-fdb-guard).
 controller_ip() {
 	local al ip
-	al=$(ubus -t 5 call ieee1905 info 2>/dev/null |
-		sed -n 's/.*"registrar_[0-9]*": *"\([0-9a-f:]\{17\}\)".*/\1/p' | head -1)
+	al=$(controller_al)
 	if [ -n "$al" ] && libs; then
 		ip=$(live_addrs_json | tr -d '{}"' | tr ',' '\n' | sed -n "s/^$al:\([0-9.]*\)$/\1/p" | head -1)
 	fi
@@ -73,12 +78,85 @@ busy() {
 	return 1
 }
 
+# Every interface address of the boxes in OUR mesh that are neither this box
+# nor below it, one per line - the only parents worth moving to. Until
+# 2026-09-29 any BSS with the backhaul SSID was a candidate: a relay usually
+# heard its own child strongest, and every other install of this firmware
+# broadcasts the same SSID (review, 2026-09-29).
+#
+# Read from the 1905 topology, which every box holds for the whole mesh - but
+# not in full. Measured on hall, 2026-09-29: the controller came with no
+# interfaces and no neighbours, and bedroom's neighbours came and went between
+# two reads. So:
+#   - a box's addresses are its own interface list plus both ends of every
+#     link reported about it (the controller's backhaul AP is known from its
+#     children's reports);
+#   - a link counts when either end reports it, and the tree is walked down
+#     from the controller breadth first: a box is below us when its way up
+#     passes through us;
+#   - our own children come from our own entry, which is local and complete:
+#     every neighbour we do not reach through our backhaul station.
+# A box whose links nobody reported stays a candidate: it is in our mesh,
+# and not our child. What this cannot give: a box two hops down never learns
+# the controller's own addresses (hall, three reads), so from there the
+# controller is not a target - moving closer to it is the planner's job.
+mesh_targets() {
+	local t n i j id nb root self bsta
+	root=$(controller_al)
+	self=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+	bsta=$($W status 2>/dev/null | sed -n 's/^address=//p' | tr 'A-Z' 'a-z')
+	[ -n "$root" ] && [ -n "$self" ] && [ -n "$bsta" ] || return 1
+	t=$(ubus -t 5 call ieee1905.topology dump 2>/dev/null) || return 1
+	n=$(jsonfilter -s "$t" -e '@.num_nodes' 2>/dev/null)
+	i=0
+	while [ "$i" -lt "${n:-0}" ]; do
+		id=$(jsonfilter -s "$t" -e "@.nodes[$i].ieee1905id" 2>/dev/null)
+		echo "I $id $(jsonfilter -s "$t" -e "@.nodes[$i].interface[*].macaddress" 2>/dev/null | tr '\n' ' ')"
+		j=0
+		while nb=$(jsonfilter -s "$t" -e "@.nodes[$i].ieee1905_neighbors[$j].macaddress" 2>/dev/null) &&
+		      [ -n "$nb" ]; do
+			echo "N $id $nb $(jsonfilter -s "$t" -e "@.nodes[$i].ieee1905_neighbors[$j].via" 2>/dev/null)" \
+				"$(jsonfilter -s "$t" -e "@.nodes[$i].ieee1905_neighbors[$j].remote_via" 2>/dev/null)"
+			j=$((j + 1))
+		done
+		i=$((i + 1))
+	done | tr 'A-Z' 'a-z' | awk -v root="$root" -v self="$self" -v bsta="$bsta" '
+		$1 == "i" { box[$2] = 1; for (a = 3; a <= NF; a++) mac[$2] = mac[$2] " " $a; next }
+		$1 == "n" {
+			box[$2] = 1; box[$3] = 1
+			nbs[$2] = nbs[$2] " " $3; nbs[$3] = nbs[$3] " " $2
+			mac[$2] = mac[$2] " " $4; mac[$3] = mac[$3] " " $5
+			if ($2 == self && $4 != bsta) kid[$3] = 1
+		}
+		END {
+			q[0] = root; seen[root] = 1; head = 0; tail = 1
+			while (head < tail) {
+				x = q[head++]; k = split(nbs[x], e, " ")
+				for (a = 1; a <= k; a++) {
+					y = e[a]
+					if (y in seen) continue
+					seen[y] = 1; par[y] = x; q[tail++] = y
+				}
+			}
+			for (x in box) {
+				if (x == self || (x in kid)) continue
+				below = 0
+				if (x in seen)
+					for (y = par[x]; y != ""; y = par[y]) if (y == self) { below = 1; break }
+				if (below) continue
+				k = split(mac[x], m, " ")
+				for (a = 1; a <= k; a++) if (m[a] != "00:00:00:00:00:00") print m[a]
+			}
+		}' | sort -u
+}
+
 # "<mld> <signal> <parent-signal>" of the strongest other parent in the last
 # scan, if it is MARGIN dB stronger than the strongest link of ours; nothing
 # otherwise. The AP MLD of each link comes from the scan itself: looked up
 # here, up to 600 s later, a 6 GHz link had none any more, the link address
 # became the target and the move could never be seen to arrive (review,
-# 2026-09-28). A link without one is not a target.
+# 2026-09-28). A link without one is not a target, and neither is an AP MLD
+# that is not in $TARGETS (mesh_targets).
 better_parent() {
 	local p=$1 ts now best bmld bsig psig b f s m
 	[ -s "$PARENTS" ] || return 1
@@ -93,7 +171,8 @@ better_parent() {
 		m=$(jsonfilter -i "$PARENTS" -e "@.cand[$i].mld" 2>/dev/null)
 		if [ "$m" = "$p" ] || [ "$b" = "$p" ]; then
 			[ "$s" -gt "$psig" ] && psig=$s
-		elif [ -n "$m" ] && [ "$s" -gt "$bsig" ] && ! banned "$m"; then
+		elif [ -n "$m" ] && [ "$s" -gt "$bsig" ] && ! banned "$m" &&
+		     echo "$TARGETS" | grep -qxF "$m"; then
 			bsig=$s; bmld=$m
 		fi
 	done
@@ -101,7 +180,7 @@ better_parent() {
 	echo "$bmld $bsig $psig"
 }
 
-hist=""; par=""; since=$(date +%s); ctrl=""; cnext=0
+hist=""; par=""; since=$(date +%s); ctrl=""; cnext=0; TARGETS=""
 while :; do
 	sleep "$PERIOD"
 	now=$(date +%s)
@@ -110,9 +189,16 @@ while :; do
 	[ "$(state)" = COMPLETED ] || { hist=""; continue; }
 	if [ "$now" -ge "$cnext" ] || [ -z "$ctrl" ]; then
 		ctrl=$(controller_ip); cnext=$((now + 300))
+		tnext=0
 	fi
 	[ -n "$ctrl" ] || continue
 	if ping -c1 -W2 "$ctrl" >/dev/null 2>&1; then r=1; else r=0; fi
+	# the parents worth moving to, learned while the backhaul still works:
+	# once it does not, the topology may already be going stale
+	if [ "$r" = 1 ] && [ "$now" -ge "${tnext:-0}" ]; then
+		t=$(mesh_targets) && [ -n "$t" ] && TARGETS=$t
+		tnext=$((now + 300))
+	fi
 	hist=$(printf "%s%s" "$hist" "$r" | tail -c "$WINDOW")
 	[ ${#hist} -ge "$WINDOW" ] || continue
 	lost=$(echo "$hist" | tr -cd 0 | wc -c)
@@ -122,22 +208,30 @@ while :; do
 	[ $((now - since)) -ge "$SETTLE_S" ] || continue
 	[ -s "$LAST" ] && [ $((now - $(cat "$LAST"))) -lt "$HOLD_S" ] && continue
 	busy && continue
+	[ -n "$TARGETS" ] || { log "parent $p unusable, but the mesh topology is not known yet - staying"; hist=""; continue; }
 	c=$(better_parent "$p") || { hist=""; continue; }
 	set -- $c
 	echo "$now" > "$LAST"
 	log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - moving to $1 heard at $2 dBm"
 	MOVE_ONLY=1 /usr/sbin/easymesh-bh-trial "$1" "$ctrl" >/dev/null 2>&1
-	# the station may roam on by itself right after the pin is released
-	# (kitchen hall -> corridor 11 s later, 2026-09-28): report what sticks
+	# What the mover itself decided, not where the station is 15 s later: it
+	# may roam on by itself once the pin is released (kitchen hall ->
+	# corridor 11 s later, 2026-09-28), and a trial that never started (one
+	# already running, no network) says nothing about the target. Only a
+	# target that could not carry us is not tried again for BAN_S - the move
+	# and the way back cost the subtree two drops.
+	v=""
+	[ -s "$TRIAL" ] && [ "$(jsonfilter -i "$TRIAL" -e '@.ts' 2>/dev/null || echo 0)" -ge "$now" ] &&
+		v=$(jsonfilter -i "$TRIAL" -e '@.verdict' 2>/dev/null)
 	sleep 15
-	# Not there: the target cannot carry us - or is below us, and 0277 had it
-	# refuse us once our own children were dropped. Either way, not again
-	# for BAN_S; the move and the way back cost the subtree two drops.
-	if [ "$(parent)" = "$1" ]; then
-		log "move to $1 done: parent now $1"
-	else
+	case "$v" in
+	moved|already-there)
+		log "move to $1 done: parent now $(parent)" ;;
+	target-unreachable)
 		echo "$1 $(( $(date +%s) + BAN_S ))" >> "$BAN"
-		log "move to $1 did not stick: parent now $(parent) - $1 not tried again for $BAN_S s"
-	fi
+		log "move to $1 failed: parent now $(parent) - $1 not tried again for $BAN_S s" ;;
+	*)
+		log "move to $1 did not run (${v:-no result}): parent now $(parent)" ;;
+	esac
 	hist=""
 done

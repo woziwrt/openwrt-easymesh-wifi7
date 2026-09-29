@@ -86,8 +86,11 @@ measure() {
 # A target the station has not associated with within ASSOC_S is given up at
 # once: waiting the whole 90 s for a parent that never answers, and then up to
 # 90 s more for the way back, left kitchen three minutes without a backhaul
-# (2026-09-28, the controller at -71 dBm never acknowledged its auth).
-ASSOC_S=${ASSOC_S:-30}
+# (2026-09-28, the controller at -71 dBm never acknowledged its auth). Not
+# 30: the one move measured under that window took 32 s (corridor -> hall,
+# 2026-09-28), and a trial given up too early denies the right parent for a
+# day (review, 2026-09-29).
+ASSOC_S=${ASSOC_S:-45}
 move_to() {
 	$W set_network "$NID" bssid "$1" >/dev/null 2>&1
 	$W reassociate >/dev/null 2>&1
