@@ -783,7 +783,7 @@ resv_claim() {
 # agent saw the whole mesh, clicked the pencil drawn right there, and got
 # "only the controller keeps the names". A control that is visible and refuses
 # is worse than one that is absent.
-CTRL_METHODS="health topology nodes clients client_history steer_history db_stats db_table rename forget_node ttlm_state events parent_plan"
+CTRL_METHODS="health topology nodes clients client_history steer_history db_stats db_table rename forget_node ttlm_state events parent_plan move_options"
 
 controller_addr() {
 	local a
@@ -958,6 +958,9 @@ list)
   "suggest_address": { },
   "claim_address": { "almac": "str", "address": "str" },
   "forget_node": { "almac": "str" },
+  "parent_plan_set": { "live": false },
+  "move_options": { "almac": "str" },
+  "manual_move": { "almac": "str", "parent": "str" },
   "link_state": {},
   "parent_scan": {},
   "bh_trial": { "target": "str", "controller": "str" },
@@ -1619,6 +1622,95 @@ call)
 			exit 0
 		fi
 		cat "$f"
+		;;
+	move_options)
+		# Where a box could be moved by hand ("Move..." in LuCI): every parent
+		# its last scan heard, with the signal per band, the current one
+		# marked, and the boxes below it marked - moving under its own child
+		# would cut it off (a loop), so LuCI offers those greyed out.
+		input=$(cat)
+		need_db_or_proxy move_options "$input" || exit 0
+		child=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		case "$child" in
+		[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+		*) echo '{"error":"almac: expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
+		esac
+		sqlite3 -cmd ".timeout 3000" -separator ' ' "$DB" "
+			WITH RECURSIVE below(x) AS (
+				SELECT child_almac FROM topology_link WHERE parent_almac = '$child'
+				UNION SELECT t.child_almac FROM topology_link t JOIN below b ON t.parent_almac = b.x),
+			heard AS (
+				SELECT m.agent_almac AS al, CASE WHEN c.freq > 5925 THEN 6 ELSE 5 END AS band, max(c.signal) AS sig,
+				       strftime('%s','now') - max(ifnull(c.scan_ts, 0)) AS age
+				FROM bh_candidate c JOIN apmld m ON m.mld_macaddr = (SELECT mm.mld_macaddr FROM apmld mm
+					WHERE mm.mld_macaddr = c.bssid OR mm.mld_macaddr = (SELECT f.mld_macaddr FROM affiliated_ap f WHERE f.bssid = c.bssid) LIMIT 1)
+				WHERE c.agent_almac = '$child' AND c.freq > 4900 AND m.agent_almac IS NOT NULL AND m.agent_almac != '$child'
+				GROUP BY m.agent_almac, band)
+			SELECT al,
+			       ifnull((SELECT sig FROM heard h5 WHERE h5.al = h.al AND h5.band = 5), 'null'),
+			       ifnull((SELECT sig FROM heard h6 WHERE h6.al = h.al AND h6.band = 6), 'null'),
+			       min(age),
+			       CASE WHEN al IN (SELECT x FROM below) THEN 1 ELSE 0 END,
+			       CASE WHEN al = (SELECT parent_almac FROM topology_link WHERE child_almac = '$child' LIMIT 1) THEN 1 ELSE 0 END
+			FROM heard h GROUP BY al;" 2>/dev/null |
+		awk -v c="$child" -v r="$([ -s /tmp/easymesh/parent-steer/running ] && echo true || echo false)" '
+			BEGIN { printf "{\"almac\":\"%s\",\"trial_running\":%s,\"options\":[", c, r }
+			NF == 6 { printf "%s{\"almac\":\"%s\",\"s5\":%s,\"s6\":%s,\"scan_age_s\":%d,\"below\":%s,\"current\":%s}",
+				(n++ ? "," : ""), $1, $2, $3, $4, ($5 == 1 ? "true" : "false"), ($6 == 1 ? "true" : "false") }
+			END { print "]}" }'
+		;;
+	manual_move)
+		# A measured trial asked for by hand: move a box under another parent,
+		# measure before and after, keep it only if it is faster, otherwise
+		# it goes back by itself (easymesh-parent-plan try). One at a time in
+		# the whole mesh. Asked on an agent, the controller answers.
+		input=$(cat)
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			out="$(proxy_to_controller manual_move "$input")"
+			[ -n "$out" ] && { echo "$out"; exit 0; }
+			echo '{"error":"the controller did not answer"}'
+			exit 0
+		fi
+		child=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		parent=$(echo "$input" | jsonfilter -e '@.parent' 2>/dev/null | tr 'A-Z' 'a-z')
+		for m in "$child" "$parent"; do
+			case "$m" in
+			[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+			*) echo '{"error":"expected aa:bb:cc:dd:ee:ff"}'; exit 0 ;;
+			esac
+		done
+		below=$(sqlite3 -cmd ".timeout 3000" "$DB" "
+			WITH RECURSIVE below(x) AS (
+				SELECT child_almac FROM topology_link WHERE parent_almac = '$child'
+				UNION SELECT t.child_almac FROM topology_link t JOIN below b ON t.parent_almac = b.x)
+			SELECT count(*) FROM below WHERE x = '$parent';" 2>/dev/null)
+		[ "${below:-0}" = 0 ] || { echo '{"started":false,"error":"that box is below this one - it would cut itself off"}'; exit 0; }
+		/usr/sbin/easymesh-parent-plan try "$child" "$parent" 2>/dev/null ||
+			echo '{"started":false,"error":"the planner could not start the trial"}'
+		;;
+	parent_plan_set)
+		# Switch the parent planner between acting and only logging what it
+		# would do. Its one switch is a file on the controller, read on every
+		# run (easymesh-parent-plan); this is that file, from LuCI, so nobody
+		# needs a shell for it. Asked on an agent, the controller answers.
+		input=$(cat)
+		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
+			out="$(proxy_to_controller parent_plan_set "$input")"
+			[ -n "$out" ] && { echo "$out"; exit 0; }
+			echo '{"error":"the controller did not answer"}'
+			exit 0
+		fi
+		case "$(echo "$input" | jsonfilter -e '@.live' 2>/dev/null)" in
+		true|1)
+			mkdir -p /etc/mapc && touch /etc/mapc/parent-steer-live
+			logger -t easymesh-parent-plan "the planner was switched on in LuCI - it moves boxes now, one measured trial at a time" ;;
+		false|0)
+			rm -f /etc/mapc/parent-steer-live
+			logger -t easymesh-parent-plan "the planner was switched off in LuCI - it only writes down what it would do" ;;
+		*)
+			echo '{"error":"live: expected true or false"}'; exit 0 ;;
+		esac
+		printf '{"live":%s}\n' "$([ -e /etc/mapc/parent-steer-live ] && echo true || echo false)"
 		;;
 	forget_node)
 		# A re-provisioned box, or one taken out of service, leaves a row
@@ -2491,13 +2583,20 @@ call)
 					wk = split(msg, ww, /[ (),]+/); wm = idx(ww, wk, "MOVE"); wj = idx(ww, wk, "->")
 					if (wm && wj) {
 						pre = ww[1]
-						who = n(nc((pre == "would" || pre == "proposed" || pre == "trying" || pre == "reverted") ? ww[2] : pre))
+						hand = (pre == "handtry" || pre == "handkept" || pre == "handback")
+						who = n(nc((pre == "would" || pre == "proposed" || pre == "trying" || pre == "reverted" || hand) ? ww[2] : pre))
 						pfrom = n(ww[wm + 1]); pto = n(ww[wj + 1])
 						wq = idx(ww, wk, "[measured")
 						meas = (wq && ww[wq + 2] == "->") ? " (measured " ww[wq + 1] " -> " ww[wq + 3] " Mbit/s up/down)" : ""
 						est = (ww[wm + 7] == "Mbit/s" && ww[wj + 7] == "Mbit/s") ? ", about " ww[wm + 6] " -> " ww[wj + 6] " Mbit/s to the controller" : ""
 						hops = " (" ww[wm + 3] " -> " ww[wj + 3] " hops" est ")"
-						if (pre == "would")
+						if (pre == "handtry")
+							out(ts, "planner", who " is being tried under " pto " - moved by hand, a measured trial (back under " pfrom " if it is not faster)")
+						else if (pre == "handkept")
+							out(ts, "planner", who " was moved by hand from " pfrom " to " pto " - kept after a measured trial" meas)
+						else if (pre == "handback")
+							out(ts, "planner", who " was tried by hand under " pto " - not faster, back under " pfrom meas)
+						else if (pre == "would")
 							out(ts, "planner", "The parent planner would move " who " from " pfrom " to " pto hops " - dry run, not done")
 						else if (pre == "proposed")
 							out(ts, "planner", "The parent planner proposes moving " who " from " pfrom " to " pto hops " - a measured trial decides")

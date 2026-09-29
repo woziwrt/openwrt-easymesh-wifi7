@@ -5,6 +5,7 @@
 'require rpc';
 'require poll';
 'require dom';
+'require ui';
 
 /* Backhaul & MLO (2026-09-25): how each box reaches its parent, leg by leg,
  * and what the controller does with those legs.
@@ -22,6 +23,62 @@ var callTopology = rpc.declare({ object: 'easymesh', method: 'topology' });
 var callTtlm = rpc.declare({ object: 'easymesh', method: 'ttlm_state' });
 var callNodes = rpc.declare({ object: 'easymesh', method: 'nodes' });
 var callPlan = rpc.declare({ object: 'easymesh', method: 'parent_plan' });
+var callPlanSet = rpc.declare({ object: 'easymesh', method: 'parent_plan_set', params: [ 'live' ] });
+var refreshNow = function() {};
+var callMoveOptions = rpc.declare({ object: 'easymesh', method: 'move_options', params: [ 'almac' ] });
+var callManualMove = rpc.declare({ object: 'easymesh', method: 'manual_move', params: [ 'almac', 'parent' ] });
+
+/* "Move..." - put a box under another parent by hand. It is the same
+ * measured trial the planner runs: throughput before and after, kept only
+ * if it is faster, otherwise the box goes back by itself. The dialog says
+ * plainly what it costs, since a move takes the box and every box behind
+ * it off the mesh for a moment - and for longer if the new place does not
+ * answer. */
+function moveDialog(almac, nm) {
+	var body = E('div', {}, E('p', { 'class': 'spinning' }, _('Asking which parents this box can hear…')));
+	ui.showModal(_('Move %s').format(nm(almac)), [ body,
+		E('div', { 'class': 'right' }, E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))) ]);
+	callMoveOptions(almac).then(function(r) {
+		var opts = (r && r.options) || [];
+		if (r && r.trial_running) {
+			dom.content(body, E('p', {}, _('Another move is being tried right now. Try again in a few minutes.')));
+			return;
+		}
+		if (!opts.length) {
+			dom.content(body, E('p', {}, _('This box has not heard any other parent in its last scan (it scans every 10 minutes).')));
+			return;
+		}
+		function sig(o) {
+			return [ o.s5 != null ? '5 GHz ' + o.s5 + ' dBm' : null, o.s6 != null ? '6 GHz ' + o.s6 + ' dBm' : null ]
+				.filter(function(x) { return x; }).join(' · ');
+		}
+		var list = E('div', {});
+		opts.sort(function(a, b) { return (b.s5 || -200) - (a.s5 || -200); }).forEach(function(o) {
+			var why = o.current ? _('it is there now') : (o.below ? _('it is below this box - it would cut itself off') : '');
+			var b = E('button', { 'class': 'cbi-button cbi-button-action', 'style': 'min-width:14em;text-align:left', 'disabled': why ? '' : null },
+				nm(o.almac));
+			b.addEventListener('click', function() {
+				dom.content(body, E('p', { 'class': 'spinning' }, _('Starting the trial…')));
+				callManualMove(almac, o.almac).then(function(res) {
+					if (!res || !res.started) {
+						dom.content(body, E('p', {}, _('Not started: %s').format((res && res.error) || _('no answer'))));
+						return;
+					}
+					dom.content(body, [ E('p', {}, _('Trying %s under %s. It measures for about three minutes, then keeps the move only if it is faster, or goes back by itself. The result appears under "Last trials" below and in Events.').format(nm(almac), nm(o.almac))),
+						E('p', {}, _('You can close this window.')) ]);
+					refreshNow();
+				}, function(err) { dom.content(body, E('p', {}, _('Not started: %s').format(err))); });
+			});
+			list.appendChild(E('div', { 'style': 'margin:6px 0' }, [ b, ' ', E('span', { 'style': 'opacity:.75' }, why || sig(o)) ]));
+		});
+		dom.content(body, [
+			E('p', {}, _('Put it under:')),
+			list,
+			E('p', { 'style': 'margin-top:12px;font-size:12px;opacity:.8' },
+				_('A move takes this box and every box behind it off the mesh for a few seconds. If the new parent does not answer, they are off for one to three minutes before the box goes back by itself. While it measures, about three minutes of test traffic run on this branch.'))
+		]);
+	});
+}
 
 var BAND = { 1: '2.4 GHz', 2: '5 GHz', 8: '6 GHz' };
 var OK = '#2e8540', WARN = '#b58900', BAD = '#c0392b';
@@ -131,7 +188,9 @@ return view.extend({
 			var ln = r1 || r2, live = r1 ? tt.rule1_live : tt.rule2_live;
 			rows.push(E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, nm(n.almac))),
-				E('td', { 'class': 'td' }, nm(parentOf[n.almac])),
+				E('td', { 'class': 'td' }, [ nm(parentOf[n.almac]), ' ',
+					E('button', { 'class': 'cbi-button', 'style': 'padding:0 6px;font-size:11px',
+						'click': function() { moveDialog(n.almac, nm); } }, _('Move…')) ]),
 				legCell(l5),
 				legCell(l6),
 				E('td', { 'class': 'td', 'title': _('PHY rate the parent last reported for this backhaul station; about a third of it arrives as TCP.') },
@@ -206,13 +265,32 @@ return view.extend({
 			var stale = (plan.age_s != null && plan.age_s > 900)
 				? E('div', { 'style': 'font-weight:bold;color:' + WARN },
 				    _('The planner has not reported for %d min - what follows is old.').format(Math.floor(plan.age_s / 60))) : '';
+			/* the switch: off by default, since every move costs the box and
+			 * the boxes behind it a few seconds and a minute of measuring */
+			var sw = E('button', { 'class': 'cbi-button', 'style': 'margin-left:8px' },
+				plan.live ? _('Switch off') : _('Switch on'));
+			sw.addEventListener('click', function() {
+				sw.disabled = true;
+				callPlanSet(!plan.live).then(function() { refreshNow(); }, function() { sw.disabled = false; });
+			});
+			/* a danger zone, as the word is used elsewhere: a switch that
+			 * trades moments of connectivity for faster paths */
+			var danger = E('div', { 'style': 'border:1px solid ' + BAD + ';border-radius:6px;padding:8px 12px;margin:6px 0 8px;max-width:760px' }, [
+				E('strong', { 'style': 'color:' + BAD }, _('Danger zone')), ' — ', _('automatic moves'), sw, E('br'),
+				E('span', {}, plan.live
+					? _('On: the planner moves a box when it is clearly better elsewhere. Each move takes that box and every box behind it off the mesh for a few seconds (one to three minutes if the new parent does not answer), and measuring runs about three minutes of test traffic.')
+					: _('Off (default): it only writes down what it would do. Your devices are never moved for speed.')),
+				E('br'), E('span', { 'style': 'font-size:12px;color:' + WARN },
+					_('Switching it off does not undo the moves it made - put a box back with "Move…" in the table above.'))
+			]);
 			return E('p', {}, [ E('strong', {}, _('3. Choosing the parent')), ' — ', mode(plan.live), E('br'),
+				danger,
 				_('A box is moved to another parent when its path is bad (under about 100 Mbit/s) and another parent is at least twice as good, or when a parent one hop closer to the main box is at least 1.5 times as good. Every move is a measured trial: throughput before and after, and a move that does not pay is undone.'),
 				stale,
 				items.length ? E('ul', { 'style': 'margin:4px 0 0 18px' }, items)
 				             : E('div', { 'style': 'opacity:.75' }, _('The planner has not reported yet.')),
-				trials.length ? [ E('div', { 'style': 'margin-top:6px' }, _('Last trials:')),
-				                  E('ul', { 'style': 'margin:2px 0 0 18px' }, trials) ] : '' ]);
+				trials.length ? E('div', { 'style': 'margin-top:6px' }, _('Last trials:')) : '',
+				trials.length ? E('ul', { 'style': 'margin:2px 0 0 18px' }, trials) : '' ]);
 		}
 
 		var rules = E('div', { 'class': 'cbi-section' }, [
@@ -228,7 +306,7 @@ return view.extend({
 			planSection(),
 			E('p', { 'style': 'font-size:11px;opacity:.7' },
 				(tt.alive_s != null ? _('Rules last evaluated %d s ago.').format(tt.alive_s) + ' ' : '') +
-				_('A dry run only writes down what it would do; switching a rule or the planner live is done on the controller.'))
+				_('A dry run only writes down what it would do. Rules 1 and 2 are switched live on the controller; the planner in its danger zone above.'))
 		]);
 
 		return E('div', {}, [
@@ -245,11 +323,12 @@ return view.extend({
 	render: function(data) {
 		var self = this;
 		var box = E('div', {}, this.renderAll(data[0], data[1], data[2], data[3]));
-		poll.add(function() {
+		refreshNow = function() {
 			return Promise.all([ callTopology(), callTtlm(), callNodes(), callPlan() ]).then(function(r) {
 				dom.content(box, self.renderAll(r[0], r[1], r[2], r[3]));
 			});
-		}, 15);
+		};
+		poll.add(refreshNow, 15);
 		return E('div', {}, [
 			E('h2', {}, _('Backhaul & MLO')),
 			E('div', { 'class': 'cbi-section-descr' },

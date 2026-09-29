@@ -273,12 +273,23 @@ steer_once() {
 			_bu=$(echo "$r" | jsonfilter -e '@.base[0]' 2>/dev/null); _bd=$(echo "$r" | jsonfilter -e '@.base[1]' 2>/dev/null)
 			_tu=$(echo "$r" | jsonfilter -e '@.trial[0]' 2>/dev/null); _td=$(echo "$r" | jsonfilter -e '@.trial[1]' 2>/dev/null)
 			[ -n "$_bu" ] && [ -n "$_tu" ] && m=" [measured $_bu/$_bd -> $_tu/$_td Mbit/s up/down]"
-			if [ "$v" = kept ]; then
-				logger -t easymesh-parent-plan "$line - kept after a measured trial$m"
-			else
-				echo "$now" > "$MEM/deny.$child.$parent"
-				logger -t easymesh-parent-plan "reverted $line - the trial did not pay ($v)$m"
-			fi
+			case "$line" in
+			"HAND "*)
+				# asked for in LuCI: the user decided to try it, so a move
+				# that did not pay denies nothing - they may ask again
+				if [ "$v" = kept ]; then
+					logger -t easymesh-parent-plan "handkept ${line#HAND } - kept after a measured trial$m"
+				else
+					logger -t easymesh-parent-plan "handback ${line#HAND } - went back, it was not faster ($v)$m"
+				fi ;;
+			*)
+				if [ "$v" = kept ]; then
+					logger -t easymesh-parent-plan "$line - kept after a measured trial$m"
+				else
+					echo "$now" > "$MEM/deny.$child.$parent"
+					logger -t easymesh-parent-plan "reverted $line - the trial did not pay ($v)$m"
+				fi ;;
+			esac
 			trial_record "$v" "${_bu:+$_bu,$_bd}" "${_tu:+$_tu,$_td}"
 			echo "$now" > "$MEM/last.$child"
 			rm -f "$ST/running"; iperf_stop
@@ -320,6 +331,41 @@ steer_once() {
 	fi
 	return 0
 }
+
+# easymesh-parent-plan try <child-al> <parent-al> - a trial asked for by hand
+# (LuCI, "Move..."). The same measured trial as the planner's own, through
+# the same path: one trial in the mesh at a time, measured before and after,
+# back by itself if it does not pay. It runs whether the planner is live or
+# not - the user chose it - and this loop records the verdict. Prints one
+# JSON line for the API.
+if [ "$1" = try ]; then
+	child=$(echo "$2" | tr 'A-Z' 'a-z'); parent=$(echo "$3" | tr 'A-Z' 'a-z'); now=$(date +%s)
+	no() { printf '{"started":false,"error":"%s"}\n' "$1"; exit 0; }
+	[ -s "$ST/running" ] && no "another move is being tried right now - wait until it has finished"
+	cur=$(q "SELECT parent_almac FROM topology_link WHERE child_almac = '$child' LIMIT 1;")
+	[ -n "$cur" ] || no "this box has no backhaul parent in the database"
+	[ "$cur" = "$parent" ] && no "it is already there"
+	# the parent's backhaul AP MLD as the box heard it in its last scan
+	target=$(q "SELECT m.mld_macaddr FROM bh_candidate c JOIN apmld m ON m.mld_macaddr = $(mld_of c.bssid)
+		WHERE c.agent_almac = '$child' AND m.agent_almac = '$parent' AND c.freq > 4900 LIMIT 1;")
+	[ -n "$target" ] || no "the box has not heard that parent in its last scan"
+	ip=$(ip_of "$child")
+	ctrl_ip=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }')
+	[ -n "$ip" ] && [ -n "$ctrl_ip" ] || no "cannot reach the box over the mesh"
+	iperf3 -s -p 5203 -D --pidfile "$IPERF_PIDF" 2>/dev/null
+	r=$(ask_p "$ip" bh_trial "{\"target\":\"$target\",\"controller\":\"$ctrl_ip\"}")
+	if [ "$(echo "$r" | jsonfilter -e '@.started' 2>/dev/null)" = true ]; then
+		printf '%s %s %s %s %s\n%s\n' "$child" "$parent" "$target" "$ip" "$now" "HAND $child: MOVE $cur -> $parent" > "$ST/running"
+		steer_log "trial started by hand: $child ($ip) -> $parent via $target"
+		logger -t easymesh-parent-plan "handtry $child: MOVE $cur -> $parent - a measured trial asked for in LuCI"
+		touch "$KICK"
+		printf '{"started":true}\n'
+	else
+		iperf_stop
+		no "the box refused: $(echo "$r" | jsonfilter -e '@.error' 2>/dev/null)"
+	fi
+	exit 0
+fi
 
 if [ "${ONESHOT:-0}" = 1 ]; then
 	plan_once; cat "$OUT"; exit 0

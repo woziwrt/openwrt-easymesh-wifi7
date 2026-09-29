@@ -13,6 +13,7 @@
 					"events",
 					"ttlm_state",
 					"parent_plan",
+					"move_options",
 					"topology",
 					"nodes",
 					"clients",
@@ -36,6 +37,8 @@
 					"wps_status",
 					"suggest_address",
 					"forget_node",
+					"parent_plan_set",
+					"manual_move",
 					"rename",
 					"set_credentials"
 				]
