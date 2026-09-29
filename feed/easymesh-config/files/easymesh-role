@@ -540,6 +540,13 @@ keep_5ghz_out_of_dfs() {
 
 die() {
 	echo "easymesh-role: $1" >&2
+	# Past the first commit there is no going back from here: say so rather
+	# than promise a clean box (review, 2026-09-29). The checks that can
+	# fail on an unsuitable board run before that point (check_mesh_network).
+	if [ -n "$COMMITTED" ]; then
+		echo "easymesh-role: the new role is only partly applied - run the same command again, or erase the box (hold its button 10 s)" >&2
+		exit 1
+	fi
 	echo "easymesh-role: no changes committed" >&2
 	uci revert dhcp network mapcontroller mapagent 2>/dev/null
 	# Nothing was committed, so the node keeps the role it had.
@@ -570,6 +577,21 @@ case "$ROLE" in
 controller|agent) ;;
 *) usage ;;
 esac
+
+# What setup_mesh_network would die on, asked before anything is written: it
+# runs after the role's config is committed, and a board without the
+# service port used to end up half controller, half nothing (review,
+# 2026-09-29).
+check_mesh_network() {
+	local idx p n=0
+	idx=$(lan_device_index) || die "no $MESH_BRIDGE device section in /etc/config/network"
+	[ -e "/sys/class/net/$MGMT_PORT" ] || die "service port $MGMT_PORT does not exist here - pass --mgmt-port"
+	for p in $(uci -q get network.@device[$idx].ports); do
+		[ "$p" = "$MGMT_PORT" ] || n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] || die "$MGMT_PORT is the only port in $MESH_BRIDGE - nothing left for the mesh"
+}
+[ -z "$MESH_ADDR" ] || check_mesh_network
 
 # Say out loud that this box is meant to be part of a mesh, before anything
 # else happens.
@@ -642,6 +664,7 @@ controller)
 		uci -q get wireless.$_radio >/dev/null 2>&1 || continue
 		uci -q delete wireless.$_radio.disabled
 	done
+	COMMITTED=1
 	uci commit wireless
 
 	# The creds the controller hands out over WSC M2 live in these sections,
@@ -780,6 +803,7 @@ agent)
 	# controllers invalidate the whole mesh view. Hardware-confirmed.
 	uci set mapagent.@controller_select[0].autostart='0' || die "cannot set controller_select.autostart"
 
+	COMMITTED=1
 	uci commit dhcp
 	uci commit network
 	uci -q get mapcontroller >/dev/null 2>&1 && uci commit mapcontroller
