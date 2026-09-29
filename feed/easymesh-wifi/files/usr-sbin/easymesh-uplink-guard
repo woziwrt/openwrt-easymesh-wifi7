@@ -1,0 +1,135 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# /usr/sbin/easymesh-uplink-guard - get off a parent that no longer takes our
+# frames.
+#
+# On 2026-09-29 a freshly paired agent went silent towards its parent twice in
+# 45 minutes, under two different parents. Nothing logged anywhere: the
+# backhaul station stayed COMPLETED, beacons kept coming, the parent's frames
+# reached us and our frames were ACKed on air - and then lost inside the
+# parent before its driver saw them. The parent kept us as an associated
+# station for as long as anyone watched (its inactivity poll is ACKed by our
+# radio), the overview said "healthy", and every client behind this box was
+# without internet until the box was power-cycled. A deauthentication from
+# the parent brought it back in 24 s every time. The cause is below our code;
+# this is the defence.
+#
+# Only the node itself sees it, so this runs on every agent. It asks the
+# DIRECT parent (the 1905 neighbour on the backhaul station), one hop, at
+# layer 2 - never the controller: a controller reboot or a failure further
+# up the tree must not send whole subtrees looking for new parents. A parent
+# that is really gone takes its beacons with it, the station leaves on its
+# own, and this stays out of the way (it only acts while COMPLETED).
+#
+# When LOSS of the last WINDOW probes went unanswered it writes down the
+# state of the link for the post-mortem, then disconnects and reconnects the backhaul
+# station. Disconnecting closes this node's own backhaul BSS (0277), so it
+# cannot pick one of its own children on the way back.
+#
+# A window, not a streak: in the zombie of 2026-09-29 about one frame in
+# eight still got through, and it was a broadcast ARP - exactly what a probe
+# sends - so one lucky answer must not reset the count.
+#
+# /etc/mapc/uplink-guard-dry: detect and record, do not act.
+
+PERIOD=${PERIOD:-10}
+WINDOW=${WINDOW:-9}       # probes, one per PERIOD
+LOSS=${LOSS:-6}           # of WINDOW unanswered -> act
+BOOT_S=${BOOT_S:-180}
+SETTLE_S=${SETTLE_S:-60}  # after a parent change
+HOLD_S=${HOLD_S:-600}     # between two actions
+KEEP=${KEEP:-10}          # snapshots kept
+DIR=/tmp/uplink-guard
+DRY=/etc/mapc/uplink-guard-dry
+BSTA=bsta-mld-3
+W="wpa_cli -i $BSTA"
+
+log() { logger -t easymesh-uplink-guard "$*"; }
+
+[ "$(cat /etc/mapc/role 2>/dev/null)" = controller ] && exit 0
+mkdir -p "$DIR"
+
+state() { $W status 2>/dev/null | sed -n 's/^wpa_state=//p'; }
+parent() { $W status 2>/dev/null | sed -n 's/^ap_mld_addr=//p'; }
+uptime_s() { cut -d. -f1 /proc/uptime; }
+
+# The parent's AL address: the direct 1905 neighbour heard on the backhaul
+# station. Its IP from the address cache in names.sh, which remembers it for
+# a while - exactly the while in which the parent stops answering us.
+parent_ip() {
+	local al
+	al=$(ubus -t 5 call "ieee1905.al.$BSTA" neighbors 2>/dev/null |
+		jsonfilter -e '@.neighbors[@.direct=true].aladdr' 2>/dev/null | head -1)
+	[ -n "$al" ] || return 1
+	[ -r /usr/share/easymesh/names.sh ] || return 1
+	. /usr/share/easymesh/names.sh
+	live_addrs_json | tr -d '{}"' | tr ',' '\n' | sed -n "s/^$al:\([0-9.]*\)$/\1/p" | head -1
+}
+
+probe() {
+	arping -q -c 1 -w 2 -I br-lan "$1" >/dev/null 2>&1 ||
+		arping -q -c 1 -w 2 -I br-lan "$1" >/dev/null 2>&1
+}
+
+snapshot() {
+	local f="$DIR/$(date +%Y%m%d-%H%M%S).txt" p d
+	{
+		echo "## $(date) parent=$1 ip=$2 probes=$3"
+		$W status
+		iw dev "$BSTA" station dump
+		ip neigh show dev br-lan
+		for p in /sys/kernel/debug/ieee80211/phy*; do
+			for d in "$p"/netdev:"$BSTA"/stations/*; do
+				[ -d "$d" ] || continue
+				echo "== $d"
+				cat "$d/mt76_links_info" "$d/agg_status" 2>/dev/null
+			done
+			cat "$p/mt76/tx_drop_stats" "$p/mt76/rx_drop_stats" 2>/dev/null
+		done
+		logread | tail -60
+	} > "$f" 2>&1
+	ls -1t "$DIR"/*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+	echo "$f"
+}
+
+cur="" ip="" since=0 hist="" last=0 said=0
+while sleep "$PERIOD"; do
+	[ "$(uptime_s)" -ge "$BOOT_S" ] || continue
+	if [ "$(state)" != COMPLETED ]; then
+		hist="" said=0
+		continue
+	fi
+	p=$(parent)
+	if [ "$p" != "$cur" ]; then
+		cur=$p ip="" hist="" said=0 since=$(uptime_s)
+	fi
+	[ $(( $(uptime_s) - since )) -ge "$SETTLE_S" ] || continue
+	[ -n "$ip" ] || ip=$(parent_ip)
+	[ -n "$ip" ] || continue
+	probe "$ip" && r=0 || r=1
+	hist=$(echo "$hist$r" | tail -c "$((WINDOW + 1))")
+	lost=$(echo "$hist" | tr -cd 1 | wc -c)
+	if [ "$lost" -lt "$LOSS" ]; then
+		[ "$said" = 1 ] && [ "$lost" -eq 0 ] && { log "parent $ip answers again"; said=0; }
+		[ "$said" = 0 ] && [ "$lost" -ge 2 ] && { log "parent $ip ($p) misses probes ($hist) while the backhaul is COMPLETED"; said=1; }
+		continue
+	fi
+	f=$(snapshot "$p" "$ip" "$hist")
+	if [ -e "$DRY" ]; then
+		log "parent $ip lost $lost of the last $WINDOW probes - dry run, recorded $f"
+		hist=""
+		continue
+	fi
+	if [ "$last" -gt 0 ] && [ $(( $(uptime_s) - last )) -lt "$HOLD_S" ]; then
+		log "parent $ip lost $lost of the last $WINDOW probes - held, acted $(( $(uptime_s) - last )) s ago"
+		hist=""
+		continue
+	fi
+	log "parent $ip lost $lost of the last $WINDOW probes - reconnecting the backhaul (recorded $f)"
+	$W disconnect >/dev/null 2>&1
+	sleep 2
+	$W reconnect >/dev/null 2>&1
+	last=$(uptime_s) hist="" said=0 cur=""
+done
