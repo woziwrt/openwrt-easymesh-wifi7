@@ -537,8 +537,9 @@ em_archive() {
 	mkdir -p "$dst/images" "$dst/packages" "$dst/sdk"
 
 	find "$root/bin/targets" \( -name '*.itb' -o -name '*.img.gz' \) -exec cp {} "$dst/images/" \;
-	# eMMC and NAND images are .bin (~188 MB unpacked); the NVMe image (592 MB)
-	# is installed another way and left out.
+	# eMMC and NAND images are .bin (~188 MB unpacked), kept for a later
+	# release: this one runs from the SD card only. The NVMe image (592 MB)
+	# is left out.
 	for f in "$root"/bin/targets/*/*/*emmc-img.bin "$root"/bin/targets/*/*/*snand-img.bin; do
 		[ -f "$f" ] && gzip -c "$f" > "$dst/images/$(basename "$f").gz"
 	done

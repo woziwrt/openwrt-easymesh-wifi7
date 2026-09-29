@@ -138,6 +138,9 @@ while :; do
 	sleep "$PERIOD"
 	now=$(date +%s)
 	s=$(local_sig)
+	# no answer at start (wpa_supplicant not up yet) is not a backhaul: the
+	# first real one is where we are, not a change that flushes the mesh
+	[ "$lsig" = "?" ] && lsig=$s
 	[ "$s" != "?" ] && [ "$s" != "$lsig" ] && { why="${why:+$why, }backhaul here changed"; lsig=$s; }
 	if is_controller && [ "$now" -ge "$tnext" ]; then
 		tnext=$((now + TOPO_PERIOD))
