@@ -317,6 +317,16 @@ mesh_addr_reason() {
 	for o in $(echo "$a" | tr . " "); do
 		{ [ "$o" -ge 0 ] && [ "$o" -le 255 ]; } 2>/dev/null || { echo "expected four numbers like 10.10.10.1"; return 0; }
 	done
+	# 192.168.1.0/24 is the service port's, on every box (easymesh-role
+	# MGMT_ADDR). A mesh there puts one subnet on two interfaces, and on the
+	# founder the mesh address would be the service address itself. It is
+	# also the one a user who "wants to stay on 192.168.1.1" types in.
+	# Compared as numbers, so 192.168.01.5 is caught too.
+	set -- $(echo "$a" | tr . " ")
+	if [ "$1" -eq 192 ] && [ "$2" -eq 168 ] && [ "$3" -eq 1 ]; then
+		echo "that network belongs to the service port (192.168.1.1 on every box). Use another one, like 10.10.10.1."
+		return 0
+	fi
 	o=${a##*.}
 	mx=$(node_addr_max)
 	[ "$o" -ge 1 ] && [ "$o" -le "$mx" ] && return 0
