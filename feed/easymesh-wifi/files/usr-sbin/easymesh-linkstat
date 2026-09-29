@@ -234,7 +234,11 @@ DEAF_PCT=5		# a leg below this share of expected beacons hears nothing
 DEAF_WINS=3		# consecutive windows (3 x 30 s) before acting
 DEAF_GAP=600		# at most one reassociate per 10 min
 DEAF_LOG=/etc/mapc/deaf-guard.log
-DEAF_OFF=/etc/mapc/deaf-guard-off	# lab switch: detect and log, do not act
+# Off by default (2026-09-29): it reconnects on missing beacons alone, and a
+# one-legged node's 6 GHz beacons can be gone for a minute while data still
+# flows - that took a whole subtree off for nothing (review). Detect and log;
+# /etc/mapc/deaf-guard-live lets it act.
+DEAF_LIVE=/etc/mapc/deaf-guard-live
 deaf_n=0
 deaf_last=0
 deaf_check=0
@@ -338,8 +342,8 @@ deaf_guard() {
 	deaf_last=$_now
 	deaf_n=0
 	_why="COMPLETED on $(bsta_parent) with every leg deaf for $((DEAF_WINS * WIN)) s ($3)"
-	if [ -e "$DEAF_OFF" ]; then
-		deaf_log "$_why - would reassociate ($DEAF_OFF present)"
+	if [ ! -e "$DEAF_LIVE" ]; then
+		deaf_log "$_why - would reconnect (off: touch $DEAF_LIVE to let it act)"
 		return 0
 	fi
 	deaf_log "$_why - reconnecting"

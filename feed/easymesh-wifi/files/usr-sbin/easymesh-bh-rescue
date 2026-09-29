@@ -211,6 +211,17 @@ while :; do
 	[ -n "$TARGETS" ] || { log "parent $p unusable, but the mesh topology is not known yet - staying"; hist=""; continue; }
 	c=$(better_parent "$p") || { hist=""; continue; }
 	set -- $c
+	# Off by default (2026-09-29): a move takes this node and every node
+	# behind it off the mesh, and with the controller itself down (its
+	# reboot) every node would try to run at once. Until it has been proven
+	# on the mesh, it writes down what it would do; /etc/mapc/bh-rescue-live
+	# switches it on.
+	if [ ! -e /etc/mapc/bh-rescue-live ]; then
+		echo "$now" > "$LAST"
+		log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - would move to $1 heard at $2 dBm (off: touch /etc/mapc/bh-rescue-live to let it act)"
+		hist=""
+		continue
+	fi
 	echo "$now" > "$LAST"
 	log "parent $p unusable ($lost of $WINDOW pings to the controller $ctrl lost, parent heard at $3 dBm) - moving to $1 heard at $2 dBm"
 	MOVE_ONLY=1 /usr/sbin/easymesh-bh-trial "$1" "$ctrl" >/dev/null 2>&1
