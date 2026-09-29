@@ -542,6 +542,14 @@ die() {
 	echo "easymesh-role: $1" >&2
 	echo "easymesh-role: no changes committed" >&2
 	uci revert dhcp network mapcontroller mapagent 2>/dev/null
+	# Nothing was committed, so the node keeps the role it had.
+	if [ -n "$ROLE_WRITTEN" ]; then
+		if [ -n "$OLD_ROLE" ]; then
+			echo "$OLD_ROLE" > /etc/mapc/role 2>/dev/null
+		else
+			rm -f /etc/mapc/role
+		fi
+	fi
 	exit 1
 }
 
@@ -555,7 +563,13 @@ ensure_controller_select() {
 	uci add mapagent controller_select >/dev/null || die "cannot create controller_select section"
 }
 
-[ -n "$ROLE" ] || usage
+# Only a valid role gets past this point: the marker below is written before
+# anything else, and "easymesh-role status" (or a typo) used to turn a factory
+# box into a mesh node that way (review C11, 2026-09-27).
+case "$ROLE" in
+controller|agent) ;;
+*) usage ;;
+esac
 
 # Say out loud that this box is meant to be part of a mesh, before anything
 # else happens.
@@ -577,7 +591,9 @@ ensure_controller_select() {
 # again. That ordering is what lets map_genconfig create sta_mld_1 for a
 # joining agent exactly when it should, and not a boot earlier.
 mkdir -p /etc/mapc 2>/dev/null
+OLD_ROLE=$(cat /etc/mapc/role 2>/dev/null)
 echo "$ROLE" > /etc/mapc/role 2>/dev/null
+ROLE_WRITTEN=1
 
 case "$ROLE" in
 controller)
