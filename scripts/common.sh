@@ -224,9 +224,6 @@ em_install_board_files() {
 	mkdir -p files
 	cp -a "$REPO/boards/common/files/." files/
 	[ -d "$BOARD_DIR/files" ] && cp -a "$BOARD_DIR/files/." files/
-	mkdir -p files/root/install-dir
-	cp "$BOARD_DIR"/install/install-*.sh files/root/install-dir/
-	chmod +x files/root/install-dir/*.sh
 
 	# Image model, read by easymesh-config: a production image has the mesh
 	# baked in and must never point itself at a development package feed.

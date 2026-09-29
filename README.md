@@ -172,7 +172,7 @@ This is a preview. What is not done yet, or not done well:
   WPS push-button. The backhaul links themselves are encrypted Wi-Fi (WPA3). <!-- TODO verify SAE on release image -->
 - **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
 - **The controller database lives on the boot medium.** On a slow SD card, a large database write can stall the box for
-  seconds. For daily use put the controller on NVMe or eMMC.
+  seconds. This release runs from the SD card only; installing to eMMC, NAND or NVMe is not part of it.
 - The web interface is in English only.
 
 ## What is ours and what is not
