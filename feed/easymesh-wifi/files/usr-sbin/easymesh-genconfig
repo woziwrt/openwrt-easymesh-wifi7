@@ -80,6 +80,15 @@ own() {
 own ap_mld_2 "$bh_ssid" "$bh_key"
 own sta_mld_1 "$bh_ssid" "$bh_key"
 
+# No inactivity poll on the backhaul AP (why: mlo-backhaul-setup emit_ap).
+# Also kept here, on every boot: a box paired before emit_ap wrote it, or a
+# section map_genconfig built, would otherwise never get it (2026-09-29).
+if uci -q get wireless.ap_mld_2 >/dev/null &&
+   [ "$(uci -q get wireless.ap_mld_2.skip_inactivity_poll)" != "1" ]; then
+	uci set wireless.ap_mld_2.skip_inactivity_poll=1
+	changed=1
+fi
+
 # Everything else is squatting: image defaults, legacy per-band spawns,
 # scaffolding from failed joins. Deleted, not disabled - a disabled section
 # resurrects on the next writer's whim.
