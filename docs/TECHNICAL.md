@@ -86,6 +86,36 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
 | `easymesh-ttlm-policy` | the TTLM decisions above |
 | API + LuCI | `ubus call easymesh …` (topology, clients, health, ttlm_state, events, …) and the 8 LuCI tabs |
 
+## Self-healing and optimisation
+
+Everything that can move a box costs connectivity for a moment, so the rule is: the mesh repairs what is broken by
+itself, and optimises only when the user asks for it.
+
+- **Joining a parent** is wpa_supplicant's own choice: the backhaul station joins the best BSS carrying the backhaul
+  SSID it hears. After a restart the resulting tree follows the radio, not the floor plan.
+- **No island (patch `0277`).** A node whose backhaul station loses its parent closes its backhaul BSS at once
+  (Authentication refused with status 17) and drops the backhaul stations it had after 1 s, so its children cannot join
+  each other or come back to it; the fronthaul keeps running for 20 s while it looks for a new parent. A wired uplink
+  counts as a backhaul.
+- **Bridges follow a moved box (`easymesh-fdb-guard`).** When a node's backhaul parent or the controller's topology
+  changes, the learned bridge entries are flushed on the node, and from the controller on every node - a bridge with
+  offload does not relearn a moved MAC for ~300 s.
+- **Stuck-box rescue (`easymesh-bh-rescue`, on).** On an agent: if at least 6 of the last 9 pings to the controller
+  (one per 10 s) are lost and the last parent scan heard a parent of our own mesh, not below us, at least 10 dB
+  stronger, the node moves there with `easymesh-bh-trial` (no measurement) and goes back if the controller cannot be
+  reached from there. Never within 5 min of boot or 2 min of a parent change, at most once per 10 min; a target that
+  could not carry us is not tried again for an hour.
+- **Parent planner (`easymesh-parent-plan`, off by default).** On the controller, every 5 min, from the database:
+  rule A - the path is bad (estimated under 100 Mbit/s) and another parent is at least twice as good; rule B - a parent
+  one hop closer to the controller is at least 1.5 times as good. A proposal must hold for 3 runs after 5 min of
+  stability; then one measured trial (iperf3 to the controller, 3 x 10 s each way, before and after); kept only if no
+  direction lost more than 10 % and one gained at least 20 %, otherwise the node goes back by itself. At most one trial
+  in the mesh, one per node per hour, a failed pair denied for 24 h. Estimates of a node's own first hop come from
+  signal and can be far off on a noisy card. Switch: `/etc/mapc/parent-steer-live`.
+- **Missing backhaul link (`mld-bsta-relink`).** A backhaul MLD that came up on fewer links than configured is logged,
+  not reconnected: a reassociation - even to the same parent - took the node and its subtree off the mesh for up to
+  90 s in our tests, and an unpinned one can pick the node's own child as its parent (a loop).
+
 ## Patches below EasyMesh
 
 Every patch we apply to code we did not write is listed, one line each, in [PATCHES.md](PATCHES.md): 16 on the Wi-Fi
