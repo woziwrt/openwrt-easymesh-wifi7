@@ -174,6 +174,8 @@ define Package/easymesh-wifi/install
 	$(INSTALL_BIN) ./files/uci-defaults/94-easymesh-drop-phantom-bsta $(1)/etc/uci-defaults/94-easymesh-drop-phantom-bsta
 	$(INSTALL_BIN) ./files/uci-defaults/96-easymesh-drop-disallow-profile $(1)/etc/uci-defaults/96-easymesh-drop-disallow-profile
 	$(INSTALL_BIN) ./files/uci-defaults/97-mapc-db-keep $(1)/etc/uci-defaults/97-mapc-db-keep
+	$(INSTALL_DIR) $(1)/lib/upgrade
+	$(INSTALL_DATA) ./files/lib-upgrade/easymesh-add-conffiles.sh $(1)/lib/upgrade/easymesh-add-conffiles.sh
 endef
 
 $(eval $(call BuildPackage,easymesh-wifi))
