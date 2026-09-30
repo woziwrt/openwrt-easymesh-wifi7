@@ -74,11 +74,11 @@ at `192.168.1.1`.
 Put the new box where it is meant to stand. For now it has to be within Wi-Fi reach of the **main box**: pairing is
 opened there. Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X). Then:
 
-1. **On the main box,** click *Pair a new box* in its *Overview*, or press its WPS button briefly. It keeps pairing open
-   for about seven minutes, so there is time to walk over.
+1. **On the main box,** click *Pair a new box* in its *Overview*, or hold its WPS button for **4 to 8 seconds** (until the
+   lamp blinks slowly) and let go. It keeps pairing open for about seven minutes, so there is time to walk over.
 2. **On the new box,** hold the WPS button for **4 to 8 seconds** and let go.
 
-Only the main box takes a short press: on a BPI-R4 that is not the main box, a short press restarts it. The other order
+A short press does not pair: the main box ignores it, and on a BPI-R4 that is not the main box it restarts it. The other order
 (new box first) works too, but leaves only about three minutes.
 
 The new box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if

@@ -950,7 +950,7 @@ return view.extend({
 				E('h3', { 'style': 'margin-top:1.5em' }, _('Adding this box to a mesh you already have?')),
 				/* The main box, not any box of the mesh: see the same
 				 * sentence in setup.js for why. */
-				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or press its WPS button briefly. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if something does not come up. Do not keep holding: ten seconds or more erases the box instead.')),
+				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or hold its WPS button for 4 to 8 seconds. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if something does not come up. Do not keep holding: ten seconds or more erases the box instead.')),
 				E('p', { 'style': 'color:#888;font-size:.9em' }, _('A short press keeps its usual meaning here, so pairing an ordinary device is unaffected.'))
 			]);
 

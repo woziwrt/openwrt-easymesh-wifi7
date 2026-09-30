@@ -34,9 +34,14 @@
 #
 # So on a box with no role, joining takes a HELD press, which is a deliberate act
 # and cannot happen by accident, while the short press keeps the stock meaning
-# for the people who never wanted any of this. On the controller there is no such
-# conflict: wps_open arms the fronthaul with wps_pbc, so one short press serves
-# the mesh and an ordinary client equally, and nothing needs to be taken away.
+# for the people who never wanted any of this.
+#
+# The controller takes the same held press to open pairing (since 2026-09-30).
+# It used to open on a short one, which meant two different instructions for
+# the two ends of one pairing, and a brush against the button opened the mesh
+# to whoever was listening. One press everywhere: hold until the lamp blinks
+# slowly, let go. wps_open still arms the fronthaul with wps_pbc, so the same
+# hold serves an ordinary client too.
 #
 # Held is what OpenWrt already means by it - 50-wps_sta reads a long press as
 # "enrol me into somebody else's network", which is the same sentence one level
@@ -51,13 +56,13 @@
 # lamp then reports one thing only: what letting go right now would do.
 #
 # The bounds are not the same on every box, which is the whole reason this is
-# worth doing. "Hold three seconds" is wrong half the time - on a box already
-# in the mesh the useful press is the SHORT one - and nobody counts seconds
-# anyway. A lamp that changes rhythm needs no counting and no instructions.
+# worth doing: an agent has nothing to offer at any length, the controller and
+# a box with no role act on a hold - and nobody counts seconds anyway. A lamp
+# that changes rhythm needs no counting and no instructions.
 if [ "$ACTION" = "pressed" ]; then
 	if is_mesh_node; then
 		case "$(cat /etc/mapc/role 2>/dev/null)" in
-		controller) easymesh-led hold 0 2 10 ;;   # short press opens the window
+		controller) easymesh-led hold 3 9 10 ;;   # held press opens the window
 		*)          easymesh-led hold 99 99 10 ;; # an agent has nothing to offer
 		esac
 	else
@@ -79,17 +84,24 @@ fi
 [ "$ACTION" = "released" ] || exit 1
 
 if is_mesh_node; then
-	# Short press only on a box that is already ours; a held press keeps its
-	# stock meaning here too - including the five-second wipe, which on a
-	# configured box is the one thing a user cannot reach any other way once
-	# they have broken it.
-	[ "${SEEN:-0}" -lt 3 ] || exit 1
+	# Ten seconds and more keeps its stock meaning on every box - the wipe,
+	# which on a configured box is the one thing a user cannot reach any other
+	# way once they have broken it.
+	[ "${SEEN:-0}" -lt 10 ] || exit 1
 	# Only the controller can hand out credentials. An agent relaying the WSC
 	# exchange was measured not to work (2026-08-11), so a press here would
 	# arm a radio that nobody is listening behind and the join would time out
 	# looking like our fault. Say where to press instead of pretending.
 	case "$(cat /etc/mapc/role 2>/dev/null)" in
 	controller)
+		# A short press is swallowed, not handed on: the BPI-R4 button is
+		# KEY_RESTART, and the stock handler would restart the gateway of the
+		# whole mesh for a brush against it.
+		if [ "${SEEN:-0}" -lt 3 ]; then
+			logger -t easymesh "button: hold it until the lamp blinks slowly (4 to 8 s) to open pairing - a short press does nothing on the main box"
+			easymesh-led refused
+			exit 0
+		fi
 		# 30 s, not 15: wps_open now puts an address aside before it
 		# answers, and working out which one is free costs about seven
 		# seconds of ARP probing - more on a subnet where the first few
@@ -105,6 +117,9 @@ if is_mesh_node; then
 		logger -t easymesh "button: window open for 120 s - now press the button on the box you are adding"
 		;;
 	*)
+		# An agent acts on a short press only; a hold keeps its stock
+		# meaning.
+		[ "${SEEN:-0}" -lt 3 ] || exit 1
 		# A box with a join in flight is not an agent yet, and sending its
 		# owner to press somewhere else is the one answer that cannot help
 		# - is_mesh_node() is true for it only because of the pending note.

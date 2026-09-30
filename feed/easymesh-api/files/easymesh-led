@@ -73,12 +73,11 @@
 #   fast blink   let go now and it ERASES the box
 #
 # Written that way on purpose, because the seconds do not mean the same thing
-# on every box. A box with no role joins a mesh between 3 s and 9 s; a box
-# already in a mesh opens its pairing window on a SHORT press and a hold does
-# nothing until the wipe. Telling people "hold three seconds" is therefore
-# wrong half the time, and nobody counts seconds anyway - but everybody notices
-# a lamp changing rhythm. So the lamp reports consequence, not duration, and
-# reads identically on both.
+# on every box. A box with no role joins a mesh between 3 s and 9 s, the
+# controller opens its pairing window in the same span, an agent does nothing
+# useful at any length - and nobody counts seconds anyway, but everybody
+# notices a lamp changing rhythm. So the lamp reports consequence, not
+# duration, and reads identically on all of them.
 #
 # ⚠️ On the box being ADDED this lamp goes dark at every reboot, and a join has
 # three of them. So what a user sees there is fast, dark, fast, dark, fast,
