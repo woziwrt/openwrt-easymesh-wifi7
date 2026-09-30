@@ -12,8 +12,11 @@
 # deaf to the rest of the mesh (no address for a joining box, empty LuCI pages
 # on the agents, no link rates, a blind parent planner).
 #
-# The "easymesh" user reaches the easymesh ubus object and nothing else
-# (acl.d/easymesh-mesh.json).
+# The "easymesh" user reaches only the easymesh methods the boxes call on each
+# other (acl.d/easymesh-mesh.json): the controller's read-only views for the
+# agents' LuCI, address claims, link state and scans for the planner, bridge
+# flushes, and the moves and renames an agent's LuCI hands to the controller.
+# Not setup, credentials, WPS or forget_node: those need a login on the box.
 #
 # Sourced; needs uci, sha256sum, uhttpd (for the password hash) and curl.
 
@@ -70,14 +73,15 @@ mesh_rpc_user() {
 
 # mesh_rpc_session <host> - a session token on that box, or nothing.
 #
-# A box still on an older image knows no "easymesh" user; it is asked the old
-# way (root, empty password) so a mesh being upgraded one box at a time keeps
-# working. That second try gets in only where root has no password anyway.
+# Only as the "easymesh" user. Until 2026-09-30 a failed login was retried as
+# root with an empty password, for boxes on images older than 2026-09-27 that
+# know no "easymesh" user. That second try handed any box whose owner had not
+# set a root password full access to every ubus object of every other box, to
+# anyone holding the backhaul key - and no image that old was ever released.
 mesh_rpc_session() {
 	local host="$1" sec s
-	sec=$(mesh_rpc_secret) &&
-		s=$(_mesh_rpc_login "$host" "$MESH_RPC_USER" "$sec")
-	[ -n "$s" ] || s=$(_mesh_rpc_login "$host" root "")
+	sec=$(mesh_rpc_secret) || return 1
+	s=$(_mesh_rpc_login "$host" "$MESH_RPC_USER" "$sec")
 	[ -n "$s" ] || return 1
 	echo "$s"
 }

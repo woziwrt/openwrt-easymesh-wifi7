@@ -1,14 +1,60 @@
 {
 	"easymesh-mesh": {
-		"description": "One box of the mesh calling the easymesh API of another (rpcd user easymesh)",
+		"description": "One box of the mesh calling the easymesh API of another (rpcd user easymesh). Only what the boxes call on each other: no setup, no credentials, no WPS, no forget_node.",
 		"read": {
 			"ubus": {
-				"easymesh": [ "*" ]
+				"easymesh": [
+					"bh_trial",
+					"bh_trial_state",
+					"claim_address",
+					"client_history",
+					"clients",
+					"db_stats",
+					"db_table",
+					"events",
+					"fdb_flush",
+					"health",
+					"link_state",
+					"manual_move",
+					"move_options",
+					"node_state",
+					"nodes",
+					"parent_plan",
+					"parent_plan_set",
+					"parent_scan",
+					"rename",
+					"steer_history",
+					"topology",
+					"ttlm_state"
+				]
 			}
 		},
 		"write": {
 			"ubus": {
-				"easymesh": [ "*" ]
+				"easymesh": [
+					"bh_trial",
+					"bh_trial_state",
+					"claim_address",
+					"client_history",
+					"clients",
+					"db_stats",
+					"db_table",
+					"events",
+					"fdb_flush",
+					"health",
+					"link_state",
+					"manual_move",
+					"move_options",
+					"node_state",
+					"nodes",
+					"parent_plan",
+					"parent_plan_set",
+					"parent_scan",
+					"rename",
+					"steer_history",
+					"topology",
+					"ttlm_state"
+				]
 			}
 		}
 	}

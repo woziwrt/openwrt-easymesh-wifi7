@@ -1722,10 +1722,12 @@ call)
 		# table avoids touching it. A live node re-registers within
 		# seconds, so this only sticks for one that is truly gone.
 		input=$(cat)
+		# Forgetting a box stops the controller and deletes its rows:
+		# the mesh user may not ask for it from another box
+		# (acl.d/easymesh-mesh.json), so an agent says where to do it
+		# instead of relaying a request the controller would refuse.
 		if [ "$(uci -q get mapcontroller.controller.enabled)" != "1" ]; then
-			out="$(proxy_to_controller forget_node "$input")"
-			[ -n "$out" ] && { echo "$out"; exit 0; }
-			echo '{"error":"the controller did not answer"}'
+			echo '{"error":"forget a box on the controller - open its web page and use Forget there"}'
 			exit 0
 		fi
 		mac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
