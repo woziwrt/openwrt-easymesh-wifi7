@@ -139,6 +139,11 @@ done
 ok "overlay: $(find "$OV" -type f | wc -l) files"
 
 # --- 3. image ---------------------------------------------------------------
+# Out with the packages of the previous run first. The ImageBuilder installs
+# the highest revision it finds, and a run from another branch leaves a higher
+# one behind: an image built from main then carried that branch's code without
+# a word (2026-09-30, caught only by diffing the rootfs).
+rm -f "$IB"/packages/easymesh*.apk
 cp -f "$SDK"/bin/packages/*/easymeshr6/*.apk "$IB/packages/"
 PKGS=$(cat "$ARCH/sdk/PACKAGES.txt")
 # A fresh build date, or the browser keeps LuCI views of the previous image
