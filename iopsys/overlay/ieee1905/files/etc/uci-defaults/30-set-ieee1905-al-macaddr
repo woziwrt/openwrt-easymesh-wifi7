@@ -1,5 +1,4 @@
 #!/bin/sh
-. /usr/share/easymesh/trace.sh 2>/dev/null || :   # EASYMESH-TRACE
 
 . /lib/functions/system.sh
 
