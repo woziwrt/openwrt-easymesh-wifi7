@@ -622,6 +622,18 @@ while :; do
 		join_final_check "10 minutes after the button"
 	fi
 
+	# A WPS credential counts only while this box is joining. The listener
+	# runs for the life of the node, and a settled agent also hears the
+	# stock 50-wps_sta and any foreign registrar - taking their key would
+	# rebuild the backhaul of a working node (review A9, 2026-09-30). Out
+	# of a join the event is dropped, spool and all, so a later join cannot
+	# pick up a stale credential either.
+	if [ -s "$WPS_SPOOL" ] && [ ! -f /etc/easymesh-wps-pending ] &&
+	   [ "$(cat $STATE 2>/dev/null)" = settled ]; then
+		: > "$WPS_SPOOL"
+		log "ignored a WPS credential - this box is not joining"
+	fi
+
 	# A WPS-delivered key lands in the spool first; stage it where the
 	# wired path would have written it, then the normal flow below takes
 	# over (including the radios-first ordering the adopt step owns).
