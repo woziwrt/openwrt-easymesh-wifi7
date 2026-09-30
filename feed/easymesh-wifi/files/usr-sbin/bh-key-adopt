@@ -126,6 +126,58 @@ fallback_armed() { soft_join; }
 
 now_iso() { date -Is 2>/dev/null || date; }
 
+# One real reboot at the end of a soft join.
+#
+# The soft join replays userspace only: services, `wifi down/up`, a synthetic
+# ieee80211 hotplug. The kernel, mt76 and the MT7996 firmware keep whatever the
+# join left in them - the temporary non-MLO station on radio0, the factory
+# non-MLO APs, several teardowns of the MLO interfaces. Measured 2026-09-29/30:
+# a box straight after a soft join lost its uplink in the parent ("zombie")
+# 6-74 min after every association, 7 times in one evening and 3 times on
+# 30. 9. (twice ten minutes after association); after its first reboot, 0 in
+# 5.5 h and ~14 associations. One snapshot showed the bSTA vif queue bound to
+# wcid 0 instead of the link's wcid, a state no rebooted box ever had. The
+# cause is not found; a reboot is the one step known to leave the driver clean.
+#
+# So the join ends where a boot ends: once, after the node has settled and
+# passed its final check. The record is written before going down and
+# completed after coming back, like the fallback fuse; a reboot that does not
+# happen is said, never retried.
+CLEAN=/etc/mapc/join-clean-reboot
+
+# The outcome, written on the round after the reboot. Never reboots: a
+# settled node reaches this every interval, for ever.
+join_clean_outcome() {
+	[ -s "$CLEAN" ] || return 0
+	grep -q " done$\| did not take" "$CLEAN" 2>/dev/null && return 0
+	if grep -q "boot=$(boot_id)" "$CLEAN" 2>/dev/null; then
+		printf '%s did not take (same boot)\n' "$(now_iso)" >> "$CLEAN"
+		log "clean reboot after the join did not take - not trying again"
+	else
+		printf '%s done\n' "$(now_iso)" >> "$CLEAN"
+		log "clean reboot after the join done"
+	fi
+	sync
+}
+
+# The reboot, on the way IN to settled only (one join, one call).
+join_clean_reboot() {
+	soft_join || return 0
+	# A join that already spent its fallback reboot has been through a boot.
+	grep -q "after reboot:" "$FALLBACK" 2>/dev/null && return 0
+	printf '%s reboot after join boot=%s\n' "$(now_iso)" "$(boot_id)" > "$CLEAN"
+	sync
+	grep -q "boot=$(boot_id)" "$CLEAN" 2>/dev/null || {
+		log "could not write $CLEAN - not rebooting"
+		return 0
+	}
+	log "join settled - one reboot to leave the driver in a clean state"
+	sleep 5
+	reboot
+	sleep 120
+	log "clean reboot after the join did not take"
+}
+
 # This box, this boot. The fuse says which boot decided to reboot, so the
 # line that reports the outcome can prove a reboot actually happened rather
 # than assuming it did - `reboot` can fail to take, and an outcome written
@@ -984,8 +1036,11 @@ PROBE
 			# the repair for the installed base belongs here.
 			rm -f "$JOIN_STARTED"
 			state settled
+			# The round after the clean reboot lands here: say how it went.
+			join_clean_outcome
 		elif join_final_check "settled"; then
 			state settled
+			join_clean_reboot
 		fi
 		continue
 	fi
