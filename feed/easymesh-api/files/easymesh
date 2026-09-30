@@ -968,6 +968,7 @@ list)
   "fdb_flush": { "mesh": false },
   "parent_plan": {},
   "rename": { "almac": "str", "name": "str" },
+  "set_hostname": { "almac": "str", "name": "str" },
   "add_status": {},
   "node_state": {},
   "health": {},
@@ -1489,20 +1490,15 @@ call)
 			hostname_set=true
 			logger -t easymesh "hostname of $almac (this box) set to $newname"
 		elif [ -n "$node_ip" ]; then
-			# -y -y, not -y: a reflashed box answers with a new host key
-			# and a single -y refuses a key that CHANGED. And the box
-			# confirms its own AL-MAC before taking the name, because an
-			# address borrowed from the ledger can belong to a neighbour
-			# by the time it is used (2026-09-20, the controller wore an
-			# agent's name).
+			# Over the mesh RPC (set_hostname), not ssh: ssh as root worked
+			# only while root had no password, and failed silently once
+			# the owner set one. The box confirms its own AL-MAC before
+			# taking the name, because an address borrowed from the ledger
+			# can belong to a neighbour by the time it is used (2026-09-20,
+			# the controller wore an agent's name).
 			almac_l=$(echo "$almac" | tr 'A-Z' 'a-z')
-			timeout 12 ssh -y -y -o BatchMode=yes \
-				"root@$node_ip" "[ \"\$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')\" = '$almac_l' ] || exit 3
-					uci set system.@system[0].hostname='$newname'
-					uci commit system
-					echo '$newname' > /proc/sys/kernel/hostname
-					ubus call service event '{\"type\":\"config.change\",\"data\":{\"package\":\"system\"}}'" \
-				>/dev/null 2>&1
+			. /usr/share/easymesh/rpc.sh
+			mesh_set_hostname "$node_ip" "$almac_l" "$newname"
 			case $? in
 			0)	hostname_set=true
 				logger -t easymesh "hostname of $almac set to $newname on $node_ip" ;;
@@ -1515,6 +1511,31 @@ call)
 
 		printf '{"ok":true,"almac":"%s","name":"%s","hostname_set":%s}\n' \
 			"$almac" "$newname" "$hostname_set"
+		;;
+	set_hostname)
+		# Another box of the mesh (the controller, or mesh-names-sync)
+		# gives this box its name. It says which box it means, and this
+		# box takes the name only if that is its own AL-MAC: an address
+		# can belong to a neighbour by the time it is used.
+		input=$(cat)
+		almac=$(echo "$input" | jsonfilter -e '@.almac' 2>/dev/null | tr 'A-Z' 'a-z')
+		newname=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+		mine=$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')
+		case "$newname" in
+		""|*[!A-Za-z0-9._-]*) echo '{"error":"name: hostname characters only"}'; exit 0 ;;
+		esac
+		if [ -z "$almac" ] || [ "$almac" != "$mine" ]; then
+			echo '{"error":"not this box"}'
+			exit 0
+		fi
+		uci set system.@system[0].hostname="$newname"
+		uci commit system
+		echo "$newname" > /proc/sys/kernel/hostname
+		ubus -t 5 call service event \
+			'{"type":"config.change","data":{"package":"system"}}' \
+			>/dev/null 2>&1
+		logger -t easymesh "hostname set to $newname at the request of another box"
+		printf '{"ok":true,"name":"%s"}\n' "$newname"
 		;;
 	link_state)
 		# Which legs of THIS node's backhaul MLD are alive, as measured by

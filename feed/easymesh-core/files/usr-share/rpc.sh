@@ -92,3 +92,29 @@ _mesh_rpc_login() {
 		"http://$1/ubus" 2>/dev/null |
 		sed -n 's/.*"ubus_rpc_session":"\([a-f0-9]*\)".*/\1/p'
 }
+
+# mesh_rpc_call <host> <method> [json] - call one easymesh method on another
+# box as the mesh user; prints the method's answer (the result object), or
+# nothing when the box cannot be reached or refuses.
+mesh_rpc_call() {
+	local host="$1" method="$2" args="$3" sess
+	[ -n "$args" ] || args='{}'
+	sess=$(mesh_rpc_session "$host") || return 1
+	curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$sess\",\"easymesh\",\"$method\",$args]}" \
+		"http://$host/ubus" 2>/dev/null |
+		jsonfilter -e '@.result[1]' 2>/dev/null
+}
+
+# mesh_set_hostname <host> <almac> <name> - ask the box at <host> to take the
+# name, if it is the box with that AL-MAC. 0 = written, 3 = the box at that
+# address is somebody else, 1 = no answer.
+mesh_set_hostname() {
+	local out
+	out=$(mesh_rpc_call "$1" set_hostname "{\"almac\":\"$2\",\"name\":\"$3\"}") || return 1
+	case "$out" in
+	*'"ok":true'*|*'"ok": true'*) return 0 ;;
+	*'not this box'*) return 3 ;;
+	esac
+	return 1
+}

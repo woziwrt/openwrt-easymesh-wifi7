@@ -91,25 +91,15 @@ apply_name() {
 		sed 's/.*:"//; s/".*//' | head -1)
 	[ -n "$ip" ] || return 1
 
-	# Two things this write has to survive, both of them ordinary in a mesh.
-	#
-	# A box that came back from a reflash answers with a NEW host key. `ssh -y`
-	# accepts a key it has never seen, but not one that changed - it refuses,
-	# and the name never reaches the one box that has lost it. Measured
-	# 2026-09-20: eight rounds of "could not reach" in a row, while the same
-	# command by hand went through the moment known_hosts was repaired.
-	#
-	# And an address is a round older than the write that uses it. A box that
+	# An address is a round older than the write that uses it. A box that
 	# rebooted into somebody else's lease would be given a name that is not
 	# its own - that is how this controller ended up carrying an agent's name.
 	# So the far end says who it is, over the very connection that writes.
-	timeout 12 ssh -y -y -o BatchMode=yes "root@$ip" \
-		"[ \"\$(uci -q get ieee1905.ieee1905.macaddress | tr 'A-Z' 'a-z')\" = '$mac' ] || exit 3
-		 uci set system.@system[0].hostname='$name'
-		 uci commit system
-		 echo '$name' > /proc/sys/kernel/hostname
-		 ubus call service event '{\"type\":\"config.change\",\"data\":{\"package\":\"system\"}}'" \
-		>/dev/null 2>&1
+	# Over the mesh RPC, not ssh as root: that worked only while root had
+	# no password, and failed silently once the owner set one.
+	[ -r /usr/share/easymesh/rpc.sh ] || return 1
+	. /usr/share/easymesh/rpc.sh
+	mesh_set_hostname "$ip" "$mac" "$name"
 	rc=$?
 	[ "$rc" = 3 ] && { log "$ip does not answer as $mac; '$name' not written"; return 1; }
 	[ "$rc" = 0 ] || return 1

@@ -23,6 +23,7 @@
 					"parent_plan_set",
 					"parent_scan",
 					"rename",
+					"set_hostname",
 					"steer_history",
 					"topology",
 					"ttlm_state"
@@ -51,6 +52,7 @@
 					"parent_plan_set",
 					"parent_scan",
 					"rename",
+					"set_hostname",
 					"steer_history",
 					"topology",
 					"ttlm_state"
