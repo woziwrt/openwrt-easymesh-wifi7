@@ -580,6 +580,14 @@ WPS_SPOOL=/tmp/bh-adopt-wps.log
 ubus listen wps_credentials > "$WPS_SPOOL" 2>/dev/null &
 WPS_PID=$!
 trap '[ -n "$WPS_PID" ] && kill "$WPS_PID" 2>/dev/null' EXIT
+# procd stops a service with SIGTERM, and busybox ash does not run the EXIT
+# trap for a signal it was not told to catch - every stop and every soft
+# restart left the listener behind, all of them appending to the one spool
+# (2026-09-30, three found on one agent). Catching TERM is only half of it:
+# ash acts on a caught signal after the running command returns, and that is
+# the 30 s sleep below, so procd lost patience and sent SIGKILL. The loop
+# therefore waits with `wait`, which a signal interrupts at once.
+trap 'exit 0' INT TERM
 
 wps_delivered_key() {
 	# Only the backhaul credential matters here; the fronthaul one from a
@@ -607,7 +615,8 @@ wps_delivered_key() {
 }
 
 while :; do
-	sleep "$INTERVAL"
+	sleep "$INTERVAL" &
+	wait $!
 
 	# The controller is handed its key at setup; this path is for the nodes
 	# that have to be told theirs.
