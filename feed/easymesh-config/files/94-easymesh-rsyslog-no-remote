@@ -1,0 +1,29 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# rsyslog takes log lines from this box only, not from the network.
+#
+# The production package set ships rsyslog with its UDP input on port 514,
+# listening on every address - br-lan included, which is the same L2 domain
+# as every client of the mesh. Nothing of ours sends to it: no box has a
+# remote log target set, and the mesh reads its logs from /var/log/messages
+# of the box itself (easymesh-logkeep, the events API). What it did offer is
+# a way for anyone on the LAN to write lines into that file - which lives in
+# RAM and which our tools read as the truth. Measured 2026-09-30 on every lab
+# box: rsyslogd bound to 0.0.0.0:514 and :::514.
+#
+# Local logging (imuxsock, /var/log/messages) is untouched; see
+# 93-easymesh-single-kmsg-reader for why the kernel log is not read here.
+
+[ -f /etc/config/rsyslog ] || exit 0
+[ "$(uci -q get rsyslog.syslog.udp_input)" = 1 ] || exit 0
+
+uci set rsyslog.syslog.udp_input='0'
+uci commit rsyslog
+
+# Only if it is already running - at first boot the init system has not
+# started it yet and this would race with that.
+[ -n "$(pidof rsyslogd)" ] && /etc/init.d/rsyslog restart >/dev/null 2>&1
+
+exit 0

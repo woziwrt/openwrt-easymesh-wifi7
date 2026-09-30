@@ -57,6 +57,7 @@ define Package/easymesh-config/install
 	$(INSTALL_BIN) ./files/995-easymesh-dhcp-safe $(1)/etc/uci-defaults/995-easymesh-dhcp-safe
 	$(INSTALL_BIN) ./files/92-easymesh-apk-feed $(1)/etc/uci-defaults/92-easymesh-apk-feed
 	$(INSTALL_BIN) ./files/93-easymesh-single-kmsg-reader $(1)/etc/uci-defaults/93-easymesh-single-kmsg-reader
+	$(INSTALL_BIN) ./files/94-easymesh-rsyslog-no-remote $(1)/etc/uci-defaults/94-easymesh-rsyslog-no-remote
 	$(INSTALL_BIN) ./files/95-easymesh-mlo-steerd-off $(1)/etc/uci-defaults/95-easymesh-mlo-steerd-off
 	$(INSTALL_BIN) ./files/96-easymesh-6g-backhaul-no-mbssid $(1)/etc/uci-defaults/96-easymesh-6g-backhaul-no-mbssid
 	$(INSTALL_BIN) ./files/97-easymesh-stp-root-controller $(1)/etc/uci-defaults/97-easymesh-stp-root-controller
