@@ -48,7 +48,7 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 - **2 boxes** to see the core of it (a controller and one agent over a multi-link backhaul, TTLM on that link);
 - **3 or more** to see a real mesh (chains, choice of parent, relaying);
 - Banana Pi **BPI-R4** (4 GB or 8 GB) or **BPI-R4 Pro 8X**, each with the **BPI-R4-NIC-BE14** Wi-Fi 7 card (MT7996);
-- a microSD card per box. Running from SD leaves whatever is in the box's own flash untouched: take the card out and the
+- a microSD card per box, 8 GB or larger and a good one (A1 or better: the main box keeps its database on it). Running from SD leaves whatever is in the box's own flash untouched: take the card out and the
   box boots its old system.
 
 Any box can be the main box, and it can stand anywhere; a BPI-R4 Pro 8X can just as well be one of the others.
