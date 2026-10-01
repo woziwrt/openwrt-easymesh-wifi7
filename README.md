@@ -2,7 +2,9 @@
 
 **A Wi-Fi 7 mesh built from open-source routers, whose main box can steer which band each backhaul link carries.**
 
-*Implements the Wi-Fi EasyMesh™ R6 specification; not certified by the Wi-Fi Alliance.*
+*Implements the Wi-Fi EasyMesh™ R6 specification; not certified by the Wi-Fi Alliance yet. The next releases work
+towards conformance with the published EasyMesh test cases, so that it can be taken to certification
+(see [Planned](#planned-for-the-next-releases)).*
 
 > **Pre-release (v0.1-preview, <!-- TODO date -->).** It runs every day on a five-box lab, but it is not a product yet.
 > We publish it early for reviewers and testers. Please read [Known limitations](#known-limitations) before you flash anything.
