@@ -236,7 +236,7 @@ The one exception is a box left on a path under about 100 Mbit/s - that is moved
 
 | Mechanism | By default | What it does | What it costs |
 |---|---|---|---|
-| Finding a new parent after a box or its parent restarts | on | the backhaul joins the best parent it hears, within seconds | the boxes behind a restarting box are offline for 30-60 s; after a restart of the main box the whole mesh re-forms, which takes a few minutes |
+| Finding a new parent after a box or its parent restarts | on | the backhaul joins the best parent it hears, within seconds | the boxes behind a restarting box are offline for 30 s to 2.5 min; after a restart of the main box the whole mesh re-forms and clients are without internet for about 5-6 minutes |
 | No island ([details](docs/TECHNICAL.md#self-healing-and-optimisation)) | on | a box without a path to the main box stops accepting others at once | nothing |
 | Bridges follow a moved box | on | every box forgets its learned bridge entries when the tree changes | nothing noticeable |
 | Moving a box by hand | when you ask | *Backhaul & MLO* → *Move…* next to a box: pick a parent it hears; a measured trial keeps the move only if it is faster, otherwise the box goes back by itself | a few seconds for the box and the boxes behind it; one to three minutes if the new parent does not answer; about three minutes of test traffic |
@@ -257,10 +257,10 @@ the deaf-link guard are switched on the boxes with
 **How long things take** (measured in our lab):
 - a new box joins and carries traffic about four to six minutes after you pair it, including its one restart (longer
   on the Pro 8X);
-- after a power cut of the whole mesh, clients are back on the internet in about 1.5 minutes and every box is back in
+- after a power cut of the whole mesh, clients are back on the internet in about 1.5-2 minutes and every box is back in
   under 3 minutes;
-- when one box restarts, the clients and boxes behind it are back within about a minute; after a restart of the main box
-  alone, it takes a few minutes, and the rescue may then need from 10 minutes to a few tens of minutes to rebuild the
+- when one box restarts, the clients and boxes behind it are back within 30 seconds to 2.5 minutes; after a restart of
+  the main box alone, clients are without internet for about 5-6 minutes, and the rescue may then need from 10 minutes to a few tens of minutes to rebuild the
   chains - it waits 5 minutes for the mesh to settle and moves one box at a time, about 3 minutes each (see *Known
   limitations*);
 - a move by hand is decided in about three to four minutes;
