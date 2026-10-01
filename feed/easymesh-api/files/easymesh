@@ -2229,11 +2229,26 @@ call)
 					if [ -n "$_now" ] &&
 					   [ "$_now" != "$(cat /tmp/easymesh-add.regbase 2>/dev/null)" ]; then
 						date +%s > /tmp/easymesh-add.regsuccess 2>/dev/null
+						/usr/sbin/easymesh-led ok >/dev/null 2>&1
 						exit 0
 					fi
 					/usr/sbin/hostapd_cli -i ap-mld-1 wps_pbc >/dev/null 2>&1 &&
 						logger -t easymesh "wps: window re-armed - the box being added restarts once before it can pair"
 				done
+				# The last window closes 120 s after its re-arm. The lamp
+				# was set to "armed" by the button (30-easymesh) and nothing
+				# gave it back: on 2026-10-01 the controller blinked
+				# "waiting for you" all night with no window open, which
+				# invites a press on a new box that cannot pair.
+				sleep 120
+				_now=$(logread -l 400 2>/dev/null | grep WPS-REG-SUCCESS | tail -1)
+				if [ -n "$_now" ] &&
+				   [ "$_now" != "$(cat /tmp/easymesh-add.regbase 2>/dev/null)" ]; then
+					date +%s > /tmp/easymesh-add.regsuccess 2>/dev/null
+					/usr/sbin/easymesh-led ok >/dev/null 2>&1
+				else
+					/usr/sbin/easymesh-led off >/dev/null 2>&1
+				fi
 			' >/dev/null 2>&1 &
 			echo $! > /tmp/easymesh-add.rearm.pid 2>/dev/null
 			# The steering daemon reads an enrollee as an idle legacy
