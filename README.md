@@ -200,6 +200,12 @@ the main box last, one at a time, and wait until each is back in *Nodes* before 
   hysteresis. If the WAN cable is moved to another box, the mesh rearranges around it. A temporary failover to LTE does
   not rearrange anything. This is the airtime metric known from 802.11s and mesh routing protocols. What we add is
   applying it to EasyMesh topology from the controller.
+- **The planner as a graph problem:** the mesh as a graph whose edges carry measured link capacities (per box and band,
+  calibrated against what the links really carry), the target tree as the shortest-path tree by airtime from the gateway,
+  and one rule for every move - it must lower a potential of the whole mesh (the sum of path costs of all boxes) by at
+  least 20 %. That replaces today's two thresholds with one criterion that can be explained in a sentence, lets a relay
+  move only when its children gain too, and stops oscillation by construction for a given set of measurements. It will
+  be checked first against a measured "truth table" of all reasonable trees of the lab before it moves anything.
 - **Traffic statistics history:** traffic per box, backhaul link and client, link quality, topology changes, outages and
   gateway failovers over hours, days and weeks, kept in the controller database with retention, shown as graphs in LuCI
   and exported through the API
@@ -249,7 +255,9 @@ the deaf-link guard are switched on the boxes with
 - after a power cut of the whole mesh, clients are back on the internet in about 1.5 minutes and every box is back in
   under 3 minutes;
 - when one box restarts, the clients and boxes behind it are back within about a minute; after a restart of the main box
-  alone, it takes a few minutes, and the rescue may then need 10-20 minutes to rebuild the chains (see *Known limitations*);
+  alone, it takes a few minutes, and the rescue may then need from 10 minutes to a few tens of minutes to rebuild the
+  chains - it waits 5 minutes for the mesh to settle and moves one box at a time, about 3 minutes each (see *Known
+  limitations*);
 - a move by hand is decided in about three to four minutes;
 - with the planner on, it waits until a box has been stable for about 7 minutes before it tries a move.
 
@@ -288,7 +296,9 @@ This is a preview. What is not done yet, or not done well:
   then, put a box where you want it with *Move…*.
 - **After a restart of the main box alone, the mesh tends to become a star.** Relays drop their children while their own
   path is down, so when the main box comes back every box attaches straight to it, far ones at a few Mbit/s. The rescue
-  then rebuilds the chains one box at a time - 10-20 minutes in our tests. Keeping children attached while a relay
+  then rebuilds the chains one box at a time - 10 minutes to a few tens of minutes in our tests (a four-hop chain of
+  boxes at 3 Mbit/s took the rescue about 20 minutes; one of its moves took a relay from 2/4 to 670/848 Mbit/s).
+  Keeping children attached while a relay
   reconnects is planned. (A power cut of the whole mesh does not do this: the boxes start together.)
 - **Not fully understood, with a defence in place:** after pairing from a blank card, a box sometimes cannot authenticate
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. In our lab this happened towards parents
