@@ -26,7 +26,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
   box (the EasyMesh *controller*) can tell each backhaul link which band carries which traffic
   (*TID-to-Link Mapping*, TTLM) based on the shape of the whole mesh, not on one radio's view. In this preview the
   automatic policy runs as a dry run; the mechanism itself is verified on hardware.
-- **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup. The
+- **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup
+  (tested: Telit FN990A40, M.2; other modems that OpenWrt supports may work, untested). The
   mesh keeps one gateway address for all clients. When the cable is pulled, clients are back online in about 10-25
   seconds.
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
@@ -62,7 +63,7 @@ against `SHA256SUMS`, and write it to one SD card per box:
 | BPI-R4, 8 GB | `openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-sdcard.img.gz` |
 | BPI-R4 Pro 8X | `openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-sdcard.img.gz` |
 
-Set the boot switch of every box to SD. Like stock OpenWrt, every box starts at `http://192.168.1.1` with the user
+Set the boot switch of every box to SD (**A = 1, B = 1**). Like stock OpenWrt, every box starts at `http://192.168.1.1` with the user
 `root` and **no password** (just click *Log in*).
 
 The image starts with the Wi-Fi country set to **CZ** (Czech Republic). If you are elsewhere, set yours on each box in
