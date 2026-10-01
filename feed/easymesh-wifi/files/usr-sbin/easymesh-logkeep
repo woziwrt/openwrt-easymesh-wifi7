@@ -44,6 +44,40 @@ NEED_KB=${NEED_KB:-$(( (MAX / 1024) * 4 ))}
 
 free_kb() { df -kP "$DIR" 2>/dev/null | awk 'NR==2 {print $4}'; }
 
+# The inode of /dev/log. Whoever binds the socket last owns it.
+devlog_ino() { ls -i /dev/log 2>/dev/null | awk '{print $1}'; }
+
+# rsyslogd deaf after a logd restart.
+#
+# 2026-09-30 23:51:28 logd restarted on kitchen-hall (procd respawned it; no trace
+# of why in dmesg) and created a new /dev/log. rsyslogd kept listening on the old,
+# unlinked socket and received nothing more: /var/log/messages - and with it this
+# file - stopped at 23:51:07, and the rest of the night went only into logd's
+# 128 kB ring, which wraps in under an hour on a mesh node. Found at 03:00 only
+# because the file had not grown.
+#
+# A new /dev/log is only the trigger; the check is whether a line still reaches
+# the file. If not, rsyslogd is restarted (it binds /dev/log again) and what logd
+# collected in the gap is copied over, marked, so the gap is in the file too.
+deaf_check() {
+	[ -f /var/log/messages ] || return 0
+	pidof rsyslogd >/dev/null 2>&1 || return 0
+	local t="probe-$$-$(date +%s)"
+	logger -t easymesh-logkeep "$t"
+	sleep 2
+	grep -q "$t" /var/log/messages 2>/dev/null && return 0
+	{
+		echo "=== easymesh-logkeep: /dev/log was re-created and rsyslogd heard nothing - lines from logd's ring follow"
+		logread 2>/dev/null
+		echo "=== easymesh-logkeep: end of logd's ring, rsyslogd restarted"
+	} >> "$FILE"
+	/etc/init.d/rsyslog restart >/dev/null 2>&1
+	# procd starts rsyslogd in the background: give it time to bind /dev/log,
+	# or this line goes to logd and the caller reads the old inode
+	sleep 3
+	logger -t easymesh-logkeep "rsyslogd stopped receiving after /dev/log was re-created (logd restart?) - restarted it, the gap is copied from logread"
+}
+
 room() {
 	local free
 	free=$(free_kb)
@@ -95,8 +129,17 @@ follow)
 	exec logread -f >> "$FILE"
 	;;
 cap)
+	ino=$(devlog_ino)
 	while :; do
 		sleep "$CHECK"
+		now=$(devlog_ino)
+		if [ -n "$now" ] && [ "$now" != "$ino" ]; then
+			deaf_check
+			# rsyslogd's restart re-creates /dev/log once more: take the
+			# inode after it, or the next round would restart it again
+			now=$(devlog_ino)
+		fi
+		ino=$now
 		sz=$(wc -c < "$FILE" 2>/dev/null) || continue
 		[ "${sz:-0}" -gt "$MAX" ] || continue
 		# ⚠️ NOT $PREV. That file is the previous boot - the night this whole
