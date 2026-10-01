@@ -17,13 +17,13 @@
 # remote rollback would travel over is the link this puts at risk.
 #
 #   1. throughput to the controller now (iperf3, 3 x 10 s, up and down, mean)
-#   2. pin the target parent's BSSID and reassociate
+#   2. accept only the target parent's links and reassociate (see move_to)
 #   3. wait for the target and the controller; on failure go back
 #   4. measure again after a short settle
 #   5. keep only if neither direction lost more than MAX_LOSS % and at least
 #      one gained KEEP_GAIN %; otherwise go back. (Not "the worse direction
 #      must gain": kitchen's right move gained +56 % up and 0 % down.)
-#   6. ALWAYS release the pin - a pinned node cannot heal onto another parent
+#   6. ALWAYS release the pin (bssid_accept) - a pinned node cannot heal onto another parent
 #      if this one dies (2026-09-23)
 #
 # MOVE_ONLY=1 (easymesh-bh-rescue) skips both measurements: the parent it
@@ -41,6 +41,7 @@ KEEP_GAIN=${KEEP_GAIN:-20}
 MAX_LOSS=${MAX_LOSS:-10}
 SECS=${SECS:-10}
 ROUNDS=${ROUNDS:-3}
+SCAN=/tmp/easymesh/parents.json
 OUT=/tmp/easymesh/bh-trial.json
 PIDF=/tmp/easymesh/bh-trial.pid
 
@@ -82,7 +83,25 @@ measure() {
 	echo "$_su $_sd $_n" | awk '{ printf "%d %d\n", $1 / $3, $2 / $3 }'
 }
 
-# pin <bssid>, wait until it is the parent and the controller answers.
+# move_to <ap-mld>: let the station associate only with that parent, wait until
+# it is the parent and the controller answers.
+#
+# Which link the station associates on decides the band of the association, and
+# that becomes the primary link of the whole multi-link station. Up to RC2 this
+# pinned `bssid <ap-mld>`; the AP-MLD address of our parents is also the BSSID
+# of their 5 GHz link, so every move landed on 5 GHz: night 1 of RC2
+# (2026-09-30) - 3 of 3 pinned moves associated on 5180, the one association
+# without a pin on 6135. Pinning the 6 GHz link's BSSID instead does not work:
+# the association is made, then the 4-way handshake times out (reason 15),
+# 2 of 2 on corridor, 2026-10-01. So nothing is pinned any more: the network
+# accepts exactly the links of that parent (bssid_accept, from the last parent
+# scan) and wpa_supplicant chooses the band as it does when a box reconnects on
+# its own - 6 GHz when it works, and on its own the 5 GHz link when 6 GHz
+# authentication fails (BPI-x8-mac, torn 6 GHz antenna). Re-pinning a weak but
+# working 6 GHz link to 5 GHz is only logged in this release - a second
+# reassociation per move doubles the hole and could swing back and forth on a
+# borderline link.
+#
 # A target the station has not associated with within ASSOC_S is given up at
 # once: waiting the whole 90 s for a parent that never answers, and then up to
 # 90 s more for the way back, left kitchen three minutes without a backhaul
@@ -91,13 +110,52 @@ measure() {
 # 2026-09-28), and a trial given up too early denies the right parent for a
 # day (review, 2026-09-29).
 ASSOC_S=${ASSOC_S:-45}
+
+# links <ap-mld>: every BSSID of that parent from the last parent scan, and
+# the AP-MLD address itself (the BSSID of its 5 GHz link) in case the scan has
+# not seen it yet
+links() {
+	{ echo "$1"
+	  [ -r "$SCAN" ] && jsonfilter -i "$SCAN" -e "@.cand[@.mld='$1'].bssid" 2>/dev/null
+	} | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+# What the association became: band of the primary link, its tx rate and NSS.
+# The primary link is read from mt76_links_info - wpa_cli's freq= is NOT the
+# band of the association (wrong on 3 of 4 boxes, 2026-10-01).
+LINKF=""; LINKR=""; LINKN=""
+link_report() {
+	sleep 5
+	_pl=$(sed -n 's/.*primary link, link ID = \([0-9]*\).*/\1/p' \
+		/sys/kernel/debug/ieee80211/phy0/netdev:"$BSTA"/stations/*/mt76_links_info 2>/dev/null | head -1)
+	LINKF=$(iw dev "$BSTA" link 2>/dev/null | awk -v l="$_pl" \
+		'$1 == "Link" && $2 == l { f = 1; next } f && $1 == "freq:" { print int($2); exit }')
+	set -- $(iw dev "$BSTA" station dump 2>/dev/null | awk -v l="$_pl:" '
+		$1 == "Link" && $2 == l { f = 1; next }
+		f && /tx bitrate:/ {
+			n = "?"; for (i = 1; i <= NF; i++) if ($i ~ /-NSS$/) n = $(i + 1)
+			print int($3), n; exit
+		}')
+	LINKR=${1:-?}; LINKN=${2:-?}
+	log "associated with $(parent) on ${LINKF:-?} MHz (accepted $ACCEPT), primary link ${_pl:-?}, tx $LINKR Mbit/s, NSS $LINKN"
+	case "$LINKF" in 59[3-9]?|6???|7???)
+		if [ "$LINKN" = 1 ] || { [ "$LINKR" != "?" ] && [ "$LINKR" -lt "${WEAK6_MBIT:-600}" ]; }; then
+			log "would re-pin to the 5 GHz link: the 6 GHz link is weak (tx $LINKR Mbit/s, NSS $LINKN) - not done in this release"
+		fi ;;
+	esac
+}
+
 move_to() {
-	$W set_network "$NID" bssid "$1" >/dev/null 2>&1
+	ACCEPT=$(links "$1")
+	$W set_network "$NID" bssid any >/dev/null 2>&1
+	$W set_network "$NID" bssid_accept "$ACCEPT" >/dev/null 2>&1
 	$W reassociate >/dev/null 2>&1
 	_i=0
 	while [ $_i -lt 90 ]; do
 		if [ "$(parent)" = "$1" ]; then
-			ping -c 1 -W 2 "$CIP" >/dev/null 2>&1 && return 0
+			if ping -c 1 -W 2 "$CIP" >/dev/null 2>&1; then
+				link_report; return 0
+			fi
 		elif [ $_i -ge "$ASSOC_S" ]; then
 			return 1
 		fi
@@ -106,13 +164,16 @@ move_to() {
 	return 1
 }
 
-release() { $W set_network "$NID" bssid any >/dev/null 2>&1; }
+release() {
+	$W set_network "$NID" bssid_accept '' >/dev/null 2>&1
+	$W set_network "$NID" bssid any >/dev/null 2>&1
+}
 
 result() {
-	printf '{"ts":%s,"from":"%s","to":"%s","verdict":"%s","base":[%s],"trial":[%s],"parent":"%s"}\n' \
+	printf '{"ts":%s,"from":"%s","to":"%s","verdict":"%s","base":[%s],"trial":[%s],"parent":"%s","assoc_mhz":"%s","accepted":"%s"}\n' \
 		"$(date +%s)" "$P0" "$TARGET" "$1" "${BASE:+$(echo $BASE | tr ' ' ',')}" \
-		"${NEW:+$(echo $NEW | tr ' ' ',')}" "$(parent)" > "$OUT"
-	log "$1: $P0 -> $TARGET, before ${BASE:-?} after ${NEW:-?} Mbit/s (up down), parent now $(parent)"
+		"${NEW:+$(echo $NEW | tr ' ' ',')}" "$(parent)" "$LINKF" "$ACCEPT" > "$OUT"
+	log "$1: $P0 -> $TARGET, before ${BASE:-?} after ${NEW:-?} Mbit/s (up down), parent now $(parent) on ${LINKF:-?} MHz"
 	rm -f "$PIDF"
 }
 
