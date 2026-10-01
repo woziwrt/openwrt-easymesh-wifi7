@@ -1323,13 +1323,17 @@ call)
 				# for thirteen, and the user's report was the plainest kind -
 				# "nothing else can be added".
 				#
-				# Ten minutes, against a join that takes four. Long enough
+				# Fifteen minutes, against a join that takes four to six. It was
+				# ten until the join gained its one clean reboot (5588bef,
+				# 2026-09-30): a Pro 8X then took 9 min (17:53 -> 18:02), one
+				# minute short of being told to press again - and a second press
+				# cancels a join that is going fine. Long enough
 				# that a slow box is never called stalled, short enough that
 				# nobody waits out an evening on one that is. Saying "stalled"
 				# costs nothing if it is wrong: the mesh is untouched and the
 				# screen's advice is to press again, which is what a genuinely
 				# slow box would want anyway.
-				if [ "$age" -gt "${ADD_SETTLE_MAX:-600}" ]; then
+				if [ "$age" -gt "${ADD_SETTLE_MAX:-900}" ]; then
 					printf '{"state":"stalled","almac":"%s","name":"%s","elapsed_s":%s}\n' \
 						"$newcomer" "$(nameof "$newcomer")" "$age"
 					exit 0
@@ -1389,7 +1393,8 @@ call)
 			# the one message a user cannot act on. Measured 2026-08-20: press
 			# to counted-in-the-mesh was 4 min 17 s, so twice that is late by
 			# any reading and not a threshold anyone will hit by being patient.
-			if [ "$age" -gt 600 ]; then
+			# 900 since the join's clean reboot (5588bef): a Pro 8X took 9 min.
+			if [ "$age" -gt "${ADD_SETTLE_MAX:-900}" ]; then
 				printf '{"state":"stalled","elapsed_s":%s}\n' "$age"
 				exit 0
 			fi

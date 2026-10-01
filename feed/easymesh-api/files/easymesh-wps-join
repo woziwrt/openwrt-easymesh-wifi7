@@ -413,7 +413,7 @@ if [ "$1" = "--resume" ]; then
 	echo working > /etc/mapc/adopt-state
 	/etc/init.d/bh-key-adopt start >/dev/null 2>&1
 	if no_reboot; then
-		step "joined - finishing the setup, no restart needed"
+		step "joined - finishing the setup, the box restarts once at the end"
 	else
 		step "joined - the box reboots itself shortly"
 	fi

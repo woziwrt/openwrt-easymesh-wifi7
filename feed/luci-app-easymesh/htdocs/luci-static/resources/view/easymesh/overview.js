@@ -79,7 +79,7 @@ function renderAdd(st) {
 	 * question they did not ask, and leaves the one they did ask open. */
 	if (st.state == 'armed') {
 		body = [ E('strong', {}, _('Button registered here.')), ' ',
-			_('Now hold the WPS button on the new box for 4 to 8 seconds and let go. Nothing else - no cable, and nothing to type in. After that it sets itself up on its own in about four minutes, and restarts once by itself only if something does not come up; nothing here needs doing until this box says it is done.'),
+			_('Now hold the WPS button on the new box for 4 to 8 seconds and let go. Nothing else - no cable, and nothing to type in. After that it sets itself up on its own in about four to six minutes, and restarts once by itself on the way; nothing here needs doing until this box says it is done.'),
 			st.window_left_s != null
 				? E('div', { 'style': 'color:#69707a;font-size:.9em;margin-top:.3em' },
 					_('You have %d s left to do it. If it runs out, nothing is lost - just press here again.').format(st.window_left_s))
@@ -91,7 +91,7 @@ function renderAdd(st) {
 	} else if (st.state == 'paired') {
 		cls += ' info';
 		body = [ E('strong', {}, _('Both buttons registered - the boxes have agreed.')), ' ',
-			_('The new box is setting itself up now. It takes about four minutes from the second press, and it restarts once by itself only if something does not come up. Leave both boxes alone; there is nothing more to press.') ];
+			_('The new box is setting itself up now. It takes about four to six minutes from the second press, and the box restarts once by itself on the way - that is expected. Leave both boxes alone; there is nothing more to press, and a second press would cancel the pairing.') ];
 	} else if (st.state == 'stalled') {
 		cls += ' warning';
 		/* No button of its own. This panel used to carry one, and "Pair a
@@ -101,7 +101,7 @@ function renderAdd(st) {
 		 * press instead. */
 		body = [ E('strong', {}, _('The boxes agreed, but the new one has not finished.')),
 			E('div', { 'style': 'margin-top:.3em' },
-				_('It usually takes about four minutes and it has now been much longer. The mesh itself is unaffected - nothing here was changed. Press "Pair a new box" below to open the window again, then hold the button on the new box once more.')) ];
+				_('It usually takes four to six minutes, longer on a Pro 8X, and it has now been much longer. The mesh itself is unaffected - nothing here was changed. Press "Pair a new box" below to open the window again, then hold the button on the new box once more.')) ];
 	} else if (st.state == 'settling') {
 					/* Seen, but not finished. The box reports itself over 1905
 					 * before its last reboot, so this is the window in which
@@ -950,7 +950,7 @@ return view.extend({
 				E('h3', { 'style': 'margin-top:1.5em' }, _('Adding this box to a mesh you already have?')),
 				/* The main box, not any box of the mesh: see the same
 				 * sentence in setup.js for why. */
-				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or hold its WPS button for 4 to 8 seconds. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if something does not come up. Do not keep holding: ten seconds or more erases the box instead.')),
+				E('p', {}, _('Then you do not need this screen at all. Leave it plugged in. First, on the main box (the first one you set up), press "Pair a new box" in its Overview or hold its WPS button for 4 to 8 seconds. Then hold the WPS button on this box for 4 to 8 seconds and let go. The main box keeps pairing open for about seven minutes, so there is time to walk over; the other order works too, but leaves only about three. This box joins on its own in about four to six minutes, with nothing to type in, and restarts once by itself on the way. Do not keep holding: ten seconds or more erases the box instead.')),
 				E('p', { 'style': 'color:#888;font-size:.9em' }, _('A short press keeps its usual meaning here, so pairing an ordinary device is unaffected.'))
 			]);
 
@@ -1040,7 +1040,7 @@ return view.extend({
 			var addrLine = E('div', { 'style': 'margin-top:8px;font-size:13px' },
 				_('Looking for a free address…'));
 			var stepsLine = E('div', { 'style': 'margin-top:4px;color:#69707a;font-size:12px' },
-				_('Press this first, then walk to the new box, hold its WPS button for 4 to 8 seconds and let go. This box keeps pairing open for about seven minutes, so there is time to get there. The other order works too, but leaves only about three: the new box waits for a shorter while than this one keeps the door open. It joins on its own in about four minutes, with nothing to type in anywhere, and restarts once by itself only if something does not come up.'));
+				_('Press this first, then walk to the new box, hold its WPS button for 4 to 8 seconds and let go. This box keeps pairing open for about seven minutes, so there is time to get there. The other order works too, but leaves only about three: the new box waits for a shorter while than this one keeps the door open. It joins on its own in about four to six minutes, with nothing to type in anywhere, and restarts once by itself on the way.'));
 			callSuggest().then(function(r) {
 				if (r && r.address) {
 					dom.content(addrLine, [
