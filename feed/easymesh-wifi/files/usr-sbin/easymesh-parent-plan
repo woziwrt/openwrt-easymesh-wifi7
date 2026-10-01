@@ -43,9 +43,13 @@
 # other up with the controller knowing none of them), never onto a node below
 # itself.
 #
-# It PLANS; it ACTS only when /etc/mapc/parent-steer-live exists, and then
-# the move is decided by a measured trial on the node (easymesh-bh-trial),
-# not by this estimate.
+# It PLANS always. It ACTS on rule A - the rescue of a node on a bad path -
+# by default (since 2026-10-01: a relay moved by hand left its children on
+# parents at 6 and 3 Mbit/s, and with the planner off they would have stayed
+# there for good), unless /etc/mapc/parent-rescue-off exists. Rule B, the
+# tidy-up towards the controller, only with /etc/mapc/parent-steer-live (the
+# danger zone). Either way the move is decided by a measured trial on the
+# node (easymesh-bh-trial), not by this estimate.
 #
 # When it runs: every PERIOD, and at once when the mesh changed - a node
 # appeared, vanished or changed parent (one small query every TICK), or when
@@ -104,6 +108,7 @@ unset _lib
 [ -n "$PLAN_DB" ] && DB=$PLAN_DB
 
 LIVE=${LIVE:-/etc/mapc/parent-steer-live}
+RESCUE_OFF=${RESCUE_OFF:-/etc/mapc/parent-rescue-off}
 ST=${ST:-/tmp/easymesh/parent-steer}
 # What a trial decided has to outlive a reboot of this box. Kept in /tmp,
 # the 24 h deny and the cooldown vanished with every reflash of the
@@ -155,8 +160,10 @@ gather() {
 	   WHERE c.freq > 4900 AND m.agent_almac IS NOT NULL
 	     AND m.agent_almac != c.agent_almac;"
 	[ -r "$ST/state" ] && sed 's/^/X /' "$ST/state"
-	for f in "$MEM"/last.*; do
-		[ -r "$f" ] && echo "cool ${f##*/last.} $(cat "$f")"
+	for f in "$MEM"/hold.*; do
+		[ -r "$f" ] || continue
+		k=${f##*/hold.}
+		echo "hold ${k%%.*} ${k#*.} $(cat "$f")"
 	done
 	for f in "$MEM"/deny.*; do
 		[ -r "$f" ] || continue
@@ -191,7 +198,10 @@ plan_once() {
 	grep ": MOVE " "$OUT.tmp" | while read -r l; do
 		k=$(echo "$l" | sed 's/^\([^ ]*\): MOVE \([^ ]*\) .* -> \([^ ]*\) .*/\1 \3/')
 		grep -qxF "$k" "$ST/proposed" 2>/dev/null && continue
+		# rule B lines say "closer to the controller"; A acts by default
 		if [ -e "$LIVE" ]; then logger -t easymesh-parent-plan "proposed $l"
+		elif [ ! -e "$RESCUE_OFF" ] && ! echo "$l" | grep -q "closer to the controller"; then
+			logger -t easymesh-parent-plan "proposed $l"
 		else logger -t easymesh-parent-plan "would $l"; fi
 	done
 	mv "$ST/proposed.new" "$ST/proposed"
@@ -276,10 +286,13 @@ steer_once() {
 			case "$line" in
 			"HAND "*)
 				# asked for in LuCI: the user decided to try it, so a move
-				# that did not pay denies nothing - they may ask again
+				# that did not pay denies nothing for a day - they may ask
+				# again - but the planner does not propose that same pair
+				# for COOLDOWN
 				if [ "$v" = kept ]; then
 					logger -t easymesh-parent-plan "handkept ${line#HAND } - kept after a measured trial$m"
 				else
+					echo "$now" > "$MEM/hold.$child.$parent"
 					logger -t easymesh-parent-plan "handback ${line#HAND } - went back, it was not faster ($v)$m"
 				fi ;;
 			*)
@@ -291,29 +304,32 @@ steer_once() {
 				fi ;;
 			esac
 			trial_record "$v" "${_bu:+$_bu,$_bd}" "${_tu:+$_tu,$_td}"
-			echo "$now" > "$MEM/last.$child"
 			rm -f "$ST/running"; iperf_stop
 		elif [ $((now - started)) -gt "$TRIAL_MAX" ]; then
 			steer_log "trial $child -> $parent: no result after ${TRIAL_MAX}s ($r) - giving up"
 			trial_record timeout "" ""
-			echo "$now" > "$MEM/deny.$child.$parent"; echo "$now" > "$MEM/last.$child"
+			echo "$now" > "$MEM/deny.$child.$parent"
 			rm -f "$ST/running"; iperf_stop
 		fi
 		return 0
 	fi
 
-	[ -e "$LIVE" ] || return 0
+	[ -e "$RESCUE_OFF" ] && [ ! -e "$LIVE" ] && return 0
 	[ -s "$ST/ripe" ] || return 0
 
 	# 2. the ripe move with the largest gain; the awk already applied the
-	#    streak, cooldown and deny
-	read -r child parent target cur new pct < "$ST/ripe"
+	#    streak, cooldown and deny. Without the danger zone only a rescue (A).
+	if [ -e "$LIVE" ]; then pick=$(head -1 "$ST/ripe")
+	else pick=$(awk '$7 == "A"' "$ST/ripe" | head -1); fi
+	[ -n "$pick" ] || return 0
+	# shellcheck disable=SC2086
+	set -- $pick; child=$1 parent=$2 target=$3 cur=$4 new=$5 pct=$6
 	line=$(grep "^$child: MOVE " "$OUT" | head -1)
 	ip=$(ip_of "$child")
 	ctrl_ip=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }')
 	[ -n "$target" ] && [ -n "$ip" ] && [ -n "$ctrl_ip" ] || {
 		steer_log "cannot try $child -> $parent: target '$target' ip '$ip' controller '$ctrl_ip'"
-		echo "$now" > "$MEM/last.$child"
+		echo "$now" > "$MEM/hold.$child.$parent"
 		return 0
 	}
 	iperf3 -s -p 5203 -D --pidfile "$IPERF_PIDF" 2>/dev/null
@@ -327,7 +343,7 @@ steer_once() {
 		logger -t easymesh-parent-plan "trying $line"
 	else
 		steer_log "trial for $child refused: $r"
-		iperf_stop; echo "$now" > "$MEM/last.$child"
+		iperf_stop; echo "$now" > "$MEM/hold.$child.$parent"
 	fi
 	return 0
 }

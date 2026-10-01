@@ -1595,8 +1595,9 @@ call)
 		# live planner - review, 2026-09-29). The names are LuCI's business.
 		need_db_or_proxy parent_plan || exit 0
 		pf=/tmp/easymesh/parent-plan.txt
-		printf '{"live":%s,"running":"%s","age_s":%s,"nodes":[' \
+		printf '{"live":%s,"rescue":%s,"running":"%s","age_s":%s,"nodes":[' \
 			"$([ -e /etc/mapc/parent-steer-live ] && echo true || echo false)" \
+			"$([ -e /etc/mapc/parent-rescue-off ] && echo false || echo true)" \
 			"$(cut -d' ' -f1 /tmp/easymesh/parent-steer/running 2>/dev/null | head -1)" \
 			"$([ -e "$pf" ] && echo $(( $(date +%s) - $(date -r "$pf" +%s) )) || echo null)"
 		[ -e "$pf" ] && grep -v '^#' "$pf" | awk '
@@ -1729,10 +1730,10 @@ call)
 		case "$(echo "$input" | jsonfilter -e '@.live' 2>/dev/null)" in
 		true|1)
 			mkdir -p /etc/mapc && touch /etc/mapc/parent-steer-live
-			logger -t easymesh-parent-plan "the planner was switched on in LuCI - it moves boxes now, one measured trial at a time" ;;
+			logger -t easymesh-parent-plan "the danger zone was switched on in LuCI - the planner also moves boxes towards the main box now, one measured trial at a time" ;;
 		false|0)
 			rm -f /etc/mapc/parent-steer-live
-			logger -t easymesh-parent-plan "the planner was switched off in LuCI - it only writes down what it would do" ;;
+			logger -t easymesh-parent-plan "the danger zone was switched off in LuCI - only a box on a bad path is moved" ;;
 		*)
 			echo '{"error":"live: expected true or false"}'; exit 0 ;;
 		esac

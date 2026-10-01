@@ -266,7 +266,9 @@ return view.extend({
 				? E('div', { 'style': 'font-weight:bold;color:' + WARN },
 				    _('The planner has not reported for %d min - what follows is old.').format(Math.floor(plan.age_s / 60))) : '';
 			/* the switch: off by default, since every move costs the box and
-			 * the boxes behind it a few seconds and a minute of measuring */
+			 * the boxes behind it a few seconds and a minute of measuring.
+			 * Since 2026-10-01 it covers the tidy-up (rule B) only; the
+			 * rescue of a box on a bad path (rule A) runs by default. */
 			var sw = E('button', { 'class': 'cbi-button', 'style': 'margin-left:8px' },
 				plan.live ? _('Switch off') : _('Switch on'));
 			sw.addEventListener('click', function() {
@@ -276,16 +278,19 @@ return view.extend({
 			/* a danger zone, as the word is used elsewhere: a switch that
 			 * trades moments of connectivity for faster paths */
 			var danger = E('div', { 'style': 'border:1px solid ' + BAD + ';border-radius:6px;padding:8px 12px;margin:6px 0 8px;max-width:760px' }, [
-				E('strong', { 'style': 'color:' + BAD }, _('Danger zone')), ' — ', _('automatic moves'), sw, E('br'),
+				E('strong', { 'style': 'color:' + BAD }, _('Danger zone')), ' — ', _('moves towards the main box'), sw, E('br'),
 				E('span', {}, plan.live
-					? _('On: the planner moves a box when it is clearly better elsewhere. Each move takes that box and every box behind it off the mesh for a few seconds (one to three minutes if the new parent does not answer), and measuring runs about three minutes of test traffic.')
-					: _('Off (default): it only writes down what it would do. Your devices are never moved for speed.')),
+					? _('On: besides rescuing a box on a bad path, the planner also moves a box to a parent closer to the main box when that is clearly better. Each move takes that box and every box behind it off the mesh for a few seconds (one to three minutes if the new parent does not answer), and measuring runs about three minutes of test traffic.')
+					: _('Off (default): only a box on a path under about 100 Mbit/s is moved - the rescue below. Nothing is moved for speed alone.')),
 				E('br'), E('span', { 'style': 'font-size:12px;color:' + WARN },
 					_('Switching it off does not undo the moves it made - put a box back with "Move…" in the table above.'))
 			]);
-			return E('p', {}, [ E('strong', {}, _('3. Choosing the parent')), ' — ', mode(plan.live), E('br'),
+			return E('p', {}, [ E('strong', {}, _('3. Choosing the parent')), ' — ',
+				E('span', { 'style': 'font-weight:bold;color:' + (plan.rescue !== false ? OK : WARN) },
+					plan.rescue !== false ? _('rescue on') : _('rescue off')),
+				', ', _('towards the main box:'), ' ', mode(plan.live), E('br'),
 				danger,
-				_('A box is moved to another parent when its path is bad (under about 100 Mbit/s) and another parent is at least twice as good, or when a parent one hop closer to the main box is at least 1.5 times as good. Every move is a measured trial: throughput before and after, and a move that does not pay is undone.'),
+				_('Rescue (on by default): a box whose path is bad (under about 100 Mbit/s) is moved when another parent is at least twice as good. With the danger zone on, a box is also moved when a parent one hop closer to the main box is at least 1.5 times as good. Every move is a measured trial: throughput before and after, and a move that does not pay is undone.'),
 				stale,
 				items.length ? E('ul', { 'style': 'margin:4px 0 0 18px' }, items)
 				             : E('div', { 'style': 'opacity:.75' }, _('The planner has not reported yet.')),

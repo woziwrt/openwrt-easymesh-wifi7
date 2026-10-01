@@ -151,13 +151,14 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 - ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients, ~11 s outage
   <!-- TODO: ✅ only if the 11 s is measured on RC3, otherwise 🧪 -->
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
-- 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules - its path is
-  bad (under ~100 Mbit/s) and another parent is at least twice as good, or another parent one hop closer to the
-  controller is at least 1.5 times as good. Every move is a measured trial on the box itself (throughput before and
-  after, three rounds each) and is kept only if it paid; otherwise the box goes back on its own. One trial in the mesh
-  at a time. In a test after a controller restart, three moves brought a relay from 26/47 to 1044/1143 Mbit/s
-  (up/down). **Off by default** (it only logs what it would do) - see
+- 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules. **Rescue,
+  on by default:** its path is bad (under ~100 Mbit/s) and another parent is at least twice as good. **Towards the main
+  box, off by default (danger zone):** another parent one hop closer to the controller is at least 1.5 times as good.
+  Every move is a measured trial on the box itself (throughput before and after, three rounds each) and is kept only if
+  it paid; otherwise the box goes back on its own. One trial in the mesh at a time. In a test after a controller
+  restart, three moves brought a relay from 26/47 to 1044/1143 Mbit/s (up/down) - see
   [What the mesh does by itself](#what-the-mesh-does-by-itself).
+  <!-- TODO: add the measured rescue of 1. 10. (children of a moved relay at 6 and 3 Mbit/s) once it has run -->
 - ✅ **No island when a relay reboots:** a box that has lost its path to the controller stops accepting other boxes on
   its backhaul at once and drops the ones it had, so two children of a rebooting relay cannot join each other
 - ✅ **Wi-Fi for clients stays up while a backhaul moves:** a backhaul that lost its parent keeps the box's access
@@ -203,7 +204,8 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 ## What the mesh does by itself
 
-What matters most is that your devices stay online, so nothing moves a box on its own unless you switch it on:
+What matters most is that your devices stay online, so nothing moves a box for speed alone unless you switch it on.
+The one exception is a box left on a path under about 100 Mbit/s - that is moved, with a measured trial:
 
 | Mechanism | By default | What it does | What it costs |
 |---|---|---|---|
@@ -211,7 +213,8 @@ What matters most is that your devices stay online, so nothing moves a box on it
 | No island ([details](docs/TECHNICAL.md#self-healing-and-optimisation)) | on | a box without a path to the main box stops accepting others at once | nothing |
 | Bridges follow a moved box | on | every box forgets its learned bridge entries when the tree changes | nothing noticeable |
 | Moving a box by hand | when you ask | *Backhaul & MLO* → *Move…* next to a box: pick a parent it hears; a measured trial keeps the move only if it is faster, otherwise the box goes back by itself | a few seconds for the box and the boxes behind it; one to three minutes if the new parent does not answer; about three minutes of test traffic |
-| Parent planner | **off** (logs only) | moves a box to a clearly better parent, one measured trial at a time | as a move by hand, whenever it decides to |
+| Rescue of a box on a bad path | **on** | a box on a path under ~100 Mbit/s moves to a parent at least twice as good, one measured trial at a time; back if it did not pay | as a move by hand, only while a box is that slow |
+| Parent planner: towards the main box (danger zone) | **off** (logs only) | also moves a box to a parent one hop closer to the main box when that is clearly better | as a move by hand, whenever it decides to |
 | Stuck-box rescue | **off** (logs only) | a box that loses most pings to the main box moves to a parent at least 10 dB stronger, and goes back if that does not work | a few seconds, or one to three minutes if the new place does not answer |
 | Deaf-link guard | **off** (logs only) | a box whose parent's beacons are all gone reconnects | the box and the boxes behind it drop for a moment |
 | TTLM rules (band steering of the backhaul) | **off** (logs only) | moves traffic of a backhaul link to its better band | nothing noticeable |
@@ -252,12 +255,13 @@ This is a preview. What is not done yet, or not done well:
 - **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
 - **Every move costs a moment of connectivity.** When a box is moved - by hand or by the planner - that box and the
   boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
-  trial loads that branch with test traffic for about three minutes while it measures. That is why nothing moves boxes
-  on its own by default.
+  trial loads that branch with test traffic for about three minutes while it measures. That is why, by default, only a
+  box on a path under about 100 Mbit/s is moved (`touch /etc/mapc/parent-rescue-off` on the main box stops even that).
 - **After pairing, a power cut or a restart of the main box, the tree follows the radio, not the floor plan.** The tree
   is whoever answers first: a box may hang behind a box with a weaker card, or one hop further from the main box than it
   needs to be. **It can look illogical - we know, and arranging the tree from measured links comes in a later release**
-  (see *Planned*). The mesh works, some paths are slower. Until then, put a box where you want it with *Move…*.
+  (see *Planned*). The mesh works, some paths are slower; a box left under about 100 Mbit/s is rescued by itself. Until
+  then, put a box where you want it with *Move…*.
 - **Not understood yet, with a defence in place:** after pairing from a blank card, a box sometimes cannot authenticate
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. The box restarts once by itself during
   pairing, which clears it in our tests. Why the 6 GHz authentication fails is still open.

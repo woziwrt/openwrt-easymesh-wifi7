@@ -94,7 +94,8 @@
 #   X alive <almac> <since>                      previous state
 #   X par <child> <parent> <since>
 #   X streak <child> <count> <first-ts>
-#   cool <child> <ts-of-last-trial>
+#   hold <child> <parent> <ts>                   that pair tried by hand and not kept,
+#                                                or a trial that could not be started
 #   deny <child> <parent> <ts>
 # band: 2 = 5 GHz, 8 = 6 GHz (libwifi enum wifi_band).
 
@@ -225,7 +226,7 @@ $1 == "S" {
 $1 == "X" && $2 == "alive"  { oalive[$3] = $4; next }
 $1 == "X" && $2 == "par"    { opar[$3] = $4; opsince[$3] = $5; next }
 $1 == "X" && $2 == "streak" { ocnt[$3] = $4; ofirst[$3] = $5; next }
-$1 == "cool" { cool[$2] = $3; next }
+$1 == "hold" { hpair[$2, $3] = $4; next }
 $1 == "deny" { deny[$2, $3] = $4; next }
 
 END {
@@ -301,6 +302,15 @@ END {
 			if (p != root && (!(p in alive) || !conn[p])) { notes = notes sprintf("; %s refused: no path to the controller", p); continue }
 			if (isbelow(p, n)) { notes = notes sprintf("; %s refused: it is below %s", p, n); continue }
 			if (((n, p) in deny) && now - deny[n, p] < denys) { notes = notes sprintf("; %s refused: trial failed %d s ago", p, now - deny[n, p]); continue }
+			# A cooldown per PAIR, and only after a pair that did not
+			# work. Until 2026-10-01 it was per node and written by every
+			# trial, kept ones and hand ones included: after a relay was
+			# moved by hand its children landed on parents at 6 and
+			# 3 Mbit/s, and the planner, which saw the right parent at
+			# +2000 %, had to wait an hour because of THEIR earlier,
+			# successful trials. A kept trial is no evidence against
+			# anything.
+			if (((n, p) in hpair) && now - hpair[n, p] < cooldown) { notes = notes sprintf("; %s not again yet: tried %d s ago", p, now - hpair[n, p]); continue }
 			if (p != root && now - asince[p] < stable) { notes = notes sprintf("; %s not yet: up only %d s", p, now - asince[p]); continue }
 			pe = estphy(n, p)
 			c = hopcost(pe) + pc[p]; if (c > INF) c = INF
@@ -337,17 +347,15 @@ END {
 		cnt = (n in ocnt) ? ocnt[n] + 1 : 1
 		first = (n in ofirst) ? ofirst[n] : now
 		printf "X streak %s %d %d\n", n, cnt, first > statef
-		why = sprintf("%+d %% path estimate%s", pct, ruleb ? ", closer to the controller" : "")
+		# A is the rescue (on by default), B the tidy-up (danger zone)
+		rulea = (cur < badpath && bt >= cur * (1 + need / 100) && bt - cur >= mingain)
+		why = sprintf("%+d %% path estimate%s", pct, rulea ? "" : ", closer to the controller")
 		if (cnt < streak || now - first < hold) {
 			printf "%s: wait %s -> %s: %s (seen %d/%d runs, %d s)\n", n, curtxt, besttxt, why, cnt, streak, now - first
 			continue
 		}
-		if ((n in cool) && now - cool[n] < cooldown) {
-			printf "%s: hold %s -> %s: %s - cooldown, last trial %d s ago\n", n, curtxt, besttxt, why, now - cool[n]
-			continue
-		}
 		printf "%s: MOVE %s -> %s: %s (seen %d runs)\n", n, curtxt, besttxt, why, cnt
-		printf "%s %s %s %d %d %d\n", n, best, mldof[best], cur, bt, pct > ripef
+		printf "%s %s %s %d %d %d %s\n", n, best, mldof[best], cur, bt, pct, (rulea ? "A" : "B") > ripef
 		moves++
 	}
 	printf "# %d move(s) proposed\n", moves

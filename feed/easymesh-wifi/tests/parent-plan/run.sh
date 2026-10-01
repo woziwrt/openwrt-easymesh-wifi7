@@ -255,12 +255,19 @@ plan
 ! has "kitchen: MOVE .* -> corridor" && has "^kitchen: .*corridor refused: trial failed 3600 s ago"
 ok $? "denied parent is not proposed again within 24 h"
 
-# 9. Cooldown after a trial.
+# 9. Cooldown per pair, only after a pair that did not work (2026-10-01):
+#    a hand trial of kitchen -> corridor that went back holds that pair, a
+#    kept trial (a stale per-node last.* file of the old scheme) holds nothing.
 newcase "cooldown" stuck.sql
+echo $((NOW0 - 600)) > "$C/mem/hold.02:00:00:00:00:04.02:00:00:00:00:02"
+plan
+! has "kitchen: MOVE .* -> corridor" && has "^kitchen: .*corridor not again yet: tried 600 s ago"
+ok $? "a pair tried by hand and not kept is not proposed again within the cooldown"
+newcase "no cooldown after a kept trial" stuck.sql
 echo $((NOW0 - 600)) > "$C/mem/last.02:00:00:00:00:04"
 plan
-has "^kitchen: hold controller .* -> corridor .* cooldown, last trial 600 s ago" && ! has "^kitchen: MOVE"
-ok $? "no second move within the cooldown"
+has "^kitchen: MOVE controller .* -> corridor"
+ok $? "an earlier trial of the node holds nothing - a rescue goes at once"
 
 # 10. corridor comes back after a power cut; kitchen and hall saved
 #     themselves onto the controller long ago. With the real STABLE_S,
@@ -284,7 +291,7 @@ while [ $t -le 600 ]; do
 	refresh 60; t=$((t + 60))
 done
 unset STREAK HOLD_S STABLE_S
-nlog=$(names < "$LOGF" | grep -c "would kitchen: MOVE")
+nlog=$(names < "$LOGF" | grep -cE "(would|proposed) kitchen: MOVE")
 echo "      first MOVE for kitchen at t+${first:-never} s, logged $nlog x"
 [ "$early" = 0 ] && [ -n "$first" ] && [ "$first" -ge 300 ] && [ "$nlog" = 1 ]
 ok $? "children return only after the box is stable, after the streak, logged once"
