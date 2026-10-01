@@ -1,4 +1,4 @@
-# Installers (imported, not adapted yet)
+# Installers
 
 Imported on 2026-10-01 unchanged from `woziwrt/bpi-r4-deploy`, the scripts its releases ship:
 
@@ -11,3 +11,14 @@ The path they describe: a rescue SD card boots, `install-nand*.sh` writes a lean
 NAND (SD and eMMC share one controller, so eMMC can only be written from NAND), and `install-emmc*.sh` / `install-nvme*.sh`
 write the real image there. Still to do before they serve this repository: download from this repository's releases,
 our image names (`.bin.gz`), only our three boards, and an NVMe image the build does not produce yet.
+
+## Status (2026-10-01)
+
+| script | adapted to this repository | tested on hardware |
+|---|---|---|
+| `r4/install-emmc.sh` | yes - release of this repo, board by memory, SHA256SUMS | not yet |
+| `pro-8x/install-emmc-pro8x.sh` | yes - release of this repo, board check, SHA256SUMS | not yet |
+| `r4/install-nand.sh`, `pro-8x/install-nand-pro8x.sh` | no - they install the lean NAND helper from bpi-r4-deploy, which is what they should keep doing | - |
+| `r4/install-nvme.sh`, `pro-8x/install-nvme-pro8x.sh`, `pro-8x/boot-nvme` | no - the build does not produce an NVMe image yet | - |
+
+Until these are tested, the release supports the SD card only.
