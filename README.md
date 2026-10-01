@@ -1,9 +1,15 @@
 # EasyMesh Wi-Fi 7 for OpenWrt
 
-**A Wi-Fi 7 mesh built from open-source routers that decides by itself which way the traffic flows.**
+**A Wi-Fi 7 mesh built from open-source routers, whose main box can steer which band each backhaul link carries.**
 
 > **Pre-release (v0.1-preview, <!-- TODO date -->).** It runs every day on a five-box lab, but it is not a product yet.
 > We publish it early for reviewers and testers. Please read [Known limitations](#known-limitations) before you flash anything.
+>
+> **Everything here takes time - give it that time.** Pairing one box takes about 4-6 minutes including one restart
+> (longer on the Pro 8X), a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
+> a box joins, its lamp may go dark. **Do not press any button twice:** a second press cancels the pairing. Pairing a
+> five-box mesh takes about half an hour - enough time for a beer or two. Just don't press any button twice while you wait.
+<!-- TODO: check the times against the RC3 pairing (30. 9.: hall-kitchen WPS 17:38 -> done 17:43, Pro 8X 17:53 -> 18:02) -->
 
 ![Overview: the mesh at a glance](docs/screenshots/overview.jpg)
 <!-- TODO: retake all screenshots on the release images; ideally one short GIF where traffic moves to the other link -->
@@ -11,12 +17,13 @@
 ## What it does
 
 - **One button to add a box.** Press *Pair a new box* on the main box (or its WPS button), then hold the WPS button on
-  the new box. The new box joins the mesh, gets its settings and a name, and does not need to reboot.
+  the new box. The new box joins the mesh, gets its settings and a name, and restarts once by itself while it joins.
 - **Wi-Fi 7 multi-link backhaul.** Every box talks to its parent over two links at once (5 GHz and 6 GHz, MLO). The main
   box (the EasyMesh *controller*) can tell each backhaul link which band carries which traffic
   (*TID-to-Link Mapping*, TTLM) based on the shape of the whole mesh, not on one radio's view.
 - **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup. The
   mesh keeps one gateway address for all clients. When the cable is pulled, clients are back online in about 11 seconds.
+  <!-- TODO: the 11 s is not backed by a night measurement yet - measure on RC3 or drop the number -->
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
   It also points out a radio card that is noisier than the others, so a slow link is not blamed on the mesh.
 
@@ -59,6 +66,8 @@ The image starts with the Wi-Fi country set to **CZ** (Czech Republic). If you a
 ### 2. The first box becomes the main box (controller)
 Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
 Pro 8X) - and open `http://192.168.1.1`.
+<!-- TODO (Petr 29. 9.): rewrite to "connect the computer to the service port from the start - the page then stays at
+192.168.1.1 and nothing disappears" - only after it is verified on a fresh box -->
 Go to *Network → EasyMesh → Setup* and click **This is my first box**. Enter the network name, the Wi-Fi password and a
 name for the box. Leave *Mesh addresses* at `10.10.10.1` unless your home network already uses `10.10.10.x`; it must not
 be `192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
@@ -71,6 +80,12 @@ as that box has joined. The main box keeps one socket as a [service port](#the-s
 at `192.168.1.1`.
 
 ### 3. Add the other boxes, one at a time
+**One box at a time, nearest first.** Pair a box only when the one before it is in the picture (*Overview* / *Nodes*).
+Pressing the buttons of several boxes at once gives a bad result. Start with the box closest to the main box and work
+outwards: a far box paired before the boxes between it and the main box gets its settings, but has nothing to attach its
+5/6 GHz links to yet. That is not a fault - it keeps trying and joins by itself once the box in between is in the mesh.
+For a place far from everything, pair the box next to the main box, switch it off, carry it there and switch it on.
+
 Put the new box where it is meant to stand. For now it has to be within Wi-Fi reach of the **main box**: pairing is
 opened there. Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X). Then:
 
@@ -81,9 +96,11 @@ opened there. Power the box on and wait until it has booted (about 2 minutes, 5 
 A short press does not pair: the main box ignores it, and on a BPI-R4 that is not the main box it restarts it. The other order
 (new box first) works too, but leaves only about three minutes.
 
-The new box joins on its own in about four minutes, with nothing to type in, and restarts once by itself only if
-something does not come up. It takes the Wi-Fi settings from the main box and appears in *Overview* and *Nodes*. Then
-add the next one.
+The new box joins on its own in about four to six minutes, with nothing to type in, and restarts once by itself on the
+way (that restart is expected, not a fault). It takes the Wi-Fi settings from the main box and appears in *Overview* and
+*Nodes*. Then add the next one. Wait until it is there before you pair the next box, and do not press its button again
+in the meantime: a second press cancels the pairing.
+<!-- TODO RC3 (a): keep in line with the LuCI overview/setup texts about the restart -->
 
 ### 4. Check that it works
 - *Overview* says **"Mesh is working"**, all boxes are online, every link is healthy.
@@ -95,8 +112,9 @@ add the next one.
 - **A thick line with nothing of yours running is a measurement.** A trial move (yours, or the planner's when it is
   on) measures the throughput of a box before and after, about three minutes of traffic on that branch; *Events* says
   which box and why.
-- If a box does not appear after five minutes, pair it again: *Pair a new box* on the main box, then hold the new box's
-  button 4 to 8 seconds and let go.
+- If a box does not appear after fifteen minutes (or *Overview* says it has not finished), pair it again: *Pair a new
+  box* on the main box, then hold the new box's button 4 to 8 seconds and let go. Not earlier - a second press cancels a
+  pairing that is still running.
 - To start a box over, hold its button **10 seconds**: that erases its settings (writing its SD card again does the
   same). There is one main box per mesh; if you made a second one by mistake, start that one over and pair it.
 
@@ -110,7 +128,8 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 | BPI-R4 (4 GB, 8 GB) | **LAN3** |
 | BPI-R4 Pro 8X | **LAN1** (`mxl_lan0`) |
 
-- **No DHCP on it.** Give your computer a fixed address, e.g. `192.168.1.2`, mask `255.255.255.0`, no gateway.
+- **The box gives your computer an address there** (no gateway, no DNS, so your computer keeps its internet from
+  elsewhere). A fixed address such as `192.168.1.2`, mask `255.255.255.0`, no gateway, works too.
 - It is a way in, not a way out: no internet and no mesh traffic go through it.
 - **Every box has the same address there.** Connect the service port of one box at a time, straight to your computer,
   never to a switch or to another box. Tell the boxes apart by the name in the web interface, not by the address.
@@ -123,14 +142,14 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 
 - ✅ **EasyMesh R6 controller and agents** on OpenWrt 25.12 with the open mt76 driver, on BPI-R4 and BPI-R4 Pro 8X
 - ✅ **Multi-link (MLO) backhaul** on 5 + 6 GHz between every box and its parent, relayed over several hops
-- ✅ **One-button join** (WPS) without a reboot, with one guarded reboot as a fallback. A whole mesh can be built from
-  blank SD cards.
+- ✅ **One-button join** (WPS) with one restart of the new box on the way. A whole mesh can be built from blank SD cards.
 - ✅ **Per-station TTLM driven by the controller:** the controller maps traffic of one backhaul link to one band, in
   both directions, and removes the mapping again
 - 🧪 **Automatic TTLM policy:** avoiding a bad link, and alternating bands across a repeater (+70 % across one repeater, 2 hops,
   downloads, in one test series). Runs as a dry run by default.
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
 - ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients, ~11 s outage
+  <!-- TODO: ✅ only if the 11 s is measured on RC3, otherwise 🧪 -->
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
 - 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules - its path is
   bad (under ~100 Mbit/s) and another parent is at least twice as good, or another parent one hop closer to the
@@ -177,6 +196,10 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 - **Radar channels (DFS)** as an option, and channel suggestions from scans
 - **Onboarding with DPP (Easy Connect)**
 - **Capacity in the UI:** measured maximum of each link, not only the current traffic
+- **Installing to eMMC, NAND or NVMe,** once the mesh itself is stable. This pre-release runs from SD only.
+  <!-- TODO: link bpi-r4-deploy here only after its install menus stop offering the removed release-pro-8x-unifi -->
+- **Arranging the tree from measured links:** the first parent after a start chosen from scans, one measuring method for
+  all decisions, a trial move without test traffic, and *Try it → Possible → Confirm* for a move by hand
 - **Packages instead of images:** install on an existing OpenWrt 25.12 box, with a setup wizard
 - **Upstream:** send our driver and hostapd fixes to their maintainers, patch by patch
 
@@ -195,14 +218,17 @@ What matters most is that your devices stay online, so nothing moves a box on it
 | Deaf-link guard | **off** (logs only) | a box whose parent's beacons are all gone reconnects | the box and the boxes behind it drop for a moment |
 | TTLM rules (band steering of the backhaul) | **off** (logs only) | moves traffic of a backhaul link to its better band | nothing noticeable |
 
-**The planner is switched in its Danger zone** on *Backhaul & MLO* (or `touch /etc/mapc/parent-steer-live` on the main
-box). The name is meant: once it is on, the mesh may keep rearranging itself for an undetermined time, and switching it
-off again does not undo the moves it made - put a box back with *Move…*. What it decides, and what it would do while
-off, is in *Backhaul & MLO* and *Events*. The rescue and the deaf-link guard are switched on the boxes with
+**Danger zone.** The switch on *Backhaul & MLO* (or `touch /etc/mapc/parent-steer-live` on the main box) turns on
+optimisation algorithms that are still in development. They can arrange the mesh into an illogical topology - a box
+under a parent further away than it needs, or a relay hanging below a box it should be serving. Switching them off
+again does not restore the previous topology: the correct tree can then only be restored by moving boxes by hand with
+*Move…*. What the planner decides, and what it would do while off, is in *Backhaul & MLO* and *Events*. The rescue and
+the deaf-link guard are switched on the boxes with
 `touch /etc/mapc/bh-rescue-live` and `touch /etc/mapc/deaf-guard-live`.
 
 **How long things take** (measured in our lab):
-- a new box joins and carries traffic about four minutes after you pair it;
+- a new box joins and carries traffic about four to six minutes after you pair it, including its one restart (longer
+  on the Pro 8X);
 - after a power cut of the whole mesh, it is working again about three minutes after the boxes have booted;
 - when one box restarts, the boxes behind it find another parent within 5-30 seconds;
 - a move by hand is decided in about three to four minutes;
@@ -218,9 +244,11 @@ This is a preview. What is not done yet, or not done well:
 - **The parent planner is deliberately simple.** It corrects parents that are plainly wrong and leaves near-ties
   alone. It estimates a box's own first hop from signal, which can be far off for a noisy card, and it plans toward
   the controller, not toward whichever box currently holds the internet uplink (see *Planned*).
-- **Some BE14 cards are noisier than others** (7–13 dB on the same channel in our lab). On such a card, the box's own
-  5 GHz beacon can briefly deafen its 6 GHz receiver. The mesh detects these cards and shows them in *Nodes*. A mitigation
-  is being tested. Such a box does best at the end of a chain.
+- **BE14 cards differ, so measure yours.** Some are noisier than others (7–13 dB on the same channel in our lab), and
+  on one of our cards the 6 GHz link runs on a single stream at a low rate where the others run on two. On such a card,
+  the box's own 5 GHz beacon can briefly deafen its 6 GHz receiver. The mesh detects noisy cards and shows them in
+  *Nodes*; `easymesh-card-check` on a box measures its card. A mitigation is being tested. Such a box does best at the
+  end of a chain. These are measurements of the few cards we have, not a statement about the cards in general.
 - **EasyMesh Profile 3 without message security.** DPP onboarding and 1905 encryption are not implemented. Onboarding is
   WPS push-button. The backhaul links themselves are encrypted Wi-Fi (WPA3). <!-- TODO verify SAE on release image -->
 - **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
@@ -228,10 +256,19 @@ This is a preview. What is not done yet, or not done well:
   boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
   trial loads that branch with test traffic for about three minutes while it measures. That is why nothing moves boxes
   on its own by default.
-- **After the main box restarts, the tree follows the radio, not the floor plan.** Each box reconnects to the parent it
-  hears best at that moment, which can be a box further from the main box than it needs to be. The mesh works, some
-  paths are slower. With the planner off, it stays that way until the next reconnection, or until you move a box by
-  hand.
+- **After pairing, a power cut or a restart of the main box, the tree follows the radio, not the floor plan.** The tree
+  is whoever answers first: a box may hang behind a box with a weaker card, or one hop further from the main box than it
+  needs to be. **It can look illogical - we know, and arranging the tree from measured links comes in a later release**
+  (see *Planned*). The mesh works, some paths are slower. Until then, put a box where you want it with *Move…*.
+- **Not understood yet, with a defence in place:** after pairing from a blank card, a box sometimes cannot authenticate
+  over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. The box restarts once by itself during
+  pairing, which clears it in our tests. Why the 6 GHz authentication fails is still open.
+  <!-- TODO: add the 599 s timer here once we can say in one sentence what it is; result of the corridor test 1. 10. -->
+- **Sometimes the Wi-Fi card does not start.** Now and then the MT7996 firmware fails to load at boot
+  (`Failed to start patch` / `probe failed -11` in the kernel log) and the box runs without Wi-Fi. A restart does not
+  help: **switch the power off for 30 seconds.** The Pro 8X cannot reset its Wi-Fi card from software. You notice it
+  because the box does not come back into *Nodes*, and on its service port *Network → Wireless* shows no radios.
+  <!-- TODO: verify both signs on a box in that state; add what the lamp does, if anything -->
 - **A box that lost one of its two backhaul links keeps going on one.** The mesh does not reconnect it to get the
   second link back on purpose: a reconnection takes the box and every box behind it off the mesh for up to a minute.
 - **The controller database lives on the boot medium.** On a slow SD card, a large database write can stall the box for
@@ -252,18 +289,26 @@ Built on the work of others, and we say exactly where the line runs:
 
 **Our claim, stated precisely:** as far as we could find (search of public code and papers, September 2026), this is the
 first **publicly documented, hardware-measured** EasyMesh controller that **drives TID-to-Link Mapping of backhaul links
-according to the mesh topology, on a fully open stack.** The TTLM actuator in the driver is MediaTek's; the decision and
+according to the mesh topology, on an open-source stack** (open mt76 driver, hostapd and EasyMesh stack; the Wi-Fi
+firmware is MediaTek's binary). The TTLM actuator in the driver is MediaTek's; the decision and
 its delivery over EasyMesh (IEEE 1905, *Service Prioritization Request*) are ours. We do **not** claim to have invented TTLM
 or controller-driven link mapping. The idea is in the EasyMesh specification, and closed implementations may exist.
 How to check the claim yourself: [docs/TECHNICAL.md → Verifying](docs/TECHNICAL.md#verifying-the-claim).
 
 ## For reviewers
 
+Written for three groups: **BPI-R4 users on OpenWrt** (images, the install steps, what works and what does not),
+**Banana Pi / Sinovoip** (Wi-Fi 7 mesh on their boards on an open stack, and how cards and boards measured in our lab),
+and **Wi-Fi driver, hostapd and EasyMesh developers** (patches, messages, measurements).
+
 - **Wi-Fi driver, hostapd and EasyMesh people:** the architecture, the messages we use, where we deviate from the
   specification and the measurements are in [docs/TECHNICAL.md](docs/TECHNICAL.md); every patch below the EasyMesh layer
   is listed in [docs/PATCHES.md](docs/PATCHES.md). Review of single patches is very welcome.
 - **Testers:** a report with two boxes is already useful. Please attach the output of `easymesh-check` and a screenshot of
-  *Nodes*.
+  *Nodes*. Issues are welcome; this is one person's project and they are answered when time allows - there is no support.
+
+<!-- TODO "Open questions" section: only what is proven in a layer below ours (reproducer on plain mt76/hostapd, link to
+night data), worded neutrally - not "for MediaTek". Nothing from tests against other vendors' boxes. -->
 
 ## Building from source
 
