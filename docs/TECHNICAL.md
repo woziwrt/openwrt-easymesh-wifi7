@@ -105,16 +105,153 @@ itself, and optimises only when the user asks for it.
   stronger, the node moves there with `easymesh-bh-trial` (no measurement) and goes back if the controller cannot be
   reached from there. Never within 5 min of boot or 2 min of a parent change, at most once per 10 min; a target that
   could not carry us is not tried again for an hour.
-- **Parent planner (`easymesh-parent-plan`, off by default).** On the controller, every 5 min, from the database:
-  rule A - the path is bad (estimated under 100 Mbit/s) and another parent is at least twice as good; rule B - a parent
-  one hop closer to the controller is at least 1.5 times as good. A proposal must hold for 3 runs after 5 min of
-  stability; then one measured trial (iperf3 to the controller, 3 x 10 s each way, before and after); kept only if no
-  direction lost more than 10 % and one gained at least 20 %, otherwise the node goes back by itself. At most one trial
-  in the mesh, one per node per hour, a failed pair denied for 24 h. Estimates of a node's own first hop come from
-  signal and can be far off on a noisy card. Switch: `/etc/mapc/parent-steer-live`.
+- **Parent planner (`easymesh-parent-plan`).** On the controller, every 5 min, from the database. Rule A, the
+  rescue, is on by default (`/etc/mapc/parent-rescue-off` switches it off): the path is bad (estimated under
+  100 Mbit/s) and another parent is at least twice as good. Rule B, the danger zone, is off by default
+  (`/etc/mapc/parent-steer-live` switches it on): a parent one hop closer to the controller is at least 1.5 times as
+  good. A proposal must hold for 3 runs after 5 min of stability; then one measured trial (iperf3 to the controller,
+  3 x 10 s each way, before and after); kept only if no direction lost more than 10 % and one gained at least 20 %,
+  otherwise the node goes back by itself. At most one trial in the mesh; a pair that failed waits an hour, and a pair
+  whose automatic trial failed is denied for 24 h. Estimates of a node's own first hop come from signal and can be far
+  off on a noisy card. The formulas, and why it cannot oscillate:
+  [Choosing the parent: the math](#choosing-the-parent-the-math).
 - **Missing backhaul link (`mld-bsta-relink`).** A backhaul MLD that came up on fewer links than configured is logged,
   not reconnected: a reassociation - even to the same parent - took the node and its subtree off the mesh for up to
   90 s in our tests, and an unpinned one can pick the node's own child as its parent (a loop).
+
+## Choosing the parent: the math
+
+This is what `easymesh-parent-plan` computes (`/usr/share/easymesh/parent-plan.awk`, run offline by
+`feed/easymesh-wifi/tests/parent-plan/run.sh`), written down as formulas. The constants are the defaults of the script;
+every one of them can be overridden from the environment. The last part is the planner we intend to build next, marked
+as such.
+
+### 1. One hop
+
+A backhaul hop has one leg per band. From the signal $s$ (dBm) a leg gets a PHY rate (Mbit/s, two spatial streams,
+80 MHz on 5 GHz, 320 MHz on 6 GHz). The thresholds are the minimum receiver sensitivities of IEEE 802.11ax/be, +3 dB per
+doubling of the bandwidth, capped at the best median we ever measured on a leg of the lab:
+
+| $s$ (5 GHz) | ≥ −58 | ≥ −59 | ≥ −60 | ≥ −64 | ≥ −68 | ≥ −71 | ≥ −73 | ≥ −76 | ≥ −82 | below |
+|---|---|---|---|---|---|---|---|---|---|---|
+| $R_5(s)$ | 720 | 648 | 576 | 432 | 288 | 216 | 144 | 72 | 17 | 0 |
+
+| $s$ (6 GHz) | ≥ −65 | ≥ −67 | ≥ −70 | ≥ −80 | below |
+|---|---|---|---|---|---|
+| $R_6(s)$ | 864 | 576 | 288 | 50 | 0 |
+
+The two legs of an MLO hop do not add up: both radios share the time of one station, and the weaker one adds about a
+quarter of its rate (measured 2026-09-25). The TCP throughput of the hop is a fixed fraction of that:
+
+```math
+P(v,p) = \max(R_5, R_6) + \mu \cdot \min(R_5, R_6), \qquad
+T(v,p) = \eta \cdot P(v,p), \qquad \mu = 0.25,\ \eta = 0.35
+```
+
+$\eta$ scales every hop alike and changes no decision; it only makes the numbers comparable with iperf3. A wired hop
+has $T = \infty$.
+
+### 2. A path
+
+Every box runs its access point on the channels of its own backhaul station, so the whole mesh shares one 5 GHz and
+one 6 GHz channel. A relay sends every bit once per hop, so what adds up along a path is **airtime per bit**, not
+throughput. The cost of a hop is $c = 1/T$, and for a node $v$ with parent $p(v)$:
+
+```math
+C(\text{root}) = 0, \qquad C(v) = C\big(p(v)\big) + \frac{1}{T\big(v, p(v)\big)}, \qquad
+\widehat{T}(v) = \frac{1}{C(v)}
+```
+
+So $\widehat{T}(v)$ is the harmonic composition of the hops: never above the weakest hop, two equal hops give half,
+three a third (measured: one hop 342 Mbit/s, two hops 153-172, 2026-09-25). Two properties follow directly and the
+planner relies on both:
+
+- **The subtree follows.** If a relay $v$ moves and its cost changes by $\Delta$, the cost of every node below it
+  changes by exactly the same $\Delta$. A move is judged on $v$ alone, and its children get the same gain for free.
+- **Like for like.** The hops *above* the node are the measured medians of their legs (`easymesh-linkstat`, the
+  backhaul station's receive rate). The node's **own** first hop is estimated from the signal for the current parent
+  and for every candidate alike. Comparing a measured current leg with an estimated candidate would let the more
+  optimistic instrument win every time - a planner that moves a node and then wants it back.
+
+### 3. Today's decision (rules A and B)
+
+For a node $v$ at depth $d(v)$ on parent $p$, every candidate $q$ it heard in its last scan is admissible only if $q$
+reaches the root, is not in the subtree of $v$ (no loop), has been up for 300 s, and the pair $(v,q)$ is neither in
+cooldown (1 h after a failed trial) nor denied (24 h). Then
+
+```math
+T_{\text{cur}} = \frac{1}{\hat c(v,p) + C(p)}, \qquad
+q^\ast = \arg\min_{q} \big(\hat c(v,q) + C(q)\big), \qquad
+T^\ast = \frac{1}{\hat c(v,q^\ast) + C(q^\ast)}
+```
+
+where $\hat c$ is the cost of the estimated first hop. With $g$ the required gain (1 for a leaf, 2 for a relay - a
+relay carries others), $g'$ the gain for a closer parent (0.5 leaf, 1 relay) and $m = 50$ Mbit/s:
+
+```math
+\textbf{A (rescue, on by default):}\quad T_{\text{cur}} < 100 \ \wedge\ T^\ast \ge (1+g)\,T_{\text{cur}} \ \wedge\ T^\ast - T_{\text{cur}} \ge m
+```
+```math
+\textbf{B (closer, danger zone):}\quad d(q^\ast) + 1 < d(v) \ \wedge\ T^\ast \ge (1+g')\,T_{\text{cur}} \ \wedge\ T^\ast - T_{\text{cur}} \ge m
+```
+
+A proposal is acted on only after it held in 3 consecutive runs (one run per 5 min) spanning at least 120 s, with $v$
+on its parent for at least 300 s, and at most one trial runs in the mesh at a time. The trial is measured, not
+estimated: iperf3 to the controller, the mean of 3 x 10 s each way, before ($u_0, d_0$) and after ($u_1, d_1$) the
+move. The move is kept if and only if
+
+```math
+u_1 \ge 0.9\,u_0 \ \wedge\ d_1 \ge 0.9\,d_0 \ \wedge\ \big(u_1 \ge 1.2\,u_0 \ \vee\ d_1 \ge 1.2\,d_0\big)
+```
+
+and otherwise the node goes back by itself.
+
+**Why it does not oscillate.** Take the costs as fixed for a moment and define the potential of a tree
+
+```math
+\Phi = \sum_{v} C(v)
+```
+
+Every move that rule A or B accepts lowers $C(v)$ by some $\Delta > 0$ (both demand $T^\ast > T_{\text{cur}}$), and by
+the subtree property it lowers the cost of each of the $|S(v)|$ nodes below $v$ by the same $\Delta$, and changes no
+other node. So every move lowers $\Phi$ by $\Delta\,(1 + |S(v)|) > 0$. There are finitely many trees and $\Phi$ only
+goes down, therefore the sequence of moves is finite: with fixed costs the planner always stops, in a tree where no
+node has a parent better by the required margin. The margins (at least ×2 for a rescue, ×3 for a relay) make the reverse
+move impossible on the same estimates: it would need $T_{\text{cur}} \ge 2\,T^\ast$ and $T^\ast \ge 2\,T_{\text{cur}}$
+at once.
+
+The costs are not fixed in reality - a signal moves by several dB in a minute and the estimate with it. That is what
+the streak, the measured verdict, the cooldown and the 24 h deny are for: they bound how often a noisy estimate can
+cost a move, they do not make the estimate right. On a noisy card the estimate of the first hop can be far off
+(see *Measurements*), and the measured trial is the only judge.
+
+### 4. Planned: the planner as a graph problem
+
+Not in this release. Today the planner looks at one node at a time and fixes what is plainly wrong. The next one
+looks at the whole mesh at once.
+
+Let $G = (V, E)$ be the graph of every box and every parent each box can hear, with the weight of an edge
+$w(v,q) = 1/T(v,q)$: measured where the pair has carried traffic, estimated from the signal where it has not. Because
+the cost of a path is a sum of non-negative weights, there is **one** tree that gives every node its cheapest path to
+the root at the same time - the shortest-path tree, found by Dijkstra's algorithm in $O(|E| + |V| \log |V|)$:
+
+```math
+C^\ast(v) = \min_{q \,:\, (v,q) \in E} \big( w(v,q) + C^\ast(q) \big), \qquad C^\ast(\text{root}) = 0
+```
+
+No node has to give anything up for another: $C^\ast(v) \le C(v)$ for every $v$ and every tree. The plan is the
+difference between the current tree and that one, and it is accepted only when it is worth what the moves cost:
+
+```math
+\Phi(\text{tree}^\ast) \le 0.8\ \Phi(\text{tree})
+```
+
+then carried out one measured move at a time, from the root down, so that every move already sees its parent on the
+final path. The root becomes the box that holds the active internet uplink, not necessarily the controller.
+
+What the model leaves out, honestly: a relay with several children splits its airtime among them, so the real cost of
+a hop depends on the load on it, and the minimum under load is no longer a shortest-path tree. We will start from the
+load-free tree, measure what is left, and only then decide whether the load needs to be in the model.
 
 ## Patches below EasyMesh
 

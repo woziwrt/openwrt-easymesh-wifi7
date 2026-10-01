@@ -206,6 +206,8 @@ the main box last, one at a time, and wait until each is back in *Nodes* before 
   least 20 %. That replaces today's two thresholds with one criterion that can be explained in a sentence, lets a relay
   move only when its children gain too, and stops oscillation by construction for a given set of measurements. It will
   be checked first against a measured "truth table" of all reasonable trees of the lab before it moves anything.
+  Today's planner and the planned one, written down as formulas:
+  [docs/TECHNICAL.md → Choosing the parent: the math](docs/TECHNICAL.md#choosing-the-parent-the-math).
 - **Traffic statistics history:** traffic per box, backhaul link and client, link quality, topology changes, outages and
   gateway failovers over hours, days and weeks, kept in the controller database with retention, shown as graphs in LuCI
   and exported through the API
@@ -270,7 +272,8 @@ This is a preview. What is not done yet, or not done well:
   controller works on hardware in both directions. The automatic *policy* on top of it still needs more nights of testing.
 - **The parent planner is deliberately simple.** It corrects parents that are plainly wrong and leaves near-ties
   alone. It estimates a box's own first hop from signal, which can be far off for a noisy card, and it plans toward
-  the controller, not toward whichever box currently holds the internet uplink (see *Planned*).
+  the controller, not toward whichever box currently holds the internet uplink (see *Planned*). How it decides:
+  [the math](docs/TECHNICAL.md#choosing-the-parent-the-math).
 - **BE14 cards differ, so measure yours.** Some are noisier than others (7–13 dB on the same channel in our lab), and
   on one of our cards the 6 GHz link runs on a single stream at a low rate where the others run on two. On such a card,
   the box's own 5 GHz beacon can briefly deafen its 6 GHz receiver. The mesh detects noisy cards and shows them in
