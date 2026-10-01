@@ -196,8 +196,6 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 - **Radar channels (DFS)** as an option, and channel suggestions from scans
 - **Onboarding with DPP (Easy Connect)**
 - **Capacity in the UI:** measured maximum of each link, not only the current traffic
-- **Installing to eMMC, NAND or NVMe,** once the mesh itself is stable. This pre-release runs from SD only.
-  <!-- TODO: link bpi-r4-deploy here only after its install menus stop offering the removed release-pro-8x-unifi -->
 - **Arranging the tree from measured links:** the first parent after a start chosen from scans, one measuring method for
   all decisions, a trial move without test traffic, and *Try it → Possible → Confirm* for a move by hand
 - **Packages instead of images:** install on an existing OpenWrt 25.12 box, with a setup wizard
