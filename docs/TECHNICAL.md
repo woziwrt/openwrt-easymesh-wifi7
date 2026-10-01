@@ -257,9 +257,26 @@ difference between the current tree and that one, and it is accepted only when i
 then carried out one measured move at a time, from the root down, so that every move already sees its parent on the
 final path. The root becomes the box that holds the active internet uplink, not necessarily the controller.
 
-What the model leaves out, honestly: a relay with several children splits its airtime among them, so the real cost of
-a hop depends on the load on it, and the minimum under load is no longer a shortest-path tree. We will start from the
-load-free tree, measure what is left, and only then decide whether the load needs to be in the model.
+**Load, and what $\Phi$ means.** A relay carries the traffic of its whole subtree. If box $u$ wants $d_u$ Mbit/s from
+the gateway, the hop of $v$ carries $\sum_{u \in S(v) \cup \{v\}} d_u$, and the airtime the whole mesh spends on it is,
+after swapping the order of summation,
+
+```math
+\sum_{v} \frac{1}{T(v, p(v))} \sum_{u \in S(v) \cup \{v\}} d_u \;=\; \sum_{u} d_u \, C(u)
+```
+
+As long as every hop shares one channel and every box hears every other (one collision domain, as in our lab), that is
+the constraint: the mesh can carry the demands $\lambda d$ for $\lambda \le 1 / \sum_u d_u C(u)$. So $\Phi$ is not
+an invented score - with $d_u = 1$ it is the airtime the mesh spends per unit of traffic to every box, and the most the
+mesh can carry is $1/\Phi$. The shortest-path tree minimises every $C(u)$, hence $\sum_u d_u C(u)$ for **any**
+demands: in one collision domain, load does not change the answer. (This is Kirchhoff's current law on the incidence
+matrix of the tree, $A f = d$, the flow on each hop being the demand of its subtree.)
+
+What the model leaves out, honestly: boxes far enough apart transmit at the same time (spatial reuse). Then the
+constraint holds per group of links that interfere with each other, the throughput of a given tree is a linear
+program, and choosing the tree becomes an integer problem; the shortest-path tree is no longer guaranteed to be the
+best. The MLO hop formula is an approximation of two such domains, one per band. We will start from the shortest-path
+tree, measure what is left, and only then decide whether interference groups need to be in the model.
 
 ## Patches below EasyMesh
 
