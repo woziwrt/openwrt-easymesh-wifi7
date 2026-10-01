@@ -239,6 +239,14 @@ the root at the same time - the shortest-path tree, found by Dijkstra's algorith
 C^\ast(v) = \min_{q \,:\, (v,q) \in E} \big( w(v,q) + C^\ast(q) \big), \qquad C^\ast(\text{root}) = 0
 ```
 
+In the language of graph theory: the mesh is a directed graph - an edge $v \to q$ means $v$ hears $q$, and its
+weight is the downstream cost, which is not the cost of $q \to v$ (one leg of the lab measured 126 Mbit/s down and 424
+up). Two bands between the same pair are parallel edges, merged into one by the MLO formula. The tree we want is an
+arborescence rooted at the gateway. Not the minimum one (Chu-Liu/Edmonds), which minimises the sum of the edge
+weights and can hang a box behind three cheap weak hops; the shortest-path one, which minimises every box's own path.
+For readers from circuit theory: a hop's cost $1/T$ behaves like a resistance and the hops of a path are in series,
+$C = \sum R_i$; the two legs of an MLO hop are *not* in parallel, because they share the time of one station.
+
 No node has to give anything up for another: $C^\ast(v) \le C(v)$ for every $v$ and every tree. The plan is the
 difference between the current tree and that one, and it is accepted only when it is worth what the moves cost:
 
@@ -276,4 +284,5 @@ All on our five-box lab; the raw logs are not published yet.
 | 2026-09-23 | Negotiated TTLM per backhaul station, "all TIDs on 6 GHz" | 0 bytes on the 5 GHz link in both directions; setup and teardown 20/20 |
 | 2026-09-25 | Band alternation across one repeater (downloads) | 153 → 260 Mbit/s |
 | 2026-09-25 | Gateway failover, client outage | 24 → 11 s |
+| 2026-10-01 | Gateway failover cable → LTE on another box (WAN port down for 120-180 s, Wi-Fi client pinging 1.1.1.1 every 0.2 s), rc3 | to LTE 10, 10, 11 s; back on the cable after ~30 s of stable cable, client gap 0, 32, 0 s. With the port up and only the traffic behind it dropped: no failover (the probe asks the first router, which still answered ARP) |
 | 2026-09-28 | Parent planner, three measured trials in one night (a relay moved from 2 hops to 1) | about 120/250 → 1000/1080 Mbit/s up/down, all three kept |

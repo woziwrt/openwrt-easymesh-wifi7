@@ -28,8 +28,10 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
   automatic policy runs as a dry run; the mechanism itself is verified on hardware.
 - **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup
   (tested: Telit FN990A40, M.2; other modems that OpenWrt supports may work, untested). The
-  mesh keeps one gateway address for all clients. When the cable is pulled, clients are back online in about 10-25
-  seconds.
+  mesh keeps one gateway address for all clients. When the cable is pulled, or the router in front of the box goes
+  dead, clients are back online over LTE in about 10 seconds; when the cable comes back, the mesh returns to it after
+  about half a minute of stable cable, usually without a gap. Set the modem up in LuCI (*Network → Interfaces*, protocol
+  QMI or MBIM) and **restart that box once afterwards** (see *Known limitations*).
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
   It also points out a radio card that is noisier than the others, so a slow link is not blamed on the mesh.
 
@@ -165,7 +167,8 @@ the main box last, one at a time, and wait until each is back in *Nodes* before 
 - 🧪 **Automatic TTLM policy:** avoiding a bad link, and alternating bands across a repeater (+70 % across one repeater, 2 hops,
   downloads, in one test series). Runs as a dry run by default.
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
-- 🧪 **Gateway failover** between cable and LTE on any box, one gateway address for clients, an outage of about 10-25 s
+- ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients: about 10 s to LTE when the
+  cable is pulled (3 of 3 tests, 10/10/11 s); back on the cable without a gap in 2 of 3 tests, once with a 32 s gap
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
 - 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules. **Rescue,
   on by default:** its path is bad (under ~100 Mbit/s) and another parent is at least twice as good. **Towards the main
@@ -266,6 +269,14 @@ the deaf-link guard are switched on the boxes with
 ## Known limitations
 
 This is a preview. What is not done yet, or not done well:
+
+- **Failover to LTE watches the cable and the first router, not the internet behind it.** A pulled cable, or a router
+  in front of the box that is switched off, moves the mesh to LTE in about 10 s. If that router stays up but loses its
+  own internet connection, the mesh stays on the cable and has no internet until the router recovers. Checking the
+  whole way out is planned.
+- **A modem set up while the box is running is not used until the box restarts.** The box puts its modem into the
+  `wan` firewall zone when it starts; a modem interface added later has no NAT, and a failover to it carries nothing.
+  Restart the box once after setting the modem up (or run `/etc/init.d/mesh-gwd restart`). A fix is planned.
 
 - **Band steering of the backhaul is a dry run by default.** The TTLM rules decide and log what they would do; they only
   act when switched on (`/etc/mapc/ttlm-policy-live`, `/etc/mapc/ttlm-alternate-live`). Per-station TTLM from the
