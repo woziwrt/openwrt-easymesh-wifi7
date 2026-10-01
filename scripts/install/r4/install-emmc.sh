@@ -1,11 +1,19 @@
 #!/bin/sh
-# install-emmc.sh - Install OpenWrt to eMMC
-# Must be run from NAND rescue system only!
+# install-emmc.sh - install EasyMesh Wi-Fi 7 for OpenWrt to the eMMC of a BPI-R4 (4 GB or 8 GB)
+# Must be run from the NAND rescue system only: SD and eMMC share one controller, so the eMMC can only
+# be written while the box runs from NAND.
+#
+#   wget -O /tmp/install-emmc.sh https://raw.githubusercontent.com/woziwrt/openwrt-easymesh-wifi7/main/scripts/install/r4/install-emmc.sh
+#   sh /tmp/install-emmc.sh            (TAG=<release tag> sh ... for another release)
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the image comes from this repository's release,
+# the board is told by its memory, and the download is checked against the release's SHA256SUMS.
 
 EMMC_DEV="/dev/mmcblk0"
 EMMC_BOOT="/dev/mmcblk0boot0"
 GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-v0.1-preview}"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,45 +25,31 @@ printf "  BPI-R4 eMMC Installer\n"
 printf "=================================================\n"
 printf "\n"
 
-# || 0. Variant selection |||||||||||||||||||||||||||||||||||||||||||||||||||||
+# || 0. Board ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
 
-printf "Select your board variant:\n"
-printf "\n"
-printf "  1) 4GB standard (WiFi)\n"
-printf "  2) 4GB wired (no WiFi)\n"
-printf "  3) 4GB PoE (WiFi)\n"
-printf "  4) 4GB PoE wired (no WiFi)\n"
-printf "  5) 8GB standard (WiFi)\n"
-printf "  6) 8GB wired (no WiFi)\n"
-printf "  7) 8GB PoE (WiFi)\n"
-printf "  8) 8GB PoE wired (no WiFi)\n"
-printf "  9) 8GB wired UniFi\n"
-printf " 10) 8GB PoE wired UniFi\n"
-printf "\n"
-printf "Enter choice [1-10]: "
-read VARIANT
-
-case "$VARIANT" in
-    1) GH_TAG="release-4gb-standard";        EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-emmc-img.bin" ;;
-    2) GH_TAG="release-4gb-wired";           EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-emmc-img.bin" ;;
-    3) GH_TAG="release-4gb-poe";             EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-emmc-img.bin" ;;
-    4) GH_TAG="release-4gb-poe-wired";       EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-emmc-img.bin" ;;
-    5) GH_TAG="release-8gb-standard";        EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-emmc-img.bin" ;;
-    6) GH_TAG="release-8gb-wired";           EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-emmc-img.bin" ;;
-    7) GH_TAG="release-8gb-poe";             EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-emmc-img.bin" ;;
-    8) GH_TAG="release-8gb-poe-wired";       EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-emmc-img.bin" ;;
-    9) GH_TAG="release-8gb-wired-unifi";     EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-emmc-img.bin" ;;
-   10) GH_TAG="release-8gb-poe-wired-unifi"; EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-emmc-img.bin" ;;
+# The 4 GB and 8 GB boards need different images and report the same model name, so tell them by memory.
+RAM_GB=$(awk '/MemTotal/ { print int($2 / 1048576 + 0.5) }' /proc/meminfo)
+case "$RAM_GB" in
+    3|4) BOARD="BPI-R4 4 GB"; EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-emmc-img.bin" ;;
+    7|8) BOARD="BPI-R4 8 GB"; EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-emmc-img.bin" ;;
     *)
-        printf "\n${RED}ERROR: Invalid choice!${NC}\n\n"
+        printf "\n${RED}ERROR: %s GB of memory - not a BPI-R4 4 GB or 8 GB.${NC}\n" "$RAM_GB"
+        printf "       For a BPI-R4 Pro 8X use pro-8x/install-emmc-pro8x.sh.\n\n"
         exit 1
         ;;
 esac
 
+printf "  Board:   %s (%s GB of memory)\n" "$BOARD" "$RAM_GB"
+printf "  Release: %s/%s %s\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
+printf "  Is that right? [yes/no]: "
+read BOARD_OK
+if [ "$BOARD_OK" != "yes" ]; then
+    printf "\n  Cancelled.\n\n"
+    exit 1
+fi
+
 EMMC_IMG="/tmp/${EMMC_NAME}"
 
-printf "\n"
-printf "  Selected: %s\n" "$GH_TAG"
 printf "\n"
 
 # || 1. Check boot media |||||||||||||||||||||||||||||||||||||||||||||||||||||
@@ -111,7 +105,7 @@ case "$USE_LOCAL" in
         printf "\n"
         printf "        INFO: Using local files from /tmp\n"
         printf "        Checking files...\n"
-        EMMC_IMG="/tmp/openwrt-mediatek-filogic-bananapi_bpi-r4-emmc-img.bin"
+        EMMC_IMG="/tmp/${EMMC_NAME}"
         if [ ! -f "$EMMC_IMG" ]; then
             printf "${RED}ERROR: %s not found!${NC}\n" "$EMMC_IMG"
             exit 1
@@ -120,25 +114,9 @@ case "$USE_LOCAL" in
         ;;
     *)
         printf "\n"
-        printf "  Use default release or your own fork?\n"
-        printf "  [1] Default (woziwrt/bpi-r4-deploy)\n"
-        printf "  [2] My fork (same repo name, different username)\n"
-        printf "\n"
-        printf "  Select [1/2]: "
-        read USE_FORK
-
-        case "$USE_FORK" in
-            2)
-                printf "\n"
-                printf "        INFO: Fork repo name must remain 'bpi-r4-deploy'\n"
-                printf "        Enter your GitHub username: "
-                read GH_USER
-                ;;
-            *)
-                ;;
-        esac
-
-        EMMC_IMG_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}/${EMMC_NAME}"
+        GH_USER="${GH_USER_OVERRIDE:-$GH_USER}"
+        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        EMMC_IMG_URL="${REL_URL}/${EMMC_NAME}.gz"
         printf "        URL: %s\n\n" "$EMMC_IMG_URL"
 
         # || 4. Network check ||||||||||||||||||||||||||||||||||||||||||||||||
@@ -167,9 +145,7 @@ case "$USE_LOCAL" in
         HTTP_CODE=$(wget --server-response --spider "$EMMC_IMG_URL" 2>&1 | grep "HTTP/" | tail -1 | awk '{print $2}')
         if [ "$HTTP_CODE" != "200" ]; then
             printf "\n${RED}ERROR: Release not found on GitHub (tag: %s).\n" "$GH_TAG"
-            printf "       The build has not been created yet.\n"
-            printf "       Please run the GitHub Actions workflow first:\n"
-            printf "       https://github.com/${GH_USER}/${GH_REPO}/actions\n\n${NC}"
+            printf "       Check the tag: https://github.com/${GH_USER}/${GH_REPO}/releases\n\n${NC}"
             exit 1
         fi
         printf "        OK -- release available\n\n"
@@ -178,16 +154,26 @@ case "$USE_LOCAL" in
 
         printf "[ 5/7 ] Downloading %s...\n\n" "$EMMC_NAME"
 
-        wget -O "$EMMC_IMG" "$EMMC_IMG_URL"
+        wget -O "$EMMC_IMG.gz" "$EMMC_IMG_URL" && wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS"
 
-        if [ $? -ne 0 ] || [ ! -s "$EMMC_IMG" ]; then
+        if [ $? -ne 0 ] || [ ! -s "$EMMC_IMG.gz" ]; then
             printf "\n${RED}ERROR: Download failed.${NC}\n"
             printf "       Check network or URL and try again.\n\n"
-            rm -f "$EMMC_IMG"
+            rm -f "$EMMC_IMG.gz"
             exit 1
         fi
 
-        printf "\n        OK -- downloaded\n\n"
+        # A half-downloaded or wrong image written to the eMMC is a box that does not boot.
+        WANT=$(grep " ${EMMC_NAME}.gz\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+        GOT=$(sha256sum "$EMMC_IMG.gz" | cut -d' ' -f1)
+        if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+            printf "\n${RED}ERROR: Checksum does not match SHA256SUMS of the release.${NC}\n\n"
+            rm -f "$EMMC_IMG.gz"
+            exit 1
+        fi
+        gunzip -f "$EMMC_IMG.gz" || { printf "\n${RED}ERROR: Could not unpack the image.${NC}\n\n"; exit 1; }
+
+        printf "\n        OK -- downloaded, checksum matches, unpacked\n\n"
         ;;
 esac
 
