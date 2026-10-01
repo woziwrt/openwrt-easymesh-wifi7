@@ -16,6 +16,13 @@
 Not in this repository, fetched by the build: `modemdata` (Cezary Jackiewicz, github.com/obsy/modemdata, pinned in `pins.conf`) -
 upstream publishes it without a license, so we do not redistribute it. `sms-tool` comes from the OpenWrt packages feed.
 
+## In the images, not in this repository
+
+The build fetches and the images carry, each under its own license: OpenWrt and its package feeds (mostly GPL-2.0 and
+others per package), LuCI (Apache-2.0), the MediaTek OpenWrt feed (mt76: ISC; hostapd: BSD-3-Clause), the iopsys stack
+(BSD-3-Clause) and the **MediaTek Wi-Fi and Ethernet firmware, which is a proprietary binary** redistributed under
+MediaTek's firmware license, not open source.
+
 ## Modified copies of upstream files
 
 These files replace an upstream file during the build. They carry no header of
