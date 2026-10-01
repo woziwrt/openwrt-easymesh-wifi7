@@ -29,6 +29,28 @@
 RESET=/etc/rc.button/reset
 
 [ -f "$RESET" ] || exit 0
+
+# The press timeout from five seconds to ten, before anything else.
+#
+# base-files returns 5 from "pressed", so procd sends "timeout" after five
+# seconds of holding and the status lamp goes into the failsafe blink - on
+# stock that is right, because letting go then wipes the box. Here the wipe is
+# at ten (below), and five to nine is how the main box opens pairing: every
+# pairing opened with the button left the green lamp blinking "about to erase"
+# for good, because the mesh handler takes the release and nobody set the lamp
+# back. Measured on the controller on 2026-10-01, blinking since the evening
+# before. With the timeout at ten, the lamp says "erase" exactly from the
+# moment letting go would erase. Independent of the splice below, so a file
+# that already has the mesh handler gets this too.
+if [ "$(grep -c '^[[:space:]]*return 5$' "$RESET")" = 1 ]; then
+	sed 's/^\([[:space:]]*\)return 5$/\1return 10/' "$RESET" > "$RESET.easymesh-new"
+	if sh -n "$RESET.easymesh-new" 2>/dev/null; then
+		cat "$RESET.easymesh-new" > "$RESET"
+		logger -t easymesh "button: press timeout moved from 5 s to 10 s (the lamp says erase only when a release would)"
+	fi
+	rm -f "$RESET.easymesh-new"
+fi
+
 grep -q '30-easymesh' "$RESET" && exit 0
 
 # Anchor on the line base-files has had for years. If it ever moves, do nothing
