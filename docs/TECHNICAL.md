@@ -223,12 +223,20 @@ at once.
 The costs are not fixed in reality - a signal moves by several dB in a minute and the estimate with it. That is what
 the streak, the measured verdict, the cooldown and the 24 h deny are for: they bound how often a noisy estimate can
 cost a move, they do not make the estimate right. On a noisy card the estimate of the first hop can be far off
-(see *Measurements*), and the measured trial is the only judge.
+(see *Measurements*), and the measured trial is the only judge. Note what the theorem does and does not cover: it
+bounds the moves accepted by the model, but a move is finally kept by the measured trial, and a kept move can raise
+$\Phi$ (noise, load). In practice it is the cooldown and the deny that bound the rest.
+
+Readers who know routing will recognise the step: $C(v) \leftarrow \min_q \big(\hat c(v,q) + C(q)\big)$ is the
+relaxation of Bellman-Ford, the algorithm behind distance-vector routing, applied one node at a time and only when
+it gains by the margin. The check that a candidate is not below the node is what split horizon is to RIP: it keeps a
+node from choosing a path through its own child (counting to infinity).
 
 ### 4. Planned: the planner as a graph problem
 
-Not in this release. Today the planner looks at one node at a time and fixes what is plainly wrong. The next one
-looks at the whole mesh at once.
+Not in this release. Today the planner looks at one node at a time and fixes what is plainly wrong - a distributed
+Bellman-Ford with hysteresis. The next one looks at the whole mesh at once: the controller sees the whole graph, so it
+can use Dijkstra instead.
 
 Let $G = (V, E)$ be the graph of every box and every parent each box can hear, with the weight of an edge
 $w(v,q) = 1/T(v,q)$: measured where the pair has carried traffic, estimated from the signal where it has not. Because
