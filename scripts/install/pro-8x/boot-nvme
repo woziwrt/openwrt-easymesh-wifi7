@@ -1,0 +1,37 @@
+#!/bin/sh
+# boot-nvme — restore NVMe boot after boot-nand was used
+# Restores the ITB backup so boot_auto finds it and boots NVMe
+# Run from NAND rescue system
+
+MNT="/tmp/nvme-boot"
+ITB="bpi-r4-pro-8x.itb"
+
+# Detect NVMe p1
+NVME_P1=""
+for DEV in /dev/nvme0n1p1 /dev/nvme1n1p1; do
+    [ -b "$DEV" ] && NVME_P1="$DEV" && break
+done
+
+if [ -z "$NVME_P1" ]; then
+    echo "ERROR: NVMe p1 not found — is NVMe connected?"
+    exit 1
+fi
+
+mkdir -p "$MNT"
+if ! mount "$NVME_P1" "$MNT" 2>/dev/null; then
+    echo "ERROR: Cannot mount $NVME_P1"
+    exit 1
+fi
+
+if [ ! -f "$MNT/${ITB}.bak" ]; then
+    umount "$MNT"
+    echo "ERROR: No backup ITB found — run install-nvme.sh to reinstall"
+    exit 1
+fi
+
+mv "$MNT/${ITB}.bak" "$MNT/$ITB"
+umount "$MNT"
+
+echo "Done — rebooting to NVMe..."
+sleep 1
+reboot
