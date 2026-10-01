@@ -32,6 +32,17 @@
 # eight still got through, and it was a broadcast ARP - exactly what a probe
 # sends - so one lucky answer must not reset the count.
 #
+# The fuse. A reconnection clears the zombie that a parent's restart leaves
+# behind, but not the one that pairing from a blank card leaves: there the box
+# came back on a parent that again stopped taking its frames, and only a
+# restart of the box itself cured it (2026-09-30, fix 5588bef restarts once
+# after pairing). So a second zombie within ZOMBIE_S of the first restarts the
+# box - at most once per FUSE_S, remembered on flash across that restart, so a
+# box that keeps falling into it is restarted once a day and not in a loop. Every
+# action is also written to /etc/mapc/uplink-guard.log with the band the backhaul
+# station associated on (the primary link), so the nights can tell whether the
+# state also turns up outside pairing.
+#
 # /etc/mapc/uplink-guard-dry: detect and record, do not act.
 
 PERIOD=${PERIOD:-10}
@@ -41,12 +52,41 @@ BOOT_S=${BOOT_S:-180}
 SETTLE_S=${SETTLE_S:-60}  # after a parent change
 HOLD_S=${HOLD_S:-600}     # between two actions
 KEEP=${KEEP:-10}          # snapshots kept
+ZOMBIE_S=${ZOMBIE_S:-1800}  # a second zombie this soon after the first -> restart
+FUSE_S=${FUSE_S:-86400}     # at most one restart per this
+FUSE=/etc/mapc/uplink-guard-restart   # epoch of the last restart, on flash
+JOURNAL=/etc/mapc/uplink-guard.log     # every action, on flash
 DIR=/tmp/uplink-guard
 DRY=/etc/mapc/uplink-guard-dry
 BSTA=bsta-mld-3
 W="wpa_cli -i $BSTA"
 
 log() { logger -t easymesh-uplink-guard "$*"; }
+journal() {
+	echo "$(date -u '+%F %T') $*" >> "$JOURNAL"
+	[ "$(wc -c < "$JOURNAL")" -gt 65536 ] && { tail -n 200 "$JOURNAL" > "$JOURNAL.tmp" && mv "$JOURNAL.tmp" "$JOURNAL"; }
+}
+
+# Band of the association = frequency of the primary link (mt76_links_info;
+# wpa_cli's freq= does not say it, 2026-10-01).
+assoc_mhz() {
+	local pl
+	pl=$(sed -n 's/.*primary link, link ID = \([0-9]*\).*/\1/p' \
+		/sys/kernel/debug/ieee80211/phy0/netdev:"$BSTA"/stations/*/mt76_links_info 2>/dev/null | head -1)
+	iw dev "$BSTA" link 2>/dev/null | awk -v l="$pl" \
+		'$1 == "Link" && $2 == l { f = 1; next } f && $1 == "freq:" { print int($2); exit }'
+}
+
+# 0 when the fuse allows a restart now: the clock is set (a box without time
+# would read every stamp as fresh or as ancient) and the last restart by this
+# guard is at least FUSE_S ago.
+fuse_ok() {
+	local now t
+	now=$(date +%s)
+	[ "$now" -gt 1767225600 ] || return 1   # 2026-01-01
+	t=$(cat "$FUSE" 2>/dev/null)
+	[ -z "$t" ] || [ $((now - t)) -ge "$FUSE_S" ] || [ "$t" -gt "$now" ]
+}
 
 [ "$(cat /etc/mapc/role 2>/dev/null)" = controller ] && exit 0
 mkdir -p "$DIR"
@@ -117,17 +157,33 @@ while sleep "$PERIOD"; do
 		continue
 	fi
 	f=$(snapshot "$p" "$ip" "$hist")
+	mhz=$(assoc_mhz)
+	again=0
+	[ "$last" -gt 0 ] && [ $(( $(uptime_s) - last )) -lt "$ZOMBIE_S" ] && again=1
 	if [ -e "$DRY" ]; then
-		log "parent $ip lost $lost of the last $WINDOW probes - dry run, recorded $f"
+		[ "$again" = 1 ] && fuse_ok && w=" - would restart the box (second within ${ZOMBIE_S} s)" || w=""
+		log "parent $ip lost $lost of the last $WINDOW probes - dry run, recorded $f$w"
+		journal "dry parent=$p ip=$ip lost=$lost/$WINDOW assoc=${mhz:-?}MHz$w"
 		hist=""
 		continue
 	fi
+	if [ "$again" = 1 ] && fuse_ok; then
+		log "parent $ip lost $lost of the last $WINDOW probes again, $(( $(uptime_s) - last )) s after the last time - restarting the box (recorded $f)"
+		journal "restart parent=$p ip=$ip lost=$lost/$WINDOW assoc=${mhz:-?}MHz after=$(( $(uptime_s) - last ))s"
+		date +%s > "$FUSE"
+		sync
+		sleep 2
+		reboot
+		exit 0
+	fi
 	if [ "$last" -gt 0 ] && [ $(( $(uptime_s) - last )) -lt "$HOLD_S" ]; then
 		log "parent $ip lost $lost of the last $WINDOW probes - held, acted $(( $(uptime_s) - last )) s ago"
+		journal "held parent=$p ip=$ip lost=$lost/$WINDOW assoc=${mhz:-?}MHz"
 		hist=""
 		continue
 	fi
 	log "parent $ip lost $lost of the last $WINDOW probes - reconnecting the backhaul (recorded $f)"
+	journal "reconnect parent=$p ip=$ip lost=$lost/$WINDOW assoc=${mhz:-?}MHz"
 	$W disconnect >/dev/null 2>&1
 	sleep 2
 	$W reconnect >/dev/null 2>&1
