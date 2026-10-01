@@ -1,11 +1,18 @@
 #!/bin/sh
-# BPI-R4 Pro 8X - Install OpenWrt to eMMC
-# Must be run from NAND rescue system only!
+# install-emmc-pro8x.sh - install EasyMesh Wi-Fi 7 for OpenWrt to the eMMC of a BPI-R4 Pro 8X
+# Must be run from the NAND rescue system only: SD and eMMC share one controller.
+#
+#   wget -O /tmp/install-emmc.sh https://raw.githubusercontent.com/woziwrt/openwrt-easymesh-wifi7/main/scripts/install/pro-8x/install-emmc-pro8x.sh
+#   sh /tmp/install-emmc.sh            (TAG=<release tag> sh ... for another release)
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): one image, from this repository's release,
+# checked against the release's SHA256SUMS before anything is written.
 
 EMMC_DEV="/dev/mmcblk0"
 EMMC_BOOT="/dev/mmcblk0boot0"
-GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
+GH_USER="${GH_USER_OVERRIDE:-woziwrt}"
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-v0.1-preview}"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -16,27 +23,18 @@ printf "  BPI-R4 Pro 8X - Install OpenWrt to eMMC\n"
 printf "=================================================\n"
 printf "\n"
 
-# || 0. Variant selection |||||||||||||||||||||||||||||||||||||||||||||||||||||
+# || 0. Board ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
 
-printf "Select firmware variant:\n\n"
-printf "  1) Pro 8X standard (WiFi)\n"
-printf "  2) Pro 8X wired (no WiFi)\n"
-printf "\n"
-printf "Enter choice [1/2]: "
-read VARIANT
-
-case "$VARIANT" in
-    1) GH_TAG="release-pro-8x-standard"; EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-emmc-img.bin" ;;
-    2) GH_TAG="release-pro-8x-wired";   EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-emmc-img.bin" ;;
-    *)
-        printf "\n${RED}ERROR: Invalid choice!${NC}\n\n"
-        exit 1
-        ;;
-esac
+if ! grep -q "bpi-r4-pro-8x" /tmp/sysinfo/board_name 2>/dev/null; then
+    printf "\n${RED}ERROR: this is not a BPI-R4 Pro 8X (%s).${NC}\n" "$(cat /tmp/sysinfo/board_name 2>/dev/null)"
+    printf "       For a BPI-R4 use r4/install-emmc.sh.\n\n"
+    exit 1
+fi
+EMMC_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-emmc-img.bin"
 
 EMMC_IMG="/tmp/${EMMC_NAME}"
 
-printf "\n  Selected: %s\n\n" "$GH_TAG"
+printf "  Release: %s/%s %s\n\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
 
 # || 1. Check boot media |||||||||||||||||||||||||||||||||||||||||||||||||||||
 
@@ -86,7 +84,8 @@ case "$USE_LOCAL" in
         printf "        OK -- file present\n\n"
         ;;
     *)
-        EMMC_IMG_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}/${EMMC_NAME}"
+        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        EMMC_IMG_URL="${REL_URL}/${EMMC_NAME}.gz"
 
         # || 4. Network check ||||||||||||||||||||||||||||||||||||||||||||||||
 
@@ -118,13 +117,22 @@ case "$USE_LOCAL" in
 
         printf "[ 5/7 ] Downloading %s...\n\n" "$EMMC_NAME"
 
-        wget -O "$EMMC_IMG" "$EMMC_IMG_URL"
-        if [ $? -ne 0 ] || [ ! -s "$EMMC_IMG" ]; then
+        wget -O "$EMMC_IMG.gz" "$EMMC_IMG_URL" && wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS"
+        if [ $? -ne 0 ] || [ ! -s "$EMMC_IMG.gz" ]; then
             printf "\n${RED}ERROR: Download failed.${NC}\n\n"
-            rm -f "$EMMC_IMG"
+            rm -f "$EMMC_IMG.gz"
             exit 1
         fi
-        printf "\n        OK -- downloaded\n\n"
+        # A half-downloaded or wrong image written to the eMMC is a box that does not boot.
+        WANT=$(grep " ${EMMC_NAME}.gz\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+        GOT=$(sha256sum "$EMMC_IMG.gz" | cut -d' ' -f1)
+        if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+            printf "\n${RED}ERROR: Checksum does not match SHA256SUMS of the release.${NC}\n\n"
+            rm -f "$EMMC_IMG.gz"
+            exit 1
+        fi
+        gunzip -f "$EMMC_IMG.gz" || { printf "\n${RED}ERROR: Could not unpack the image.${NC}\n\n"; exit 1; }
+        printf "\n        OK -- downloaded, checksum matches, unpacked\n\n"
         ;;
 esac
 
