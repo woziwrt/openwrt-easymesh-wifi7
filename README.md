@@ -273,6 +273,9 @@ This is a preview. What is not done yet, or not done well:
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
+- **On the BPI-R4 Pro 8X the lamps do not show pairing.** Its board wires the LEDs differently, so holding its WPS
+  button gives no blink. The press still works - just wait. A Pro 8X can also restart twice while it joins instead of
+  once (it boots slowly, about five minutes), so give it 10-15 minutes.
 - **Sometimes the Wi-Fi card does not start.** Now and then the MT7996 firmware fails to load at boot
   (`Failed to start patch` / `probe failed -11` in the kernel log) and the box runs without Wi-Fi. A restart does not
   help: **switch the power off for 30 seconds.** The Pro 8X cannot reset its Wi-Fi card from software. You notice it
