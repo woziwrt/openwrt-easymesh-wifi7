@@ -156,9 +156,9 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
   box, off by default (danger zone):** another parent one hop closer to the controller is at least 1.5 times as good.
   Every move is a measured trial on the box itself (throughput before and after, three rounds each) and is kept only if
   it paid; otherwise the box goes back on its own. One trial in the mesh at a time. In a test after a controller
-  restart, three moves brought a relay from 26/47 to 1044/1143 Mbit/s (up/down) - see
-  [What the mesh does by itself](#what-the-mesh-does-by-itself).
-  <!-- TODO: add the measured rescue of 1. 10. (children of a moved relay at 6 and 3 Mbit/s) once it has run -->
+  restart, three moves brought a relay from 26/47 to 1044/1143 Mbit/s (up/down). In another, a relay was moved by hand
+  and two of its children landed on parents at 3 and 6 Mbit/s; the rescue moved them on its own within eight minutes,
+  to 190/208 and 207/376 Mbit/s - see [What the mesh does by itself](#what-the-mesh-does-by-itself).
 - ✅ **No island when a relay reboots:** a box that has lost its path to the controller stops accepting other boxes on
   its backhaul at once and drops the ones it had, so two children of a rebooting relay cannot join each other
 - ✅ **Wi-Fi for clients stays up while a backhaul moves:** a backhaul that lost its parent keeps the box's access
@@ -250,6 +250,10 @@ This is a preview. What is not done yet, or not done well:
   the box's own 5 GHz beacon can briefly deafen its 6 GHz receiver. The mesh detects noisy cards and shows them in
   *Nodes*; `easymesh-card-check` on a box measures its card. A mitigation is being tested. Such a box does best at the
   end of a chain. These are measurements of the few cards we have, not a statement about the cards in general.
+- **Check the antenna connectors.** A loose or torn antenna connector shows as one chain far below the other two in
+  `iw dev bsta-mld-3 station dump` (e.g. `signal: -68 [-86, -69, -73] dBm` on the 6 GHz link). In our lab two boxes had
+  that on 6 GHz, and as parents they accepted 6 GHz authentication only 3 and 0 times out of 6 - their children then
+  join over 5 GHz only. `easymesh-card-check` does not look at chains yet.
 - **EasyMesh Profile 3 without message security.** DPP onboarding and 1905 encryption are not implemented. Onboarding is
   WPS push-button. The backhaul links themselves are encrypted Wi-Fi (WPA3). <!-- TODO verify SAE on release image -->
 - **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
@@ -266,6 +270,9 @@ This is a preview. What is not done yet, or not done well:
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. The box restarts once by itself during
   pairing, which clears it in our tests. Why the 6 GHz authentication fails is still open.
   <!-- TODO: add the 599 s timer here once we can say in one sentence what it is; result of the corridor test 1. 10. -->
+- **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
+  prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
+  under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
 - **Sometimes the Wi-Fi card does not start.** Now and then the MT7996 firmware fails to load at boot
   (`Failed to start patch` / `probe failed -11` in the kernel log) and the box runs without Wi-Fi. A restart does not
   help: **switch the power off for 30 seconds.** The Pro 8X cannot reset its Wi-Fi card from software. You notice it
