@@ -7,7 +7,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 (see [Planned](#planned-for-the-next-releases)).*
 
 > **Pre-release (v0.1-preview, <!-- TODO date -->).** It runs every day on a five-box lab, but it is not a product yet.
-> We publish it early for reviewers and testers. Please read [Known limitations](#known-limitations) before you flash anything.
+> We publish it early for reviewers and testers. It still has bugs - the ones we know are in
+> [Known limitations](#known-limitations), and fixes come with the next releases. Please read that section before you flash anything.
 >
 > **Everything here takes time - give it that time.** Pairing one box takes about 6-10 minutes including one restart
 > (up to 15 on the Pro 8X), a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
@@ -323,6 +324,10 @@ This is a preview. What is not done yet, or not done well:
   it as inactive; it then reconnects by itself. hostapd removes its old entry on the other band and takes the new one with
   it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
   bands at once (MLO) are not affected.
+- **After a box was cut off from the mesh, the main box may not see the clients that joined it meanwhile.** They have
+  internet, but *Clients* does not list them (and the line to a box behind it shows no link rate) until they reconnect:
+  the box does not report them again when its own link comes back. Meanwhile the main box cannot steer those clients
+  either. A fix is planned for the next release.
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
