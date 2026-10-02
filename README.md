@@ -152,6 +152,9 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 Flash the new `…squashfs-sysupgrade.itb` on each box with *System → Backup / Flash Firmware* and **keep the settings**.
 The mesh settings, the box's role and the main box's database stay. Upgrade the boxes furthest from the main box first and
 the main box last, one at a time, and wait until each is back in *Nodes* before the next (about 2 minutes, 5 on a Pro 8X).
+Clients on a box lose the internet for up to about half a minute while it upgrades, everyone for about seven minutes
+while the main box does. Afterwards the tree may not be the one you had (each box rejoins whoever answers first); put a
+box back with *Move…* - the move is measured and undone if it is not faster.
 
 ## In this pre-release
 
@@ -302,7 +305,7 @@ This is a preview. What is not done yet, or not done well:
   boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
   trial loads that branch with test traffic for about three minutes while it measures. That is why, by default, only a
   box on a path under about 100 Mbit/s is moved (`touch /etc/mapc/parent-rescue-off` on the main box stops even that).
-- **After pairing, a power cut or a restart of the main box, the tree follows the radio, not the floor plan.** The tree
+- **After pairing, a power cut, an upgrade or a restart of the main box or of a relay, the tree follows the radio, not the floor plan.** The tree
   is whoever answers first: a box may hang behind a box with a weaker card, or one hop further from the main box than it
   needs to be. **It can look illogical - we know, and arranging the tree from measured links comes in a later release**
   (see *Planned*). The mesh works, some paths are slower; a box left under about 100 Mbit/s is rescued by itself. Until
@@ -317,6 +320,11 @@ This is a preview. What is not done yet, or not done well:
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. In our lab this happened towards parents
   with a damaged 6 GHz antenna connector (see *Check the antenna connectors*). The box restarts once by itself during
   pairing, which clears it in our tests, and a guard restarts a box whose uplink stalls twice within half an hour.
+- **A client that switches bands on the same box can stall for up to about a minute.** A laptop that moves from one
+  band to another of the same box (for example from 5 to 2.4 GHz) can stay connected but pass no data until the box drops
+  it as inactive; it then reconnects by itself. hostapd removes its old entry on the other band and takes the new one with
+  it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
+  bands at once (MLO) are not affected.
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
