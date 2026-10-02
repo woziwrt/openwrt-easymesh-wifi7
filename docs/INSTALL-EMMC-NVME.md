@@ -55,7 +55,9 @@ Every installer asks the same few questions; the answers are typed and confirmed
 
 ## BPI-R4 (4 GB and 8 GB)
 
-Always download the installer fresh as shown - the copies inside the NAND system may be older.
+The release SD image does not contain the installers - download each one as shown, it takes one `wget`. (The NAND
+system written in step 1 carries copies in `/root/install-dir/`, but download the installer fresh anyway: the copies
+may be older.)
 
 **1. From the SD card: write the NAND rescue system**
 ```sh
