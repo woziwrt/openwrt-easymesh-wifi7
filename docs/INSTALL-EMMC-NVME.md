@@ -6,8 +6,8 @@ stalls the main box. This page is for those who want the system there.
 
 > **Experimental.** The installers live on the `emmc-nvme` branch. Tested in our lab on 2 Oct 2026:
 > **BPI-R4 4 GB** SD → NAND → eMMC and NAND → NVMe, **BPI-R4 8 GB** SD → NAND → eMMC; each time the box then joined the
-> mesh with the WPS button like any other. **BPI-R4 Pro 8X** SD → NAND → eMMC: installed
-> and booted (not paired - joining works the same on every medium); **NVMe on the Pro 8X has not been run yet.**
+> mesh with the WPS button like any other. **BPI-R4 Pro 8X** SD → NAND → eMMC (installed and booted) and NAND → NVMe
+> (installed, booted and joined the mesh).
 > Installing erases the target (eMMC or NVMe) completely.
 
 ## How it works
@@ -86,12 +86,14 @@ loader starts the system from the NVMe from now on.
 **3. Into the mesh**
 
 The installed box is a fresh one: make it the main box or pair it with the WPS button, exactly as in the README
-(*Getting started*, steps 2 and 3). A box that was in the mesh before gets its old name back.
+(*Getting started*, steps 2 and 3). A box that was in the mesh before gets its old name back - but only when the
+main box also runs one of these images. A main box from the `v0.1-preview` SD card does not know the new names
+with the medium in them: the box keeps `BPI-R4-eMMC-…` or `BPI-R4-NVMe-…`; give it its name in LuCI (*Nodes*).
 
 ## BPI-R4 Pro 8X
 
 The same path with the scripts in `scripts/install/pro-8x/` (`install-nand-pro8x.sh`, `install-emmc-pro8x.sh`,
-`install-nvme-pro8x.sh`) - NAND and eMMC tested on 2 Oct 2026, **NVMe not tested yet**. The Pro 8X has a 256 MiB NAND and uses its full image there.
+`install-nvme-pro8x.sh`) - NAND, eMMC and NVMe tested on 2 Oct 2026. The Pro 8X has a 256 MiB NAND and uses its full image there.
 `boot-nand` and `boot-nvme` (in `/usr/sbin`) switch between the NVMe and the NAND rescue system. Follow the switch
 positions the scripts print.
 
@@ -104,5 +106,6 @@ positions the scripts print.
 
 - On a BPI-R4 running from the NVMe, the boot loader settings cannot be changed from the running system.
 - Upgrading an eMMC or NVMe system works with `sysupgrade` like on the SD card, but has not been tested yet.
+- The Pro 8X images have no `smartctl`, so its NVMe installer skips the disk health check.
 
 Questions and reports are welcome as issues; please say which board, which medium and attach the installer's output.
