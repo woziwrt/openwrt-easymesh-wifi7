@@ -104,7 +104,7 @@ case "$USE_LOCAL" in
         printf "        OK -- file present (%s)\n\n" "$(du -h "$SNAND_IMG" | cut -f1)"
         ;;
     *)
-        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
         SNAND_URL="${REL_URL}/${SNAND_NAME}.gz"
         printf "\n        URL: %s\n\n" "$SNAND_URL"
 
@@ -120,7 +120,7 @@ case "$USE_LOCAL" in
             exit 0
         fi
 
-        if ! ping -c 1 -W 3 github.com > /dev/null 2>&1; then
+        if ! ping -c 1 -W 3 "$(echo "$REL_URL" | cut -d/ -f3 | cut -d: -f1)" > /dev/null 2>&1; then
             printf "\n"
             printf "${RED}ERROR: No network connectivity -- check ethernet and try again.${NC}\n"
             printf "\n"

@@ -114,7 +114,7 @@ case "$USE_LOCAL" in
     *)
         printf "\n"
         GH_USER="${GH_USER_OVERRIDE:-$GH_USER}"
-        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
         EMMC_IMG_URL="${REL_URL}/${EMMC_NAME}.gz"
         printf "        URL: %s\n\n" "$EMMC_IMG_URL"
 
@@ -131,7 +131,7 @@ case "$USE_LOCAL" in
             exit 0
         fi
 
-        if ! ping -c 1 -W 3 github.com > /dev/null 2>&1; then
+        if ! ping -c 1 -W 3 "$(echo "$REL_URL" | cut -d/ -f3 | cut -d: -f1)" > /dev/null 2>&1; then
             printf "\n"
             printf "${RED}ERROR: No network connectivity -- check ethernet and try again.${NC}\n"
             printf "\n"

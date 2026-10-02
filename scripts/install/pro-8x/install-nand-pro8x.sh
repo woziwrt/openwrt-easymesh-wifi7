@@ -65,7 +65,7 @@ else
             esac
             echo ""
             echo "Checking internet connection..."
-            if ! wget -q --spider --timeout=10 "https://github.com" 2>/dev/null; then
+            if ! wget -q --spider --timeout=10 "$REL_URL/SHA256SUMS" 2>/dev/null; then
                 echo ""
                 echo "ERROR: No internet connection!"
                 echo "       Check WAN cable and router/modem, then try again."
@@ -74,7 +74,7 @@ else
             fi
             echo "OK: Internet connection available."
             echo ""
-            REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+            REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
             echo "Downloading ${SNAND_NAME}.gz (${GH_TAG})..."
             if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS" \
                  || ! wget -O "/tmp/${SNAND_NAME}.gz" "${REL_URL}/${SNAND_NAME}.gz" \

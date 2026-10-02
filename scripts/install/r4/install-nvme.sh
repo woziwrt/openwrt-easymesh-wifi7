@@ -184,7 +184,7 @@ case "$USE_LOCAL" in
         printf "        OK -- both files present\n\n"
         ;;
     *)
-        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
         ITB_URL="${REL_URL}/${ITB_NAME}"
         IMG_URL="${REL_URL}/${IMG_NAME}.gz"
 
@@ -200,7 +200,7 @@ case "$USE_LOCAL" in
             exit 0
         fi
 
-        if ! ping -c 1 -W 3 github.com > /dev/null 2>&1; then
+        if ! ping -c 1 -W 3 "$(echo "$REL_URL" | cut -d/ -f3 | cut -d: -f1)" > /dev/null 2>&1; then
             printf "\n${RED}ERROR: No network connectivity -- check ethernet and try again.${NC}\n\n"
             exit 1
         fi
