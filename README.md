@@ -325,7 +325,7 @@ This is a preview. What is not done yet, or not done well:
   it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
   bands at once (MLO) are not affected.
 - **After a box was cut off from the mesh, the main box may not see the clients that joined it meanwhile.** They have
-  internet, but *Clients* does not list them (and the line to a box behind it shows no link rate) until they reconnect:
+  internet, but *Clients* does not list them until they reconnect:
   the box does not report them again when its own link comes back. Meanwhile the main box cannot steer those clients
   either. A fix is planned for the next release.
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
