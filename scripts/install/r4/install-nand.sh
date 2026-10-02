@@ -27,26 +27,40 @@ printf "\n"
 # same model name, so tell them by memory.
 RAM_GB=$(awk '/MemTotal/ { print int($2 / 1048576 + 0.5) }' /proc/meminfo)
 case "$RAM_GB" in
-    3|4) RAM_LABEL="4GB"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-snand-img.bin" ;;
-    7|8) RAM_LABEL="8GB"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-8gb-snand-img.bin" ;;
+    3|4) RAM_DEF=1 ;;
+    7|8) RAM_DEF=2 ;;
+    *)   RAM_DEF="" ;;
+esac
+printf "Select your board:\n\n"
+printf "  [1] BPI-R4 4 GB\n"
+printf "  [2] BPI-R4 8 GB\n\n"
+printf "  (this box has %s GB of memory; for a BPI-R4 Pro 8X use the pro-8x scripts)\n\n" "$RAM_GB"
+printf "  Enter choice [1/2]%s: " "${RAM_DEF:+ (Enter = $RAM_DEF)}"
+read RAM_CHOICE
+[ -z "$RAM_CHOICE" ] && RAM_CHOICE="$RAM_DEF"
+case "$RAM_CHOICE" in
+    1) RAM_LABEL="4GB"; DEV_NAME="bananapi_bpi-r4"; NAND_DEV="bananapi_bpi-r4-nand" ;;
+    2) RAM_LABEL="8GB"; DEV_NAME="bananapi_bpi-r4-8gb"; NAND_DEV="bananapi_bpi-r4-nand-8gb" ;;
     *)
-        printf "\n${RED}ERROR: %s GB of memory - not a BPI-R4 4 GB or 8 GB.${NC}\n" "$RAM_GB"
-        printf "       For a BPI-R4 Pro 8X use pro-8x/install-nand-pro8x.sh.\n\n"
+        printf "\n${RED}ERROR: Invalid choice.${NC}\n\n"
         exit 1
         ;;
 esac
-
+# The 4 GB and 8 GB images differ in the DRAM setup: the wrong one does not boot. Allowed (an image for
+# another box), but only on purpose.
+if [ "$RAM_CHOICE" != "$RAM_DEF" ]; then
+    printf "\n${YELLOW}  This box has %s GB of memory, but the %s image was chosen.${NC}\n" "$RAM_GB" "$RAM_LABEL"
+    printf "  Continue anyway? [yes/no]: "
+    read RAM_OK
+    [ "$RAM_OK" = "yes" ] || { printf "\n  Cancelled.\n\n"; exit 1; }
+fi
+BOARD="BPI-R4 $RAM_LABEL"
+SNAND_NAME="openwrt-mediatek-filogic-${NAND_DEV}-snand-img.bin"
 SNAND_IMG="/tmp/${SNAND_NAME}"
 SOURCE_IS_LOCAL=0
 
-printf "  Board:   BPI-R4 %s\n" "$RAM_LABEL"
+printf "\n  Board:   %s\n" "$BOARD"
 printf "  Release: %s/%s %s\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
-printf "  Is that right? [yes/no]: "
-read BOARD_OK
-if [ "$BOARD_OK" != "yes" ]; then
-    printf "\n  Cancelled.\n\n"
-    exit 1
-fi
 printf "\n"
 
 # || 1. Check boot media ||||||||||||||||||||||||||||||||||||||||||||||||||||||
