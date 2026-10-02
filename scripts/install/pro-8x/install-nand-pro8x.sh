@@ -64,6 +64,7 @@ else
                 *) echo "  Connect WAN cable and run this script again."; echo ""; exit 1 ;;
             esac
             echo ""
+            REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
             echo "Checking internet connection..."
             if ! wget -q --spider --timeout=10 "$REL_URL/SHA256SUMS" 2>/dev/null; then
                 echo ""
@@ -74,7 +75,6 @@ else
             fi
             echo "OK: Internet connection available."
             echo ""
-            REL_URL="${REL_URL:-https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}}"
             echo "Downloading ${SNAND_NAME}.gz (${GH_TAG})..."
             if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS" \
                  || ! wget -O "/tmp/${SNAND_NAME}.gz" "${REL_URL}/${SNAND_NAME}.gz" \
