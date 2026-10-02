@@ -16,7 +16,6 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 > while you wait.
 
 ![Overview: the mesh at a glance](docs/screenshots/overview.jpg)
-<!-- TODO: retake all screenshots on the release images; ideally one short GIF where traffic moves to the other link -->
 
 ## What it does
 
