@@ -40,7 +40,7 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 |---|---|
 | ![Nodes](docs/screenshots/nodes.jpg) **Nodes:** where each box sits, its links, its radio card | ![Clients](docs/screenshots/clients.jpg) **Clients:** per box, multi-link or single link, signal history, link rate |
 | ![Backhaul](docs/screenshots/backhaul.jpg) **Backhaul & MLO:** both links of every hop and what the controller does with them | ![Channels](docs/screenshots/channels.jpg) **Channels:** noise and load as each box hears it |
-| ![Events](docs/screenshots/events.jpg) **Events:** the last 24 hours in plain words | ![Setup](docs/screenshots/setup.jpg) **Setup:** start a new mesh or join one, and how to add a box <!-- TODO: shoot the wizard on an unconfigured box --> |
+| ![Events](docs/screenshots/events.jpg) **Events:** the last 24 hours in plain words | ![Setup](docs/screenshots/setup.jpg) **Setup:** start a new mesh or join one, and how to add a box |
 | ![Advanced](docs/screenshots/advanced.jpg) **Advanced (support):** steering history, the controller database and the raw API, for troubleshooting | |
 
 ## Getting started
@@ -74,8 +74,6 @@ it; we have built the mesh with CZ only.
 ### 2. The first box becomes the main box (controller)
 Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
 Pro 8X) - and open `http://192.168.1.1`.
-<!-- TODO (Petr 29. 9.): rewrite to "connect the computer to the service port from the start - the page then stays at
-192.168.1.1 and nothing disappears" - only after it is verified on a fresh box -->
 Go to *Network → EasyMesh → Setup* and click **This is my first box**. Enter the network name, the Wi-Fi password and a
 name for the box. Leave *Mesh addresses* at `10.10.10.1` unless your home network already uses `10.10.10.x`; it must not
 be `192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
