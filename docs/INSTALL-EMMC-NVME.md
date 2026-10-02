@@ -1,7 +1,11 @@
 # Installing to eMMC or NVMe (experimental)
 
-The release runs from the **SD card**, and that is the way we recommend. This page is for those who want the system on
-the board's own eMMC or on an NVMe disk instead.
+The release runs from the **SD card**, and that is the way we recommend for trying it. **For permanent use, the main box
+is better on eMMC or NVMe:** it writes its database and logs all the time, SD cards wear out under that, and a slow one
+stalls the main box. This page is for those who want the system there.
+
+The NAND system written on the way is for rescue and installing only: it has little room (about 40 MB on a 4 GB
+BPI-R4) and is not meant to run the mesh.
 
 > **Experimental.** The installers live on the `emmc-nvme` branch and were tested once, on one BPI-R4 4 GB in our lab
 > (2 Oct 2026): SD → NAND → eMMC and NAND → NVMe, after which the box joined the mesh with the WPS button like any other.
