@@ -6,13 +6,15 @@ Imported on 2026-10-01 unchanged from `woziwrt/bpi-r4-deploy`, the scripts its r
 |---|---|---|
 | `r4/install-nand.sh`, `r4/install-emmc.sh`, `r4/install-nvme.sh` | `main:my_files/bpi-r4-install/` | `d1cbf1afcb0b` |
 | `pro-8x/install-nand-pro8x.sh`, `pro-8x/install-emmc-pro8x.sh`, `pro-8x/install-nvme-pro8x.sh`, `pro-8x/boot-nvme` | `pro-8x-unifi:my_files/bpi-r4-install/` | `8f643ccb2c58` |
+| `pro-8x/boot-nand` (added 2026-10-02) | `pro-8x-unifi:my_files/bpi-r4-pro/files/usr/sbin/` | `8f643ccb2c58` |
 
 The path they describe: a rescue SD card boots, `install-nand*.sh` writes a NAND system to the SPI-NAND, the box boots from
 NAND (SD and eMMC share one controller, so eMMC can only be written from NAND), and `install-emmc*.sh` /
 `install-nvme*.sh` write the real image there.
 
 **In the image:** the build copies the installers of its board to `/root/install-dir/` under the names bpi-r4-deploy
-used - `install-nand.sh`, `install-emmc.sh`, `install-nvme.sh` (and `boot-nvme` on the Pro 8X). They are on the SD
+used - `install-nand.sh`, `install-emmc.sh`, `install-nvme.sh`, and on the Pro 8X `boot-nand` / `boot-nvme` in `/usr/sbin` (switch between the NVMe and the
+NAND rescue system). `install-nvme-unifi.sh` of bpi-r4-deploy is left out: it belongs to the UniFi stack. They are on the SD
 image and on the NAND system alike, so the whole path runs from the box itself.
 
 **Where they download from:** this repository's lab release `lab-emmc-rc4` by default (`TAG=<release tag>` for
@@ -33,6 +35,6 @@ and uses its full image.
 | `pro-8x/install-nand-pro8x.sh` | yes - lab release, SHA256SUMS | not yet |
 | `pro-8x/install-emmc-pro8x.sh` | yes | not yet |
 | `pro-8x/install-nvme-pro8x.sh` | yes - the sysupgrade image is stored on p1 as `bpi-r4-pro-8x.itb` | not yet |
-| `pro-8x/boot-nvme` | nothing to adapt (no download) | not yet |
+| `pro-8x/boot-nvme`, `pro-8x/boot-nand` | nothing to adapt (no download); in `/usr/sbin` | not yet |
 
 Until these are tested, the release supports the SD card only.

@@ -1,0 +1,38 @@
+#!/bin/sh
+# boot-nand — switch to NAND rescue on next reboot
+# Renames NVMe ITB so boot_auto falls back to NAND
+# Restore NVMe boot: run boot-nvme from NAND rescue
+
+MNT="/tmp/nvme-boot"
+ITB="bpi-r4-pro-8x.itb"
+
+# Detect NVMe p1
+NVME_P1=""
+for DEV in /dev/nvme0n1p1 /dev/nvme1n1p1; do
+    [ -b "$DEV" ] && NVME_P1="$DEV" && break
+done
+
+if [ -z "$NVME_P1" ]; then
+    echo "ERROR: NVMe p1 not found"
+    exit 1
+fi
+
+mkdir -p "$MNT"
+if ! mount "$NVME_P1" "$MNT" 2>/dev/null; then
+    echo "ERROR: Cannot mount $NVME_P1"
+    exit 1
+fi
+
+if [ ! -f "$MNT/$ITB" ]; then
+    umount "$MNT"
+    echo "ERROR: $ITB not found on NVMe p1"
+    exit 1
+fi
+
+mv "$MNT/$ITB" "$MNT/${ITB}.bak"
+umount "$MNT"
+
+echo "Done — rebooting to NAND rescue..."
+echo "(To restore NVMe boot: run boot-nvme from NAND rescue)"
+sleep 1
+reboot
