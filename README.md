@@ -11,7 +11,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 > [Known limitations](#known-limitations), and fixes come with the next releases. Please read that section before you flash anything.
 >
 > **Everything here takes time - give it that time.** Pairing one box takes about 6-10 minutes including one restart
-> (up to 15 on the Pro 8X), a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
+> (up to 15 on the Pro 8X, which may restart twice); how long exactly depends on the distance, the radio conditions and
+> the board, a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
 > a box joins, its lamp may go dark. **Do not press any button twice:** a second press cancels the pairing. Pairing a
 > five-box mesh takes about three quarters of an hour - enough time for a beer or two. Just don't press any button twice
 > while you wait.
@@ -107,8 +108,8 @@ opened there. Power the box on and wait until it has booted (about 2 minutes, 5 
 A short press does not pair: the main box ignores it, and on a BPI-R4 that is not the main box it restarts it. The other order
 (new box first) works too, but leaves only about three minutes.
 
-The new box joins on its own in about four to six minutes, with nothing to type in, and restarts once by itself on the
-way (that restart is expected, not a fault). It takes the Wi-Fi settings from the main box and appears in *Overview* and
+The new box joins on its own in about six to ten minutes, with nothing to type in, and restarts once by itself on the
+way (that restart is expected, not a fault; a Pro 8X may restart twice and takes up to 15 minutes). It takes the Wi-Fi settings from the main box and appears in *Overview* and
 *Nodes*. Then add the next one. Wait until it is there before you pair the next box, and do not press its button again
 in the meantime: a second press cancels the pairing.
 
@@ -260,8 +261,8 @@ the deaf-link guard are switched on the boxes with
 `touch /etc/mapc/bh-rescue-live` and `touch /etc/mapc/deaf-guard-live`.
 
 **How long things take** (measured in our lab):
-- a new box joins and carries traffic about four to six minutes after you pair it, including its one restart (longer
-  on the Pro 8X);
+- a new box joins and carries traffic about six to ten minutes after you pair it, including its one restart (up to
+  15 on the Pro 8X);
 - after a power cut of the whole mesh, clients are back on the internet in about 1.5-2 minutes and every box is back in
   under 3 minutes;
 - when one box restarts, the clients and boxes behind it are back within 30 seconds to 2.5 minutes; after a restart of
