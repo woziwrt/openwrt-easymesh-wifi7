@@ -75,8 +75,8 @@ Everything is on the [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi
 | to check a download | the same release | `SHA256SUMS` |
 | eMMC or NVMe instead of the SD card (experimental) | *Experimental: eMMC/NVMe install images* | nothing by hand - the installers fetch it, see [docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md) |
 
-The board is in the file name: `bananapi_bpi-r4` (4 GB), `bananapi_bpi-r4-8gb`, `bananapi_bpi-r4-pro-8x`. The source is the
-`main` branch; the `emmc-nvme` branch carries the experimental installers.
+The board is in the file name: `bananapi_bpi-r4` (4 GB), `bananapi_bpi-r4-8gb`, `bananapi_bpi-r4-pro-8x`. Everything else on
+GitHub - tags, branches, folders - is explained in [What is where](#what-is-where).
 
 ### 1. Prepare the cards
 Download the image for your board from [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases), check it
@@ -392,6 +392,26 @@ firmware is MediaTek's binary). The TTLM actuator in the driver is MediaTek's; t
 its delivery over EasyMesh (IEEE 1905, *Service Prioritization Request*) are ours. We do **not** claim to have invented TTLM
 or controller-driven link mapping. The idea is in the EasyMesh specification, and closed implementations may exist.
 How to check the claim yourself: [docs/TECHNICAL.md → Verifying](docs/TECHNICAL.md#verifying-the-claim).
+
+## What is where
+
+| name | what it is | what it is for |
+|---|---|---|
+| **v0.1-preview** (release) | SD card images and `sysupgrade` images for the three boards, `SHA256SUMS` | installing and upgrading - start here |
+| **Experimental: eMMC/NVMe install images** (release, tag `lab-emmc-rc4`) | NAND, eMMC and NVMe images | downloaded by the eMMC/NVMe installers, not by hand ([docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md)) |
+| `v0.1-preview` (tag) | the commit the release images were built from | rebuilding exactly the release |
+| `main` (branch) | the source of the release, this README, the docs | reading, building, reporting issues against |
+| `emmc-nvme` (branch) | `main` plus the experimental eMMC/NVMe installers | installing to eMMC or NVMe |
+| `build-bpi-r4.sh`, `build-bpi-r4-pro-8x.sh` | the builds of the images, one per board | building from source ([BUILD.md](BUILD.md)) |
+| `pins.conf` | the exact revisions of OpenWrt, the MediaTek feed and iopsys | a build that gives the same image |
+| `feed/` | our packages: the mesh tools and API, the LuCI app `luci-app-easymesh`, `luci-app-wifimgr` | what makes the mesh run and what you see |
+| `iopsys/` | the iopsys Multi-AP stack (controller, agent, IEEE 1905) and our changes to it | the EasyMesh core |
+| `patches/` | our patches to the kernel, Wi-Fi (hostapd, mt76), U-Boot, LuCI and the MediaTek feed | what the boards and the mesh need below the packages ([docs/PATCHES.md](docs/PATCHES.md)) |
+| `boards/` | what differs per board: device tree, image layout, files baked in | BPI-R4 and BPI-R4 Pro 8X |
+| `configs/` | the build configuration | which packages go into the images |
+| `scripts/` | the code both builds share, and a quick image tool for testing | building |
+| `extras/` | LuCI apps by other authors, unchanged (CPU, temperature, LTE modem, SMS, scheduled restart, watchdog) | what users of these routers expect besides the mesh; each keeps its license |
+| `docs/` | [TECHNICAL.md](docs/TECHNICAL.md) (how the mesh decides, with the math), [PATCHES.md](docs/PATCHES.md), [INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md), screenshots | the details behind this README |
 
 ## For reviewers
 
