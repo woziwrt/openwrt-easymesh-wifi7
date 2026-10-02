@@ -70,6 +70,9 @@ is_factory_name() {
 		return 0 ;;
 	BPI-R4-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
 		return 0 ;;
+	# The same with the medium it booted from (99-set-hostname, 2026-10-02).
+	BPI-R4-SD-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-NAND-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-eMMC-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-NVMe-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+		return 0 ;;
 	esac
 	return 1
 }

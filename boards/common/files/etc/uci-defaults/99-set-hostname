@@ -22,6 +22,12 @@
 # so the mesh will hand back the name it had before it was reflashed, while
 # BPI-R4-kuchyn, which a person typed, is a real name and is never overwritten.
 #
+# Since 2026-10-02 the default also says what the box booted from - SD, eMMC,
+# NVMe or NAND (Petr: with the eMMC/NVMe installers a box can run from any of
+# them, and the first thing to know about a box on the bench is which one).
+# The suffix stays, so the names still differ: BPI-R4-eMMC-89e7c5. names.sh
+# knows this form as a factory name too.
+#
 # Only a box that still carries a default name is touched. A node that was
 # deliberately named keeps its identity across a sysupgrade; overwriting it
 # silently breaks whatever addresses that name is tied to.
@@ -30,31 +36,34 @@ cur="$(uci -q get system.@system[0].hostname)"
 case "$cur" in
     ""|OpenWrt|BPI-R4|BPI-R4-NVMe|BPI-R4-NAND|BPI-R4-eMMC|BPI-R4-SD) ;;
     BPI-R4-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    BPI-R4-SD-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-NAND-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-eMMC-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]|BPI-R4-NVMe-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
     *) exit 0 ;;
 esac
+
+if [ -f /sys/firmware/devicetree/base/chosen/rootdisk-nvme ]; then
+    medium=NVMe
+elif grep -q ubi /proc/cmdline; then
+    medium=NAND
+elif [ -f /sys/firmware/devicetree/base/chosen/rootdisk-emmc ]; then
+    medium=eMMC
+elif [ -f /sys/firmware/devicetree/base/chosen/rootdisk-sd ]; then
+    medium=SD
+else
+    medium=""
+fi
 
 al="$(uci -q get ieee1905.ieee1905.macaddress | tr -d ':' | tr 'A-Z' 'a-z')"
 
 case "$al" in
 [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-    hostname="BPI-R4-$(echo "$al" | cut -c7-12)"
+    hostname="BPI-R4${medium:+-$medium}-$(echo "$al" | cut -c7-12)"
     ;;
 *)
     # No AL-MAC to name it after - the efuse read failed, or this ran before
-    # 30-set-ieee1905-al-macaddr for a reason we have not seen. Fall back to
-    # the old medium name rather than leaving the box called OpenWrt: a
-    # colliding name is bad, no name at all is worse.
-    if [ -f /sys/firmware/devicetree/base/chosen/rootdisk-nvme ]; then
-        hostname="BPI-R4-NVMe"
-    elif grep -q ubi /proc/cmdline; then
-        hostname="BPI-R4-NAND"
-    elif [ -f /sys/firmware/devicetree/base/chosen/rootdisk-emmc ]; then
-        hostname="BPI-R4-eMMC"
-    elif [ -f /sys/firmware/devicetree/base/chosen/rootdisk-sd ]; then
-        hostname="BPI-R4-SD"
-    else
-        hostname="BPI-R4"
-    fi
+    # 30-set-ieee1905-al-macaddr for a reason we have not seen. The medium
+    # alone then, rather than leaving the box called OpenWrt: a colliding
+    # name is bad, no name at all is worse.
+    hostname="BPI-R4${medium:+-$medium}"
     ;;
 esac
 
