@@ -7,7 +7,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 (see [Planned](#planned-for-the-next-releases)).*
 
 > **Pre-release (v0.1-preview, <!-- TODO date -->).** It runs every day on a five-box lab, but it is not a product yet.
-> We publish it early for reviewers and testers. Please read [Known limitations](#known-limitations) before you flash anything.
+> We publish it early for reviewers and testers. It still has bugs - the ones we know are in
+> [Known limitations](#known-limitations), and fixes come with the next releases. Please read that section before you flash anything.
 >
 > **Everything here takes time - give it that time.** Pairing one box takes about 6-10 minutes including one restart
 > (up to 15 on the Pro 8X), a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
@@ -16,7 +17,6 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 > while you wait.
 
 ![Overview: the mesh at a glance](docs/screenshots/overview.jpg)
-<!-- TODO: retake all screenshots on the release images; ideally one short GIF where traffic moves to the other link -->
 
 ## What it does
 
@@ -28,8 +28,10 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
   automatic policy runs as a dry run; the mechanism itself is verified on hardware.
 - **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup
   (tested: Telit FN990A40, M.2; other modems that OpenWrt supports may work, untested). The
-  mesh keeps one gateway address for all clients. When the cable is pulled, clients are back online in about 10-25
-  seconds.
+  mesh keeps one gateway address for all clients. When the cable is pulled, or the router in front of the box goes
+  dead, clients are back online over LTE in about 10 seconds; when the cable comes back, the mesh returns to it after
+  about half a minute of stable cable, usually without a gap. Set the modem up in LuCI (*Network → Interfaces*, protocol
+  QMI or MBIM) and **restart that box once afterwards** (see *Known limitations*).
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
   It also points out a radio card that is noisier than the others, so a slow link is not blamed on the mesh.
 
@@ -39,7 +41,7 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 |---|---|
 | ![Nodes](docs/screenshots/nodes.jpg) **Nodes:** where each box sits, its links, its radio card | ![Clients](docs/screenshots/clients.jpg) **Clients:** per box, multi-link or single link, signal history, link rate |
 | ![Backhaul](docs/screenshots/backhaul.jpg) **Backhaul & MLO:** both links of every hop and what the controller does with them | ![Channels](docs/screenshots/channels.jpg) **Channels:** noise and load as each box hears it |
-| ![Events](docs/screenshots/events.jpg) **Events:** the last 24 hours in plain words | ![Setup](docs/screenshots/setup.jpg) **Setup:** start a new mesh or join one, and how to add a box <!-- TODO: shoot the wizard on an unconfigured box --> |
+| ![Events](docs/screenshots/events.jpg) **Events:** the last 24 hours in plain words | ![Setup](docs/screenshots/setup.jpg) **Setup:** start a new mesh or join one, and how to add a box |
 | ![Advanced](docs/screenshots/advanced.jpg) **Advanced (support):** steering history, the controller database and the raw API, for troubleshooting | |
 
 ## Getting started
@@ -73,8 +75,6 @@ it; we have built the mesh with CZ only.
 ### 2. The first box becomes the main box (controller)
 Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
 Pro 8X) - and open `http://192.168.1.1`.
-<!-- TODO (Petr 29. 9.): rewrite to "connect the computer to the service port from the start - the page then stays at
-192.168.1.1 and nothing disappears" - only after it is verified on a fresh box -->
 Go to *Network → EasyMesh → Setup* and click **This is my first box**. Enter the network name, the Wi-Fi password and a
 name for the box. Leave *Mesh addresses* at `10.10.10.1` unless your home network already uses `10.10.10.x`; it must not
 be `192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
@@ -151,6 +151,9 @@ at **`192.168.1.1`** on every box, whatever the mesh is doing, across upgrades:
 Flash the new `…squashfs-sysupgrade.itb` on each box with *System → Backup / Flash Firmware* and **keep the settings**.
 The mesh settings, the box's role and the main box's database stay. Upgrade the boxes furthest from the main box first and
 the main box last, one at a time, and wait until each is back in *Nodes* before the next (about 2 minutes, 5 on a Pro 8X).
+Clients on a box lose the internet for up to about half a minute while it upgrades, everyone for about seven minutes
+while the main box does. Afterwards the tree may not be the one you had (each box rejoins whoever answers first); put a
+box back with *Move…* - the move is measured and undone if it is not faster.
 
 ## In this pre-release
 
@@ -165,7 +168,8 @@ the main box last, one at a time, and wait until each is back in *Nodes* before 
 - 🧪 **Automatic TTLM policy:** avoiding a bad link, and alternating bands across a repeater (+70 % across one repeater, 2 hops,
   downloads, in one test series). Runs as a dry run by default.
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
-- 🧪 **Gateway failover** between cable and LTE on any box, one gateway address for clients, an outage of about 10-25 s
+- ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients: about 10 s to LTE when the
+  cable is pulled (3 of 3 tests, 10/10/11 s); back on the cable without a gap in 2 of 3 tests, once with a 32 s gap
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
 - 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules. **Rescue,
   on by default:** its path is bad (under ~100 Mbit/s) and another parent is at least twice as good. **Towards the main
@@ -233,7 +237,7 @@ The one exception is a box left on a path under about 100 Mbit/s - that is moved
 
 | Mechanism | By default | What it does | What it costs |
 |---|---|---|---|
-| Finding a new parent after a box or its parent restarts | on | the backhaul joins the best parent it hears, within seconds | the boxes behind a restarting box are offline for 30-60 s; after a restart of the main box the whole mesh re-forms, which takes a few minutes |
+| Finding a new parent after a box or its parent restarts | on | the backhaul joins the best parent it hears, within seconds | the boxes behind a restarting box are offline for 30 s to 2.5 min; after a restart of the main box the whole mesh re-forms and clients are without internet for about 5-6 minutes |
 | No island ([details](docs/TECHNICAL.md#self-healing-and-optimisation)) | on | a box without a path to the main box stops accepting others at once | nothing |
 | Bridges follow a moved box | on | every box forgets its learned bridge entries when the tree changes | nothing noticeable |
 | Moving a box by hand | when you ask | *Backhaul & MLO* → *Move…* next to a box: pick a parent it hears; a measured trial keeps the move only if it is faster, otherwise the box goes back by itself | a few seconds for the box and the boxes behind it; one to three minutes if the new parent does not answer; about three minutes of test traffic |
@@ -254,10 +258,10 @@ the deaf-link guard are switched on the boxes with
 **How long things take** (measured in our lab):
 - a new box joins and carries traffic about four to six minutes after you pair it, including its one restart (longer
   on the Pro 8X);
-- after a power cut of the whole mesh, clients are back on the internet in about 1.5 minutes and every box is back in
+- after a power cut of the whole mesh, clients are back on the internet in about 1.5-2 minutes and every box is back in
   under 3 minutes;
-- when one box restarts, the clients and boxes behind it are back within about a minute; after a restart of the main box
-  alone, it takes a few minutes, and the rescue may then need from 10 minutes to a few tens of minutes to rebuild the
+- when one box restarts, the clients and boxes behind it are back within 30 seconds to 2.5 minutes; after a restart of
+  the main box alone, clients are without internet for about 5-6 minutes, and the rescue may then need from 10 minutes to a few tens of minutes to rebuild the
   chains - it waits 5 minutes for the mesh to settle and moves one box at a time, about 3 minutes each (see *Known
   limitations*);
 - a move by hand is decided in about three to four minutes;
@@ -266,6 +270,14 @@ the deaf-link guard are switched on the boxes with
 ## Known limitations
 
 This is a preview. What is not done yet, or not done well:
+
+- **Failover to LTE watches the cable and the first router, not the internet behind it.** A pulled cable, or a router
+  in front of the box that is switched off, moves the mesh to LTE in about 10 s. If that router stays up but loses its
+  own internet connection, the mesh stays on the cable and has no internet until the router recovers. Checking the
+  whole way out is planned.
+- **A modem set up while the box is running is not used until the box restarts.** The box puts its modem into the
+  `wan` firewall zone when it starts; a modem interface added later has no NAT, and a failover to it carries nothing.
+  Restart the box once after setting the modem up (or run `/etc/init.d/mesh-gwd restart`). A fix is planned.
 
 - **Band steering of the backhaul is a dry run by default.** The TTLM rules decide and log what they would do; they only
   act when switched on (`/etc/mapc/ttlm-policy-live`, `/etc/mapc/ttlm-alternate-live`). Per-station TTLM from the
@@ -292,7 +304,7 @@ This is a preview. What is not done yet, or not done well:
   boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
   trial loads that branch with test traffic for about three minutes while it measures. That is why, by default, only a
   box on a path under about 100 Mbit/s is moved (`touch /etc/mapc/parent-rescue-off` on the main box stops even that).
-- **After pairing, a power cut or a restart of the main box, the tree follows the radio, not the floor plan.** The tree
+- **After pairing, a power cut, an upgrade or a restart of the main box or of a relay, the tree follows the radio, not the floor plan.** The tree
   is whoever answers first: a box may hang behind a box with a weaker card, or one hop further from the main box than it
   needs to be. **It can look illogical - we know, and arranging the tree from measured links comes in a later release**
   (see *Planned*). The mesh works, some paths are slower; a box left under about 100 Mbit/s is rescued by itself. Until
@@ -307,6 +319,15 @@ This is a preview. What is not done yet, or not done well:
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. In our lab this happened towards parents
   with a damaged 6 GHz antenna connector (see *Check the antenna connectors*). The box restarts once by itself during
   pairing, which clears it in our tests, and a guard restarts a box whose uplink stalls twice within half an hour.
+- **A client that switches bands on the same box can stall for up to about a minute.** A laptop that moves from one
+  band to another of the same box (for example from 5 to 2.4 GHz) can stay connected but pass no data until the box drops
+  it as inactive; it then reconnects by itself. hostapd removes its old entry on the other band and takes the new one with
+  it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
+  bands at once (MLO) are not affected.
+- **After a box was cut off from the mesh, the main box may not see the clients that joined it meanwhile.** They have
+  internet, but *Clients* does not list them until they reconnect:
+  the box does not report them again when its own link comes back. Meanwhile the main box cannot steer those clients
+  either. A fix is planned for the next release.
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.

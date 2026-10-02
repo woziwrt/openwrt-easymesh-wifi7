@@ -223,12 +223,20 @@ at once.
 The costs are not fixed in reality - a signal moves by several dB in a minute and the estimate with it. That is what
 the streak, the measured verdict, the cooldown and the 24 h deny are for: they bound how often a noisy estimate can
 cost a move, they do not make the estimate right. On a noisy card the estimate of the first hop can be far off
-(see *Measurements*), and the measured trial is the only judge.
+(see *Measurements*), and the measured trial is the only judge. Note what the theorem does and does not cover: it
+bounds the moves accepted by the model, but a move is finally kept by the measured trial, and a kept move can raise
+$\Phi$ (noise, load). In practice it is the cooldown and the deny that bound the rest.
+
+Readers who know routing will recognise the step: $C(v) \leftarrow \min_q \big(\hat c(v,q) + C(q)\big)$ is the
+relaxation of Bellman-Ford, the algorithm behind distance-vector routing, applied one node at a time and only when
+it gains by the margin. The check that a candidate is not below the node is what split horizon is to RIP: it keeps a
+node from choosing a path through its own child (counting to infinity).
 
 ### 4. Planned: the planner as a graph problem
 
-Not in this release. Today the planner looks at one node at a time and fixes what is plainly wrong. The next one
-looks at the whole mesh at once.
+Not in this release. Today the planner looks at one node at a time and fixes what is plainly wrong - a distributed
+Bellman-Ford with hysteresis. The next one looks at the whole mesh at once: the controller sees the whole graph, so it
+can use Dijkstra instead.
 
 Let $G = (V, E)$ be the graph of every box and every parent each box can hear, with the weight of an edge
 $w(v,q) = 1/T(v,q)$: measured where the pair has carried traffic, estimated from the signal where it has not. Because
@@ -238,6 +246,14 @@ the root at the same time - the shortest-path tree, found by Dijkstra's algorith
 ```math
 C^\ast(v) = \min_{q \,:\, (v,q) \in E} \big( w(v,q) + C^\ast(q) \big), \qquad C^\ast(\text{root}) = 0
 ```
+
+In the language of graph theory: the mesh is a directed graph - an edge $v \to q$ means $v$ hears $q$, and its
+weight is the downstream cost, which is not the cost of $q \to v$ (one leg of the lab measured 126 Mbit/s down and 424
+up). Two bands between the same pair are parallel edges, merged into one by the MLO formula. The tree we want is an
+arborescence rooted at the gateway. Not the minimum one (Chu-Liu/Edmonds), which minimises the sum of the edge
+weights and can hang a box behind three cheap weak hops; the shortest-path one, which minimises every box's own path.
+For readers from circuit theory: a hop's cost $1/T$ behaves like a resistance and the hops of a path are in series,
+$C = \sum R_i$; the two legs of an MLO hop are *not* in parallel, because they share the time of one station.
 
 No node has to give anything up for another: $C^\ast(v) \le C(v)$ for every $v$ and every tree. The plan is the
 difference between the current tree and that one, and it is accepted only when it is worth what the moves cost:
@@ -249,9 +265,26 @@ difference between the current tree and that one, and it is accepted only when i
 then carried out one measured move at a time, from the root down, so that every move already sees its parent on the
 final path. The root becomes the box that holds the active internet uplink, not necessarily the controller.
 
-What the model leaves out, honestly: a relay with several children splits its airtime among them, so the real cost of
-a hop depends on the load on it, and the minimum under load is no longer a shortest-path tree. We will start from the
-load-free tree, measure what is left, and only then decide whether the load needs to be in the model.
+**Load, and what $\Phi$ means.** A relay carries the traffic of its whole subtree. If box $u$ wants $d_u$ Mbit/s from
+the gateway, the hop of $v$ carries $\sum_{u \in S(v) \cup \{v\}} d_u$, and the airtime the whole mesh spends on it is,
+after swapping the order of summation,
+
+```math
+\sum_{v} \frac{1}{T(v, p(v))} \sum_{u \in S(v) \cup \{v\}} d_u \;=\; \sum_{u} d_u \, C(u)
+```
+
+As long as every hop shares one channel and every box hears every other (one collision domain, as in our lab), that is
+the constraint: the mesh can carry the demands $\lambda d$ for $\lambda \le 1 / \sum_u d_u C(u)$. So $\Phi$ is not
+an invented score - with $d_u = 1$ it is the airtime the mesh spends per unit of traffic to every box, and the most the
+mesh can carry is $1/\Phi$. The shortest-path tree minimises every $C(u)$, hence $\sum_u d_u C(u)$ for **any**
+demands: in one collision domain, load does not change the answer. (This is Kirchhoff's current law on the incidence
+matrix of the tree, $A f = d$, the flow on each hop being the demand of its subtree.)
+
+What the model leaves out, honestly: boxes far enough apart transmit at the same time (spatial reuse). Then the
+constraint holds per group of links that interfere with each other, the throughput of a given tree is a linear
+program, and choosing the tree becomes an integer problem; the shortest-path tree is no longer guaranteed to be the
+best. The MLO hop formula is an approximation of two such domains, one per band. We will start from the shortest-path
+tree, measure what is left, and only then decide whether interference groups need to be in the model.
 
 ## Patches below EasyMesh
 
@@ -276,4 +309,5 @@ All on our five-box lab; the raw logs are not published yet.
 | 2026-09-23 | Negotiated TTLM per backhaul station, "all TIDs on 6 GHz" | 0 bytes on the 5 GHz link in both directions; setup and teardown 20/20 |
 | 2026-09-25 | Band alternation across one repeater (downloads) | 153 → 260 Mbit/s |
 | 2026-09-25 | Gateway failover, client outage | 24 → 11 s |
+| 2026-10-01 | Gateway failover cable → LTE on another box (WAN port down for 120-180 s, Wi-Fi client pinging 1.1.1.1 every 0.2 s), rc3 | to LTE 10, 10, 11 s; back on the cable after ~30 s of stable cable, client gap 0, 32, 0 s. With the port up and only the traffic behind it dropped: no failover (the probe asks the first router, which still answered ARP) |
 | 2026-09-28 | Parent planner, three measured trials in one night (a relay moved from 2 hops to 1) | about 120/250 → 1000/1080 Mbit/s up/down, all three kept |

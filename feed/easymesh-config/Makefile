@@ -62,6 +62,7 @@ define Package/easymesh-config/install
 	$(INSTALL_BIN) ./files/96-easymesh-6g-backhaul-no-mbssid $(1)/etc/uci-defaults/96-easymesh-6g-backhaul-no-mbssid
 	$(INSTALL_BIN) ./files/97-easymesh-stp-root-controller $(1)/etc/uci-defaults/97-easymesh-stp-root-controller
 	$(INSTALL_BIN) ./files/98-easymesh-bh-no-inactivity-poll $(1)/etc/uci-defaults/98-easymesh-bh-no-inactivity-poll
+	$(INSTALL_BIN) ./files/99-easymesh-fh-max-inactivity $(1)/etc/uci-defaults/99-easymesh-fh-max-inactivity
 endef
 
 define Package/easymesh-config/postinst
