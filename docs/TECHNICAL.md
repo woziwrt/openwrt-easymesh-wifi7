@@ -252,8 +252,8 @@ weight is the downstream cost, which is not the cost of $q \to v$ (one leg of th
 up). Two bands between the same pair are parallel edges, merged into one by the MLO formula. The tree we want is an
 arborescence rooted at the gateway. Not the minimum one (Chu-Liu/Edmonds), which minimises the sum of the edge
 weights and can hang a box behind three cheap weak hops; the shortest-path one, which minimises every box's own path.
-For readers from circuit theory: a hop's cost $1/T$ behaves like a resistance and the hops of a path are in series,
-$C = \sum R_i$; the two legs of an MLO hop are *not* in parallel, because they share the time of one station.
+The two legs of an MLO hop do not simply add up: they share the airtime of one station, which is what the MLO
+formula accounts for.
 
 No node has to give anything up for another: $C^\ast(v) \le C(v)$ for every $v$ and every tree. The plan is the
 difference between the current tree and that one, and it is accepted only when it is worth what the moves cost:
@@ -277,8 +277,7 @@ As long as every hop shares one channel and every box hears every other (one col
 the constraint: the mesh can carry the demands $\lambda d$ for $\lambda \le 1 / \sum_u d_u C(u)$. So $\Phi$ is not
 an invented score - with $d_u = 1$ it is the airtime the mesh spends per unit of traffic to every box, and the most the
 mesh can carry is $1/\Phi$. The shortest-path tree minimises every $C(u)$, hence $\sum_u d_u C(u)$ for **any**
-demands: in one collision domain, load does not change the answer. (This is Kirchhoff's current law on the incidence
-matrix of the tree, $A f = d$, the flow on each hop being the demand of its subtree.)
+demands: in one collision domain, load does not change the answer.
 
 What the model leaves out, honestly: boxes far enough apart transmit at the same time (spatial reuse). Then the
 constraint holds per group of links that interfere with each other, the throughput of a given tree is a linear
