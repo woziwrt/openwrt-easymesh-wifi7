@@ -1,10 +1,18 @@
 #!/bin/sh
-# install-nvme.sh - BPI-R4 NVMe install script
-# Run from NAND rescue system
+# install-nvme.sh - install EasyMesh Wi-Fi 7 for OpenWrt to the NVMe disk of a BPI-R4 (4 GB or 8 GB)
+# Must be run from the NAND rescue system: the box keeps booting from NAND, whose U-Boot then loads the system
+# from the NVMe (nvme_boot=1).
+#
+#   wget -O /tmp/install-nvme.sh https://raw.githubusercontent.com/woziwrt/openwrt-easymesh-wifi7/emmc-nvme/scripts/install/r4/install-nvme.sh
+#   sh /tmp/install-nvme.sh            (TAG=<release tag> sh ... for another release)
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the images come from this repository's release, the
+# board is told by its memory, and every download is checked against the release's SHA256SUMS.
 
 NVME_DEV="/dev/nvme0n1"
 GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-lab-emmc-rc4}"
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
@@ -16,46 +24,33 @@ printf "  BPI-R4 NVMe Installer\n"
 printf "=================================================\n"
 printf "\n"
 
-# || 0. Variant selection |||||||||||||||||||||||||||||||||||||||||||||||||||||
+# || 0. Board ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
 
-printf "Select your board variant:\n"
-printf "\n"
-printf "  1) 4GB standard (WiFi)\n"
-printf "  2) 4GB wired (no WiFi)\n"
-printf "  3) 4GB PoE (WiFi)\n"
-printf "  4) 4GB PoE wired (no WiFi)\n"
-printf "  5) 8GB standard (WiFi)\n"
-printf "  6) 8GB wired (no WiFi)\n"
-printf "  7) 8GB PoE (WiFi)\n"
-printf "  8) 8GB PoE wired (no WiFi)\n"
-printf "  9) 8GB wired UniFi\n"
-printf " 10) 8GB PoE wired UniFi\n"
-printf "\n"
-printf "Enter choice [1-10]: "
-read VARIANT
-
-case "$VARIANT" in
-    1) GH_TAG="release-4gb-standard";        ITB_NAME="bpi-r4.itb";     IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nvme-img.bin" ;;
-    2) GH_TAG="release-4gb-wired";           ITB_NAME="bpi-r4.itb";     IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nvme-img.bin" ;;
-    3) GH_TAG="release-4gb-poe";             ITB_NAME="bpi-r4-poe.itb"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-nvme-img.bin" ;;
-    4) GH_TAG="release-4gb-poe-wired";       ITB_NAME="bpi-r4-poe.itb"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-nvme-img.bin" ;;
-    5) GH_TAG="release-8gb-standard";        ITB_NAME="bpi-r4.itb";     IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-nvme-img.bin" ;;
-    6) GH_TAG="release-8gb-wired";           ITB_NAME="bpi-r4.itb";     IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-nvme-img.bin" ;;
-    7) GH_TAG="release-8gb-poe";             ITB_NAME="bpi-r4-poe.itb"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-nvme-img.bin" ;;
-    8) GH_TAG="release-8gb-poe-wired";       ITB_NAME="bpi-r4-poe.itb"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-nvme-img.bin" ;;
-    9) GH_TAG="release-8gb-wired-unifi";     ITB_NAME="bpi-r4.itb";     IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-8gb-nvme-img.bin" ;;
-   10) GH_TAG="release-8gb-poe-wired-unifi"; ITB_NAME="bpi-r4-poe.itb"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-poe-8gb-nvme-img.bin" ;;
+# The 4 GB and 8 GB boards need different images and report the same model name, so tell them by memory.
+RAM_GB=$(awk '/MemTotal/ { print int($2 / 1048576 + 0.5) }' /proc/meminfo)
+case "$RAM_GB" in
+    3|4) BOARD="BPI-R4 4 GB"; DEV_NAME="bananapi_bpi-r4" ;;
+    7|8) BOARD="BPI-R4 8 GB"; DEV_NAME="bananapi_bpi-r4-8gb" ;;
     *)
-        printf "\n${RED}ERROR: Invalid choice!${NC}\n\n"
+        printf "\n${RED}ERROR: %s GB of memory - not a BPI-R4 4 GB or 8 GB.${NC}\n" "$RAM_GB"
+        printf "       For a BPI-R4 Pro 8X use pro-8x/install-nvme-pro8x.sh.\n\n"
         exit 1
         ;;
 esac
-
+ITB_NAME="openwrt-mediatek-filogic-${DEV_NAME}-squashfs-sysupgrade.itb"
+IMG_NAME="openwrt-mediatek-filogic-${DEV_NAME}-nvme-img.bin"
 ITB="/tmp/${ITB_NAME}"
 IMG="/tmp/${IMG_NAME}"
 
-printf "\n"
-printf "  Selected: %s\n" "$GH_TAG"
+printf "  Board:   %s (%s GB of memory)\n" "$BOARD" "$RAM_GB"
+printf "  Release: %s/%s %s\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
+printf "  Is that right? [yes/no]: "
+read BOARD_OK
+if [ "$BOARD_OK" != "yes" ]; then
+    printf "\n  Cancelled.\n\n"
+    exit 1
+fi
+
 printf "\n"
 
 # || 1. Check boot media |||||||||||||||||||||||||||||||||||||||||||||||||||||
@@ -180,8 +175,6 @@ case "$USE_LOCAL" in
     2)
         printf "\n        INFO: Using local files from /tmp\n"
         printf "        Checking files...\n"
-        ITB="/tmp/openwrt-mediatek-filogic-bananapi_bpi-r4-squashfs-sysupgrade.itb"
-        IMG="/tmp/openwrt-mediatek-filogic-bananapi_bpi-r4-nvme-img.bin"
         if [ ! -f "$ITB" ]; then
             printf "${RED}ERROR: %s not found!${NC}\n" "$ITB"; exit 1
         fi
@@ -191,28 +184,14 @@ case "$USE_LOCAL" in
         printf "        OK -- both files present\n\n"
         ;;
     *)
-        printf "\n  Use default release or your own fork?\n"
-        printf "  [1] Default (woziwrt/bpi-r4-deploy)\n"
-        printf "  [2] My fork (same repo name, different username)\n\n"
-        printf "  Select [1/2]: "
-        read USE_FORK
+        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        ITB_URL="${REL_URL}/${ITB_NAME}"
+        IMG_URL="${REL_URL}/${IMG_NAME}.gz"
 
-        case "$USE_FORK" in
-            2)
-                printf "\n        INFO: Fork repo name must remain 'bpi-r4-deploy'\n"
-                printf "        Enter your GitHub username: "
-                read GH_USER
-                ;;
-        esac
-
-        BASE_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
-        ITB_URL="${BASE_URL}/${ITB_NAME}"
-        IMG_URL="${BASE_URL}/${IMG_NAME}"
-
-        printf "        URL: %s\n\n" "$BASE_URL"
+        printf "        URL: %s\n\n" "$REL_URL"
 
         printf "[ 5/7 ] Network check...\n\n"
-        printf "        INFO: Internet required (~150 MB download)\n"
+        printf "        INFO: Internet required (~270 MB download)\n"
         printf "        Is ethernet connected? [yes/no]: "
         read NET_CONFIRM
 
@@ -228,31 +207,34 @@ case "$USE_LOCAL" in
         printf "        OK -- network available\n\n"
 
         printf "        Checking release availability...\n"
-        HTTP_CODE=$(wget --server-response --spider "$ITB_URL" 2>&1 | grep "HTTP/" | tail -1 | awk '{print $2}')
+        HTTP_CODE=$(wget --server-response --spider "$IMG_URL" 2>&1 | grep "HTTP/" | tail -1 | awk '{print $2}')
         if [ "$HTTP_CODE" != "200" ]; then
             printf "\n${RED}ERROR: Release not found on GitHub (tag: %s).\n" "$GH_TAG"
-            printf "       The build has not been created yet.\n"
-            printf "       Please run the GitHub Actions workflow first:\n"
-            printf "       https://github.com/${GH_USER}/${GH_REPO}/actions\n\n${NC}"
+            printf "       Check the tag: https://github.com/${GH_USER}/${GH_REPO}/releases\n\n${NC}"
             exit 1
         fi
         printf "        OK -- release available\n\n"
 
-        printf "        Downloading %s...\n" "$ITB_NAME"
-        wget -O "$ITB" "$ITB_URL"
-        if [ $? -ne 0 ] || [ ! -s "$ITB" ]; then
-            printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$ITB_NAME"
-            rm -f "$ITB"; exit 1
+        if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS"; then
+            printf "\n${RED}ERROR: Download of SHA256SUMS failed.${NC}\n\n"; exit 1
         fi
-        printf "        OK -- %s downloaded\n\n" "$ITB_NAME"
 
-        printf "        Downloading %s...\n" "$IMG_NAME"
-        wget -O "$IMG" "$IMG_URL"
-        if [ $? -ne 0 ] || [ ! -s "$IMG" ]; then
-            printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$IMG_NAME"
-            rm -f "$ITB" "$IMG"; exit 1
-        fi
-        printf "        OK -- %s downloaded\n\n" "$IMG_NAME"
+        # A half-downloaded or wrong image written to the disk is a box that does not boot.
+        for F in "$ITB_NAME" "$IMG_NAME.gz"; do
+            printf "        Downloading %s...\n" "$F"
+            if ! wget -O "/tmp/$F" "${REL_URL}/$F" || [ ! -s "/tmp/$F" ]; then
+                printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$F"
+                rm -f "$ITB" "$IMG.gz"; exit 1
+            fi
+            WANT=$(grep " ${F}\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+            GOT=$(sha256sum "/tmp/$F" | cut -d' ' -f1)
+            if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+                printf "\n${RED}ERROR: %s does not match SHA256SUMS of the release.${NC}\n\n" "$F"
+                rm -f "$ITB" "$IMG.gz"; exit 1
+            fi
+            printf "        OK -- %s downloaded, checksum matches\n\n" "$F"
+        done
+        gunzip -f "$IMG.gz" || { printf "\n${RED}ERROR: Could not unpack the image.${NC}\n\n"; exit 1; }
         ;;
 esac
 
