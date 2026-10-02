@@ -270,13 +270,22 @@ endef
 TARGET_DEVICES += bananapi_bpi-r4-poe-8gb
 
 # --- Lean NAND installer devices (no docker) — snand-img only ---
-# NAND is 128 MiB; docker (and friends) is =m and is NOT in these devices,
-# so the NAND rootfs is full-minus-docker. It is used to install eMMC/NVMe (a HW necessity).
+# The NAND is 128 MiB. docker, dockerd, containerd and docker-compose are =y in
+# configs/bpi-r4.config, so the shared rootfs carries them (~65 MB of squashfs)
+# and the NAND image came out at 139.6 MB - it did not fit. The "-pkg" entries
+# below make the per-device rootfs drop them again (include/image.mk runs
+# "apk del" on them after copying the shared rootfs). The whole chain goes at
+# once: apk refuses to remove a package another one still needs, and the build
+# ignores that refusal silently. wipefs and smartmontools are what the eMMC/NVMe
+# installers run from this NAND system.
+NAND_INSTALLER_PACKAGES := -docker-compose -docker -dockerd -containerd -runc -tini \
+	wipefs smartmontools
 define Device/bananapi_bpi-r4-nand
   DEVICE_MODEL := BPi-R4 NAND installer
   DEVICE_DTS := mt7988a-bananapi-bpi-r4
   DEVICE_DTS_CONFIG := config-mt7988a-bananapi-bpi-r4
   $(call Device/bananapi_bpi-r4-common-4gb)
+  DEVICE_PACKAGES += $(NAND_INSTALLER_PACKAGES)
   ARTIFACTS := snand-img.bin
 endef
 TARGET_DEVICES += bananapi_bpi-r4-nand
@@ -286,6 +295,7 @@ define Device/bananapi_bpi-r4-nand-8gb
   DEVICE_DTS := mt7988a-bananapi-bpi-r4
   DEVICE_DTS_CONFIG := config-mt7988a-bananapi-bpi-r4
   $(call Device/bananapi_bpi-r4-common-8gb)
+  DEVICE_PACKAGES += $(NAND_INSTALLER_PACKAGES)
   ARTIFACTS := snand-img.bin
 endef
 TARGET_DEVICES += bananapi_bpi-r4-nand-8gb
