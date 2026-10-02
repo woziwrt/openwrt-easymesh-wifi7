@@ -207,8 +207,9 @@ case "$USE_LOCAL" in
         printf "        OK -- network available\n\n"
 
         printf "        Checking release availability...\n"
-        HTTP_CODE=$(wget --server-response --spider "$IMG_URL" 2>&1 | grep "HTTP/" | tail -1 | awk '{print $2}')
-        if [ "$HTTP_CODE" != "200" ]; then
+        # The exit code, not a header: a "Server:" header containing "HTTP/" was
+        # taken for the status line (2026-10-02, a test mirror).
+        if ! wget -q --spider "$IMG_URL" 2>/dev/null; then
             printf "\n${RED}ERROR: Release not found on GitHub (tag: %s).\n" "$GH_TAG"
             printf "       Check the tag: https://github.com/${GH_USER}/${GH_REPO}/releases\n\n${NC}"
             exit 1
