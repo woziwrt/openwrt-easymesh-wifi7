@@ -89,6 +89,15 @@ if uci -q get wireless.ap_mld_2 >/dev/null &&
 	changed=1
 fi
 
+# A silent fronthaul client is dropped after 60 s, not 300 s (why:
+# 99-easymesh-fh-max-inactivity). Here too, on every boot: the join rebuilds
+# ap_mld_1 after the uci-defaults have run. An explicit value is kept.
+if uci -q get wireless.ap_mld_1 >/dev/null &&
+   [ -z "$(uci -q get wireless.ap_mld_1.max_inactivity)" ]; then
+	uci set wireless.ap_mld_1.max_inactivity=60
+	changed=1
+fi
+
 # Everything else is squatting: image defaults, legacy per-band spawns,
 # scaffolding from failed joins. Deleted, not disabled - a disabled section
 # resurrects on the next writer's whim.

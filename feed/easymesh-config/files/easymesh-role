@@ -750,6 +750,9 @@ controller)
 			uci set wireless.ap_mld_1.multi_ap_backhaul_key="$bh_key"
 			uci set wireless.ap_mld_1.wps_pushbutton=1
 			uci set wireless.ap_mld_1.wps_cred_add_sae=1
+			# why: 99-easymesh-fh-max-inactivity; an explicit value is kept
+			[ -n "$(uci -q get wireless.ap_mld_1.max_inactivity)" ] ||
+				uci set wireless.ap_mld_1.max_inactivity=60
 			uci commit wireless
 			echo "easymesh-role: fronthaul armed for push-button join"
 		else

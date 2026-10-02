@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Petr Wozniak (WOZIWRT project)
+#
+# A client that switches bands on the same box is cut off for a minute, not
+# for five.
+#
+# A non-MLO client (a laptop on 2.4 GHz) that authenticates on one link of the
+# fronthaul AP MLD and associates on another leaves a stale entry behind.
+# hostapd prunes it ("Prune association for <mac>") and 30 s later its
+# DEAUTH/REMOVE timer removes the station by MAC - which also takes down the
+# client's new association in the driver. The client stays associated but no
+# data moves until ap_max_inactivity expires and hostapd drops it; then it
+# reconnects. Measured 2026-10-01 on the office box, 2 of 2: Prune at T,
+# "deauthenticated due to inactivity" at T+30 s, "disassociated due to
+# inactivity" at T+300 s, internet back right after.
+#
+# 60 s instead of the default 300 s bounds that stall to about a minute. The
+# fix itself (do not remove a pruned station by MAC while the same MAC is
+# live on a sibling link) belongs in hostapd. Fronthaul only: the backhaul BSS
+# has its own rule (98-easymesh-bh-no-inactivity-poll).
+#
+# This covers boxes upgraded with their settings kept. easymesh-genconfig
+# (agents, every boot) and easymesh-role (a new controller) set the same value,
+# because a box paired later rebuilds ap_mld_1 after this file has run.
+# An explicit setting is never overridden.
+
+if ! uci -q show wireless >/dev/null 2>&1; then
+	echo "99-easymesh-fh-max-inactivity: no wireless config yet, will retry at boot" >&2
+	exit 1
+fi
+
+uci -q get wireless.ap_mld_1 >/dev/null || exit 0
+[ -n "$(uci -q get wireless.ap_mld_1.max_inactivity)" ] && exit 0
+uci set wireless.ap_mld_1.max_inactivity=60
+uci commit wireless
+logger -t easymesh-config "fronthaul: drop a silent client after 60 s, not 300 s (stall after a band switch on one box)"
+exit 0
