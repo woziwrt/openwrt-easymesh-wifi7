@@ -51,6 +51,10 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 - **2 boxes** to see the core of it (a controller and one agent over a multi-link backhaul, TTLM on that link);
 - **3 or more** to see a real mesh (chains, choice of parent, relaying);
 - Banana Pi **BPI-R4** (4 GB or 8 GB) or **BPI-R4 Pro 8X**, each with the **BPI-R4-NIC-BE14** Wi-Fi 7 card (MT7996);
+  **the card is the part that differs most from box to box.** Some are noisier than others, a 6 GHz antenna chain can be
+  weak, now and then the card does not start at boot, and on its multi-link setup a Wi-Fi reload is not reliable (the mesh
+  restarts the box instead). Most odd behaviour we met came from a card or its antennas, not from the mesh: check
+  yours with `easymesh-card-check` and read [Known limitations](#known-limitations);
 - a microSD card per box, 8 GB or larger and a good one (A1 or better: the main box keeps its database on it). Running from SD leaves whatever is in the box's own flash untouched: take the card out and the
   box boots its old system.
 - **For permanent use, the main box is better on eMMC or NVMe.** It writes its database and logs all the time: SD
