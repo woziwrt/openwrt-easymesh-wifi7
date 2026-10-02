@@ -336,6 +336,12 @@ This is a preview. What is not done yet, or not done well:
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
+- **The box restarts where a Wi-Fi reload would seem enough** - while it pairs, after its Wi-Fi settings change, and
+  when its radios need a clean start. That is deliberate. On the multi-link (MLO) setup of the MT7996 (BE14) card, a
+  Wi-Fi reload has been unreliable in our tests: the radios sometimes did not come back, or a link came back without
+  traffic. A restart costs one or two minutes (five on a Pro 8X) but always ends in a known state. The one restart while
+  a box pairs also clears a case where its 6 GHz link would otherwise stall. If you want to remove a restart, measure the
+  reload on several boxes and over several days first.
 - **On the BPI-R4 Pro 8X the lamps do not show pairing.** Its board wires the LEDs differently, so holding its WPS
   button gives no blink. The press still works - just wait. A Pro 8X can also restart twice while it joins instead of
   once (it boots slowly, about five minutes), so give it 10-15 minutes.
