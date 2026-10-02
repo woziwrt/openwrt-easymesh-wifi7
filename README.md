@@ -51,7 +51,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 - **3 or more** to see a real mesh (chains, choice of parent, relaying);
 - Banana Pi **BPI-R4** (4 GB or 8 GB) or **BPI-R4 Pro 8X**, each with the **BPI-R4-NIC-BE14** Wi-Fi 7 card (MT7996);
 - a microSD card per box, 8 GB or larger and a good one (A1 or better: the main box keeps its database on it). Running from SD leaves whatever is in the box's own flash untouched: take the card out and the
-  box boots its old system.
+  box boots its old system. (Installing to the board's eMMC or to an NVMe disk instead is possible as an experimental
+  alternative: [docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md).)
 
 Any box can be the main box, and it can stand anywhere; a BPI-R4 Pro 8X can just as well be one of the others.
 
@@ -341,7 +342,7 @@ This is a preview. What is not done yet, or not done well:
 - **A box that lost one of its two backhaul links keeps going on one.** The mesh does not reconnect it to get the
   second link back on purpose: a reconnection takes the box and every box behind it off the mesh for up to a minute.
 - **The controller database lives on the boot medium.** A slow SD card can stall the main box for seconds; use a good
-  one (A1 or better). This release runs from the SD card only; installing to eMMC, NAND or NVMe is not part of it.
+  one (A1 or better). This release runs from the SD card; installing to eMMC or NVMe is experimental ([docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md)).
 - The web interface is in English only.
 
 ## What is ours and what is not
