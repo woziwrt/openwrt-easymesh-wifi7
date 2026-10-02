@@ -23,7 +23,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 
 - **One button to add a box.** Press *Pair a new box* on the main box (or its WPS button), then hold the WPS button on
   the new box. The new box joins the mesh, gets its settings and a name, and restarts once by itself while it joins.
-- **Wi-Fi 7 multi-link backhaul.** Every box talks to its parent over two links at once (5 GHz and 6 GHz, MLO). The main
+- **Wi-Fi 7 multi-link backhaul.** Each box connects to its parent over two links at once, one on 5 GHz and one on
+  6 GHz (MLO), when both come up (see *Known limitations*). The main
   box (the EasyMesh *controller*) can tell each backhaul link which band carries which traffic
   (*TID-to-Link Mapping*, TTLM) based on the shape of the whole mesh, not on one radio's view. In this preview the
   automatic policy runs as a dry run; the mechanism itself is verified on hardware.
@@ -89,11 +90,13 @@ against `SHA256SUMS`, and write it to one SD card per box:
 | BPI-R4 Pro 8X | `openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-sdcard.img.gz` |
 
 Set the boot switch of every box to SD (**A = 1, B = 1**). Like stock OpenWrt, every box starts at `http://192.168.1.1` with the user
-`root` and **no password** (just click *Log in*).
+`root` and **no password** (just click *Log in*). Until a box is set up, its Wi-Fi `OpenWrt-MLD` also uses the published
+key `12345678`: build the mesh with nobody else in range, and set root passwords afterwards (step 4).
 
 The image starts with the Wi-Fi country set to **CZ** (Czech Republic). If you are elsewhere, set yours on each box in
 *Network → WiFi Manager → Change Country* before you build the mesh. The backhaul uses 6 GHz where your country allows
-it; we have built the mesh with CZ only.
+it; we have built the mesh with CZ only. Where 6 GHz is not allowed, the backhaul runs on 5 GHz only - we have not
+tested that.
 
 ### 2. The first box becomes the main box (controller)
 Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
@@ -147,6 +150,8 @@ in the meantime: a second press cancels the pairing.
 - **Set a root password on every box** (*System → Administration*) once it is in the mesh. The mesh does not need it;
   your network does. Until a box is set up, its Wi-Fi `OpenWrt-MLD` uses the published key `12345678` - so set the box
   up, or keep it off, while strangers are in range.
+- While pairing is open (about seven minutes), any device in range that starts WPS gets the mesh's Wi-Fi credentials -
+  that is how WPS push-button works. Open it only when you are adding a box.
 - To start a box over, hold its button **10 seconds**: that erases its settings (writing its SD card again does the
   same). There is one main box per mesh; if you made a second one by mistake (its *Overview* shows a mesh of one box),
   start that one over and pair it.
@@ -175,8 +180,10 @@ Flash the new `…squashfs-sysupgrade.itb` on each box with *System → Backup /
 The mesh settings, the box's role and the main box's database stay. Upgrade the boxes furthest from the main box first and
 the main box last, one at a time, and wait until each is back in *Nodes* before the next (about 2 minutes, 5 on a Pro 8X).
 Clients on a box lose the internet for up to about half a minute while it upgrades, everyone for about seven minutes
-while the main box does. Afterwards the tree may not be the one you had (each box rejoins whoever answers first); put a
-box back with *Move…* - the move is measured and undone if it is not faster.
+while the main box does. Afterwards the tree may not be the one you had (each box rejoins whoever answers first), and
+after the main box the mesh may come back as a star for 10 to a few tens of minutes (see *Known limitations*); put a
+box back with *Move…* - the move is measured and undone if it is not faster. This is for boxes running from the SD card:
+**do not `sysupgrade` a box installed to eMMC or NVMe yet** (see [docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md)).
 
 ## In this pre-release
 
@@ -193,7 +200,7 @@ box back with *Move…* - the move is measured and undone if it is not faster.
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
 - ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients: about 10 s to LTE when the
   cable is pulled (3 of 3 tests, 10/10/11 s); back on the cable without a gap in 2 of 3 tests, once with a 32 s gap
-- ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own every time
+- ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own in each of our tests
 - 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules. **Rescue,
   on by default:** its path is bad (under ~100 Mbit/s) and another parent is at least twice as good. **Towards the main
   box, off by default (danger zone):** another parent one hop closer to the controller is at least 1.5 times as good.
@@ -208,7 +215,8 @@ box back with *Move…* - the move is measured and undone if it is not faster.
   points running for 20 s, enough to find a new parent on the same channel (a move took ~6 s instead of ~26 s off air)
 - ✅ **Bridges follow a moved box:** when the backhaul tree changes, every box forgets its learned bridge entries at
   once. Without it, a box that moved behind another relay was unreachable for up to five minutes.
-- 🧪 **A box stuck on a parent it cannot use moves by itself:** when most pings to the main box are lost and a much
+- 🧪 **A box stuck on a parent it cannot use can move by itself** (off by default - it logs what it would do;
+  `touch /etc/mapc/bh-rescue-live` on a box lets it act): when most pings to the main box are lost and a much
   stronger parent is in range, the box moves there, and goes back if the new place does not work. It needs no help from
   the main box, which cannot reach it in that state anyway.
 - ✅ **Backhaul watchdogs:** a backhaul BSS that stopped beaconing is re-armed. A backhaul station that has moved away is
@@ -322,7 +330,8 @@ This is a preview. What is not done yet, or not done well:
   WPS push-button. The backhaul links themselves are encrypted Wi-Fi (WPA3-SAE). We report Profile 3 capabilities (needed
   for Wi-Fi 7 link reports), so a third-party controller that enforces Profile 3 security will reject our agents: in this
   preview the mesh is meant to be built from our boxes only.
-- **5 GHz stays on channel 36** (no radar channels) by default: the cards cannot watch for radar in the background.
+- **5 GHz stays on channel 36** (no radar channels) by default: a radar hit on a radar channel would take the backhaul
+  down for at least a minute, and background radar detection is not enabled or tested in this release.
 - **Every move costs a moment of connectivity.** When a box is moved - by hand or by the planner - that box and the
   boxes behind it are off the mesh for a few seconds, for one to three minutes if the new parent does not answer, and a
   trial loads that branch with test traffic for about three minutes while it measures. That is why, by default, only a
@@ -344,9 +353,11 @@ This is a preview. What is not done yet, or not done well:
   pairing, which clears it in our tests, and a guard restarts a box whose uplink stalls twice within half an hour.
 - **A client that switches bands on the same box can stall for up to about a minute.** A laptop that moves from one
   band to another of the same box (for example from 5 to 2.4 GHz) can stay connected but pass no data until the box drops
-  it as inactive; it then reconnects by itself. hostapd removes its old entry on the other band and takes the new one with
-  it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
+  it as inactive; it then reconnects by itself. When the laptop's old entry on the other band is removed, hostapd
+  removes it by address, and the current connection goes with it. This release shortens the stall from five minutes to one; a fix in hostapd is planned. Clients that use several
   bands at once (MLO) are not affected.
+- **A box moved to eMMC or NVMe with the experimental installers loses its name** in a mesh whose main box runs
+  the `v0.1-preview` SD card: it shows as `BPI-R4-eMMC-…` or `BPI-R4-NVMe-…`; rename it in *Nodes*.
 - **After a box was cut off from the mesh, the main box may not see the clients that joined it meanwhile.** They have
   internet, but *Clients* does not list them until they reconnect:
   the box does not report them again when its own link comes back. Meanwhile the main box cannot steer those clients

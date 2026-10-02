@@ -39,10 +39,12 @@ decides and delivers:
      cards do not stop data.
    - *Rule 2, alternate bands across a repeater:* a relaying box receives from its parent on one band and sends to its
      children on the other. It relies on the card doing STR (simultaneous transmit/receive). Measured across one repeater
-     (2 hops, downloads): 153 → 260 Mbit/s (+70 %). The upload direction (receive 6, send 5) is not measured yet. Run-to-run variance on our lab is about 30 %, so more A/B runs are pending.
+     (2 hops, downloads): 153 → 260 Mbit/s (+70 %). On a card whose 5 GHz transmission deafens its 6 GHz reception
+     (see README, *BE14 cards differ*) the card is not fully STR and alternation can hurt - one reason this rule is a
+     dry run. The upload direction (receive 6, send 5) is not measured yet. Run-to-run variance on our lab is about 30 %, so more A/B runs are pending.
    - Both rules are **dry runs** unless switched on. A dry run logs what it would do.
 2. **Deliver:** map-controller sends the map to the parent agent in a **Service Prioritization Request (CMDU `0x8023`)**.
-   Riding on an existing CMDU means we inherit its retry logic, and the map survives a controller restart.
+   Riding on an existing CMDU means no new message type is needed; after a restart the controller sends the map again.
 3. **Apply:** map-agent on the parent hands the map to hostapd. hostapd negotiates it with the station
    (**Negotiated TTLM**, TTLM Request/Response action frames), and the firmware enforces it.
    Advertised TTLM (per AP) is not used. It must never be mixed with Negotiated TTLM on one AP.
@@ -56,8 +58,10 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
 
 1. **On the wire:** `tcpdump -i <backhaul bridge> -w 1905.pcap ether proto 0x893a` on the parent. You will see the
    Service Prioritization Request (`0x8023`) arrive from the controller.
-2. **In the air:** a monitor-mode capture on the backhaul channel shows the protected EHT action frames *TTLM Request* /
-   *TTLM Response* between the parent AP MLD and the station, with the same map.
+2. **In the air:** *TTLM Request* / *TTLM Response* are protected action frames, encrypted like data (PMF is mandatory
+   with WPA3). A monitor-mode capture shows the map only if you decrypt it: capture the backhaul's association (SAE and
+   the 4-way handshake) and give Wireshark the backhaul passphrase; decrypting multi-link associations depends on the
+   Wireshark version. The simpler check is hostapd's debug log on the parent, which shows the request and the response.
 3. **In the traffic:** run `iperf3` through the link. Before the map both links carry bytes. After it, only the mapped
    one does. ⚠️ Read **received** bytes at the other end: per-link *transmit* counters on this platform are not reliable.
 
@@ -67,7 +71,8 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
   together with every LAN socket except one. One L2 domain across the whole mesh, STP on (a cable between two boxes is a
   loop), the controller has bridge priority 4096 so it is always the root.
 - **One socket is carved out as the service port** (`network.mgmt`): `lan3` on the BPI-R4, `mxl_lan0` (labelled LAN1)
-  on the BPI-R4 Pro 8X. Static `192.168.1.1/24`, no gateway, no DNS, DHCP explicitly off (`dhcp.mgmt.ignore=1`), in the
+  on the BPI-R4 Pro 8X. Static `192.168.1.1/24` with a DHCP server for a computer plugged in there (`dhcp.mgmt`, addresses
+  .100-.149, no gateway, no DNS - a laptop keeps its internet on Wi-Fi), in the
   `lan` firewall zone. The same address can live on every box only because this socket is **not** in the mesh; the
   price is that it answers on exactly one socket. Chosen by board in `easymesh-role` (`default_mgmt_port`); an unknown
   board falls back to `lan3` and refuses to continue if that socket does not exist.
@@ -79,10 +84,10 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
 
 | Service | What it does |
 |---|---|
-| `easymesh-wps-join` / setup | one-button join without reboot: takes the backhaul credentials over WPS, brings up the MLO backhaul station, names the box, falls back to one guarded reboot only if the soft path fails |
+| `easymesh-wps-join` / setup | one-button join: takes the backhaul credentials over WPS, brings up the MLO backhaul station, names the box, and restarts it once when the join has settled (a join without that restart could leave a backhaul that stalls) |
 | `mesh-gwd` | one virtual gateway address for all clients; any box with a cable (*primary*) or LTE (*backup*) can hold it; releases it at once on carrier loss (client outage ~11 s) |
 | `beacon-kick`, link watchdogs | re-arm a backhaul BSS that stopped beaconing after a reconfiguration; record the per-link beacon share |
-| `easymesh-card-check` | compares each radio's noise (ANPI from AP Metrics) with the other boxes on the same channel, over one hour; ≥ 6 dB above = suspect card |
+| `easymesh-card-check` | compares each radio's noise (ANPI, from the Radio Metrics TLV in the AP Metrics Response) with the other boxes on the same channel, over one hour; ≥ 6 dB above = suspect card |
 | `easymesh-ttlm-policy` | the TTLM decisions above |
 | API + LuCI | `ubus call easymesh …` (topology, clients, health, ttlm_state, events, …) and the 8 LuCI tabs |
 
@@ -100,7 +105,8 @@ itself, and optimises only when the user asks for it.
 - **Bridges follow a moved box (`easymesh-fdb-guard`).** When a node's backhaul parent or the controller's topology
   changes, the learned bridge entries are flushed on the node, and from the controller on every node - a bridge with
   offload does not relearn a moved MAC for ~300 s.
-- **Stuck-box rescue (`easymesh-bh-rescue`, on).** On an agent: if at least 6 of the last 9 pings to the controller
+- **Stuck-box rescue (`easymesh-bh-rescue`, off by default: it logs what it would do; `touch /etc/mapc/bh-rescue-live`
+  on a box lets it act).** On an agent: if at least 6 of the last 9 pings to the controller
   (one per 10 s) are lost and the last parent scan heard a parent of our own mesh, not below us, at least 10 dB
   stronger, the node moves there with `easymesh-bh-trial` (no measurement) and goes back if the controller cannot be
   reached from there. Never within 5 min of boot or 2 min of a parent change, at most once per 10 min; a target that
@@ -140,8 +146,10 @@ doubling of the bandwidth, capped at the best median we ever measured on a leg o
 |---|---|---|---|---|---|
 | $R_6(s)$ | 864 | 576 | 288 | 50 | 0 |
 
-The two legs of an MLO hop do not add up: both radios share the time of one station, and the weaker one adds about a
-quarter of its rate (measured 2026-09-25). The TCP throughput of the hop is a fixed fraction of that:
+The two legs of an MLO hop do not add up in our measurements: the weaker one adds about a quarter of its rate
+(measured 2026-09-25). A likely reason is how the driver spreads traffic over the links - by TID, so a single
+best-effort flow stays on one link - rather than a limit of MLO itself; $\mu$ is a property of this driver and card, not
+of the hop. The TCP throughput of the hop is a fixed fraction of that:
 
 ```math
 P(v,p) = \max(R_5, R_6) + \mu \cdot \min(R_5, R_6), \qquad
@@ -252,8 +260,7 @@ weight is the downstream cost, which is not the cost of $q \to v$ (one leg of th
 up). Two bands between the same pair are parallel edges, merged into one by the MLO formula. The tree we want is an
 arborescence rooted at the gateway. Not the minimum one (Chu-Liu/Edmonds), which minimises the sum of the edge
 weights and can hang a box behind three cheap weak hops; the shortest-path one, which minimises every box's own path.
-The two legs of an MLO hop do not simply add up: they share the airtime of one station, which is what the MLO
-formula accounts for.
+The two legs of an MLO hop do not simply add up (see §1), which is what the MLO formula accounts for.
 
 No node has to give anything up for another: $C^\ast(v) \le C(v)$ for every $v$ and every tree. The plan is the
 difference between the current tree and that one, and it is accepted only when it is worth what the moves cost:
@@ -295,8 +302,15 @@ and ours go away once MediaTek publishes its own fixes.
 
 ## Deviations from the EasyMesh specification
 
-- Profile 3 capabilities are reported without DPP and without 1905 message security (both mandatory for certification,
-  not for interoperability of the rest).
+- Profile 3 capabilities are reported without DPP and without 1905 message security, which the specification requires
+  of a Profile 3 device. A controller or agent of another vendor that enforces Profile 3 security will not work with
+  ours: meshes of our own boxes only, in this preview.
+- The TTLM policy comes from a file of our own (`/etc/mapc/ttlm-policy`), not from a message defined by the
+  specification.
+- A node that loses its parent closes its backhaul BSS (Authentication refused with status 17, patch `0277`) - local
+  behaviour the specification does not describe.
+- The pairing window stays open for about seven minutes (120 s re-armed three times) unless a box pairs first -
+  longer than the 120 s walk time of WPS push-button.
 
 ## Measurements
 
@@ -304,7 +318,7 @@ All on our five-box lab; the raw logs are not published yet.
 
 | Date | What | Result |
 |---|---|---|
-| 2026-09-21 | Throughput by hop count (iperf3 to the controller) | 1 hop 418, 2 hops 89–152, 3 hops 29.7 Mbit/s - depth costs more than signal strength |
+| 2026-09-21 | Throughput by hop count (iperf3 to the controller) | 1 hop 418, 2 hops 89–152, 3 hops 29.7 Mbit/s (hops of different quality, before the fixes of late September; §2 has equal hops) |
 | 2026-09-23 | Negotiated TTLM per backhaul station, "all TIDs on 6 GHz" | 0 bytes on the 5 GHz link in both directions; setup and teardown 20/20 |
 | 2026-09-25 | Band alternation across one repeater (downloads) | 153 → 260 Mbit/s |
 | 2026-09-25 | Gateway failover, client outage | 24 → 11 s |
