@@ -270,7 +270,8 @@ endef
 TARGET_DEVICES += bananapi_bpi-r4-poe-8gb
 
 # --- Lean NAND installer devices (no docker) — snand-img only ---
-# The NAND is 128 MiB. docker, dockerd, containerd and docker-compose are =y in
+# The NAND is 128 MiB on our 4 GB board (256 MiB on our 8 GB one; both get
+# this lean image, so it does not matter which a board has). docker, dockerd, containerd and docker-compose are =y in
 # configs/bpi-r4.config, so the shared rootfs carries them (~65 MB of squashfs)
 # and the NAND image came out at 139.6 MB - it did not fit. The "-pkg" entries
 # below make the per-device rootfs drop them again (include/image.mk runs

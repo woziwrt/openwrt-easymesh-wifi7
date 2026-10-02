@@ -21,7 +21,7 @@ image and on the NAND system alike, so the whole path runs from the box itself.
 another); every download is checked against that release's `SHA256SUMS`. The board is told by its memory (BPI-R4
 4 GB / 8 GB); the menus of bpi-r4-deploy's variants (wired, PoE, UniFi) are gone.
 
-**The NAND system:** the BPI-R4 NAND is 128 MiB, so its NAND devices (`bananapi_bpi-r4-nand`, `-nand-8gb`) drop
+**The NAND system:** the BPI-R4 NAND is 128 MiB on our 4 GB board (256 MiB on our 8 GB one), so its NAND devices (`bananapi_bpi-r4-nand`, `-nand-8gb`) drop
 docker per device and add `wipefs` and `smartmontools` (boards/bpi-r4/filogic.mk). The Pro 8X has a 256 MiB NAND
 and uses its full image.
 
