@@ -64,6 +64,20 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 
 Any box can be the main box, and it can stand anywhere; a BPI-R4 Pro 8X can just as well be one of the others.
 
+### Downloads
+
+Everything is on the [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases) page:
+
+| you want | release | file |
+|---|---|---|
+| **to run the mesh** (recommended) | **v0.1-preview** | `…-sdcard.img.gz` for your board, written to an SD card |
+| to upgrade a box that already runs it | **v0.1-preview** | `…-squashfs-sysupgrade.itb` for your board (see *Upgrading*) |
+| to check a download | the same release | `SHA256SUMS` |
+| eMMC or NVMe instead of the SD card (experimental) | *Experimental: eMMC/NVMe install images* | nothing by hand - the installers fetch it, see [docs/INSTALL-EMMC-NVME.md](docs/INSTALL-EMMC-NVME.md) |
+
+The board is in the file name: `bananapi_bpi-r4` (4 GB), `bananapi_bpi-r4-8gb`, `bananapi_bpi-r4-pro-8x`. The source is the
+`main` branch; the `emmc-nvme` branch carries the experimental installers.
+
 ### 1. Prepare the cards
 Download the image for your board from [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases), check it
 against `SHA256SUMS`, and write it to one SD card per box:
