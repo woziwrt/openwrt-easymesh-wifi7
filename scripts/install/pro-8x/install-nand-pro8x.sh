@@ -1,20 +1,21 @@
 #!/bin/sh
-# install-nand-pro8x.sh - BPI-R4 Pro 8X - Install OpenWrt to NAND
-# Run from SD card: sh /root/install-dir/install-nand.sh
+# install-nand-pro8x.sh - write the NAND system to the SPI-NAND of a BPI-R4 Pro 8X
+# Run from the SD card: sh /root/install-dir/install-nand.sh   (TAG=<release tag> sh ... for another release)
+# The Pro 8X has a 256 MiB NAND, so its NAND system is the full image.
 #
-# Firmware variant is chosen interactively:
-#   [1] Standard  -- full WiFi 7 (default)
-#   [2] Wired     -- no WiFi
 # Image source is chosen interactively:
 #   [1] Download from GitHub (default)  -- needs WAN/internet
 #   [2] Use local file from /tmp        -- offline, for development/testing
 # An explicit path argument overrides the menu (e.g. install-nand.sh /tmp/x.bin).
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the image comes from this repository's release
+# and the download is checked against the release's SHA256SUMS.
 
 set -e
 
 GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
-GH_TAG="release-pro-8x-standard"   # default; overridden by the variant menu below
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-lab-emmc-rc4}"
 SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-snand-img.bin"
 
 echo ""
@@ -23,25 +24,12 @@ echo "  BPI-R4 Pro 8X - Install OpenWrt to NAND"
 echo "=================================================="
 echo ""
 
-# || Image source: explicit arg -> variant menu -> source menu |||||||||||||||||
+# || Image source: explicit arg -> source menu |||||||||||||||||
 if [ -n "${1:-}" ]; then
     NAND_IMG="$1"
     echo "OK: Using image passed as argument: ${NAND_IMG}"
 else
-    # -- firmware variant (selects the release tag) --------------------------
-    echo "  Select firmware variant:"
-    echo ""
-    echo "    [1] Standard  -- full WiFi 7 (default)"
-    echo "    [2] Wired     -- no WiFi"
-    echo ""
-    printf "  Select [1/2]: "
-    read VAR
-    echo ""
-    case "$VAR" in
-        2) GH_TAG="release-pro-8x-wired";    VARIANT_LABEL="wired (no WiFi)" ;;
-        *) GH_TAG="release-pro-8x-standard"; VARIANT_LABEL="standard (WiFi 7)" ;;
-    esac
-    echo "  Variant: ${VARIANT_LABEL}   [tag: ${GH_TAG}]"
+    echo "  Release: ${GH_USER}/${GH_REPO} ${GH_TAG}"
     echo ""
 
     # -- image source --------------------------------------------------------
@@ -86,14 +74,24 @@ else
             fi
             echo "OK: Internet connection available."
             echo ""
-            echo "Downloading ${SNAND_NAME} (${GH_TAG})..."
-            if ! wget -O "/tmp/${SNAND_NAME}" \
-                    "https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}/${SNAND_NAME}" \
-                 || [ ! -s "/tmp/${SNAND_NAME}" ]; then
+            REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+            echo "Downloading ${SNAND_NAME}.gz (${GH_TAG})..."
+            if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS" \
+                 || ! wget -O "/tmp/${SNAND_NAME}.gz" "${REL_URL}/${SNAND_NAME}.gz" \
+                 || [ ! -s "/tmp/${SNAND_NAME}.gz" ]; then
                 echo "ERROR: Download failed."
-                rm -f "/tmp/${SNAND_NAME}"
+                rm -f "/tmp/${SNAND_NAME}.gz"
                 exit 1
             fi
+            # A half-downloaded or wrong image written to the NAND is a box that does not boot.
+            WANT=$(grep " ${SNAND_NAME}.gz\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+            GOT=$(sha256sum "/tmp/${SNAND_NAME}.gz" | cut -d' ' -f1)
+            if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+                echo "ERROR: The image does not match SHA256SUMS of the release."
+                rm -f "/tmp/${SNAND_NAME}.gz"
+                exit 1
+            fi
+            gunzip -f "/tmp/${SNAND_NAME}.gz"
             NAND_IMG="/tmp/${SNAND_NAME}"
             echo "OK: Downloaded ($(du -h ${NAND_IMG} | cut -f1))."
             ;;

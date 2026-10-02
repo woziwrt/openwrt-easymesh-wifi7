@@ -2,8 +2,7 @@
 # install-emmc-pro8x.sh - install EasyMesh Wi-Fi 7 for OpenWrt to the eMMC of a BPI-R4 Pro 8X
 # Must be run from the NAND rescue system only: SD and eMMC share one controller.
 #
-#   wget -O /tmp/install-emmc.sh https://raw.githubusercontent.com/woziwrt/openwrt-easymesh-wifi7/main/scripts/install/pro-8x/install-emmc-pro8x.sh
-#   sh /tmp/install-emmc.sh            (TAG=<release tag> sh ... for another release)
+#   sh /root/install-dir/install-emmc.sh   (TAG=<release tag> sh ... for another release)
 #
 # Adapted from woziwrt/bpi-r4-deploy (see ../README.md): one image, from this repository's release,
 # checked against the release's SHA256SUMS before anything is written.

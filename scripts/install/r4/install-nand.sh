@@ -1,11 +1,16 @@
 #!/bin/sh
-# install-nand.sh - Install the lean NAND installer image to NAND (spi0.0)
-# Run from SD card (or eMMC). Writes the small NAND system that is then used
-# to install eMMC/NVMe (eMMC shares its controller with SD, so eMMC/NVMe can
-# only be installed from NAND).
+# install-nand.sh - write the lean NAND installer system to the SPI-NAND of a BPI-R4 (4 GB or 8 GB)
+# Run from the SD card. The NAND system is what installs the eMMC/NVMe: SD and eMMC share one controller,
+# so the eMMC can only be written while the box runs from NAND.
+#
+#   sh /root/install-dir/install-nand.sh   (TAG=<release tag> sh ... for another release)
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the image comes from this repository's release,
+# the board is told by its memory, and the download is checked against the release's SHA256SUMS.
 
 GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-lab-emmc-rc4}"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,23 +22,16 @@ printf "  BPI-R4 NAND Installer\n"
 printf "=================================================\n"
 printf "\n"
 
-# || 0. RAM variant selection |||||||||||||||||||||||||||||||||||||||||||||||||
-# The NAND image is a lean installer (no docker/UniFi) and is variant-agnostic;
-# it only differs by RAM (DRAM training in BL2). PoE boards are not handled here.
-
-printf "Select your board RAM variant:\n"
-printf "\n"
-printf "  1) 4GB\n"
-printf "  2) 8GB  (required for UniFi stack)\n"
-printf "\n"
-printf "Enter choice [1-2]: "
-read RAM_CHOICE
-
-case "$RAM_CHOICE" in
-    1) GH_TAG="release-4gb-standard"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-snand-img.bin";     RAM_LABEL="4GB" ;;
-    2) GH_TAG="release-8gb-standard"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-8gb-snand-img.bin"; RAM_LABEL="8GB" ;;
+# || 0. Board ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+# The NAND image only differs by memory (DRAM training in BL2), and the 4 GB and 8 GB boards report the
+# same model name, so tell them by memory.
+RAM_GB=$(awk '/MemTotal/ { print int($2 / 1048576 + 0.5) }' /proc/meminfo)
+case "$RAM_GB" in
+    3|4) RAM_LABEL="4GB"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-snand-img.bin" ;;
+    7|8) RAM_LABEL="8GB"; SNAND_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-nand-8gb-snand-img.bin" ;;
     *)
-        printf "\n${RED}ERROR: Invalid choice!${NC}\n\n"
+        printf "\n${RED}ERROR: %s GB of memory - not a BPI-R4 4 GB or 8 GB.${NC}\n" "$RAM_GB"
+        printf "       For a BPI-R4 Pro 8X use pro-8x/install-nand-pro8x.sh.\n\n"
         exit 1
         ;;
 esac
@@ -41,8 +39,14 @@ esac
 SNAND_IMG="/tmp/${SNAND_NAME}"
 SOURCE_IS_LOCAL=0
 
-printf "\n"
-printf "  Selected: %s (%s)\n" "$RAM_LABEL" "$GH_TAG"
+printf "  Board:   BPI-R4 %s\n" "$RAM_LABEL"
+printf "  Release: %s/%s %s\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
+printf "  Is that right? [yes/no]: "
+read BOARD_OK
+if [ "$BOARD_OK" != "yes" ]; then
+    printf "\n  Cancelled.\n\n"
+    exit 1
+fi
 printf "\n"
 
 # || 1. Check boot media ||||||||||||||||||||||||||||||||||||||||||||||||||||||
@@ -100,32 +104,14 @@ case "$USE_LOCAL" in
         printf "        OK -- file present (%s)\n\n" "$(du -h "$SNAND_IMG" | cut -f1)"
         ;;
     *)
-        printf "\n"
-        printf "  Use default release or your own fork?\n"
-        printf "  [1] Default (woziwrt/bpi-r4-deploy)\n"
-        printf "  [2] My fork (same repo name, different username)\n"
-        printf "\n"
-        printf "  Select [1/2]: "
-        read USE_FORK
-
-        case "$USE_FORK" in
-            2)
-                printf "\n"
-                printf "        INFO: Fork repo name must remain 'bpi-r4-deploy'\n"
-                printf "        Enter your GitHub username: "
-                read GH_USER
-                ;;
-            *)
-                ;;
-        esac
-
-        SNAND_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}/${SNAND_NAME}"
-        printf "        URL: %s\n\n" "$SNAND_URL"
+        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        SNAND_URL="${REL_URL}/${SNAND_NAME}.gz"
+        printf "\n        URL: %s\n\n" "$SNAND_URL"
 
         # || 4. Network check ||||||||||||||||||||||||||||||||||||||||||||||||
         printf "[ 4/6 ] Network check...\n"
         printf "\n"
-        printf "        INFO: Internet required (~30-60 MB download)\n"
+        printf "        INFO: Internet required (~40 MB download)\n"
         printf "        Is ethernet connected? [yes/no]: "
         read NET_CONFIRM
 
@@ -147,9 +133,7 @@ case "$USE_LOCAL" in
         HTTP_CODE=$(wget --server-response --spider "$SNAND_URL" 2>&1 | grep "HTTP/" | tail -1 | awk '{print $2}')
         if [ "$HTTP_CODE" != "200" ]; then
             printf "\n${RED}ERROR: Release not found on GitHub (tag: %s).\n" "$GH_TAG"
-            printf "       The build has not been created yet.\n"
-            printf "       Please run the GitHub Actions workflow first:\n"
-            printf "       https://github.com/${GH_USER}/${GH_REPO}/actions\n\n${NC}"
+            printf "       Check the tag: https://github.com/${GH_USER}/${GH_REPO}/releases\n\n${NC}"
             exit 1
         fi
         printf "        OK -- release available\n\n"
@@ -157,16 +141,26 @@ case "$USE_LOCAL" in
         # || 5. Download snand-img.bin |||||||||||||||||||||||||||||||||||||||
         printf "[ 5/6 ] Downloading %s...\n\n" "$SNAND_NAME"
 
-        wget -O "$SNAND_IMG" "$SNAND_URL"
-
-        if [ $? -ne 0 ] || [ ! -s "$SNAND_IMG" ]; then
-            printf "\n${RED}ERROR: Download failed.${NC}\n"
-            printf "       Check network or URL and try again.\n\n"
-            rm -f "$SNAND_IMG"
-            exit 1
+        if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS"; then
+            printf "\n${RED}ERROR: Download of SHA256SUMS failed.${NC}\n\n"; exit 1
         fi
-
-        printf "\n        OK -- downloaded (%s)\n\n" "$(du -h "$SNAND_IMG" | cut -f1)"
+        # A half-downloaded or wrong image written to the flash is a box that does not boot.
+        for F in "${SNAND_NAME}.gz"; do
+            printf "        Downloading %s...\n" "$F"
+            if ! wget -O "/tmp/$F" "${REL_URL}/$F" || [ ! -s "/tmp/$F" ]; then
+                printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$F"
+                rm -f "$SNAND_IMG.gz"; exit 1
+            fi
+            WANT=$(grep " ${F}\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+            GOT=$(sha256sum "/tmp/$F" | cut -d' ' -f1)
+            if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+                printf "\n${RED}ERROR: %s does not match SHA256SUMS of the release.${NC}\n\n" "$F"
+                rm -f "$SNAND_IMG.gz"; exit 1
+            fi
+            printf "        OK -- %s downloaded, checksum matches\n\n" "$F"
+        done
+        gunzip -f "$SNAND_IMG.gz" || { printf "\n${RED}ERROR: Could not unpack the image.${NC}\n\n"; exit 1; }
+        printf "        OK -- unpacked (%s)\n\n" "$(du -h "$SNAND_IMG" | cut -f1)"
         ;;
 esac
 

@@ -225,6 +225,21 @@ em_install_board_files() {
 	cp -a "$REPO/boards/common/files/." files/
 	[ -d "$BOARD_DIR/files" ] && cp -a "$BOARD_DIR/files/." files/
 
+	# The eMMC/NAND/NVMe installers of this board, under the names
+	# bpi-r4-deploy used: /root/install-dir/install-{nand,emmc,nvme}.sh.
+	# One source (scripts/install/), copied at build time.
+	local inst
+	case "$BOARD" in
+	bpi-r4) inst=r4 ;;
+	bpi-r4-pro-8x) inst=pro-8x ;;
+	*) em_die "no installers for board $BOARD" ;;
+	esac
+	mkdir -p files/root/install-dir
+	for p in "$REPO/scripts/install/$inst"/*; do
+		cp "$p" "files/root/install-dir/$(basename "$p" | sed 's/-pro8x//')"
+	done
+	chmod 755 files/root/install-dir/*
+
 	# Image model, read by easymesh-config: a production image has the mesh
 	# baked in and must never point itself at a development package feed.
 	echo production > files/etc/easymesh-model

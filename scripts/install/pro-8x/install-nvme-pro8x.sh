@@ -1,10 +1,18 @@
 #!/bin/sh
-# BPI-R4 Pro 8X - Install OpenWrt to NVMe
-# Must be run from NAND rescue system only!
+# install-nvme-pro8x.sh - install EasyMesh Wi-Fi 7 for OpenWrt to the NVMe disk of a BPI-R4 Pro 8X
+# Must be run from the NAND rescue system: sh /root/install-dir/install-nvme.sh
+#   (TAG=<release tag> sh ... for another release)
+#
+# Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the images come from this repository's release
+# and every download is checked against the release's SHA256SUMS. U-Boot looks for the kernel on p1 as
+# bpi-r4-pro-8x.itb, so the downloaded sysupgrade image is stored under that name.
 
 GH_USER="woziwrt"
-GH_REPO="bpi-r4-deploy"
+GH_REPO="openwrt-easymesh-wifi7"
+GH_TAG="${TAG:-lab-emmc-rc4}"
 ITB_NAME="bpi-r4-pro-8x.itb"
+DL_ITB_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-squashfs-sysupgrade.itb"
+IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-nvme-img.bin"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -16,28 +24,10 @@ printf "  BPI-R4 Pro 8X - Install OpenWrt to NVMe\n"
 printf "=================================================\n"
 printf "\n"
 
-# || 0. Variant selection |||||||||||||||||||||||||||||||||||||||||||||||||||||
-
-printf "Select firmware variant:\n\n"
-printf "  1) Pro 8X standard (WiFi)\n"
-printf "  2) Pro 8X wired (no WiFi)\n"
-printf "\n"
-printf "Enter choice [1/2]: "
-read VARIANT
-
-case "$VARIANT" in
-    1) GH_TAG="release-pro-8x-standard"; IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-nvme-img.bin" ;;
-    2) GH_TAG="release-pro-8x-wired";   IMG_NAME="openwrt-mediatek-filogic-bananapi_bpi-r4-pro-8x-nvme-img.bin" ;;
-    *)
-        printf "\n${RED}ERROR: Invalid choice!${NC}\n\n"
-        exit 1
-        ;;
-esac
-
 ITB="/tmp/${ITB_NAME}"
 IMG="/tmp/${IMG_NAME}"
 
-printf "\n  Selected: %s\n\n" "$GH_TAG"
+printf "  Release: %s/%s %s\n\n" "$GH_USER" "$GH_REPO" "$GH_TAG"
 
 # || Pro: NVMe device detection ||||||||||||||||||||||||||||||||||||||||||||||
 
@@ -198,12 +188,11 @@ case "$USE_LOCAL" in
         printf "        OK -- both files present\n\n"
         ;;
     *)
-        BASE_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
-        ITB_URL="${BASE_URL}/${ITB_NAME}"
-        IMG_URL="${BASE_URL}/${IMG_NAME}"
+        REL_URL="https://github.com/${GH_USER}/${GH_REPO}/releases/download/${GH_TAG}"
+        ITB_URL="${REL_URL}/${DL_ITB_NAME}"
 
         printf "[ 5/7 ] Network check...\n\n"
-        printf "        INFO: Internet required (~150 MB download)\n"
+        printf "        INFO: Internet required (~270 MB download)\n"
         printf "        Is WAN cable connected? [yes/no]: "
         read NET_CONFIRM
 
@@ -226,21 +215,26 @@ case "$USE_LOCAL" in
         fi
         printf "        OK -- release available\n\n"
 
-        printf "        Downloading %s...\n" "$ITB_NAME"
-        wget -O "$ITB" "$ITB_URL"
-        if [ $? -ne 0 ] || [ ! -s "$ITB" ]; then
-            printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$ITB_NAME"
-            rm -f "$ITB"; exit 1
+        if ! wget -O /tmp/SHA256SUMS "${REL_URL}/SHA256SUMS"; then
+            printf "\n${RED}ERROR: Download of SHA256SUMS failed.${NC}\n\n"; exit 1
         fi
-        printf "        OK -- %s downloaded\n\n" "$ITB_NAME"
-
-        printf "        Downloading %s...\n" "$IMG_NAME"
-        wget -O "$IMG" "$IMG_URL"
-        if [ $? -ne 0 ] || [ ! -s "$IMG" ]; then
-            printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$IMG_NAME"
-            rm -f "$ITB" "$IMG"; exit 1
-        fi
-        printf "        OK -- %s downloaded\n\n" "$IMG_NAME"
+        # A half-downloaded or wrong image written to the flash is a box that does not boot.
+        for F in "$DL_ITB_NAME" "${IMG_NAME}.gz"; do
+            printf "        Downloading %s...\n" "$F"
+            if ! wget -O "/tmp/$F" "${REL_URL}/$F" || [ ! -s "/tmp/$F" ]; then
+                printf "\n${RED}ERROR: Download of %s failed.${NC}\n\n" "$F"
+                rm -f "/tmp/$DL_ITB_NAME" "$IMG.gz"; exit 1
+            fi
+            WANT=$(grep " ${F}\$" /tmp/SHA256SUMS | cut -d' ' -f1)
+            GOT=$(sha256sum "/tmp/$F" | cut -d' ' -f1)
+            if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
+                printf "\n${RED}ERROR: %s does not match SHA256SUMS of the release.${NC}\n\n" "$F"
+                rm -f "/tmp/$DL_ITB_NAME" "$IMG.gz"; exit 1
+            fi
+            printf "        OK -- %s downloaded, checksum matches\n\n" "$F"
+        done
+        mv "/tmp/$DL_ITB_NAME" "$ITB"
+        gunzip -f "$IMG.gz" || { printf "\n${RED}ERROR: Could not unpack the image.${NC}\n\n"; exit 1; }
         ;;
 esac
 

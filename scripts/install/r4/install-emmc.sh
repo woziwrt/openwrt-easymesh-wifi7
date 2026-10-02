@@ -3,8 +3,7 @@
 # Must be run from the NAND rescue system only: SD and eMMC share one controller, so the eMMC can only
 # be written while the box runs from NAND.
 #
-#   wget -O /tmp/install-emmc.sh https://raw.githubusercontent.com/woziwrt/openwrt-easymesh-wifi7/main/scripts/install/r4/install-emmc.sh
-#   sh /tmp/install-emmc.sh            (TAG=<release tag> sh ... for another release)
+#   sh /root/install-dir/install-emmc.sh   (TAG=<release tag> sh ... for another release)
 #
 # Adapted from woziwrt/bpi-r4-deploy (see ../README.md): the image comes from this repository's release,
 # the board is told by its memory, and the download is checked against the release's SHA256SUMS.
