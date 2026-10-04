@@ -39,5 +39,6 @@ and uses its full image.
 | `pro-8x/install-nvme-pro8x.sh` | yes - the sysupgrade image is stored on p1 as `bpi-r4-pro-8x.itb` | 2026-10-02 |
 | `pro-8x/boot-nvme`, `pro-8x/boot-nand` | nothing to adapt (no download); in `/usr/sbin` | not yet |
 
-Tested with the downloads served from a local copy of the release, not yet from GitHub itself. The release supports
+Tested on 2 Oct 2026 with the downloads served from a local copy of the release; on 4 Oct 2026 the BPI-R4 4 GB path
+(`install-nand.sh`, `install-emmc.sh`, `install-nvme.sh`) ran with every download straight from GitHub. The release supports
 the SD card; installing to eMMC/NVMe is experimental (`docs/INSTALL-EMMC-NVME.md` on `main`).
