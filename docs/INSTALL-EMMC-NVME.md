@@ -7,8 +7,9 @@ stalls the main box. This page is for those who want the system there.
 **Installing starts the box from scratch:** it loses its mesh settings, and if it is the main box, you build the mesh
 again and pair every other box again. **The easiest time to move the main box is before you build the mesh.**
 
-> **Experimental.** The installers live on the `emmc-nvme` branch. Tested in our lab on 2 Oct 2026, with the downloads
-> served from a local copy of the release (the download from GitHub itself was first run when this was published):
+> **Experimental.** The installers live on the `emmc-nvme` branch. On 4 Oct 2026, after publication, a **BPI-R4 4 GB**
+> went SD → NAND → eMMC and NAND → NVMe with every download straight from GitHub. Tested earlier in our lab on 2 Oct 2026,
+> with the downloads served from a local copy of the release:
 > **BPI-R4 4 GB** SD → NAND → eMMC and NAND → NVMe, **BPI-R4 8 GB** SD → NAND → eMMC; each time the box then joined the
 > mesh with the WPS button like any other. **BPI-R4 Pro 8X** SD → NAND → eMMC (installed and booted) and NAND → NVMe
 > (installed, booted and joined the mesh).
@@ -65,6 +66,7 @@ have no power switch):
 | SD card | 1 | 1 |
 | NAND | 0 | 1 |
 | eMMC | 1 | 0 |
+| NVMe | 0 | 1 - the same as NAND: after step 2b the NAND boot loader starts the NVMe system |
 
 ## What the installer asks
 
@@ -76,8 +78,12 @@ The answers are typed and confirmed with Enter.
 | **File source** - download or a local file | `1` (download) |
 | **Is ethernet connected?** | `yes` (the WAN cable) |
 | **Type YES to confirm** - erases the target | `YES` |
-| NVMe only: **Disk has warnings. Continue anyway?** - shown when the disk's health check (SMART) reports something | your call: `y` continues; a disk that fails the check stops the installer by itself |
+| NVMe only: **Disk has warnings. Continue anyway?** - shown when the disk's health check (SMART) reports something | your call: `y` continues; a disk that fails the check stops the installer by itself (see below) |
 | **Pro 8X NAND installer only:** cable `[y/N]`, and **Enter** instead of `YES` | `y`, then **Enter writes the NAND** - Ctrl+C cancels |
+
+**Reading the disk warnings.** Stop if *Critical Warning* is not `0x00` or *Available Spare* is low (under about 10 %):
+the disk is wearing out. A few *Media and Data Integrity Errors* on a disk that otherwise reads `PASSED`, with plenty of
+spare, are usually old history (our lab disk shows 3); if that number grows between installs, replace the disk.
 
 The BPI-R4 installers do not check that the board is a BPI-R4: **on a Pro 8X use only the Pro 8X installers.**
 
