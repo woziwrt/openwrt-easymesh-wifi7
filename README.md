@@ -6,7 +6,7 @@
 towards conformance with the published EasyMesh test cases, so that it can be taken to certification
 (see [Planned](#planned-for-the-next-releases)).*
 
-> **Pre-release (v0.1-preview, <!-- TODO date -->).** It runs every day on a five-box lab, but it is not a product yet.
+> **Pre-release (v0.1-preview, 4 Oct 2026).** It runs every day on a five-box lab, but it is not a product yet.
 > We publish it early for reviewers and testers. It still has bugs - the ones we know are in
 > [Known limitations](#known-limitations), and fixes come with the next releases. Please read that section before you flash anything.
 >

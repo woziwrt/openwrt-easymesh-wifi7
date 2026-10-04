@@ -167,10 +167,10 @@ throughput. The cost of a hop is $c = 1/T$, and for a node $v$ with parent $p(v)
 
 ```math
 C(\text{root}) = 0, \qquad C(v) = C\big(p(v)\big) + \frac{1}{T\big(v, p(v)\big)}, \qquad
-\widehat{T}(v) = \frac{1}{C(v)}
+\hat{T}(v) = \frac{1}{C(v)}
 ```
 
-So $\widehat{T}(v)$ is the harmonic composition of the hops: never above the weakest hop, two equal hops give half,
+So the estimated throughput of a node is the harmonic composition of its hops: never above the weakest hop, two equal hops give half,
 three a third (measured: one hop 342 Mbit/s, two hops 153-172, 2026-09-25). Two properties follow directly and the
 planner relies on both:
 
