@@ -84,7 +84,7 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
 
 | Service | What it does |
 |---|---|
-| `easymesh-wps-join` / setup | one-button join: takes the backhaul credentials over WPS, brings up the MLO backhaul station, names the box, and restarts it once when the join has settled (a join without that restart could leave a backhaul that stalls) |
+| `easymesh-wps-join` / setup | one-button join: takes the backhaul credentials over WPS, brings up the MLO backhaul station, names the box, restarts it after taking the credentials, and once more when the join has settled (a join without that last restart could leave a backhaul that stalls) |
 | `mesh-gwd` | one virtual gateway address for all clients; any box with a cable (*primary*) or LTE (*backup*) can hold it; releases it at once on carrier loss (client outage ~11 s) |
 | `beacon-kick`, link watchdogs | re-arm a backhaul BSS that stopped beaconing after a reconfiguration; record the per-link beacon share |
 | `easymesh-card-check` | compares each radio's noise (ANPI, from the Radio Metrics TLV in the AP Metrics Response) with the other boxes on the same channel, over one hour; ≥ 6 dB above = suspect card |

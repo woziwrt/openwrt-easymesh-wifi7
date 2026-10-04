@@ -2,7 +2,7 @@
 
 **A Wi-Fi 7 mesh built from open-source routers, whose main box can steer which band each backhaul link carries.**
 
-*Implements the Wi-Fi EasyMesh™ R6 specification; not certified by the Wi-Fi Alliance yet. The next releases work
+*Based on the Wi-Fi EasyMesh™ R6 specification (partly implemented); not certified by the Wi-Fi Alliance. The next releases work
 towards conformance with the published EasyMesh test cases, so that it can be taken to certification
 (see [Planned](#planned-for-the-next-releases)).*
 
@@ -10,8 +10,8 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 > We publish it early for reviewers and testers. It still has bugs - the ones we know are in
 > [Known limitations](#known-limitations), and fixes come with the next releases. Please read that section before you flash anything.
 >
-> **Everything here takes time - give it that time.** Pairing one box takes about 6-10 minutes including one restart
-> (up to 15 on the Pro 8X, which may restart twice); how long exactly depends on the distance, the radio conditions and
+> **Everything here takes time - give it that time.** Pairing one box takes about 6-10 minutes including two restarts
+> (up to 15 on the Pro 8X); how long exactly depends on the distance, the radio conditions and
 > the board, a box boots in about 2 minutes (5 on the Pro 8X), a move is measured for about 3 minutes. While
 > a box joins, its lamp may go dark. **Do not press any button twice:** a second press cancels the pairing. Pairing a
 > five-box mesh takes about three quarters of an hour - enough time for a beer or two. Just don't press any button twice
@@ -22,18 +22,18 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 ## What it does
 
 - **One button to add a box.** Press *Pair a new box* on the main box (or its WPS button), then hold the WPS button on
-  the new box. The new box joins the mesh, gets its settings and a name, and restarts once by itself while it joins.
+  the new box. The new box joins the mesh, gets its settings and a factory name you can change, and restarts twice by
+  itself while it joins.
 - **Wi-Fi 7 multi-link backhaul.** Each box connects to its parent over two links at once, one on 5 GHz and one on
   6 GHz (MLO), when both come up (see *Known limitations*). The main
   box (the EasyMesh *controller*) can tell each backhaul link which band carries which traffic
   (*TID-to-Link Mapping*, TTLM) based on the shape of the whole mesh, not on one radio's view. In this preview the
   automatic policy runs as a dry run; the mechanism itself is verified on hardware.
-- **Internet from any box.** Plug the internet cable into any box, or use an LTE modem in one of them as a backup
-  (tested: Telit FN990A40, M.2; other modems that OpenWrt supports may work, untested). The
+- **Internet from any box.** Plug the internet cable into any box, and optionally use an LTE/5G modem in one of them
+  for failover (see [Optional: LTE/5G failover](#optional-lte5g-failover)). The
   mesh keeps one gateway address for all clients. When the cable is pulled, or the router in front of the box goes
   dead, clients are back online over LTE in about 10 seconds; when the cable comes back, the mesh returns to it after
-  about half a minute of stable cable, usually without a gap. Set the modem up in LuCI (*Network → Interfaces*, protocol
-  QMI or MBIM) and **restart that box once afterwards** (see *Known limitations*).
+  about half a minute of stable cable, usually without a gap.
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
   It also points out a radio card that is noisier than the others, so a slow link is not blamed on the mesh.
 
@@ -80,8 +80,12 @@ The board is in the file name: `bananapi_bpi-r4` (4 GB), `bananapi_bpi-r4-8gb`, 
 GitHub - tags, branches, folders - is explained in [What is where](#what-is-where).
 
 ### 1. Prepare the cards
-Download the image for your board from [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases), check it
-against `SHA256SUMS`, and write it to one SD card per box:
+Download the image for your board and `SHA256SUMS` from [Releases](https://github.com/woziwrt/openwrt-easymesh-wifi7/releases)
+into one folder and check them there: `shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS,
+`sha256sum -c --ignore-missing SHA256SUMS` on Linux (each image must say `OK`); on Windows,
+`certutil -hashfile <image> SHA256` and compare with its line in `SHA256SUMS`. Then write the image to one SD card per
+box. We recommend [balenaEtcher](https://etcher.balena.io/): it writes the `.img.gz` as it is, without unpacking, and
+checks what it wrote.
 
 | Board | Image |
 |---|---|
@@ -99,40 +103,76 @@ it; we have built the mesh with CZ only. Where 6 GHz is not allowed, the backhau
 tested that.
 
 ### 2. The first box becomes the main box (controller)
-Connect a computer to a LAN port of the first box - **not** the service port (**LAN3** on the BPI-R4, **LAN1** on the
-Pro 8X) - and open `http://192.168.1.1`.
+Connect a computer, set to get its address automatically (DHCP), to the **service port** of the first box - **LAN3**
+on the BPI-R4 (4 GB and 8 GB), **LAN1** on the BPI-R4 Pro 8X - and open `http://192.168.1.1`. Use the service port from
+the very start: it answers at `192.168.1.1` on every box, before and after the mesh exists. The other LAN ports join the
+mesh when you create it, and a computer left on one of them may lose the page.
 Go to *Network → EasyMesh → Setup* and click **This is my first box**. Enter the network name, the Wi-Fi password and a
-name for the box. Leave *Mesh addresses* at `10.10.10.1` unless your home network already uses `10.10.10.x`; it must not
-be `192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
-Click **Create the mesh**, then **Reboot now**. After about 2 minutes (5 on the Pro 8X) the main box answers at
-**`http://10.10.10.1`** (or the address you chose), and the page moves there by itself. That LAN port is now part of the
-mesh: your computer gets a `10.10.10.x` address from the main box.
+name for the box. The page suggests `10.10.10.1` for *Mesh addresses*. That is only a suggestion: any private address
+works (we built the last test mesh on `172.16.20.1`), as long as your home network does not use it and it is not
+`192.168.1.x`, which belongs to the service port. That is the only place where you type anything.
+
+Leave *Taking over an existing mesh?* closed for a new mesh. It is only for moving the main-box role to another box in a
+mesh that already runs: the boxes that stay keep the old backhaul key and there is no way to tell them a new one, so the
+new main box has to start with the old key - then they attach to it by themselves. LuCI does not show the key; read it
+on the old main box over SSH:
+
+```sh
+for i in 0 1 2 3 4 5 6 7 8 9 10 11; do case "$(uci -q get ieee1905.@ap[$i].ssid)" in MAP--BH*) uci get ieee1905.@ap[$i].key; break;; esac; done
+```
+
+Then switch the old main box off for good - two main boxes in one mesh do not work. We have not tested a takeover
+with this release.
+Click **Create the mesh**, then **Reboot now**. After about 2 minutes (5 on the Pro 8X) the login page comes back by
+itself at `http://192.168.1.1`. A computer on one of the other LAN ports or on the mesh Wi-Fi reaches the main box at
+**`http://10.10.10.1`** (or the address you chose) and gets a `10.10.10.x` address from it.
 
 **The internet cable** goes into the WAN port of **any** box, the main box or another one. The mesh has internet as soon
 as that box has joined. The main box keeps one socket as a [service port](#the-service-port-a-way-in-when-the-mesh-is-not)
 at `192.168.1.1`.
 
 ### 3. Add the other boxes, one at a time
+**Pair each box where it will stand.** It only has to be within reach of the main box's Wi-Fi - the 2.4 GHz network,
+which reaches farthest, is enough to pair; the fast 5/6 GHz links then attach to the nearest box. For a place far from
+everything, pair the box next to the main box, switch it off, carry it there and switch it on.
+
 **One box at a time, nearest first.** Pair a box only when the one before it is in the picture (*Overview* / *Nodes*).
 Pressing the buttons of several boxes at once gives a bad result. Start with the box closest to the main box and work
 outwards: a far box paired before the boxes between it and the main box gets its settings, but has nothing to attach its
 5/6 GHz links to yet. That is not a fault - it keeps trying and joins by itself once the box in between is in the mesh.
-For a place far from everything, pair the box next to the main box, switch it off, carry it there and switch it on.
 
-Put the new box where it is meant to stand. For now it has to be within Wi-Fi reach of the **main box**: pairing is
-opened there. Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X). Then:
+Power the box on and wait until it has booted (about 2 minutes, 5 on the Pro 8X). Then:
 
-1. **On the main box,** click *Pair a new box* in its *Overview*, or hold its WPS button for **4 to 8 seconds** (until the
+1. **On the main box,** open *Add a box to the mesh…* in its *Overview* and click *Pair a new box*, or hold its WPS button for **4 to 8 seconds** (until the
    lamp blinks slowly) and let go. It keeps pairing open for about seven minutes, so there is time to walk over.
-2. **On the new box,** hold the WPS button for **4 to 8 seconds** and let go.
+2. **On the new box,** hold the WPS button for **4 to 8 seconds** and let go. (On a BPI-R4 Pro 8X no lamp blinks -
+   the press still works: count to six and let go.)
+
+**Never hold a WPS button for 10 seconds or longer** - on the new box or on the main box. Let go after that and the box
+erases its settings (factory reset): a box in the mesh drops out of it, and the main box loses the whole mesh.
 
 A short press does not pair: the main box ignores it, and on a BPI-R4 that is not the main box it restarts it. The other order
 (new box first) works too, but leaves only about three minutes.
 
-The new box joins on its own in about six to ten minutes, with nothing to type in, and restarts once by itself on the
-way (that restart is expected, not a fault; a Pro 8X may restart twice and takes up to 15 minutes). It takes the Wi-Fi settings from the main box and appears in *Overview* and
-*Nodes*. Then add the next one. Wait until it is there before you pair the next box, and do not press its button again
-in the meantime: a second press cancels the pairing.
+The new box joins on its own in about six to ten minutes (up to 15 on a Pro 8X), with nothing to type in. On the way it
+restarts twice by itself and once more restarts its services - that is expected, not a fault. Meanwhile its tile in
+*Overview* comes and goes and changes several times: a MAC address, a `BPI-R4-…` name, `192.168.1.1`, one link, a
+brown dot. It can look finished two or three times before it is. **Do nothing, and do not press any button** - a second
+press cancels the pairing. If the picture looks stuck, reload the page; that never disturbs the pairing.
+
+> **✅ The box is in the mesh when at least 10 minutes (15 on a Pro 8X) have passed since you pressed its button, *and*
+> its tile shows all three at once: a `BPI-R4-` name with six characters, a mesh address (not `192.168.1.1`) and a
+> green dot.** Only now give it a name (the pencil on its tile) and pair the next box.
+
+After you rename a box, its tile may say *waiting for the box* for a minute or two while the name travels there.
+
+### Optional: LTE/5G failover
+If one of your boxes has an LTE/5G modem, the mesh switches to it by itself when the cable internet goes down, and back
+when the cable returns. Put that box where the mobile signal is best (by a window, say) - the mesh carries its internet
+to all the others. Once the box is in the mesh, open its LuCI (at the mesh address on its tile, from a computer on the
+mesh Wi-Fi or a LAN port, or at `192.168.1.1` on its own service port), set the modem up in *Network → Interfaces*
+(protocol QMI or MBIM) and **restart that box once afterwards** (see *Known limitations*). Tested: Telit FN990A40 (M.2);
+other modems that OpenWrt supports may work, untested.
 
 ### 4. Check that it works
 - *Overview* says **"Mesh is working"**, all boxes are online, every link is healthy.
@@ -145,7 +185,7 @@ in the meantime: a second press cancels the pairing.
   on) measures the throughput of a box before and after, about three minutes of traffic on that branch; *Events* says
   which box and why.
 - If a box does not appear after fifteen minutes (or *Overview* says it has not finished), pair it again: *Pair a new
-  box* on the main box, then hold the new box's button 4 to 8 seconds and let go. Not earlier - a second press cancels a
+  box* on the main box (*Add a box to the mesh…*), then hold the new box's button 4 to 8 seconds and let go. Not earlier - a second press cancels a
   pairing that is still running.
 - **Set a root password on every box** (*System → Administration*) once it is in the mesh. The mesh does not need it;
   your network does. Until a box is set up, its Wi-Fi `OpenWrt-MLD` uses the published key `12345678` - so set the box
@@ -192,7 +232,7 @@ box back with *Move…* - the move is measured and undone if it is not faster. T
 - ✅ **Controller and agents based on the EasyMesh R6 specification** (the iopsys stack plus our patches; not certified)
   on OpenWrt 25.12 with the open mt76 driver, on BPI-R4 and BPI-R4 Pro 8X
 - ✅ **Multi-link (MLO) backhaul** on 5 + 6 GHz between every box and its parent, relayed over several hops
-- ✅ **One-button join** (WPS) with one restart of the new box on the way. A whole mesh can be built from blank SD cards.
+- ✅ **One-button join** (WPS) with two restarts of the new box on the way. A whole mesh can be built from blank SD cards.
 - ✅ **Per-station TTLM driven by the controller:** the controller maps traffic of one backhaul link to one band, in
   both directions, and removes the mapping again
 - 🧪 **Automatic TTLM policy:** avoiding a bad link, and alternating bands across a repeater (+70 % across one repeater, 2 hops,
@@ -287,7 +327,7 @@ the deaf-link guard are switched on the boxes with
 `touch /etc/mapc/bh-rescue-live` and `touch /etc/mapc/deaf-guard-live`.
 
 **How long things take** (measured in our lab):
-- a new box joins and carries traffic about six to ten minutes after you pair it, including its one restart (up to
+- a new box joins and carries traffic about six to ten minutes after you pair it, including its two restarts (up to
   15 on the Pro 8X);
 - after a power cut of the whole mesh, clients are back on the internet in about 1.5-2 minutes and every box is back in
   under 3 minutes;
@@ -349,8 +389,8 @@ This is a preview. What is not done yet, or not done well:
   reconnects is planned. (A power cut of the whole mesh does not do this: the boxes start together.)
 - **Not fully understood, with a defence in place:** after pairing from a blank card, a box sometimes cannot authenticate
   over 6 GHz and joins over 5 GHz only; its traffic to the parent can then stall. In our lab this happened towards parents
-  with a damaged 6 GHz antenna connector (see *Check the antenna connectors*). The box restarts once by itself during
-  pairing, which clears it in our tests, and a guard restarts a box whose uplink stalls twice within half an hour.
+  with a damaged 6 GHz antenna connector (see *Check the antenna connectors*). The last of its restarts during
+  pairing clears it in our tests, and a guard restarts a box whose uplink stalls twice within half an hour.
 - **A client that switches bands on the same box can stall for up to about a minute.** A laptop that moves from one
   band to another of the same box (for example from 5 to 2.4 GHz) can stay connected but pass no data until the box drops
   it as inactive; it then reconnects by itself. When the laptop's old entry on the other band is removed, hostapd
@@ -362,18 +402,21 @@ This is a preview. What is not done yet, or not done well:
   internet, but *Clients* does not list them until they reconnect:
   the box does not report them again when its own link comes back. Meanwhile the main box cannot steer those clients
   either. A fix is planned for the next release.
+- **A multi-link (MLO) client has no signal history in *Clients*.** Its current signal, its links and its link rate are
+  shown, but the 30-minute graph stays empty: the main box records its signal as zero. A fix is planned for the next
+  release.
 - **A box that lost its parent can pick a weak 6 GHz link.** It reconnects to what it hears, and wpa_supplicant may
   prefer a 6 GHz link at -80 dBm to a better 5 GHz one (once in our lab: 0/4 Mbit/s for 15 minutes). If its path stays
   under about 100 Mbit/s, the rescue moves it; a faster choice of the band is planned.
 - **The box restarts where a Wi-Fi reload would seem enough** - while it pairs, after its Wi-Fi settings change, and
   when its radios need a clean start. That is deliberate. On the multi-link (MLO) setup of the MT7996 (BE14) card, a
   Wi-Fi reload has been unreliable in our tests: the radios sometimes did not come back, or a link came back without
-  traffic. A restart costs one or two minutes (five on a Pro 8X) but always ends in a known state. The one restart while
+  traffic. A restart costs one or two minutes (five on a Pro 8X) but always ends in a known state. The last restart while
   a box pairs also clears a case where its 6 GHz link would otherwise stall. If you want to remove a restart, measure the
   reload on several boxes and over several days first.
 - **On the BPI-R4 Pro 8X the lamps do not show pairing.** Its board wires the LEDs differently, so holding its WPS
-  button gives no blink. The press still works - just wait. A Pro 8X can also restart twice while it joins instead of
-  once (it boots slowly, about five minutes), so give it 10-15 minutes.
+  button gives no blink. The press still works - just wait. A Pro 8X boots slowly (about five minutes), so give its
+  pairing 10-15 minutes.
 - **Sometimes the Wi-Fi card does not start.** Now and then the MT7996 firmware fails to load at boot
   (`Failed to start patch` / `probe failed -11` in the kernel log) and the box runs without Wi-Fi. A restart does not
   help: **switch the power off for 30 seconds.** The Pro 8X cannot reset its Wi-Fi card from software. You notice it
