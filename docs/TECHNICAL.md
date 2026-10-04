@@ -62,8 +62,9 @@ Everything here can be checked with two boxes, `tcpdump` and Wireshark. You do n
    with WPA3). A monitor-mode capture shows the map only if you decrypt it: capture the backhaul's association (SAE and
    the 4-way handshake) and give Wireshark the backhaul passphrase; decrypting multi-link associations depends on the
    Wireshark version. The simpler check is hostapd's debug log on the parent, which shows the request and the response.
-3. **In the traffic:** run `iperf3` through the link. Before the map both links carry bytes. After it, only the mapped
-   one does. ⚠️ Read **received** bytes at the other end: per-link *transmit* counters on this platform are not reliable.
+3. **In the traffic:** run `iperf3` through the link with several parallel flows (`-P 4`). Before the map the traffic
+   sits on the link the driver chose for each flow's TID - a single flow stays on one link (see §1), several flows use
+   both. After it, only the mapped link carries bytes. ⚠️ Read **received** bytes at the other end: per-link *transmit* counters on this platform are not reliable.
 
 ## Network layout of a box
 

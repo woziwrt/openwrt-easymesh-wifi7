@@ -32,8 +32,9 @@ towards conformance with the published EasyMesh test cases, so that it can be ta
 - **Internet from any box.** Plug the internet cable into any box, and optionally use an LTE/5G modem in one of them
   for failover (see [Optional: LTE/5G failover](#optional-lte5g-failover)). The
   mesh keeps one gateway address for all clients. When the cable is pulled, or the router in front of the box goes
-  dead, clients are back online over LTE in about 10 seconds; when the cable comes back, the mesh returns to it after
-  about half a minute of stable cable, usually without a gap.
+  dead, clients are back online over LTE in about 7-11 seconds; when the cable comes back, the mesh returns to it after
+  about half a minute of stable cable, with a gap of a second or two at most (once 32 s in our tests; none when the cable
+  and the modem are in the same box).
 - **It tells you what is going on.** The web interface (LuCI) shows every box, every link and every client in plain words.
   It also points out a radio card that is noisier than the others, so a slow link is not blamed on the mesh.
 
@@ -98,7 +99,8 @@ Set the boot switch of every box to SD (**A = 1, B = 1**). Like stock OpenWrt, e
 key `12345678`: build the mesh with nobody else in range, and set root passwords afterwards (step 4).
 
 The image starts with the Wi-Fi country set to **CZ** (Czech Republic). If you are elsewhere, set yours on each box in
-*Network → WiFi Manager → Change Country* before you build the mesh. The backhaul uses 6 GHz where your country allows
+*Network → WiFi Manager → Change Country* before you build the mesh; the box restarts after the change (about a
+minute). The backhaul uses 6 GHz where your country allows
 it; we have built the mesh with CZ only. Where 6 GHz is not allowed, the backhaul runs on 5 GHz only - we have not
 tested that.
 
@@ -155,7 +157,9 @@ A short press does not pair: the main box ignores it, and on a BPI-R4 that is no
 (new box first) works too, but leaves only about three minutes.
 
 The new box joins on its own in about six to ten minutes (up to 15 on a Pro 8X), with nothing to type in. On the way it
-restarts twice by itself and once more restarts its services - that is expected, not a fault. Meanwhile its tile in
+restarts twice by itself and once more restarts its services - that is expected, not a fault. (The *Setup* page inside
+the box still says "restarts once" and "four to six minutes"; the numbers here are the measured ones - trust these.)
+Meanwhile its tile in
 *Overview* comes and goes and changes several times: a MAC address, a `BPI-R4-…` name, `192.168.1.1`, one link, a
 brown dot. It can look finished two or three times before it is. **Do nothing, and do not press any button** - a second
 press cancels the pairing. If the picture looks stuck, reload the page; that never disturbs the pairing.
@@ -239,7 +243,9 @@ box back with *Move…* - the move is measured and undone if it is not faster. T
   downloads, in one test series). Runs as a dry run by default.
 - ✅ **Persistent controller database:** topology, links, clients and history survive restarts
 - ✅ **Gateway failover** between cable and LTE on any box, one gateway address for clients: about 10 s to LTE when the
-  cable is pulled (3 of 3 tests, 10/10/11 s); back on the cable without a gap in 2 of 3 tests, once with a 32 s gap
+  cable is pulled (3 of 3 tests, 10/10/11 s); back on the cable without a gap in 2 of 3 tests, once with a 32 s gap.
+  With the cable and the modem in the same box (4 Oct 2026): after a power cut of all five boxes the mesh came up on the
+  modem alone, and moved to the cable without a gap when it was plugged in
 - ✅ **Self-healing after power loss:** repeated power cycles of the whole mesh, and it came back on its own in each of our tests
 - 🧪 **Choosing the parent:** the controller moves a box to a better parent on its own, by two plain rules. **Rescue,
   on by default:** its path is bad (under ~100 Mbit/s) and another parent is at least twice as good. **Towards the main
@@ -499,5 +505,5 @@ mt76: ISC). See [LICENSE](LICENSE) and [LICENSES.md](LICENSES.md).
 
 Copyright (c) 2026, Petr Wozniak (WOZIWRT project)
 
-This project implements the EasyMesh R6 specification but is not certified by the Wi-Fi Alliance. Wi-Fi EasyMesh is a
+This project is based on the EasyMesh R6 specification (partly implemented) and is not certified by the Wi-Fi Alliance. Wi-Fi EasyMesh is a
 trademark of the Wi-Fi Alliance.
