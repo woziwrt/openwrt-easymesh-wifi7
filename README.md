@@ -2,9 +2,8 @@
 
 **A Wi-Fi 7 mesh built from open-source routers, whose main box can steer which band each backhaul link carries.**
 
-*Based on the Wi-Fi EasyMesh™ R6 specification (partly implemented); not certified by the Wi-Fi Alliance. The next releases work
-towards conformance with the published EasyMesh test cases, so that it can be taken to certification
-(see [Planned](#planned-for-the-next-releases)).*
+*Based on the Wi-Fi EasyMesh™ R6 specification (partly implemented); not certified by the Wi-Fi Alliance, and
+certification is not a goal of this project.*
 
 > **Pre-release (v0.1-preview, 4 Oct 2026).** It runs every day on a five-box lab, but it is not a product yet.
 > We publish it early for reviewers and testers. It still has bugs - the ones we know are in
@@ -297,8 +296,6 @@ box back with *Move…* - the move is measured and undone if it is not faster. T
 - **Mitigation for noisy BE14 cards** (beacon timing), on by default once confirmed
 - **Join from any box:** press the button on the nearest box of the mesh, not only on the main one (EasyMesh push-button event propagation)
 - **Interoperability** with other vendors' EasyMesh controllers and agents, in both roles
-- **Conformance with the specification:** follow the EasyMesh R6 specification closely and check the mesh against the
-  publicly listed EasyMesh test cases, so that a vendor who builds on it could take it to certification
 - **Radar channels (DFS)** as an option, and channel suggestions from scans
 - **Onboarding with DPP (Easy Connect)**
 - **Capacity in the UI:** measured maximum of each link, not only the current traffic
