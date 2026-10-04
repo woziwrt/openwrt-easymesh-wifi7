@@ -297,7 +297,6 @@ box back with *Move…* - the move is measured and undone if it is not faster. T
 - **Join from any box:** press the button on the nearest box of the mesh, not only on the main one (EasyMesh push-button event propagation)
 - **Interoperability** with other vendors' EasyMesh controllers and agents, in both roles
 - **Radar channels (DFS)** as an option, and channel suggestions from scans
-- **Onboarding with DPP (Easy Connect)**
 - **Capacity in the UI:** measured maximum of each link, not only the current traffic
 - **Arranging the tree from measured links:** the first parent after a start chosen from scans, one measuring method for
   all decisions, a trial move without test traffic, and *Try it → Possible → Confirm* for a move by hand
